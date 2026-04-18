@@ -8,6 +8,7 @@ import torch
 from transformers.models.deepseek_v3 import DeepseekV3Config
 from transformers.models.deepseek_v3.modeling_deepseek_v3 import (
     DeepseekV3Attention,
+    DeepseekV3ForCausalLM,
     DeepseekV3MoE,
     DeepseekV3RotaryEmbedding,
 )
@@ -15,6 +16,7 @@ from transformers.models.deepseek_v3.modeling_deepseek_v3 import (
 from nanovllm.models.deepseek_v32 import (
     DeepseekV32Config,
     DeepseekV32DSAAttention,
+    DeepseekV32ForCausalLM,
     DeepseekV32SparseMoeBlock,
 )
 from nanovllm.utils.context import reset_context, set_context
@@ -130,6 +132,25 @@ class TestDeepseekV32OfficialParity(unittest.TestCase):
         attn.post_load_prepare()
 
     @staticmethod
+    def _assign_model_cache(model: DeepseekV32ForCausalLM) -> None:
+        num_layers = len(model.model.layers)
+        ckv_cache = torch.zeros(num_layers, 2, 8, model.model.layers[0].self_attn.kv_lora_rank)
+        kpe_cache = torch.zeros(num_layers, 2, 8, model.model.layers[0].self_attn.qk_rope_head_dim)
+        index_cache = torch.zeros(
+            num_layers,
+            2,
+            8,
+            model.model.layers[0].self_attn.indexer.head_dim,
+        )
+        for layer_idx, layer in enumerate(model.model.layers):
+            layer.self_attn.assign_dsa_cache(
+                ckv_cache[layer_idx],
+                kpe_cache[layer_idx],
+                index_cache[layer_idx],
+            )
+        model.post_load_prepare()
+
+    @staticmethod
     def _copy_attention_weights(
         dst: DeepseekV32DSAAttention,
         src: DeepseekV3Attention,
@@ -171,6 +192,25 @@ class TestDeepseekV32OfficialParity(unittest.TestCase):
             dst_expert.down_proj.weight.data.copy_(
                 src_expert.down_proj.weight.data
             )
+
+    def _copy_full_model_weights(
+        self,
+        dst: DeepseekV32ForCausalLM,
+        src: DeepseekV3ForCausalLM,
+    ) -> None:
+        dst.model.embed_tokens.weight.data.copy_(src.model.embed_tokens.weight.data)
+        dst.model.norm.weight.data.copy_(src.model.norm.weight.data)
+        dst.lm_head.weight.data.copy_(src.lm_head.weight.data)
+
+        for dst_layer, src_layer in zip(dst.model.layers, src.model.layers):
+            dst_layer.input_layernorm.weight.data.copy_(
+                src_layer.input_layernorm.weight.data
+            )
+            dst_layer.post_attention_layernorm.weight.data.copy_(
+                src_layer.post_attention_layernorm.weight.data
+            )
+            self._copy_attention_weights(dst_layer.self_attn, src_layer.self_attn)
+            self._copy_moe_weights(dst_layer.mlp, src_layer.mlp)
 
     def test_attention_matches_huggingface_reference(self):
         torch.manual_seed(0)
@@ -254,6 +294,46 @@ class TestDeepseekV32OfficialParity(unittest.TestCase):
             nv_out = nv_moe(hidden_states)
 
         self.assertTrue(torch.allclose(hf_out, nv_out, atol=1e-6, rtol=1e-6))
+
+    def test_full_model_matches_huggingface_reference(self):
+        torch.manual_seed(0)
+        hf_config = _build_hf_config(n_routed_experts=4, num_experts_per_tok=2)
+        nv_config = _build_nv_config(n_routed_experts=4, num_experts_per_tok=2)
+        hf_config.base_model_tp_plan = {}
+        hf_config.base_model_pp_plan = {}
+        hf_model = DeepseekV3ForCausalLM(hf_config)
+        nv_model = DeepseekV32ForCausalLM(nv_config)
+
+        for param in hf_model.parameters():
+            torch.nn.init.uniform_(param, -0.1, 0.1)
+        self._copy_full_model_weights(nv_model, hf_model)
+        self._assign_model_cache(nv_model)
+
+        input_ids = torch.tensor([1, 2, 3, 4], dtype=torch.long)
+        positions = torch.arange(input_ids.numel(), dtype=torch.long)
+
+        with torch.inference_mode():
+            hf_outputs = hf_model(input_ids=input_ids.unsqueeze(0))
+            hf_last_logits = hf_outputs.logits[:, -1, :].squeeze(0)
+
+            set_context(
+                True,
+                cu_seqlens_q=torch.tensor([0, input_ids.numel()], dtype=torch.int32),
+                cu_seqlens_k=torch.tensor([0, input_ids.numel()], dtype=torch.int32),
+                max_seqlen_q=input_ids.numel(),
+                max_seqlen_k=input_ids.numel(),
+                slot_mapping=torch.arange(input_ids.numel(), dtype=torch.int32),
+                context_lens=None,
+                block_tables=torch.tensor([[0]], dtype=torch.int32),
+                block_size=8,
+            )
+            nv_hidden_states = nv_model(input_ids, positions)
+            nv_last_logits = nv_model.compute_logits(nv_hidden_states).squeeze(0)
+            reset_context()
+
+        self.assertTrue(
+            torch.allclose(hf_last_logits, nv_last_logits, atol=1e-3, rtol=1e-3)
+        )
 
 
 if __name__ == "__main__":
