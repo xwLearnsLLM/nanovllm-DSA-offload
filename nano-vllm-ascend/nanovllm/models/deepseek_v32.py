@@ -27,6 +27,8 @@ from nanovllm.utils.logger import init_logger
 
 logger = init_logger(__name__)
 BMM_TRANS_MAX_SUPPORTED_TOKENS = 1024
+_VLLM_ASCEND_OPS_REGISTERED = False
+_VLLM_ASCEND_OPS_IMPORT_ERROR: str | None = None
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -72,6 +74,47 @@ def _profile_layer_selected(layer_idx: int, num_layers: int) -> bool:
         if selected == layer_idx:
             return True
     return False
+
+
+def _import_vllm_ascend_custom_ops() -> bool:
+    global _VLLM_ASCEND_OPS_REGISTERED, _VLLM_ASCEND_OPS_IMPORT_ERROR
+    if _VLLM_ASCEND_OPS_REGISTERED:
+        return True
+    if _VLLM_ASCEND_OPS_IMPORT_ERROR is not None:
+        return False
+    try:
+        import torch_npu  # noqa: F401  # type: ignore
+        import vllm  # noqa: F401  # type: ignore
+        import vllm_ascend  # noqa: F401  # type: ignore
+        from vllm_ascend import vllm_ascend_C  # noqa: F401  # type: ignore
+    except Exception as exc:
+        _VLLM_ASCEND_OPS_IMPORT_ERROR = repr(exc)
+        if _is_rank0():
+            logger.info(
+                "vllm-ascend custom op registration unavailable: %s",
+                _VLLM_ASCEND_OPS_IMPORT_ERROR,
+            )
+        return False
+    _VLLM_ASCEND_OPS_REGISTERED = True
+    return True
+
+
+def _get_ascend_op(name: str, *, allow_vllm_ascend_import: bool = False):
+    ascend_ops = getattr(torch.ops, "_C_ascend", None)
+    if ascend_ops is not None and hasattr(ascend_ops, name):
+        return getattr(ascend_ops, name), "torch.ops._C_ascend"
+    if allow_vllm_ascend_import and _import_vllm_ascend_custom_ops():
+        ascend_ops = getattr(torch.ops, "_C_ascend", None)
+        if ascend_ops is not None and hasattr(ascend_ops, name):
+            return getattr(ascend_ops, name), "torch.ops._C_ascend(vllm_ascend_C)"
+    try:
+        import torch_npu  # type: ignore
+    except Exception:
+        return None, None
+    op = getattr(torch_npu, name, None)
+    if op is not None:
+        return op, "torch_npu"
+    return None, None
 
 
 def yarn_get_mscale(scale: float = 1.0, mscale: float = 1.0) -> float:
@@ -1295,12 +1338,19 @@ class DeepseekV32DSAAttention(nn.Module):
     ) -> torch.Tensor | None:
         if not self.use_npu_sfa:
             return None
-        ascend_ops = getattr(torch.ops, "_C_ascend", None)
-        missing_ops = [
-            op_name
-            for op_name in ("npu_lightning_indexer", "npu_sparse_flash_attention")
-            if ascend_ops is None or not hasattr(ascend_ops, op_name)
-        ]
+        lightning_indexer, lightning_source = _get_ascend_op(
+            "npu_lightning_indexer",
+            allow_vllm_ascend_import=True,
+        )
+        sparse_flash_attention, sfa_source = _get_ascend_op(
+            "npu_sparse_flash_attention",
+            allow_vllm_ascend_import=True,
+        )
+        missing_ops = []
+        if lightning_indexer is None:
+            missing_ops.append("npu_lightning_indexer")
+        if sparse_flash_attention is None:
+            missing_ops.append("npu_sparse_flash_attention")
         if missing_ops:
             self._log_sfa_status_once(
                 f"unavailable: missing_ops={','.join(missing_ops)}"
@@ -1323,7 +1373,7 @@ class DeepseekV32DSAAttention(nn.Module):
         block_tables = context.block_tables.to(torch.int32)
 
         try:
-            topk_indices = torch.ops._C_ascend.npu_lightning_indexer(
+            topk_indices = lightning_indexer(
                 query=q_index,
                 key=self.index_cache.unsqueeze(2),
                 weights=weights,
@@ -1335,7 +1385,9 @@ class DeepseekV32DSAAttention(nn.Module):
                 sparse_count=self.index_topk,
                 sparse_mode=3,
             )
-            latent = torch.ops._C_ascend.npu_sparse_flash_attention(
+            if isinstance(topk_indices, tuple):
+                topk_indices = topk_indices[0]
+            latent = sparse_flash_attention(
                 query=ql_nope,
                 key=self.ckv_cache.unsqueeze(2),
                 value=self.ckv_cache.unsqueeze(2),
@@ -1351,7 +1403,11 @@ class DeepseekV32DSAAttention(nn.Module):
                 layout_kv="PA_BSND",
                 sparse_mode=3,
             )
-            self._log_sfa_status_once("active")
+            if isinstance(latent, tuple):
+                latent = latent[0]
+            self._log_sfa_status_once(
+                f"active: lightning={lightning_source} sfa={sfa_source}"
+            )
             return self._v_up_proj(latent)
         except Exception as exc:
             messages = type(self)._sfa_status_messages
