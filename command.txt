@@ -1,48 +1,8 @@
-# Next round after adding optional vllm_ascend_C custom-op registration.
-# Run from the directory that contains run.py. Stop after command 2 and send
-# the grep output plus any "failed once" traceback line.
+# Next round after fixing LightningIndexer input dtype for SFA.
+# Run from the directory that contains run.py. Send the grep output back.
 
-# 1) Show whether importing vllm_ascend_C registers the two SFA custom ops.
-mkdir -p logs && python - <<'PY' 2>&1 | tee logs/30_vllm_ascend_op_import_probe.log
-import torch
+# 1) Confirm SFA no longer fails on query/weights dtype.
+mkdir -p logs && NANOVLLM_ENABLE_NPU_SFA=1 NANOVLLM_USE_TQDM=0 NANOVLLM_WARMUP_RUNS=1 NANOVLLM_BENCH_RUNS=1 NANOVLLM_PERF_SUMMARY=1 NANOVLLM_PROFILE_DECODE=1 python run.py 2>&1 | tee logs/40_sfa_dtype_fix_decode.log
 
-def show(label):
-    ascend_ops = getattr(torch.ops, "_C_ascend", None)
-    print(f"== {label} ==")
-    for name in (
-        "npu_lightning_indexer",
-        "npu_sparse_flash_attention",
-        "batch_matmul_transpose",
-        "moe_gating_top_k",
-    ):
-        print(f"torch.ops._C_ascend.{name}:", bool(ascend_ops is not None and hasattr(ascend_ops, name)))
-    try:
-        import torch_npu
-        for name in (
-            "npu_lightning_indexer",
-            "npu_sparse_flash_attention",
-            "npu_kv_rmsnorm_rope_cache",
-            "npu_interleave_rope",
-            "npu_moe_gating_top_k",
-        ):
-            print(f"torch_npu.{name}:", hasattr(torch_npu, name))
-    except Exception as exc:
-        print("torch_npu import failed:", repr(exc))
-
-show("before vllm_ascend_C import")
-try:
-    import vllm
-    import vllm_ascend
-    from vllm_ascend import vllm_ascend_C
-    print("vllm_ascend_C import: ok")
-except Exception as exc:
-    print("vllm_ascend_C import: failed", repr(exc))
-show("after vllm_ascend_C import")
-PY
-
-# 2) Run SFA decode. The important line should be:
-# "NPU SFA decode fast path active: lightning=torch.ops._C_ascend(vllm_ascend_C) sfa=torch.ops._C_ascend"
-mkdir -p logs && NANOVLLM_ENABLE_NPU_SFA=1 NANOVLLM_USE_TQDM=0 NANOVLLM_WARMUP_RUNS=1 NANOVLLM_BENCH_RUNS=1 NANOVLLM_PERF_SUMMARY=1 NANOVLLM_PROFILE_DECODE=1 python run.py 2>&1 | tee logs/31_sfa_vllm_ascend_ops_decode.log
-
-# 3) Extract the lines I need from this round.
-grep -E "== |vllm_ascend_C import|torch.ops._C_ascend|torch_npu\\.|vllm-ascend custom op registration|NPU SFA decode fast path|Decode profile avg|Perf summary|summary :" logs/30_vllm_ascend_op_import_probe.log logs/31_sfa_vllm_ascend_ops_decode.log
+# 2) Extract the lines I need.
+grep -E "vllm-ascend custom op registration|NPU SFA decode fast path|Decode profile avg|Perf summary|summary :|failed once|AclNN_Parameter_Error|response:" logs/40_sfa_dtype_fix_decode.log

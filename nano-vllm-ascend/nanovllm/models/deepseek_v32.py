@@ -1373,10 +1373,13 @@ class DeepseekV32DSAAttention(nn.Module):
         block_tables = context.block_tables.to(torch.int32)
 
         try:
+            sfa_index_dtype = self.index_cache.dtype
+            q_index_sfa = q_index.to(sfa_index_dtype).contiguous()
+            weights_sfa = weights.to(sfa_index_dtype).contiguous()
             topk_indices = lightning_indexer(
-                query=q_index,
+                query=q_index_sfa,
                 key=self.index_cache.unsqueeze(2),
-                weights=weights,
+                weights=weights_sfa,
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_key=actual_seq_lengths_key,
                 block_table=block_tables,
