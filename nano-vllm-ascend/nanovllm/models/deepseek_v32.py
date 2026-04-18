@@ -272,17 +272,21 @@ class DeepseekV32MLP(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         hidden_act: str,
+        *,
+        disable_tp: bool = False,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size, intermediate_size],
             bias=False,
+            disable_tp=disable_tp,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
             bias=False,
+            disable_tp=disable_tp,
         )
         if hidden_act != "silu":
             raise ValueError("Only silu is supported for DeepSeek-V3.2.")
@@ -312,6 +316,27 @@ class DeepseekV32SparseMoeBlock(nn.Module):
         self.num_expert_group = max(1, int(getattr(config, "n_group", 1) or 1))
         self.topk_group = max(1, int(getattr(config, "topk_group", 1) or 1))
         self.num_shared_experts = int(getattr(config, "n_shared_experts", 1) or 1)
+        self.enable_expert_parallel = bool(
+            getattr(config, "nanovllm_enable_expert_parallel", False)
+        )
+        self.ep_size = dist.get_world_size() if self.enable_expert_parallel else 1
+        self.ep_rank = dist.get_rank() if self.enable_expert_parallel else 0
+        if self.enable_expert_parallel and self.num_experts % self.ep_size != 0:
+            raise ValueError(
+                "DeepSeek-V3.2 expert_parallel requires n_routed_experts to "
+                "be divisible by the EP world size."
+            )
+        self.num_local_experts = (
+            self.num_experts // self.ep_size
+            if self.enable_expert_parallel
+            else self.num_experts
+        )
+        self.local_expert_start = self.ep_rank * self.num_local_experts
+        self.local_expert_end = self.local_expert_start + self.num_local_experts
+        self.local_expert_ids = tuple(
+            range(self.local_expert_start, self.local_expert_end)
+        )
+        self.local_expert_id_set = set(self.local_expert_ids)
         trace_dir = os.environ.get("NANOVLLM_MOE_TRACE_DIR")
         self.trace_dir = Path(trace_dir) if trace_dir else None
         if self.trace_dir is not None:
@@ -338,15 +363,16 @@ class DeepseekV32SparseMoeBlock(nn.Module):
             intermediate_size=self.moe_intermediate_size * self.num_shared_experts,
             hidden_act=self.hidden_act,
         )
-        self.experts = nn.ModuleList(
-            [
-                DeepseekV32MLP(
+        self.experts = nn.ModuleDict(
+            {
+                str(expert_idx): DeepseekV32MLP(
                     hidden_size=self.hidden_size,
                     intermediate_size=self.moe_intermediate_size,
                     hidden_act=self.hidden_act,
+                    disable_tp=self.enable_expert_parallel,
                 )
-                for _ in range(self.num_experts)
-            ]
+                for expert_idx in self.local_expert_ids
+            }
         )
 
     def _maybe_trace_inputs(self, hidden_states: torch.Tensor) -> None:
@@ -461,7 +487,7 @@ class DeepseekV32SparseMoeBlock(nn.Module):
         )
         routing_weights = routing_weights.to(hidden_states.dtype)
 
-        final_hidden_states = torch.zeros(
+        routed_hidden_states = torch.zeros(
             hidden_states.shape,
             dtype=hidden_states.dtype,
             device=hidden_states.device,
@@ -474,20 +500,25 @@ class DeepseekV32SparseMoeBlock(nn.Module):
         ).nonzero(as_tuple=False).flatten()
 
         for expert_idx in expert_hitted.tolist():
-            expert_layer = self.experts[expert_idx]
+            if expert_idx not in self.local_expert_id_set:
+                continue
+            expert_layer = self.experts[str(expert_idx)]
             idx, top_x = torch.where(expert_mask[expert_idx])
             current_state = hidden_states[top_x].reshape(-1, hidden_dim)
             current_hidden_states = (
                 expert_layer(current_state)
                 * routing_weights[top_x, idx, None]
             )
-            final_hidden_states.index_add_(
+            routed_hidden_states.index_add_(
                 0,
                 top_x,
                 current_hidden_states.to(hidden_states.dtype),
             )
 
-        final_hidden_states += shared_output
+        if self.enable_expert_parallel and self.ep_size > 1:
+            dist.all_reduce(routed_hidden_states)
+
+        final_hidden_states = routed_hidden_states + shared_output
         return final_hidden_states.view(sequence_length, hidden_dim)
 
 
@@ -1000,3 +1031,19 @@ class DeepseekV32ForCausalLM(nn.Module):
 
     def post_load_prepare(self) -> None:
         self.model.post_load_prepare()
+
+    def weight_name_mapping(self, weight_name: str) -> str | None:
+        if ".mlp.experts." not in weight_name:
+            return weight_name
+        parts = weight_name.split(".")
+        try:
+            layer_idx = int(parts[2])
+            expert_idx = int(parts[5])
+        except (IndexError, ValueError):
+            return weight_name
+        layer = self.model.layers[layer_idx].mlp
+        if not isinstance(layer, DeepseekV32SparseMoeBlock):
+            return weight_name
+        if expert_idx in layer.local_expert_id_set:
+            return weight_name
+        return None

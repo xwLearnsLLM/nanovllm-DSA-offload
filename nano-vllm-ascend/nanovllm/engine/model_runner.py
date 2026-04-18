@@ -85,7 +85,11 @@ class ModelRunner:
     def _load_default_strategy(self):
         arch = self.hf_config.architectures[0]
         model = model_dict[arch](self.hf_config)
-        load_model(model, self.config.model)
+        load_model(
+            model,
+            self.config.model,
+            name_mapping=getattr(model, "weight_name_mapping", None),
+        )
         if hasattr(model, "post_load_prepare"):
             model.post_load_prepare()
         return model

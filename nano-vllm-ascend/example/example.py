@@ -108,6 +108,10 @@ def main():
         )
     )
     tensor_parallel_size = get_env_int("NANOVLLM_TP_SIZE", 4)
+    enable_expert_parallel = get_env_bool(
+        "NANOVLLM_ENABLE_EXPERT_PARALLEL",
+        True,
+    )
     max_model_len = get_env_int("NANOVLLM_MAX_MODEL_LEN", 256)
     max_num_batched_tokens = get_env_int(
         "NANOVLLM_MAX_BATCHED_TOKENS",
@@ -133,6 +137,7 @@ def main():
         model_path,
         enforce_eager=True,
         tensor_parallel_size=tensor_parallel_size,
+        enable_expert_parallel=enable_expert_parallel,
         max_model_len=max_model_len,
         max_num_batched_tokens=max_num_batched_tokens,
         max_num_seqs=max_num_seqs,
@@ -155,7 +160,7 @@ def main():
         "example config: tp=%s, max_model_len=%s, max_num_batched_tokens=%s, "
         "max_num_seqs=%s, kvcache_block_size=%s, skip_warmup=%s, "
         "max_gen_tokens=%s, temperature=%s, use_deepseek_chat=%s, add_bos=%s, "
-        "gpu_memory_utilization=%s, tokenizer_path=%s",
+        "enable_expert_parallel=%s, gpu_memory_utilization=%s, tokenizer_path=%s",
         tensor_parallel_size,
         max_model_len,
         max_num_batched_tokens,
@@ -166,6 +171,7 @@ def main():
         temperature,
         use_deepseek_chat,
         add_bos,
+        enable_expert_parallel,
         gpu_memory_utilization,
         tokenizer_path,
     )

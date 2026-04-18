@@ -22,6 +22,7 @@ class Config:
     max_model_len: int = 4096
     gpu_memory_utilization: float = 0.7
     tensor_parallel_size: int = 1
+    enable_expert_parallel: bool = False
     enforce_eager: bool = False
     hf_config: AutoConfig | None = None
     eos: int = -1
@@ -40,6 +41,11 @@ class Config:
         assert self.kvcache_block_size % 16 == 0
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = self._load_hf_config()
+        setattr(
+            self.hf_config,
+            "nanovllm_enable_expert_parallel",
+            bool(self.enable_expert_parallel),
+        )
         self._validate_model_format()
         if getattr(self.hf_config, "model_type", None) == "deepseek_v32":
             self.enforce_eager = True
