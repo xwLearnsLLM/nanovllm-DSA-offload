@@ -1,11 +1,10 @@
-# Run these commands one by one on the Ascend machine from the directory that
-# contains run.py. Do not run all benchmark variants in one batch; stop and send
-# the log if any command prints "NPU SFA decode fast path failed once".
+# Next round only. Run from the directory that contains run.py.
+# Do not set NANOVLLM_ENABLE_NPU_MOE_GATING=1 for now; your last run showed it
+# regresses decode from ~11.6 tok/s to ~8.8 tok/s.
 
-mkdir -p logs
-
-# 0) Probe whether the vllm-ascend-style custom ops exist in this environment.
-python - <<'PY' 2>&1 | tee logs/00_op_probe.log
+# 0) Probe the custom ops. This was skipped last time, and it tells us whether
+# the SFA path can really call the vllm-ascend-style kernels.
+mkdir -p logs && python - <<'PY' 2>&1 | tee logs/10_op_probe.log
 import torch
 
 print("torch:", getattr(torch, "__version__", "unknown"))
@@ -42,27 +41,17 @@ if torch_npu is not None:
         print(f"torch_npu.{name}:", hasattr(torch_npu, name))
 PY
 
-# 1) Baseline after the current nano patch. This keeps SFA and NPU MoE gating off.
-NANOVLLM_USE_TQDM=0 NANOVLLM_WARMUP_RUNS=1 NANOVLLM_BENCH_RUNS=1 NANOVLLM_PERF_SUMMARY=1 NANOVLLM_PROFILE_DECODE=1 python run.py 2>&1 | tee logs/01_default_decode.log
+# 1) Confirm whether NANOVLLM_ENABLE_NPU_SFA=1 is actually active or silently
+# falling back. Look for "NPU SFA decode fast path active/unavailable/failed".
+mkdir -p logs && NANOVLLM_ENABLE_NPU_SFA=1 NANOVLLM_USE_TQDM=0 NANOVLLM_WARMUP_RUNS=1 NANOVLLM_BENCH_RUNS=1 NANOVLLM_PERF_SUMMARY=1 NANOVLLM_PROFILE_DECODE=1 python run.py 2>&1 | tee logs/11_sfa_status_decode.log
 
-# 2) Baseline layer split. Paste the "Layer profile avg" lines back.
-NANOVLLM_USE_TQDM=0 NANOVLLM_WARMUP_RUNS=0 NANOVLLM_BENCH_RUNS=1 NANOVLLM_PERF_SUMMARY=1 NANOVLLM_PROFILE_LAYERS=1 NANOVLLM_PROFILE_LAYER_IDS=0,mid,last python run.py 2>&1 | tee logs/02_default_layers.log
+# 2) Detailed split for SFA enabled. Paste the "Attention detail avg",
+# "MoE detail avg", and "Layer profile avg" lines.
+mkdir -p logs && NANOVLLM_ENABLE_NPU_SFA=1 NANOVLLM_USE_TQDM=0 NANOVLLM_WARMUP_RUNS=0 NANOVLLM_BENCH_RUNS=1 NANOVLLM_PERF_SUMMARY=1 NANOVLLM_PROFILE_LAYERS=1 NANOVLLM_PROFILE_ATTENTION_DETAIL=1 NANOVLLM_PROFILE_MOE_DETAIL=1 NANOVLLM_PROFILE_LAYER_IDS=mid,last python run.py 2>&1 | tee logs/12_sfa_detail.log
 
-# 3) Enable the SFA decode fast path: npu_lightning_indexer + npu_sparse_flash_attention.
-NANOVLLM_ENABLE_NPU_SFA=1 NANOVLLM_USE_TQDM=0 NANOVLLM_WARMUP_RUNS=1 NANOVLLM_BENCH_RUNS=1 NANOVLLM_PERF_SUMMARY=1 NANOVLLM_PROFILE_DECODE=1 python run.py 2>&1 | tee logs/03_sfa_decode.log
+# 3) Detailed split for the native DSA path. This compares against step 2 and
+# shows exactly what the SFA switch changed.
+mkdir -p logs && NANOVLLM_USE_TQDM=0 NANOVLLM_WARMUP_RUNS=0 NANOVLLM_BENCH_RUNS=1 NANOVLLM_PERF_SUMMARY=1 NANOVLLM_PROFILE_LAYERS=1 NANOVLLM_PROFILE_ATTENTION_DETAIL=1 NANOVLLM_PROFILE_MOE_DETAIL=1 NANOVLLM_PROFILE_LAYER_IDS=mid,last python run.py 2>&1 | tee logs/13_native_detail.log
 
-# 4) SFA layer split. The attention column should drop if the fast path is active.
-NANOVLLM_ENABLE_NPU_SFA=1 NANOVLLM_USE_TQDM=0 NANOVLLM_WARMUP_RUNS=0 NANOVLLM_BENCH_RUNS=1 NANOVLLM_PERF_SUMMARY=1 NANOVLLM_PROFILE_LAYERS=1 NANOVLLM_PROFILE_LAYER_IDS=0,mid,last python run.py 2>&1 | tee logs/04_sfa_layers.log
-
-# 5) Enable SFA plus NPU MoE gating. This only optimizes router top-k, not expert MLP yet.
-NANOVLLM_ENABLE_NPU_SFA=1 NANOVLLM_ENABLE_NPU_MOE_GATING=1 NANOVLLM_USE_TQDM=0 NANOVLLM_WARMUP_RUNS=1 NANOVLLM_BENCH_RUNS=1 NANOVLLM_PERF_SUMMARY=1 NANOVLLM_PROFILE_DECODE=1 python run.py 2>&1 | tee logs/05_sfa_moe_gate_decode.log
-
-# 6) SFA plus NPU MoE gating layer split.
-NANOVLLM_ENABLE_NPU_SFA=1 NANOVLLM_ENABLE_NPU_MOE_GATING=1 NANOVLLM_USE_TQDM=0 NANOVLLM_WARMUP_RUNS=0 NANOVLLM_BENCH_RUNS=1 NANOVLLM_PERF_SUMMARY=1 NANOVLLM_PROFILE_LAYERS=1 NANOVLLM_PROFILE_LAYER_IDS=0,mid,last python run.py 2>&1 | tee logs/06_sfa_moe_gate_layers.log
-
-# 7) Optional isolation run: only use this if the default patched baseline is
-# slower than your previous 9-12 tok/s result. It disables batch_matmul_transpose.
-NANOVLLM_DISABLE_BATCH_MATMUL_TRANSPOSE=1 NANOVLLM_USE_TQDM=0 NANOVLLM_WARMUP_RUNS=1 NANOVLLM_BENCH_RUNS=1 NANOVLLM_PERF_SUMMARY=1 NANOVLLM_PROFILE_DECODE=1 python run.py 2>&1 | tee logs/07_no_batch_matmul_transpose_decode.log
-
-# 8) After the runs, this extracts the lines I need most.
-grep -E "Decode profile avg|Layer profile avg|Perf summary|summary :|NPU SFA decode fast path failed|response:" logs/*.log
+# 4) Extract the important lines after the three runs.
+grep -E "NPU SFA decode fast path|Decode profile avg|Attention detail avg|MoE detail avg|Layer profile avg|Perf summary|summary :" logs/10_op_probe.log logs/11_sfa_status_decode.log logs/12_sfa_detail.log logs/13_native_detail.log

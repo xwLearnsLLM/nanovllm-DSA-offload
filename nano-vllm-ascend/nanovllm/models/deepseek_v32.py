@@ -444,6 +444,28 @@ class DeepseekV32SparseMoeBlock(nn.Module):
             os.environ.get("NANOVLLM_ENABLE_NPU_MOE_GATING", "0").lower()
             in ("1", "true", "yes", "on")
         )
+        self.profile_moe_detail = (
+            _env_flag("NANOVLLM_PROFILE_MOE_DETAIL", False)
+            and _profile_layer_selected(
+                self.layer_idx,
+                int(config.num_hidden_layers),
+            )
+        )
+        self.profile_moe_every = max(
+            1,
+            int(os.environ.get("NANOVLLM_PROFILE_MOE_DETAIL_EVERY", "31")),
+        )
+        self.profile_moe_steps = 0
+        self.profile_moe_times = {
+            "shared": 0.0,
+            "gate": 0.0,
+            "topk": 0.0,
+            "route_setup": 0.0,
+            "experts": 0.0,
+            "all_reduce": 0.0,
+            "total": 0.0,
+        }
+        self.profile_moe_experts = 0
 
         self.gate = ReplicatedLinear(self.hidden_size, self.num_experts, bias=False)
         if getattr(config, "topk_method", None) == "noaux_tc":
@@ -641,7 +663,103 @@ class DeepseekV32SparseMoeBlock(nn.Module):
 
         return topk_weights.float(), topk_ids.long()
 
+    def _forward_profiled(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        device = hidden_states.device
+
+        def _record(name: str, fn):
+            _profile_sync(device)
+            start = perf_counter()
+            output = fn()
+            _profile_sync(device)
+            self.profile_moe_times[name] += perf_counter() - start
+            return output
+
+        _profile_sync(device)
+        total_start = perf_counter()
+        sequence_length, hidden_dim = hidden_states.shape
+        self._maybe_trace_inputs(hidden_states)
+        shared_output = _record("shared", lambda: self.shared_experts(hidden_states))
+        router_logits = _record("gate", lambda: self.gate(hidden_states))
+        routing_weights, selected_experts = _record(
+            "topk",
+            lambda: self._grouped_topk(hidden_states, router_logits),
+        )
+        routing_weights = routing_weights.to(hidden_states.dtype)
+
+        routed_hidden_states = torch.zeros(
+            hidden_states.shape,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+
+        def _route_setup():
+            expert_mask = torch.nn.functional.one_hot(
+                selected_experts, num_classes=self.num_experts
+            ).permute(2, 1, 0)
+            if self.use_static_local_expert_loop:
+                expert_indices = self.local_expert_ids
+            else:
+                expert_hitted = torch.greater(
+                    expert_mask.sum(dim=(-1, -2)), 0
+                ).nonzero(as_tuple=False).flatten()
+                expert_indices = tuple(
+                    expert_idx
+                    for expert_idx in expert_hitted.tolist()
+                    if expert_idx in self.local_expert_id_set
+                )
+            return expert_mask, expert_indices
+
+        expert_mask, expert_indices = _record("route_setup", _route_setup)
+
+        def _run_experts():
+            for expert_idx in expert_indices:
+                expert_layer = self.experts[str(expert_idx)]
+                idx, top_x = torch.where(expert_mask[expert_idx])
+                current_state = hidden_states[top_x].reshape(-1, hidden_dim)
+                current_hidden_states = (
+                    expert_layer(current_state)
+                    * routing_weights[top_x, idx, None]
+                )
+                routed_hidden_states.index_add_(
+                    0,
+                    top_x,
+                    current_hidden_states.to(hidden_states.dtype),
+                )
+
+        _record("experts", _run_experts)
+        final_hidden_states = routed_hidden_states + shared_output
+        if self.enable_expert_parallel and self.ep_size > 1:
+            _record("all_reduce", lambda: dist.all_reduce(final_hidden_states))
+
+        _profile_sync(device)
+        self.profile_moe_times["total"] += perf_counter() - total_start
+        self.profile_moe_steps += 1
+        self.profile_moe_experts += len(expert_indices)
+        if (
+            _is_rank0()
+            and self.profile_moe_steps % self.profile_moe_every == 0
+        ):
+            steps = self.profile_moe_steps
+            logger.info(
+                "MoE detail avg: layer=%d steps=%d experts=%.2f "
+                "shared=%.4fs gate=%.4fs topk=%.4fs route_setup=%.4fs "
+                "experts=%.4fs all_reduce=%.4fs total=%.4fs",
+                self.layer_idx,
+                steps,
+                self.profile_moe_experts / steps,
+                self.profile_moe_times["shared"] / steps,
+                self.profile_moe_times["gate"] / steps,
+                self.profile_moe_times["topk"] / steps,
+                self.profile_moe_times["route_setup"] / steps,
+                self.profile_moe_times["experts"] / steps,
+                self.profile_moe_times["all_reduce"] / steps,
+                self.profile_moe_times["total"] / steps,
+            )
+        return final_hidden_states.view(sequence_length, hidden_dim)
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.profile_moe_detail and not get_context().is_prefill:
+            return self._forward_profiled(hidden_states)
         sequence_length, hidden_dim = hidden_states.shape
         self._maybe_trace_inputs(hidden_states)
         shared_output = self.shared_experts(hidden_states)
@@ -753,6 +871,8 @@ class DeepseekV32Indexer(nn.Module):
 
 
 class DeepseekV32DSAAttention(nn.Module):
+    _sfa_status_messages: set[str] = set()
+
     def __init__(self, config: DeepseekV32Config, layer_idx: int) -> None:
         super().__init__()
         tp_size = dist.get_world_size()
@@ -837,6 +957,31 @@ class DeepseekV32DSAAttention(nn.Module):
             False,
         )
         self._npu_sfa_failure_logged = False
+        self._npu_sfa_status_logged = False
+        self.profile_attention_detail = (
+            _env_flag("NANOVLLM_PROFILE_ATTENTION_DETAIL", False)
+            and _profile_layer_selected(
+                self.layer_id,
+                int(config.num_hidden_layers),
+            )
+        )
+        self.profile_attention_every = max(
+            1,
+            int(os.environ.get("NANOVLLM_PROFILE_ATTENTION_DETAIL_EVERY", "31")),
+        )
+        self.profile_attention_steps = 0
+        self.profile_attention_times = {
+            "q_a": 0.0,
+            "q_b": 0.0,
+            "kv_a": 0.0,
+            "kv_norm_rope": 0.0,
+            "indexer": 0.0,
+            "store_cache": 0.0,
+            "q_up": 0.0,
+            "dsa": 0.0,
+            "o_proj": 0.0,
+            "total": 0.0,
+        }
 
     def assign_dsa_cache(
         self,
@@ -985,6 +1130,12 @@ class DeepseekV32DSAAttention(nn.Module):
         latent_by_head = latent.transpose(0, 1).contiguous()
         output = torch.bmm(latent_by_head, self.w_uv)
         return output.transpose(0, 1).reshape(num_tokens, -1)
+
+    def _log_sfa_status_once(self, message: str) -> None:
+        messages = type(self)._sfa_status_messages
+        if _is_rank0() and message not in messages:
+            logger.info("NPU SFA decode fast path %s", message)
+            messages.add(message)
 
     def _prefill_forward(
         self,
@@ -1144,15 +1295,21 @@ class DeepseekV32DSAAttention(nn.Module):
     ) -> torch.Tensor | None:
         if not self.use_npu_sfa:
             return None
-        if not (
-            hasattr(torch.ops, "_C_ascend")
-            and hasattr(torch.ops._C_ascend, "npu_lightning_indexer")
-            and hasattr(torch.ops._C_ascend, "npu_sparse_flash_attention")
-        ):
+        ascend_ops = getattr(torch.ops, "_C_ascend", None)
+        missing_ops = [
+            op_name
+            for op_name in ("npu_lightning_indexer", "npu_sparse_flash_attention")
+            if ascend_ops is None or not hasattr(ascend_ops, op_name)
+        ]
+        if missing_ops:
+            self._log_sfa_status_once(
+                f"unavailable: missing_ops={','.join(missing_ops)}"
+            )
             return None
 
         context = get_context()
         if context.block_tables is None or context.context_lens is None:
+            self._log_sfa_status_once("unavailable: missing decode metadata")
             return None
 
         batch_size = ql_nope.shape[0]
@@ -1194,15 +1351,17 @@ class DeepseekV32DSAAttention(nn.Module):
                 layout_kv="PA_BSND",
                 sparse_mode=3,
             )
+            self._log_sfa_status_once("active")
             return self._v_up_proj(latent)
         except Exception as exc:
-            if _is_rank0() and not self._npu_sfa_failure_logged:
+            messages = type(self)._sfa_status_messages
+            if _is_rank0() and "failed" not in messages:
                 logger.warning(
                     "NPU SFA decode fast path failed once; falling back to "
                     "PyTorch DSA attention. error=%r",
                     exc,
                 )
-                self._npu_sfa_failure_logged = True
+                messages.add("failed")
             self.use_npu_sfa = False
             return None
 
@@ -1233,6 +1392,100 @@ class DeepseekV32DSAAttention(nn.Module):
             )
         return self._decode_forward_loop(ql_nope, q_pe, q_index, weights)
 
+    def _forward_profiled(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        device = hidden_states.device
+
+        def _record(name: str, fn):
+            _profile_sync(device)
+            start = perf_counter()
+            output = fn()
+            _profile_sync(device)
+            self.profile_attention_times[name] += perf_counter() - start
+            return output
+
+        _profile_sync(device)
+        total_start = perf_counter()
+        q_c = _record("q_a", lambda: self.q_a_layernorm(self.q_a_proj(hidden_states)))
+
+        def _q_b():
+            q = self.q_b_proj(q_c).view(
+                -1, self.num_local_heads, self.qk_head_dim
+            )
+            return torch.split(
+                q,
+                [self.qk_nope_head_dim, self.qk_rope_head_dim],
+                dim=-1,
+            )
+
+        q_nope, q_pe = _record("q_b", _q_b)
+        ckv, k_pe = _record(
+            "kv_a",
+            lambda: torch.split(
+                self.kv_a_proj_with_mqa(hidden_states),
+                [self.kv_lora_rank, self.qk_rope_head_dim],
+                dim=-1,
+            ),
+        )
+
+        def _kv_norm_rope():
+            ckv_normed = self.kv_a_layernorm(ckv)
+            q_pe_rot, k_pe_rot = self.rotary_emb(
+                positions,
+                q_pe,
+                k_pe.unsqueeze(1),
+            )
+            return ckv_normed, q_pe_rot, k_pe_rot.squeeze(1)
+
+        ckv, q_pe, k_pe = _record("kv_norm_rope", _kv_norm_rope)
+        q_index, index_k, weights = _record(
+            "indexer",
+            lambda: self.indexer(
+                hidden_states,
+                q_c,
+                positions,
+                self.indexer_rotary_emb,
+            ),
+        )
+        _record("store_cache", lambda: self._store_cache(ckv, k_pe, index_k))
+        ql_nope = _record("q_up", lambda: self._q_nope_up_proj(q_nope))
+        attn_output = _record(
+            "dsa",
+            lambda: self._decode_forward(ql_nope, q_pe, q_index, weights),
+        )
+        output = _record("o_proj", lambda: self.o_proj(attn_output))
+
+        _profile_sync(device)
+        self.profile_attention_times["total"] += perf_counter() - total_start
+        self.profile_attention_steps += 1
+        if (
+            _is_rank0()
+            and self.profile_attention_steps % self.profile_attention_every == 0
+        ):
+            steps = self.profile_attention_steps
+            logger.info(
+                "Attention detail avg: layer=%d steps=%d q_a=%.4fs "
+                "q_b=%.4fs kv_a=%.4fs kv_norm_rope=%.4fs indexer=%.4fs "
+                "store_cache=%.4fs q_up=%.4fs dsa=%.4fs o_proj=%.4fs "
+                "total=%.4fs",
+                self.layer_id,
+                steps,
+                self.profile_attention_times["q_a"] / steps,
+                self.profile_attention_times["q_b"] / steps,
+                self.profile_attention_times["kv_a"] / steps,
+                self.profile_attention_times["kv_norm_rope"] / steps,
+                self.profile_attention_times["indexer"] / steps,
+                self.profile_attention_times["store_cache"] / steps,
+                self.profile_attention_times["q_up"] / steps,
+                self.profile_attention_times["dsa"] / steps,
+                self.profile_attention_times["o_proj"] / steps,
+                self.profile_attention_times["total"] / steps,
+            )
+        return output
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -1240,6 +1493,8 @@ class DeepseekV32DSAAttention(nn.Module):
     ) -> torch.Tensor:
         if self.w_uk_t is None or self.w_uv is None:
             self.post_load_prepare()
+        if self.profile_attention_detail and not get_context().is_prefill:
+            return self._forward_profiled(positions, hidden_states)
 
         q_c = self.q_a_layernorm(self.q_a_proj(hidden_states))
         q = self.q_b_proj(q_c).view(
