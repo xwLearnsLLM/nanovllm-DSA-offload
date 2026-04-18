@@ -404,6 +404,10 @@ class DeepseekV32SparseMoeBlock(nn.Module):
         router_logits: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         del hidden_states
+        grouped_topk = self._grouped_topk_npu(router_logits)
+        if grouped_topk is not None:
+            return grouped_topk
+
         router_logits = router_logits.float()
         if self.scoring_func == "softmax":
             scores = torch.softmax(router_logits, dim=-1)
@@ -475,6 +479,46 @@ class DeepseekV32SparseMoeBlock(nn.Module):
         if self.routed_scaling_factor != 1.0:
             topk_weights = topk_weights * self.routed_scaling_factor
         return topk_weights, topk_ids
+
+    def _grouped_topk_npu(
+        self,
+        router_logits: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if router_logits.device.type != "npu":
+            return None
+
+        try:
+            import torch_npu  # type: ignore
+        except Exception:
+            return None
+
+        gating_op = getattr(torch_npu, "npu_moe_gating_top_k", None)
+        if gating_op is None:
+            return None
+
+        bias = getattr(self.gate, "e_score_correction_bias", None)
+        group_select_mode = 1 if bias is not None else 0
+        norm_type = 1 if self.scoring_func == "sigmoid" else 0
+        if self.scoring_func not in ("softmax", "sigmoid"):
+            return None
+
+        try:
+            topk_weights, topk_ids, _ = gating_op(
+                router_logits.float(),
+                self.top_k,
+                bias=bias,
+                k_group=self.topk_group,
+                group_count=self.num_expert_group,
+                group_select_mode=group_select_mode,
+                renorm=1 if self.renormalize else 0,
+                norm_type=norm_type,
+                out_flag=False,
+                routed_scaling_factor=self.routed_scaling_factor,
+            )
+        except Exception:
+            return None
+
+        return topk_weights.float(), topk_ids.long()
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         sequence_length, hidden_dim = hidden_states.shape
