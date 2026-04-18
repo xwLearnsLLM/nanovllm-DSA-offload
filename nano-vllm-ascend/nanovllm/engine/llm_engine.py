@@ -102,12 +102,60 @@ class LLMEngine:
         atexit.register(self.exit)
 
     @staticmethod
-    def _load_tokenizer(config: Config):
+    def _is_true_env(name: str, default: bool = False) -> bool:
+        value = os.environ.get(name)
+        if value is None:
+            return default
+        return value.lower() in ("1", "true", "yes", "on")
+
+    @staticmethod
+    def _is_deepseek_v32(config: Config) -> bool:
+        return getattr(config.hf_config, "model_type", None) == "deepseek_v32"
+
+    @classmethod
+    def _tokenizer_load_kwargs(cls, config: Config) -> dict:
+        kwargs = {
+            "trust_remote_code": config.trust_remote_code,
+        }
+        if cls._is_deepseek_v32(config):
+            kwargs["fix_mistral_regex"] = True
+        return kwargs
+
+    @staticmethod
+    def _format_deepseek_prompt(prompt: str, use_chat_template: bool) -> str:
+        if not use_chat_template:
+            return prompt
+        return f"<｜User｜>{prompt}<｜Assistant｜>"
+
+    def _encode_string_prompt(self, prompt: str) -> list[int]:
+        if not self._is_deepseek_v32(self.config):
+            return self.tokenizer.encode(prompt)
+
+        use_chat_template = self._is_true_env(
+            "NANOVLLM_USE_DEEPSEEK_CHAT",
+            False,
+        )
+        formatted_prompt = self._format_deepseek_prompt(prompt, use_chat_template)
+        token_ids = self.tokenizer.encode(
+            formatted_prompt,
+            add_special_tokens=False,
+        )
+        add_bos = self._is_true_env(
+            "NANOVLLM_ADD_BOS",
+            use_chat_template,
+        )
+        bos_token_id = self.tokenizer.bos_token_id
+        if add_bos and bos_token_id is not None:
+            token_ids = [bos_token_id] + token_ids
+        return token_ids
+
+    @classmethod
+    def _load_tokenizer(cls, config: Config):
         try:
             tokenizer = AutoTokenizer.from_pretrained(
                 config.model,
                 use_fast=True,
-                trust_remote_code=config.trust_remote_code,
+                **cls._tokenizer_load_kwargs(config),
             )
         except Exception:
             if getattr(config.hf_config, "model_type", None) != "deepseek_v32":
@@ -118,6 +166,7 @@ class LLMEngine:
             tokenizer = LlamaTokenizerFast.from_pretrained(
                 config.model,
                 legacy=True,
+                fix_mistral_regex=True,
             )
         if (
             getattr(config.hf_config, "model_type", None) == "deepseek_v32"
@@ -209,7 +258,7 @@ class LLMEngine:
                     vision_placeholders=None,
                     ):
         if isinstance(prompt, str):
-            prompt = self.tokenizer.encode(prompt)
+            prompt = self._encode_string_prompt(prompt)
         seq = Sequence(
             prompt,
             sampling_params,

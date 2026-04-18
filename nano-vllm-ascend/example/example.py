@@ -149,7 +149,11 @@ def main():
     prompt_tokenizer = (
         llm.tokenizer
         if tokenizer_path == model_path
-        else LlamaTokenizerFast.from_pretrained(tokenizer_path, legacy=True)
+        else LlamaTokenizerFast.from_pretrained(
+            tokenizer_path,
+            legacy=True,
+            fix_mistral_regex=True,
+        )
     )
     sampling_params = SamplingParams(
         temperature=temperature,
