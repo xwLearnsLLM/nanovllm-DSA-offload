@@ -915,6 +915,7 @@ class DeepseekV32Indexer(nn.Module):
 
 class DeepseekV32DSAAttention(nn.Module):
     _sfa_status_messages: set[str] = set()
+    _sfa_input_summary_logged = False
 
     def __init__(self, config: DeepseekV32Config, layer_idx: int) -> None:
         super().__init__()
@@ -931,6 +932,9 @@ class DeepseekV32DSAAttention(nn.Module):
         self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         self.v_head_dim = int(config.v_head_dim)
         self.index_topk = int(config.index_topk)
+        self.npu_sfa_sparse_count = int(
+            os.environ.get("NANOVLLM_NPU_SFA_SPARSE_COUNT", "2048")
+        )
         self.layer_id = layer_idx
         self.scale = self.qk_head_dim ** -0.5
         if config.rope_parameters.get("rope_type") == "deepseek_yarn":
@@ -1376,6 +1380,27 @@ class DeepseekV32DSAAttention(nn.Module):
             sfa_index_dtype = self.index_cache.dtype
             q_index_sfa = q_index.to(sfa_index_dtype).contiguous()
             weights_sfa = weights.to(sfa_index_dtype).contiguous()
+            if _is_rank0() and not type(self)._sfa_input_summary_logged:
+                logger.info(
+                    "NPU SFA input summary: q_index=%s %s index_cache=%s %s "
+                    "weights=%s %s ql_nope=%s %s q_pe=%s %s block_tables=%s "
+                    "context_lens=%s sparse_count=%d config_index_topk=%d",
+                    tuple(q_index_sfa.shape),
+                    q_index_sfa.dtype,
+                    tuple(self.index_cache.unsqueeze(2).shape),
+                    self.index_cache.dtype,
+                    tuple(weights_sfa.shape),
+                    weights_sfa.dtype,
+                    tuple(ql_nope.shape),
+                    ql_nope.dtype,
+                    tuple(q_pe.shape),
+                    q_pe.dtype,
+                    tuple(block_tables.shape),
+                    tuple(actual_seq_lengths_key.shape),
+                    self.npu_sfa_sparse_count,
+                    self.index_topk,
+                )
+                type(self)._sfa_input_summary_logged = True
             topk_indices = lightning_indexer(
                 query=q_index_sfa,
                 key=self.index_cache.unsqueeze(2),
@@ -1385,7 +1410,7 @@ class DeepseekV32DSAAttention(nn.Module):
                 block_table=block_tables,
                 layout_query="TND",
                 layout_key="PA_BSND",
-                sparse_count=self.index_topk,
+                sparse_count=self.npu_sfa_sparse_count,
                 sparse_mode=3,
             )
             if isinstance(topk_indices, tuple):

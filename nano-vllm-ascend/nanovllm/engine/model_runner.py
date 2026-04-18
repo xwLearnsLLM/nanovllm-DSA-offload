@@ -535,6 +535,18 @@ class ModelRunner:
             pin_memory=True,
         ).to(self.device, non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
+        if _env_flag("NANOVLLM_ENABLE_NPU_SFA", False):
+            static_max_block_cols = (
+                self.config.max_model_len + self.config.kvcache_block_size - 1
+            ) // self.config.kvcache_block_size
+            if block_tables.shape[1] < static_max_block_cols:
+                padded_block_tables = torch.zeros(
+                    (len(seqs), static_max_block_cols),
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                padded_block_tables[:, : block_tables.shape[1]] = block_tables
+                block_tables = padded_block_tables
         set_context(False,
                     slot_mapping=slot_mapping,
                     context_lens=context_lens,

@@ -1,8 +1,8 @@
-# Next round after fixing LightningIndexer input dtype for SFA.
+# Next round after matching the SFA op input spec more closely.
 # Run from the directory that contains run.py. Send the grep output back.
 
-# 1) Confirm SFA no longer fails on query/weights dtype.
-mkdir -p logs && NANOVLLM_ENABLE_NPU_SFA=1 NANOVLLM_USE_TQDM=0 NANOVLLM_WARMUP_RUNS=1 NANOVLLM_BENCH_RUNS=1 NANOVLLM_PERF_SUMMARY=1 NANOVLLM_PROFILE_DECODE=1 python run.py 2>&1 | tee logs/40_sfa_dtype_fix_decode.log
+# 1) SFA sparse_count=2048, matching vllm-ascend sfa_v1.py and the DSA model path.
+mkdir -p logs && NANOVLLM_ENABLE_NPU_SFA=1 NANOVLLM_USE_TQDM=0 NANOVLLM_WARMUP_RUNS=1 NANOVLLM_BENCH_RUNS=1 NANOVLLM_PERF_SUMMARY=1 NANOVLLM_PROFILE_DECODE=1 python run.py 2>&1 | tee logs/50_sfa_2048_padded_bt_decode.log
 
 # 2) Extract the lines I need.
-grep -E "vllm-ascend custom op registration|NPU SFA decode fast path|Decode profile avg|Perf summary|summary :|failed once|AclNN_Parameter_Error|response:" logs/40_sfa_dtype_fix_decode.log
+grep -E "NPU SFA input summary|NPU SFA decode fast path|Decode profile avg|Perf summary|summary :|failed once|AclNN_|binary bin|response:" logs/50_sfa_2048_padded_bt_decode.log
