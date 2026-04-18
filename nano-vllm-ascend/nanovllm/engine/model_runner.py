@@ -10,8 +10,6 @@ from time import perf_counter
 
 import torch
 import torch.distributed as dist
-import torchair
-from torchair.configs.compiler_config import CompilerConfig
 
 from nanovllm.config import Config, GraphMode
 from nanovllm.engine.sequence import Sequence
@@ -30,6 +28,17 @@ def _env_flag(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.lower() in ("1", "true", "yes", "on")
+
+
+def _import_torchair():
+    try:
+        import torchair  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(
+            "torchair is only required for the non-eager graph/compile path. "
+            "Install torchair, or run with `enforce_eager=True`."
+        ) from exc
+    return torchair
 
 
 class ModelRunner:
@@ -163,6 +172,7 @@ class ModelRunner:
         return torch_dtype
 
     def decode_compile(self, config):
+        torchair = _import_torchair()
         """
         max-autotune模式（Ascend IR）：将PyTorch的FX计算图转换为昇腾中间表示（IR，Intermediate Representation），
         即Ascend IR计算图，并通过GE（Graph Engine，图引擎）实现计算图的编译和执行。
@@ -184,7 +194,9 @@ class ModelRunner:
         Replay阶段从Host侧发出执行指令，Device侧再执行已捕获的任务，从而减少Host调度开销，提升性能。
         """
         if config.graph_mode == GraphMode.REDUCE_OVERHEAD.value:
-            compiler_config: CompilerConfig = torchair.CompilerConfig()
+            from torchair.configs.compiler_config import CompilerConfig
+
+            compiler_config = CompilerConfig()
             compiler_config.mode = GraphMode.REDUCE_OVERHEAD.value
             npu_backend = torchair.get_npu_backend(compiler_config=compiler_config)
             self.compile_decode = torch.compile(self.model.forward, backend=npu_backend)

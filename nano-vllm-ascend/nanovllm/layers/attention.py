@@ -1,5 +1,4 @@
 import torch
-import torchair as tng
 import torch_npu
 from torch import nn
 from nanovllm.utils.context import get_context
@@ -77,6 +76,8 @@ class Attention(nn.Module):
             else:
                 # 图编译
                 q_input = q.view(batch_size, 1, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+                import torchair as tng  # type: ignore
+
                 attn_output, _ = tng.ops.npu_fused_infer_attention_score(
                     q_input,
                     self.k_cache,

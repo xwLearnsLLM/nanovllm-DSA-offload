@@ -2,7 +2,13 @@
 # Do not set NANOVLLM_ENABLE_NPU_MOE_GATING=1 for now; your last run showed it
 # regresses decode from ~11.6 tok/s to ~8.8 tok/s.
 
-# 0) Probe the custom ops. This was skipped last time, and it tells us whether
+# 0) Import sanity check. This should not require torchair in eager mode.
+python - <<'PY'
+from nanovllm import LLM, SamplingParams
+print("nanovllm import ok")
+PY
+
+# 1) Probe the custom ops. This was skipped last time, and it tells us whether
 # the SFA path can really call the vllm-ascend-style kernels.
 mkdir -p logs && python - <<'PY' 2>&1 | tee logs/10_op_probe.log
 import torch
@@ -41,17 +47,17 @@ if torch_npu is not None:
         print(f"torch_npu.{name}:", hasattr(torch_npu, name))
 PY
 
-# 1) Confirm whether NANOVLLM_ENABLE_NPU_SFA=1 is actually active or silently
+# 2) Confirm whether NANOVLLM_ENABLE_NPU_SFA=1 is actually active or silently
 # falling back. Look for "NPU SFA decode fast path active/unavailable/failed".
 mkdir -p logs && NANOVLLM_ENABLE_NPU_SFA=1 NANOVLLM_USE_TQDM=0 NANOVLLM_WARMUP_RUNS=1 NANOVLLM_BENCH_RUNS=1 NANOVLLM_PERF_SUMMARY=1 NANOVLLM_PROFILE_DECODE=1 python run.py 2>&1 | tee logs/11_sfa_status_decode.log
 
-# 2) Detailed split for SFA enabled. Paste the "Attention detail avg",
+# 3) Detailed split for SFA enabled. Paste the "Attention detail avg",
 # "MoE detail avg", and "Layer profile avg" lines.
 mkdir -p logs && NANOVLLM_ENABLE_NPU_SFA=1 NANOVLLM_USE_TQDM=0 NANOVLLM_WARMUP_RUNS=0 NANOVLLM_BENCH_RUNS=1 NANOVLLM_PERF_SUMMARY=1 NANOVLLM_PROFILE_LAYERS=1 NANOVLLM_PROFILE_ATTENTION_DETAIL=1 NANOVLLM_PROFILE_MOE_DETAIL=1 NANOVLLM_PROFILE_LAYER_IDS=mid,last python run.py 2>&1 | tee logs/12_sfa_detail.log
 
-# 3) Detailed split for the native DSA path. This compares against step 2 and
+# 4) Detailed split for the native DSA path. This compares against step 3 and
 # shows exactly what the SFA switch changed.
 mkdir -p logs && NANOVLLM_USE_TQDM=0 NANOVLLM_WARMUP_RUNS=0 NANOVLLM_BENCH_RUNS=1 NANOVLLM_PERF_SUMMARY=1 NANOVLLM_PROFILE_LAYERS=1 NANOVLLM_PROFILE_ATTENTION_DETAIL=1 NANOVLLM_PROFILE_MOE_DETAIL=1 NANOVLLM_PROFILE_LAYER_IDS=mid,last python run.py 2>&1 | tee logs/13_native_detail.log
 
-# 4) Extract the important lines after the three runs.
+# 5) Extract the important lines after the three runs.
 grep -E "NPU SFA decode fast path|Decode profile avg|Attention detail avg|MoE detail avg|Layer profile avg|Perf summary|summary :" logs/10_op_probe.log logs/11_sfa_status_decode.log logs/12_sfa_detail.log logs/13_native_detail.log
