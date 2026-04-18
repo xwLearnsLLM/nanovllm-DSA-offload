@@ -1,3 +1,4 @@
+import json
 import os
 from dataclasses import dataclass
 from enum import Enum
@@ -88,6 +89,29 @@ class Config:
         )
 
     def _load_hf_config(self):
+        config_path = os.path.join(self.model, "config.json")
+        raw_config = {}
+        if os.path.isfile(config_path):
+            with open(config_path, "r", encoding="utf-8") as file:
+                raw_config = json.load(file)
+
+        deepseek_v32_like = (
+            raw_config.get("model_type") == "deepseek_v32"
+            or "DeepseekV32ForCausalLM"
+            in (raw_config.get("architectures") or [])
+            or all(
+                key in raw_config
+                for key in (
+                    "first_k_dense_replace",
+                    "q_lora_rank",
+                    "kv_lora_rank",
+                    "index_topk",
+                )
+            )
+        )
+        if deepseek_v32_like:
+            return DeepseekV32Config.from_pretrained(self.model)
+
         try:
             return AutoConfig.from_pretrained(
                 self.model,

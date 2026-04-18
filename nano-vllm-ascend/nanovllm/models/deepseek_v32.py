@@ -245,6 +245,27 @@ class DeepseekScalingRotaryEmbedding(nn.Module):
         return query, key
 
 
+def _resolve_export_mode(config) -> tuple[bool, bool]:
+    is_shared_only = bool(
+        getattr(config, "nanovllm_pruned_shared_only", False)
+    )
+    keep_routed_flag = getattr(
+        config,
+        "nanovllm_pruned_keep_routed_experts",
+        None,
+    )
+    routed_experts = int(getattr(config, "n_routed_experts", 0) or 0)
+
+    if keep_routed_flag is None:
+        keep_routed_experts = routed_experts > 0 and not is_shared_only
+        if routed_experts == 0:
+            is_shared_only = True
+    else:
+        keep_routed_experts = bool(keep_routed_flag)
+
+    return is_shared_only, keep_routed_experts
+
+
 class DeepseekV32MLP(nn.Module):
     def __init__(
         self,
@@ -850,12 +871,7 @@ class DeepseekV32DecoderLayer(nn.Module):
     def __init__(self, config: DeepseekV32Config, layer_idx: int) -> None:
         super().__init__()
         self.self_attn = DeepseekV32DSAAttention(config, layer_idx)
-        is_shared_only = bool(
-            getattr(config, "nanovllm_pruned_shared_only", False)
-        )
-        keep_routed_experts = bool(
-            getattr(config, "nanovllm_pruned_keep_routed_experts", False)
-        )
+        is_shared_only, keep_routed_experts = _resolve_export_mode(config)
         if (
             layer_idx >= int(config.first_k_dense_replace)
             and is_shared_only
@@ -954,10 +970,8 @@ class DeepseekV32ForCausalLM(nn.Module):
 
     def __init__(self, config: DeepseekV32Config) -> None:
         super().__init__()
-        if not (
-            getattr(config, "nanovllm_pruned_shared_only", False)
-            or getattr(config, "nanovllm_pruned_keep_routed_experts", False)
-        ):
+        is_shared_only, keep_routed_experts = _resolve_export_mode(config)
+        if not (is_shared_only or keep_routed_experts):
             raise ValueError(
                 "DeepSeek-V3.2 support in nano-vllm-ascend currently expects "
                 "either a shared-only export or a routed-expert BF16 model "
