@@ -364,6 +364,17 @@ class DeepseekV32SparseMoeBlock(nn.Module):
             range(self.local_expert_start, self.local_expert_end)
         )
         self.local_expert_id_set = set(self.local_expert_ids)
+        static_loop_enabled = (
+            os.environ.get("NANOVLLM_MOE_STATIC_LOCAL_EXPERTS", "1").lower()
+            in ("1", "true", "yes", "on")
+        )
+        static_loop_threshold = int(
+            os.environ.get("NANOVLLM_MOE_STATIC_LOCAL_EXPERT_THRESHOLD", "16")
+        )
+        self.use_static_local_expert_loop = (
+            static_loop_enabled
+            and self.num_local_experts <= static_loop_threshold
+        )
         trace_dir = os.environ.get("NANOVLLM_MOE_TRACE_DIR")
         self.trace_dir = Path(trace_dir) if trace_dir else None
         if self.trace_dir is not None:
@@ -576,13 +587,20 @@ class DeepseekV32SparseMoeBlock(nn.Module):
         expert_mask = torch.nn.functional.one_hot(
             selected_experts, num_classes=self.num_experts
         ).permute(2, 1, 0)
-        expert_hitted = torch.greater(
-            expert_mask.sum(dim=(-1, -2)), 0
-        ).nonzero(as_tuple=False).flatten()
 
-        for expert_idx in expert_hitted.tolist():
-            if expert_idx not in self.local_expert_id_set:
-                continue
+        if self.use_static_local_expert_loop:
+            expert_indices = self.local_expert_ids
+        else:
+            expert_hitted = torch.greater(
+                expert_mask.sum(dim=(-1, -2)), 0
+            ).nonzero(as_tuple=False).flatten()
+            expert_indices = tuple(
+                expert_idx
+                for expert_idx in expert_hitted.tolist()
+                if expert_idx in self.local_expert_id_set
+            )
+
+        for expert_idx in expert_indices:
             expert_layer = self.experts[str(expert_idx)]
             idx, top_x = torch.where(expert_mask[expert_idx])
             current_state = hidden_states[top_x].reshape(-1, hidden_dim)

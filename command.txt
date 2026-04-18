@@ -1,0 +1,8 @@
+# Main short-sequence benchmark after static local MoE loop change.
+NANOVLLM_WARMUP_RUNS=1 NANOVLLM_BENCH_RUNS=1 NANOVLLM_PERF_SUMMARY=1 python run.py
+
+# Decode profile, now split into model_forward and lm_head.
+NANOVLLM_WARMUP_RUNS=1 NANOVLLM_BENCH_RUNS=1 NANOVLLM_PERF_SUMMARY=1 NANOVLLM_PROFILE_DECODE=1 python run.py
+
+# Fallback A/B: disable the static local expert loop if the main run regresses or errors.
+NANOVLLM_MOE_STATIC_LOCAL_EXPERTS=0 NANOVLLM_WARMUP_RUNS=1 NANOVLLM_BENCH_RUNS=1 NANOVLLM_PERF_SUMMARY=1 python run.py

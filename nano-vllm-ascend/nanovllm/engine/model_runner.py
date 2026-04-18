@@ -76,7 +76,11 @@ class ModelRunner:
         self.profile_decode_tokens = 0
         self.profile_prepare_time = 0.0
         self.profile_model_time = 0.0
+        self.profile_forward_time = 0.0
+        self.profile_logits_time = 0.0
         self.profile_sample_time = 0.0
+        self._last_forward_time = 0.0
+        self._last_logits_time = 0.0
         torch.npu.empty_cache()
         self.allocate_kv_cache()
         if not self.enforce_eager:
@@ -559,10 +563,23 @@ class ModelRunner:
                 f"{'prefill' if is_prefill else 'decode'} execute tokens: "
                 f"{execute_tokens}"
             )
+        should_profile = self.profile_decode and not is_prefill
+        if should_profile:
+            torch.npu.synchronize()
+            forward_start = perf_counter()
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
-            return self.model.compute_logits(self.model(input_ids, positions, **model_kwargs))
+            hidden_states = self.model(input_ids, positions, **model_kwargs)
         else:
-            return self.model.compute_logits(self.compile_decode(input_ids, positions))
+            hidden_states = self.compile_decode(input_ids, positions)
+        if should_profile:
+            torch.npu.synchronize()
+            self._last_forward_time = perf_counter() - forward_start
+            logits_start = perf_counter()
+        logits = self.model.compute_logits(hidden_states)
+        if should_profile:
+            torch.npu.synchronize()
+            self._last_logits_time = perf_counter() - logits_start
+        return logits
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         def _sync_if_profile():
@@ -637,6 +654,8 @@ class ModelRunner:
             self.profile_decode_tokens += int(real_bs)
             self.profile_prepare_time += prepare_time
             self.profile_model_time += model_time
+            self.profile_forward_time += self._last_forward_time
+            self.profile_logits_time += self._last_logits_time
             self.profile_sample_time += sample_time
             if self.profile_decode_steps % self.profile_decode_every == 0:
                 steps = self.profile_decode_steps
@@ -648,11 +667,14 @@ class ModelRunner:
                 )
                 logger.info(
                     "Decode profile avg: steps=%d tokens=%d "
-                    "prepare=%.4fs/step model_lm=%.4fs/step "
+                    "prepare=%.4fs/step model_forward=%.4fs/step "
+                    "lm_head=%.4fs/step model_lm=%.4fs/step "
                     "sample=%.4fs/step total=%.4fs/step %.2f toks/s",
                     steps,
                     tokens,
                     self.profile_prepare_time / steps,
+                    self.profile_forward_time / steps,
+                    self.profile_logits_time / steps,
                     self.profile_model_time / steps,
                     self.profile_sample_time / steps,
                     total_time / steps,
