@@ -126,6 +126,36 @@ class LLMEngine:
             tokenizer.chat_template = DEEPSEEK_V32_CHAT_TEMPLATE
         return tokenizer
 
+    def _decode_token_ids(self, token_ids: list[int]) -> str:
+        text = self.tokenizer.decode(token_ids)
+        if "Ġ" not in text and "Ċ" not in text:
+            return text
+
+        try:
+            tokens = self.tokenizer.convert_ids_to_tokens(token_ids)
+            decoded = self.tokenizer.convert_tokens_to_string(tokens)
+            if "Ġ" not in decoded and "Ċ" not in decoded:
+                return decoded
+        except Exception:
+            pass
+
+        backend = getattr(self.tokenizer, "backend_tokenizer", None)
+        decoder = getattr(backend, "decoder", None)
+        if decoder is not None:
+            try:
+                tokens = self.tokenizer.convert_ids_to_tokens(token_ids)
+                decoded = decoder.decode(tokens)
+                if "Ġ" not in decoded and "Ċ" not in decoded:
+                    return decoded
+            except Exception:
+                pass
+
+        return (
+            text.replace("Ċ", "\n")
+            .replace("ĉ", "\n")
+            .replace("Ġ", " ")
+        )
+
     def prefill_warmup(self):
         max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
         num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs)
@@ -244,7 +274,7 @@ class LLMEngine:
                 if use_tqdm:
                     pbar.update(1)
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
-        outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids, "prompt_len": prompt_len,
+        outputs = [{"text": self._decode_token_ids(token_ids), "token_ids": token_ids, "prompt_len": prompt_len,
                     "cache_tokens": cache_tokens} for
                    token_ids, prompt_len, cache_tokens in outputs]
         if use_tqdm:
