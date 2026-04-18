@@ -1,8 +1,11 @@
-# Main short-sequence benchmark after static local MoE loop change.
+# Main short-sequence benchmark. Static local MoE loop is now default-off
+# because the A/B run showed it regressed decode speed.
 NANOVLLM_WARMUP_RUNS=1 NANOVLLM_BENCH_RUNS=1 NANOVLLM_PERF_SUMMARY=1 python run.py
 
 # Decode profile, now split into model_forward and lm_head.
 NANOVLLM_WARMUP_RUNS=1 NANOVLLM_BENCH_RUNS=1 NANOVLLM_PERF_SUMMARY=1 NANOVLLM_PROFILE_DECODE=1 python run.py
 
-# Fallback A/B: disable the static local expert loop if the main run regresses or errors.
-NANOVLLM_MOE_STATIC_LOCAL_EXPERTS=0 NANOVLLM_WARMUP_RUNS=1 NANOVLLM_BENCH_RUNS=1 NANOVLLM_PERF_SUMMARY=1 python run.py
+# Sampled per-layer profile. This intentionally profiles only first/middle/last
+# layers to keep sync overhead tolerable; please paste the "Layer profile avg"
+# lines back.
+NANOVLLM_WARMUP_RUNS=0 NANOVLLM_BENCH_RUNS=1 NANOVLLM_PERF_SUMMARY=1 NANOVLLM_USE_TQDM=0 NANOVLLM_PROFILE_LAYERS=1 NANOVLLM_PROFILE_LAYER_IDS=0,mid,last python run.py

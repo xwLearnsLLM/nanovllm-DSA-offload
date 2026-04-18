@@ -4,6 +4,7 @@ import json
 import math
 import os
 from pathlib import Path
+from time import perf_counter
 
 import torch
 import torch.distributed as dist
@@ -21,6 +22,55 @@ from nanovllm.layers.linear import (
     RowParallelLinear,
 )
 from nanovllm.utils.context import get_context
+from nanovllm.utils.logger import init_logger
+
+
+logger = init_logger(__name__)
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() in ("1", "true", "yes", "on")
+
+
+def _is_rank0() -> bool:
+    try:
+        return (not dist.is_initialized()) or dist.get_rank() == 0
+    except Exception:
+        return True
+
+
+def _profile_sync(device: torch.device) -> None:
+    if device.type == "npu":
+        torch.npu.synchronize()
+    elif device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def _profile_layer_selected(layer_idx: int, num_layers: int) -> bool:
+    spec = os.environ.get("NANOVLLM_PROFILE_LAYER_IDS", "0,mid,last").strip()
+    if spec.lower() in ("all", "*"):
+        return True
+    for raw_token in spec.split(","):
+        token = raw_token.strip().lower()
+        if not token:
+            continue
+        if token == "mid":
+            selected = num_layers // 2
+        elif token == "last":
+            selected = num_layers - 1
+        else:
+            try:
+                selected = int(token)
+            except ValueError:
+                continue
+            if selected < 0:
+                selected += num_layers
+        if selected == layer_idx:
+            return True
+    return False
 
 
 def yarn_get_mscale(scale: float = 1.0, mscale: float = 1.0) -> float:
@@ -365,8 +415,7 @@ class DeepseekV32SparseMoeBlock(nn.Module):
         )
         self.local_expert_id_set = set(self.local_expert_ids)
         static_loop_enabled = (
-            os.environ.get("NANOVLLM_MOE_STATIC_LOCAL_EXPERTS", "1").lower()
-            in ("1", "true", "yes", "on")
+            _env_flag("NANOVLLM_MOE_STATIC_LOCAL_EXPERTS", False)
         )
         static_loop_threshold = int(
             os.environ.get("NANOVLLM_MOE_STATIC_LOCAL_EXPERT_THRESHOLD", "16")
@@ -1090,6 +1139,7 @@ class DeepseekV32DSAAttention(nn.Module):
 class DeepseekV32DecoderLayer(nn.Module):
     def __init__(self, config: DeepseekV32Config, layer_idx: int) -> None:
         super().__init__()
+        self.layer_idx = int(layer_idx)
         self.self_attn = DeepseekV32DSAAttention(config, layer_idx)
         is_shared_only, keep_routed_experts = _resolve_export_mode(config)
         if (
@@ -1126,6 +1176,94 @@ class DeepseekV32DecoderLayer(nn.Module):
             int(config.hidden_size),
             eps=float(config.rms_norm_eps),
         )
+        self.profile_layers = (
+            _env_flag("NANOVLLM_PROFILE_LAYERS", False)
+            and _profile_layer_selected(
+                self.layer_idx,
+                int(config.num_hidden_layers),
+            )
+        )
+        self.profile_layers_every = max(
+            1,
+            int(os.environ.get("NANOVLLM_PROFILE_LAYERS_EVERY", "31")),
+        )
+        self.profile_layer_steps = 0
+        self.profile_layer_times = {
+            "input_norm": 0.0,
+            "attention": 0.0,
+            "post_norm": 0.0,
+            "dense_mlp": 0.0,
+            "moe_mlp": 0.0,
+            "total": 0.0,
+        }
+
+    def _forward_profiled(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        device = hidden_states.device
+
+        def _record(name: str, fn):
+            _profile_sync(device)
+            start = perf_counter()
+            output = fn()
+            _profile_sync(device)
+            self.profile_layer_times[name] += perf_counter() - start
+            return output
+
+        _profile_sync(device)
+        total_start = perf_counter()
+
+        if residual is None:
+            residual = hidden_states
+            hidden_states = _record(
+                "input_norm",
+                lambda: self.input_layernorm(hidden_states),
+            )
+        else:
+            hidden_states, residual = _record(
+                "input_norm",
+                lambda: self.input_layernorm(hidden_states, residual),
+            )
+        hidden_states = _record(
+            "attention",
+            lambda: self.self_attn(positions, hidden_states),
+        )
+        hidden_states, residual = _record(
+            "post_norm",
+            lambda: self.post_attention_layernorm(hidden_states, residual),
+        )
+        mlp_key = (
+            "moe_mlp"
+            if isinstance(self.mlp, DeepseekV32SparseMoeBlock)
+            else "dense_mlp"
+        )
+        hidden_states = _record(mlp_key, lambda: self.mlp(hidden_states))
+
+        _profile_sync(device)
+        self.profile_layer_times["total"] += perf_counter() - total_start
+        self.profile_layer_steps += 1
+        if (
+            _is_rank0()
+            and self.profile_layer_steps % self.profile_layers_every == 0
+        ):
+            steps = self.profile_layer_steps
+            logger.info(
+                "Layer profile avg: layer=%d steps=%d "
+                "input_norm=%.4fs attention=%.4fs post_norm=%.4fs "
+                "dense_mlp=%.4fs moe_mlp=%.4fs total=%.4fs",
+                self.layer_idx,
+                steps,
+                self.profile_layer_times["input_norm"] / steps,
+                self.profile_layer_times["attention"] / steps,
+                self.profile_layer_times["post_norm"] / steps,
+                self.profile_layer_times["dense_mlp"] / steps,
+                self.profile_layer_times["moe_mlp"] / steps,
+                self.profile_layer_times["total"] / steps,
+            )
+        return hidden_states, residual
 
     def forward(
         self,
@@ -1133,6 +1271,8 @@ class DeepseekV32DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.profile_layers and not get_context().is_prefill:
+            return self._forward_profiled(positions, hidden_states, residual)
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
