@@ -235,7 +235,7 @@ def build_manifest(
     num_groups = max(1, int(config.get("n_group", 1) or 1))
     topk_group = max(1, int(config.get("topk_group", 1) or 1))
     top_k = int(config["num_experts_per_tok"])
-    scoring_func = str(config.get("scoring_func", "softmax"))
+    scoring_func = str(config.get("scoring_func", "sigmoid"))
     renormalize = bool(config.get("norm_topk_prob", True))
 
     manifest: dict[str, list[int]] = {}

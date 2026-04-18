@@ -330,7 +330,9 @@ class DeepseekV32SparseMoeBlock(nn.Module):
         self.num_experts = int(config.n_routed_experts)
         self.top_k = max(1, min(int(config.num_experts_per_tok), self.num_experts))
         self.renormalize = bool(getattr(config, "norm_topk_prob", True))
-        self.scoring_func = str(getattr(config, "scoring_func", "softmax"))
+        # DeepSeek-V3/V3.2 routed expert gating uses sigmoid scores when the
+        # config does not explicitly override the scoring function.
+        self.scoring_func = str(getattr(config, "scoring_func", "sigmoid"))
         self.routed_scaling_factor = float(
             getattr(config, "routed_scaling_factor", 1.0)
         )

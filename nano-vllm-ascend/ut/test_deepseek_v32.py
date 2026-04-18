@@ -11,6 +11,12 @@ MODULE_PATH = (
     / "deepseek_v32.py"
 )
 SOURCE = MODULE_PATH.read_text(encoding="utf-8")
+SELECTION_MANIFEST_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "scripts"
+    / "build_deepseek_v32_selection_manifest.py"
+)
+SELECTION_MANIFEST_SOURCE = SELECTION_MANIFEST_PATH.read_text(encoding="utf-8")
 HELPER_NAMESPACE = {"torch": torch}
 
 
@@ -48,6 +54,18 @@ class TestDeepseekV32Helpers(unittest.TestCase):
         x = torch.ones(2, 3, dtype=torch.float32)
         with self.assertRaisesRegex(ValueError, "power of 2"):
             _hadamard_transform(x)
+
+    def test_default_router_scoring_func_is_sigmoid(self):
+        self.assertIn(
+            'getattr(config, "scoring_func", "sigmoid")',
+            SOURCE,
+        )
+
+    def test_selection_manifest_defaults_to_sigmoid(self):
+        self.assertIn(
+            'config.get("scoring_func", "sigmoid")',
+            SELECTION_MANIFEST_SOURCE,
+        )
 
 
 if __name__ == "__main__":
