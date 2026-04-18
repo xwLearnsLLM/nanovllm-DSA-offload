@@ -17,6 +17,8 @@ class Context:
     is_enforce_eager: bool = True
     real_bs: int = -1
     block_size: int = 256
+    decode_slots: torch.Tensor | None = None
+    decode_mask: torch.Tensor | None = None
 
 
 _CONTEXT = Context()
@@ -27,10 +29,11 @@ def get_context():
 
 
 def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0, max_seqlen_k=0, slot_mapping=None,
-                context_lens=None, block_tables=None, is_enforce_eager=None, real_bs=None, block_size=None):
+                context_lens=None, block_tables=None, is_enforce_eager=None, real_bs=None, block_size=None,
+                decode_slots=None, decode_mask=None):
     global _CONTEXT
     _CONTEXT = Context(is_prefill, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, context_lens,
-                       block_tables, is_enforce_eager, real_bs, block_size)
+                       block_tables, is_enforce_eager, real_bs, block_size, decode_slots, decode_mask)
     # print(f"_CONTEXT is set to {_CONTEXT}")
 
 

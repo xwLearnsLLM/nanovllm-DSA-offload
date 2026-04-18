@@ -162,6 +162,7 @@ class RowParallelLinear(LinearBase):
         output_size: int,
         bias: bool = False,
         disable_tp: bool = False,
+        reduce_results: bool = True,
     ):
         tp_size = dist.get_world_size()
         local_input_size = input_size if disable_tp else divide(input_size, tp_size)
@@ -172,6 +173,7 @@ class RowParallelLinear(LinearBase):
             1,
             disable_tp=disable_tp,
         )
+        self.reduce_results = reduce_results
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
@@ -190,6 +192,6 @@ class RowParallelLinear(LinearBase):
         if self.disable_tp:
             return F.linear(x, self.weight, self.bias)
         y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
-        if self.tp_size > 1:
+        if self.tp_size > 1 and self.reduce_results:
             dist.all_reduce(y)
         return y

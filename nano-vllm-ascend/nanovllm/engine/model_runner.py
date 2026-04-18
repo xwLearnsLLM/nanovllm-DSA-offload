@@ -473,15 +473,40 @@ class ModelRunner:
         positions = []
         slot_mapping = []
         context_lens = []
+        decode_slot_rows = []
+        decode_mask_rows = []
+        max_context_len = max(len(seq) for seq in seqs)
         for seq in seqs:
             input_ids.append(seq.last_token)
             positions.append(len(seq) - 1)
             context_lens.append(len(seq))
             slot_mapping.append([seq.block_table[-1], seq.last_block_num_tokens - 1])
+            seq_slots: list[int] = []
+            remaining = len(seq)
+            for block in seq.block_table[:seq.num_blocks]:
+                take = min(self.block_size, remaining)
+                start = block * self.block_size
+                seq_slots.extend(range(start, start + take))
+                remaining -= take
+                if remaining <= 0:
+                    break
+            padding = max_context_len - len(seq_slots)
+            decode_slot_rows.append(seq_slots + [0] * padding)
+            decode_mask_rows.append([True] * len(seq_slots) + [False] * padding)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).to(self.device, non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).to(self.device, non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
+        decode_slots = torch.tensor(
+            decode_slot_rows,
+            dtype=torch.int64,
+            pin_memory=True,
+        ).to(self.device, non_blocking=True)
+        decode_mask = torch.tensor(
+            decode_mask_rows,
+            dtype=torch.bool,
+            pin_memory=True,
+        ).to(self.device, non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
         set_context(False,
                     slot_mapping=slot_mapping,
@@ -489,7 +514,9 @@ class ModelRunner:
                     block_tables=block_tables,
                     is_enforce_eager=self.enforce_eager,
                     real_bs=len(seqs),
-                    block_size=self.config.kvcache_block_size)
+                    block_size=self.config.kvcache_block_size,
+                    decode_slots=decode_slots,
+                    decode_mask=decode_mask)
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):

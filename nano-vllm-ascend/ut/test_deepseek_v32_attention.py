@@ -268,6 +268,70 @@ class TestDeepseekV32Attention(unittest.TestCase):
         )
         self.assertTrue(torch.allclose(actual, expected, atol=2e-2, rtol=2e-2))
 
+    def test_vectorized_decode_matches_loop_decode(self):
+        attn, block_size = self._build_attention()
+        prefix_hidden_states = torch.randn(5, 16, dtype=torch.bfloat16)
+        prefix_positions = torch.tensor([0, 1, 2, 0, 1], dtype=torch.int64)
+
+        set_context(
+            True,
+            cu_seqlens_q=torch.tensor([0, 3, 5], dtype=torch.int32),
+            cu_seqlens_k=torch.tensor([0, 3, 5], dtype=torch.int32),
+            max_seqlen_q=3,
+            max_seqlen_k=3,
+            slot_mapping=torch.tensor([0, 1, 2, 8, 9], dtype=torch.int32),
+            context_lens=None,
+            block_tables=torch.tensor([[0], [1]], dtype=torch.int32),
+            block_size=block_size,
+        )
+        _ = attn(prefix_positions, prefix_hidden_states)
+        reset_context()
+
+        cached_ckv = attn.ckv_cache.clone()
+        cached_kpe = attn.kpe_cache.clone()
+        cached_index = attn.index_cache.clone()
+        decode_hidden_states = torch.randn(2, 16, dtype=torch.bfloat16)
+        decode_positions = torch.tensor([3, 2], dtype=torch.int64)
+
+        set_context(
+            False,
+            slot_mapping=torch.tensor([[0, 3], [1, 2]], dtype=torch.int32),
+            context_lens=torch.tensor([4, 3], dtype=torch.int32),
+            block_tables=torch.tensor([[0], [1]], dtype=torch.int32),
+            is_enforce_eager=True,
+            real_bs=2,
+            block_size=block_size,
+        )
+        loop_output = attn(decode_positions, decode_hidden_states)
+        reset_context()
+
+        attn.ckv_cache.copy_(cached_ckv)
+        attn.kpe_cache.copy_(cached_kpe)
+        attn.index_cache.copy_(cached_index)
+        set_context(
+            False,
+            slot_mapping=torch.tensor([[0, 3], [1, 2]], dtype=torch.int32),
+            context_lens=torch.tensor([4, 3], dtype=torch.int32),
+            block_tables=torch.tensor([[0], [1]], dtype=torch.int32),
+            is_enforce_eager=True,
+            real_bs=2,
+            block_size=block_size,
+            decode_slots=torch.tensor(
+                [[0, 1, 2, 3], [8, 9, 10, 0]],
+                dtype=torch.int64,
+            ),
+            decode_mask=torch.tensor(
+                [[True, True, True, True], [True, True, True, False]],
+                dtype=torch.bool,
+            ),
+        )
+        vectorized_output = attn(decode_positions, decode_hidden_states)
+        reset_context()
+
+        self.assertTrue(
+            torch.allclose(loop_output, vectorized_output, atol=2e-2, rtol=2e-2)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

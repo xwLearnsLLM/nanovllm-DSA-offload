@@ -297,6 +297,7 @@ class DeepseekV32MLP(nn.Module):
         hidden_act: str,
         *,
         disable_tp: bool = False,
+        reduce_results: bool = True,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -310,6 +311,7 @@ class DeepseekV32MLP(nn.Module):
             hidden_size,
             bias=False,
             disable_tp=disable_tp,
+            reduce_results=reduce_results,
         )
         if hidden_act != "silu":
             raise ValueError("Only silu is supported for DeepSeek-V3.2.")
@@ -394,6 +396,7 @@ class DeepseekV32SparseMoeBlock(nn.Module):
             hidden_size=self.hidden_size,
             intermediate_size=self.moe_intermediate_size * self.num_shared_experts,
             hidden_act=self.hidden_act,
+            reduce_results=not (self.enable_expert_parallel and self.ep_size > 1),
         )
         self.experts = nn.ModuleDict(
             {
@@ -593,10 +596,9 @@ class DeepseekV32SparseMoeBlock(nn.Module):
                 current_hidden_states.to(hidden_states.dtype),
             )
 
-        if self.enable_expert_parallel and self.ep_size > 1:
-            dist.all_reduce(routed_hidden_states)
-
         final_hidden_states = routed_hidden_states + shared_output
+        if self.enable_expert_parallel and self.ep_size > 1:
+            dist.all_reduce(final_hidden_states)
         return final_hidden_states.view(sequence_length, hidden_dim)
 
 
@@ -891,7 +893,7 @@ class DeepseekV32DSAAttention(nn.Module):
                 )
         return torch.stack(outputs, dim=0)
 
-    def _decode_forward(
+    def _decode_forward_loop(
         self,
         ql_nope: torch.Tensor,
         q_pe: torch.Tensor,
@@ -929,6 +931,95 @@ class DeepseekV32DSAAttention(nn.Module):
                 )
             )
         return torch.stack(outputs, dim=0)
+
+    def _decode_forward_vectorized(
+        self,
+        ql_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        q_index: torch.Tensor,
+        weights: torch.Tensor,
+        slots: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        flat_ckv = self.ckv_cache.view(-1, self.kv_lora_rank)
+        flat_kpe = self.kpe_cache.view(-1, self.qk_rope_head_dim)
+        flat_index = self.index_cache.view(-1, self.indexer.head_dim)
+
+        batch_size, max_seq_len = slots.shape
+        flat_slots = slots.reshape(-1)
+        seq_ckv = flat_ckv.index_select(0, flat_slots).view(
+            batch_size,
+            max_seq_len,
+            self.kv_lora_rank,
+        )
+        seq_kpe = flat_kpe.index_select(0, flat_slots).view(
+            batch_size,
+            max_seq_len,
+            self.qk_rope_head_dim,
+        )
+        seq_index = flat_index.index_select(0, flat_slots).view(
+            batch_size,
+            max_seq_len,
+            self.indexer.head_dim,
+        )
+
+        index_scores = torch.einsum(
+            "bhd,bsd->bhs",
+            q_index.float(),
+            seq_index.float(),
+        )
+        index_scores = (
+            index_scores.relu() * weights.float().unsqueeze(-1)
+        ).sum(dim=1)
+        index_scores = index_scores.masked_fill(~mask, float("-inf"))
+        topk = min(self.index_topk, max_seq_len)
+        selected = torch.topk(index_scores, k=topk, dim=-1).indices
+        selected_mask = mask.gather(1, selected)
+
+        selected_ckv = seq_ckv.gather(
+            1,
+            selected.unsqueeze(-1).expand(-1, -1, self.kv_lora_rank),
+        )
+        selected_kpe = seq_kpe.gather(
+            1,
+            selected.unsqueeze(-1).expand(-1, -1, self.qk_rope_head_dim),
+        )
+
+        scores = torch.einsum(
+            "bhl,bsl->bhs",
+            ql_nope.float(),
+            selected_ckv.float(),
+        )
+        scores = scores + torch.einsum(
+            "bhr,bsr->bhs",
+            q_pe.float(),
+            selected_kpe.float(),
+        )
+        scores = scores * self.scale
+        scores = scores.masked_fill(~selected_mask.unsqueeze(1), float("-inf"))
+        probs = torch.softmax(scores, dim=-1).to(selected_ckv.dtype)
+        latent = torch.einsum("bhs,bsl->bhl", probs, selected_ckv)
+        out = torch.einsum("bhl,hlv->bhv", latent, self.w_uv)
+        return out.reshape(batch_size, -1)
+
+    def _decode_forward(
+        self,
+        ql_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        q_index: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> torch.Tensor:
+        context = get_context()
+        if context.decode_slots is not None and context.decode_mask is not None:
+            return self._decode_forward_vectorized(
+                ql_nope,
+                q_pe,
+                q_index,
+                weights,
+                context.decode_slots,
+                context.decode_mask,
+            )
+        return self._decode_forward_loop(ql_nope, q_pe, q_index, weights)
 
     def forward(
         self,
