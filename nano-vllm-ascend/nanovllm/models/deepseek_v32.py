@@ -26,6 +26,7 @@ from nanovllm.utils.logger import init_logger
 
 
 logger = init_logger(__name__)
+BMM_TRANS_MAX_SUPPORTED_TOKENS = 1024
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -590,13 +591,36 @@ class DeepseekV32SparseMoeBlock(nn.Module):
             return None
 
         gating_op = getattr(torch_npu, "npu_moe_gating_top_k", None)
-        if gating_op is None:
-            return None
 
         bias = getattr(self.gate, "e_score_correction_bias", None)
         group_select_mode = 1 if bias is not None else 0
         norm_type = 1 if self.scoring_func == "sigmoid" else 0
         if self.scoring_func not in ("softmax", "sigmoid"):
+            return None
+
+        if hasattr(torch.ops, "_C_ascend") and hasattr(
+            torch.ops._C_ascend,
+            "moe_gating_top_k",
+        ):
+            try:
+                topk_weights, topk_ids, _ = torch.ops._C_ascend.moe_gating_top_k(
+                    router_logits.float(),
+                    k=self.top_k,
+                    k_group=self.topk_group,
+                    group_count=self.num_expert_group,
+                    group_select_mode=group_select_mode,
+                    renorm=1 if self.renormalize else 0,
+                    norm_type=norm_type,
+                    out_flag=False,
+                    routed_scaling_factor=self.routed_scaling_factor,
+                    eps=1e-20,
+                    bias_opt=bias,
+                )
+                return topk_weights.float(), topk_ids.long()
+            except Exception:
+                pass
+
+        if gating_op is None:
             return None
 
         try:
@@ -807,6 +831,12 @@ class DeepseekV32DSAAttention(nn.Module):
         self.index_cache = torch.tensor([])
         self.w_uk_t = None
         self.w_uv = None
+        self.use_npu_sfa = _env_flag("NANOVLLM_ENABLE_NPU_SFA", False)
+        self.use_batch_matmul_transpose = not _env_flag(
+            "NANOVLLM_DISABLE_BATCH_MATMUL_TRANSPOSE",
+            False,
+        )
+        self._npu_sfa_failure_logged = False
 
     def assign_dsa_cache(
         self,
@@ -916,8 +946,45 @@ class DeepseekV32DSAAttention(nn.Module):
         scores = scores * self.scale
         probs = torch.softmax(scores, dim=-1).to(selected_ckv.dtype)
         latent = torch.einsum("hs,sl->hl", probs, selected_ckv)
-        out = torch.einsum("hl,hlv->hv", latent, self.w_uv)
-        return out.reshape(-1)
+        return self._v_up_proj(latent.unsqueeze(0)).reshape(-1)
+
+    def _q_nope_up_proj(self, q_nope: torch.Tensor) -> torch.Tensor:
+        q_nope_by_head = q_nope.transpose(0, 1).contiguous()
+        ql_nope = torch.bmm(q_nope_by_head, self.w_uk_t)
+        return ql_nope.transpose(0, 1).contiguous()
+
+    def _v_up_proj(self, latent: torch.Tensor) -> torch.Tensor:
+        num_tokens = latent.shape[0]
+        if (
+            self.use_batch_matmul_transpose
+            and latent.dtype in (torch.float16, torch.bfloat16)
+            and hasattr(torch.ops, "_C_ascend")
+            and hasattr(torch.ops._C_ascend, "batch_matmul_transpose")
+            and num_tokens <= BMM_TRANS_MAX_SUPPORTED_TOKENS
+        ):
+            try:
+                latent = latent.contiguous()
+                output = torch.empty(
+                    (
+                        num_tokens,
+                        self.num_local_heads,
+                        self.v_head_dim,
+                    ),
+                    dtype=latent.dtype,
+                    device=latent.device,
+                )
+                torch.ops._C_ascend.batch_matmul_transpose(
+                    latent,
+                    self.w_uv,
+                    output,
+                )
+                return output.reshape(num_tokens, -1)
+            except Exception:
+                self.use_batch_matmul_transpose = False
+
+        latent_by_head = latent.transpose(0, 1).contiguous()
+        output = torch.bmm(latent_by_head, self.w_uv)
+        return output.transpose(0, 1).reshape(num_tokens, -1)
 
     def _prefill_forward(
         self,
@@ -1066,8 +1133,78 @@ class DeepseekV32DSAAttention(nn.Module):
         scores = scores.masked_fill(~selected_mask.unsqueeze(1), float("-inf"))
         probs = torch.softmax(scores, dim=-1).to(selected_ckv.dtype)
         latent = torch.einsum("bhs,bsl->bhl", probs, selected_ckv)
-        out = torch.einsum("bhl,hlv->bhv", latent, self.w_uv)
-        return out.reshape(batch_size, -1)
+        return self._v_up_proj(latent)
+
+    def _decode_forward_npu_sfa(
+        self,
+        ql_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        q_index: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> torch.Tensor | None:
+        if not self.use_npu_sfa:
+            return None
+        if not (
+            hasattr(torch.ops, "_C_ascend")
+            and hasattr(torch.ops._C_ascend, "npu_lightning_indexer")
+            and hasattr(torch.ops._C_ascend, "npu_sparse_flash_attention")
+        ):
+            return None
+
+        context = get_context()
+        if context.block_tables is None or context.context_lens is None:
+            return None
+
+        batch_size = ql_nope.shape[0]
+        actual_seq_lengths_query = torch.arange(
+            1,
+            batch_size + 1,
+            dtype=torch.int32,
+            device=ql_nope.device,
+        )
+        actual_seq_lengths_key = context.context_lens.to(torch.int32)
+        block_tables = context.block_tables.to(torch.int32)
+
+        try:
+            topk_indices = torch.ops._C_ascend.npu_lightning_indexer(
+                query=q_index,
+                key=self.index_cache.unsqueeze(2),
+                weights=weights,
+                actual_seq_lengths_query=actual_seq_lengths_query,
+                actual_seq_lengths_key=actual_seq_lengths_key,
+                block_table=block_tables,
+                layout_query="TND",
+                layout_key="PA_BSND",
+                sparse_count=self.index_topk,
+                sparse_mode=3,
+            )
+            latent = torch.ops._C_ascend.npu_sparse_flash_attention(
+                query=ql_nope,
+                key=self.ckv_cache.unsqueeze(2),
+                value=self.ckv_cache.unsqueeze(2),
+                sparse_indices=topk_indices,
+                scale_value=self.scale,
+                sparse_block_size=1,
+                block_table=block_tables,
+                actual_seq_lengths_query=actual_seq_lengths_query,
+                actual_seq_lengths_kv=actual_seq_lengths_key,
+                query_rope=q_pe,
+                key_rope=self.kpe_cache.unsqueeze(2),
+                layout_query="TND",
+                layout_kv="PA_BSND",
+                sparse_mode=3,
+            )
+            return self._v_up_proj(latent)
+        except Exception as exc:
+            if _is_rank0() and not self._npu_sfa_failure_logged:
+                logger.warning(
+                    "NPU SFA decode fast path failed once; falling back to "
+                    "PyTorch DSA attention. error=%r",
+                    exc,
+                )
+                self._npu_sfa_failure_logged = True
+            self.use_npu_sfa = False
+            return None
 
     def _decode_forward(
         self,
@@ -1077,6 +1214,14 @@ class DeepseekV32DSAAttention(nn.Module):
         weights: torch.Tensor,
     ) -> torch.Tensor:
         context = get_context()
+        npu_sfa_output = self._decode_forward_npu_sfa(
+            ql_nope,
+            q_pe,
+            q_index,
+            weights,
+        )
+        if npu_sfa_output is not None:
+            return npu_sfa_output
         if context.decode_slots is not None and context.decode_mask is not None:
             return self._decode_forward_vectorized(
                 ql_nope,
@@ -1124,7 +1269,7 @@ class DeepseekV32DSAAttention(nn.Module):
         )
         self._store_cache(ckv, k_pe, index_k)
 
-        ql_nope = torch.einsum("thp,hpl->thl", q_nope, self.w_uk_t)
+        ql_nope = self._q_nope_up_proj(q_nope)
         if get_context().is_prefill:
             attn_output = self._prefill_forward(
                 ql_nope, q_pe, q_index, weights
