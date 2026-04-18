@@ -67,6 +67,16 @@ class TestDeepseekV32Helpers(unittest.TestCase):
             SELECTION_MANIFEST_SOURCE,
         )
 
+    def test_npu_moe_gating_is_opt_in(self):
+        self.assertIn(
+            'NANOVLLM_ENABLE_NPU_MOE_GATING", "0"',
+            SOURCE,
+        )
+        self.assertIn(
+            "if not self.use_npu_gating:",
+            SOURCE,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

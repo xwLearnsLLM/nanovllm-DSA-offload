@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import math
 import os
@@ -372,6 +374,13 @@ class DeepseekV32SparseMoeBlock(nn.Module):
             os.environ.get("NANOVLLM_MOE_TRACE_MAX_TOKENS_PER_CALL", "0")
         )
         self.trace_counter = 0
+        # Prefer the eager PyTorch router path by default on NPU. The fused
+        # gating kernel is opt-in until we have parity coverage for the
+        # DeepSeek-V3.2 grouped-topk routing path.
+        self.use_npu_gating = (
+            os.environ.get("NANOVLLM_ENABLE_NPU_MOE_GATING", "0").lower()
+            in ("1", "true", "yes", "on")
+        )
 
         self.gate = ReplicatedLinear(self.hidden_size, self.num_experts, bias=False)
         if getattr(config, "topk_method", None) == "noaux_tc":
@@ -507,6 +516,8 @@ class DeepseekV32SparseMoeBlock(nn.Module):
         self,
         router_logits: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if not self.use_npu_gating:
+            return None
         if router_logits.device.type != "npu":
             return None
 
