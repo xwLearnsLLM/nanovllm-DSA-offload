@@ -1,0 +1,179 @@
+root@atlas-800t-29:/data/wangxuan# ASCEND_RT_VISIBLE_DEVICES=0,1 python test_vllm_ascend.py
+INFO 04-12 15:45:23 [__init__.py:44] Available plugins for group vllm.platform_plugins:
+INFO 04-12 15:45:23 [__init__.py:46] - ascend -> vllm_ascend:register
+INFO 04-12 15:45:23 [__init__.py:49] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 04-12 15:45:23 [__init__.py:212] Platform plugin ascend is activated
+正在加载模型: /data/model/DeepSeek-V3.2-W8A8-Pruning/
+首次加载需要几分钟，请耐心等待...
+INFO 04-12 15:45:26 [__init__.py:108] Registered model loader `<class 'vllm_ascend.model_loader.netloader.netloader.ModelNetLoaderElastic'>` with load format `netloader`
+INFO 04-12 15:45:26 [utils.py:238] non-default args: {'tokenizer_mode': 'deepseek_v32', 'trust_remote_code': True, 'max_model_len': 8192, 'enable_expert_parallel': True, 'disable_log_stats': True, 'quantization': 'ascend', 'model': '/data/model/DeepSeek-V3.2-W8A8-Pruning/'}
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+You are using a model of type `deepseek_v32` to instantiate a model of type `deepseek_v3`. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+INFO 04-12 15:45:26 [model.py:531] Resolved architecture: DeepseekV32ForCausalLM
+INFO 04-12 15:45:26 [model.py:1554] Using max model len 8192
+INFO 04-12 15:45:26 [scheduler.py:231] Chunked prefill is enabled with max_num_batched_tokens=8192.
+INFO 04-12 15:45:27 [vllm.py:747] Asynchronous scheduling is enabled.
+WARNING 04-12 15:45:27 [platform.py:770] Ignored parameter 'use_trtllm_ragged_deepseek_prefill'. This is a GPU-specific feature not supported on Ascend. Resetting to False.
+INFO 04-12 15:45:27 [ascend_config.py:434] Dynamic EPLB is False
+INFO 04-12 15:45:27 [ascend_config.py:435] The number of redundant experts is 0
+INFO 04-12 15:45:27 [platform.py:288] PIECEWISE compilation enabled on NPU. use_inductor not supported - using only ACL Graph mode
+INFO 04-12 15:45:27 [utils.py:548] Calculated maximum supported batch sizes for ACL graph: 450
+WARNING 04-12 15:45:27 [utils.py:549] Currently, communication is performed using FFTS+ method, which reduces the number of available streams and, as a result, limits the range of runtime shapes that can be handled. To both improve communication performance and increase the number of supported shapes, set HCCL_OP_EXPANSION_MODE=AIV.
+INFO 04-12 15:45:27 [utils.py:581] No adjustment needed for ACL graph batch sizes: DeepseekV32ForCausalLM model (layers: 3) with 51 sizes
+INFO 04-12 15:45:27 [platform.py:440] Set PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+You are using a model of type `deepseek_v32` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+PreTrainedConfig got `key=rope_scaling` in kwargs but hasn't set it as attribute. For RoPE standardization you need to set `self.rope_parameters` in model's config.
+Traceback (most recent call last):
+  File "/usr/local/python3.11.14/lib/python3.11/site-packages/transformers/models/auto/configuration_auto.py", line 1514, in from_pretrained
+    config_class = CONFIG_MAPPING[config_dict["model_type"]]
+                   ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/python3.11.14/lib/python3.11/site-packages/transformers/models/auto/configuration_auto.py", line 1214, in __getitem__
+    raise KeyError(key)
+KeyError: 'deepseek_v32'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/usr/local/python3.11.14/lib/python3.11/site-packages/transformers/models/auto/tokenization_auto.py", line 685, in from_pretrained
+    config = AutoConfig.from_pretrained(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/python3.11.14/lib/python3.11/site-packages/transformers/models/auto/configuration_auto.py", line 1516, in from_pretrained
+    raise ValueError(
+ValueError: The checkpoint you are trying to load has model type `deepseek_v32` but Transformers does not recognize this architecture. This could be because of an issue with the checkpoint, or because your version of Transformers is out of date.
+
+You can update Transformers with the command `pip install --upgrade transformers`. If this does not work, and the checkpoint is very new, then there may not be a release version that supports this model yet. In this case, you can get the most up-to-date code by installing Transformers from source with the command `pip install git+https://github.com/huggingface/transformers.git`
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/data/wangxuan/test_vllm_ascend.py", line 21, in <module>
+    llm = LLM(
+          ^^^^
+  File "/vllm-workspace/vllm/vllm/entrypoints/llm.py", line 379, in __init__
+    self.llm_engine = LLMEngine.from_engine_args(
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/vllm-workspace/vllm/vllm/v1/engine/llm_engine.py", line 177, in from_engine_args
+    return cls(
+           ^^^^
+  File "/vllm-workspace/vllm/vllm/v1/engine/llm_engine.py", line 92, in __init__
+    self.renderer = renderer = renderer_from_config(self.vllm_config)
+                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/vllm-workspace/vllm/vllm/renderers/registry.py", line 89, in renderer_from_config
+    return RENDERER_REGISTRY.load_renderer(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/vllm-workspace/vllm/vllm/renderers/registry.py", line 63, in load_renderer
+    return renderer_cls.from_config(config, tokenizer_kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/vllm-workspace/vllm/vllm/renderers/deepseek_v32.py", line 35, in from_config
+    tokenizer = cached_get_tokenizer(
+                ^^^^^^^^^^^^^^^^^^^^^
+  File "/vllm-workspace/vllm/vllm/tokenizers/registry.py", line 221, in get_tokenizer
+    tokenizer = tokenizer_cls_.from_pretrained(tokenizer_name, *args, **kwargs)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/vllm-workspace/vllm/vllm/tokenizers/deepseek_v32.py", line 88, in from_pretrained
+    tokenizer = AutoTokenizer.from_pretrained(*args, **kwargs)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/python3.11.14/lib/python3.11/site-packages/transformers/models/auto/tokenization_auto.py", line 689, in from_pretrained
+    config = PreTrainedConfig.from_pretrained(pretrained_model_name_or_path, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/python3.11.14/lib/python3.11/site-packages/transformers/configuration_utils.py", line 650, in from_pretrained
+    return cls.from_dict(config_dict, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/python3.11.14/lib/python3.11/site-packages/transformers/configuration_utils.py", line 827, in from_dict
+    config = cls(**config_dict)
+             ^^^^^^^^^^^^^^^^^^
+  File "/usr/local/python3.11.14/lib/python3.11/site-packages/huggingface_hub/dataclasses.py", line 275, in init_with_validate
+    initial_init(self, *args, **kwargs)  # type: ignore [call-arg]
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/python3.11.14/lib/python3.11/site-packages/huggingface_hub/dataclasses.py", line 190, in __init__
+    self.__post_init__(**additional_kwargs)
+  File "/usr/local/python3.11.14/lib/python3.11/site-packages/transformers/configuration_utils.py", line 273, in __post_init__
+    kwargs = self.convert_rope_params_to_dict(**kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/python3.11.14/lib/python3.11/site-packages/transformers/modeling_rope_utils.py", line 724, in convert_rope_params_to_dict
+    self.standardize_rope_params()
+  File "/usr/local/python3.11.14/lib/python3.11/site-packages/transformers/modeling_rope_utils.py", line 758, in standardize_rope_params
+    self.rope_parameters.setdefault("original_max_position_embeddings", self.max_position_embeddings)
+                                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/python3.11.14/lib/python3.11/site-packages/transformers/configuration_utils.py", line 422, in __getattribute__
+    return super().__getattribute__(key)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'PreTrainedConfig' object has no attribute 'max_position_embeddings'
+[ERROR] 2026-04-12-15:45:27 (PID:4170, Device:-1, RankID:-1) ERR99999 UNKNOWN applicaiton exception
+sys:1: DeprecationWarning: builtin type swigvarlink has no __module__ attribute
+root@atlas-800t-29:/data/wangxuan# cat test_vllm_ascend.py
+#!/usr/bin/env python3
+"""
+vLLM 离线推理脚本（Ascend NPU 版）
+"""
+
+from vllm import LLM, SamplingParams
+import time
+import os
+
+# 模型配置
+MODEL_PATH = "/data/model/DeepSeek-V3.2-W8A8-Pruning/"
+
+# 检查模型路径
+if not os.path.exists(MODEL_PATH):
+    raise FileNotFoundError(f"模型路径不存在: {MODEL_PATH}")
+
+print(f"正在加载模型: {MODEL_PATH}")
+print("首次加载需要几分钟，请耐心等待...")
+
+# 加载模型（离线模式）
+llm = LLM(
+    model=MODEL_PATH,
+    tokenizer_mode="deepseek_v32",
+    quantization="ascend",
+    enable_expert_parallel=True,
+    dtype="auto",   # 或 "bfloat16"，不要强制 float16
+    max_model_len=8192,
+    trust_remote_code=True,
+    disable_log_stats=True,
+)
+
+
+print("✓ 模型加载完成！")
+
+# 准备提示词
+prompts = [
+    "你好，请介绍一下自己",
+    "北京是中国的首都，请简述北京的历史",
+    "用Python写一个快速排序算法",
+]
+
+# 采样参数
+sampling_params = SamplingParams(
+    temperature=0.7,
+    top_p=0.9,
+    max_tokens=512,
+)
+
+print(f"\n开始推理，共 {len(prompts)} 条请求...")
+print("=" * 50)
+
+# 执行推理
+start_time = time.time()
+outputs = llm.generate(prompts, sampling_params)
+end_time = time.time()
+
+# 输出结果
+for i, output in enumerate(outputs):
+    prompt = output.prompt
+    generated_text = output.outputs[0].text
+
+    print(f"\n[{i+1}] 提示: {prompt}")
+    print(f"    输出: {generated_text[:200]}...")
+    print("-" * 50)
+
+print(f"\n✓ 推理完成！")
+print(f"  总耗时: {end_time - start_time:.2f} 秒")
+print(f"  平均每条: {(end_time - start_time)/len(prompts):.2f} 秒")
+root@atlas-800t-29:/data/wangxuan#
+
+
+
+用你的建议运行了，还是有问题，然后我把我运行的 example.py 打出来了让你看看，你觉得有什么问题？

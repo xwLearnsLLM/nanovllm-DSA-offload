@@ -1,0 +1,182 @@
+ ASCEND_RT_VISIBLE_DEVICES=2,3 NANOVLLM_TP_SIZE=2 NANOVLLM_MODEL=/data/model/DeepSeek-V3.2-W8A8-pruned/ NANOVLLM_SKIP_WARMUP=0 NANOVLLM_MAX_MODEL_LEN=256 NANOVLLM_MAX_BATCHED_TOKENS=512 NANOVLLM_MAX_NUM_SEQS=4 NANOVLLM_MAX_GEN_TOKENS=32 python example/example.py
+`rope_parameters`'s factor field must be a float >= 1, got 40
+`rope_parameters`'s beta_fast field must be a float, got 32
+`rope_parameters`'s beta_slow field must be a float, got 1
+`torch_dtype` is deprecated! Use `dtype` instead!
+INFO 04-12 13:21:51,750 llm_engine.py:60] config: Config(model=/data/model/DeepSeek-V3.2-W8A8-pruned/, max_num_batched_tokens=512, max_num_seqs=4, max_model_len=256, gpu_memory_utilization=0.7, tensor_parallel_size=2, enforce_eager=True, eos=1, kvcache_block_size=128, num_kvcache_blocks=-1, use_graph_cache=False, hccl_port=28000, graph_mode=max-autotune, is_multimodal=False, skip_warmup=False, trust_remote_code=True, hf_config=DeepseekV32Config(...))
+`torch_dtype` is deprecated! Use `dtype` instead!
+INFO 04-12 13:22:11,358 model_runner.py:225] Total NPU Mem: 62420.00 MB
+INFO 04-12 13:22:11,358 model_runner.py:226] Used NPU Mem (Weights): 26297.37 MB
+INFO 04-12 13:22:11,358 model_runner.py:227] Single Block Size: 10.48 MB
+INFO 04-12 13:22:11,358 model_runner.py:228] Allocating 1658 blocks.
+INFO 04-12 13:22:11,359 model_runner.py:230] DeepSeek CKV cache allocated successfully shape: (61, 1658, 128, 512)
+INFO 04-12 13:22:11,359 model_runner.py:230] DeepSeek KPE cache allocated successfully shape: (61, 1658, 128, 64)
+INFO 04-12 13:22:11,359 model_runner.py:230] DeepSeek index cache allocated successfully shape: (61, 1658, 128, 128)
+INFO 04-12 13:22:11,368 model_runner.py:70] config: Config(model=/data/model/DeepSeek-V3.2-W8A8-pruned/, max_num_batched_tokens=512, max_num_seqs=4, max_model_len=256, gpu_memory_utilization=0.7, tensor_parallel_size=2, enforce_eager=True, eos=1, kvcache_block_size=128, num_kvcache_blocks=1658, use_graph_cache=False, hccl_port=28000, graph_mode=max-autotune, is_multimodal=False, skip_warmup=False, trust_remote_code=True, hf_config=DeepseekV32Config(...))
+INFO 04-12 13:22:13,732 model_runner.py:225] Total NPU Mem: 62420.00 MB
+INFO 04-12 13:22:13,733 model_runner.py:226] Used NPU Mem (Weights): 26299.73 MB
+INFO 04-12 13:22:13,733 model_runner.py:227] Single Block Size: 10.48 MB
+INFO 04-12 13:22:13,733 model_runner.py:228] Allocating 1658 blocks.
+INFO 04-12 13:22:13,733 model_runner.py:230] DeepSeek CKV cache allocated successfully shape: (61, 1658, 128, 512)
+INFO 04-12 13:22:13,733 model_runner.py:230] DeepSeek KPE cache allocated successfully shape: (61, 1658, 128, 64)
+INFO 04-12 13:22:13,733 model_runner.py:230] DeepSeek index cache allocated successfully shape: (61, 1658, 128, 128)
+INFO 04-12 13:22:13,743 model_runner.py:70] config: Config(model=/data/model/DeepSeek-V3.2-W8A8-pruned/, max_num_batched_tokens=512, max_num_seqs=4, max_model_len=256, gpu_memory_utilization=0.7, tensor_parallel_size=2, enforce_eager=True, eos=1, kvcache_block_size=128, num_kvcache_blocks=1658, use_graph_cache=False, hccl_port=28000, graph_mode=max-autotune, is_multimodal=False, skip_warmup=False, trust_remote_code=True, hf_config=DeepseekV32Config(...))
+/usr/local/python3.11.14/lib/python3.11/site-packages/torch/distributed/distributed_c10d.py:4876: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  warnings.warn(  # warn only once
+You are using a model of type `deepseek_v32` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+PreTrainedConfig got `key=rope_scaling` in kwargs but hasn't set it as attribute. For RoPE standardization you need to set `self.rope_parameters` in model's config.
+WARNING 04-12 13:22:14,360 llm_engine.py:91] Falling back to LlamaTokenizerFast for deepseek_v32 export.
+INFO 04-12 13:22:15,023 llm_engine.py:125] warmup start !!!!!!
+INFO 04-12 13:22:15,026 model_runner.py:500] prefill execute tokens: 512
+INFO 04-12 13:22:15,026 model_runner.py:500] prefill execute tokens: 512
+/usr/local/python3.11.14/lib/python3.11/site-packages/torch_npu/distributed/distributed_c10d.py:110: UserWarning: HCCL doesn't support gather at the moment. Implemented with allgather instead.
+  warnings.warn("HCCL doesn't support gather at the moment. Implemented with allgather instead.")
+INFO 04-12 13:22:47,944 model_runner.py:500] prefill execute tokens: 43
+INFO 04-12 13:22:47,944 model_runner.py:500] prefill execute tokens: 43
+INFO 04-12 13:22:50,901 model_runner.py:500] decode execute tokens: 2
+INFO 04-12 13:22:50,901 model_runner.py:500] decode execute tokens: 2
+INFO 04-12 13:22:51,439 llm_engine.py:138] warmup end !!!!!!
+INFO 04-12 13:22:51,440 llm_engine.py:139] Successfully finished model warmup in 36.42 seconds.
+INFO 04-12 13:22:51,440 example.py:63] example config: tp=2, max_model_len=256, max_num_batched_tokens=512, max_num_seqs=4, kvcache_block_size=128, skip_warmup=False, max_gen_tokens=32
+INFO 04-12 13:22:51,466 model_runner.py:500] prefill execute tokens: 33
+INFO 04-12 13:22:51,467 model_runner.py:500] prefill execute tokens: 33
+INFO 04-12 13:22:53,827 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:22:53,827 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:22:54,414 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:22:54,414 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:22:54,997 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:22:54,997 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:22:55,582 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:22:55,582 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:22:56,149 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:22:56,149 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:22:56,716 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:22:56,716 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:22:57,268 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:22:57,268 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:22:57,834 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:22:57,834 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:22:58,400 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:22:58,400 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:22:59,020 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:22:59,020 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:22:59,643 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:22:59,643 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:23:00,287 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:23:00,287 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:23:00,943 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:23:00,943 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:23:01,591 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:23:01,591 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:23:02,264 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:23:02,264 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:23:02,913 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:23:02,913 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:23:03,537 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:23:03,537 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:23:04,204 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:23:04,204 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:23:04,872 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:23:04,872 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:23:05,539 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:23:05,539 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:23:06,206 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:23:06,206 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:23:06,872 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:23:06,872 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:23:07,539 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:23:07,539 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:23:08,206 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:23:08,207 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:23:08,874 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:23:08,874 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:23:09,541 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:23:09,541 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:23:10,219 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:23:10,219 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:23:10,876 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:23:10,876 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:23:11,542 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:23:11,542 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:23:12,199 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:23:12,199 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:23:12,850 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:23:12,850 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:23:13,501 example.py:84]
+INFO 04-12 13:23:13,501 example.py:85] Prompt: 'Answer briefly: what is 2 + 3 * 4?'
+INFO 04-12 13:23:13,501 example.py:86] prompt len: 13, completion len: 32, text: '111111222111111111111111111111111111111111111111111111111111111331111111111111111111111111111111'
+INFO 04-12 13:23:13,501 example.py:84]
+INFO 04-12 13:23:13,501 example.py:85] Prompt: 'Explain sparse attention in one short paragraph.'
+INFO 04-12 13:23:13,501 example.py:86] prompt len: 10, completion len: 32, text: '33333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333'
+INFO 04-12 13:23:13,501 example.py:84]
+INFO 04-12 13:23:13,501 example.py:85] Prompt: "Translate 'hello world' into Chinese."
+INFO 04-12 13:23:13,501 example.py:86] prompt len: 10, completion len: 32, text: '333111333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333'
+root@atlas-800t-29:/data/wangxuan/nano-vllm-ascend#
+
+
+
+以上，似乎能跑了，而且是带warmup的。
+但是现在模型很傻，你看打出来的序列很不正常。
+
+可能是什么原因？是MoE裁剪后一定会变成这样？还是哪里写错了？
+
+
+
+INFO 04-12 13:36:28,626 example.py:101] Prompt: 'Answer briefly: what is 2 + 3 * 4?'
+INFO 04-12 13:36:28,626 example.py:102] prompt len: 15, completion len: 16, text: '111111111111111111111111111111111111111111111111'
+INFO 04-12 13:36:28,627 example.py:100]
+INFO 04-12 13:36:28,627 example.py:101] Prompt: 'Explain sparse attention in one short paragraph.'
+INFO 04-12 13:36:28,627 example.py:102] prompt len: 12, completion len: 16, text: '111111111111111333333111111333333333333333333333'
+INFO 04-12 13:36:28,627 example.py:100]
+INFO 04-12 13:36:28,627 example.py:101] Prompt: "Translate 'hello world' into Chinese."
+INFO 04-12 13:36:28,627 example.py:102] prompt len: 12, completion len: 16, text: '333333333333333333333333333333333333333333333333'
+
+用了你的新的example.py后，现在还是这样。
+那就按你说的，直接开始修“数值正确性”吧
+
+
+
+INFO 04-12 13:56:40,413 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:56:40,963 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:56:40,963 model_runner.py:500] decode execute tokens: 3
+INFO 04-12 13:56:41,511 example.py:111]
+INFO 04-12 13:56:41,511 example.py:112] Prompt: 'Answer briefly: what is 2 + 3 * 4?'
+INFO 04-12 13:56:41,511 example.py:113] prompt len: 14, completion len: 16, text: '0148.5312670148531267016851765'
+INFO 04-12 13:56:41,511 example.py:111]
+INFO 04-12 13:56:41,511 example.py:112] Prompt: 'Explain sparse attention in one short paragraph.'
+INFO 04-12 13:56:41,511 example.py:113] prompt len: 11, completion len: 16, text: '1341481111241244010114614604350Ġhttps493031'
+INFO 04-12 13:56:41,511 example.py:111]
+INFO 04-12 13:56:41,511 example.py:112] Prompt: "Translate 'hello world' into Chinese."
+INFO 04-12 13:56:41,511 example.py:113] prompt len: 11, completion len: 16, text: '5005000000000000'
+
+现在变成了以上这样
+
+
+
+
+
+INFO 04-12 14:50:50,024 example.py:125]
+INFO 04-12 14:50:50,024 example.py:126] Prompt: 'Answer briefly: what is 2 + 3 * 4?'
+INFO 04-12 14:50:50,024 example.py:127] prompt len: 15, completion len: 16, text: '111111111111111111111111111111111111111111111111'
+INFO 04-12 14:50:50,025 example.py:125]
+INFO 04-12 14:50:50,025 example.py:126] Prompt: 'Explain sparse attention in one short paragraph.'
+INFO 04-12 14:50:50,025 example.py:127] prompt len: 12, completion len: 16, text: '111111111111111111111111111111111111111111111111'
+INFO 04-12 14:50:50,025 example.py:125]
+INFO 04-12 14:50:50,025 example.py:126] Prompt: "Translate 'hello world' into Chinese."
+INFO 04-12 14:50:50,025 example.py:127] prompt len: 12, completion len: 16, text: '111111111111111111111111111111111111111111111111'
+
+按你改的这一版，现在变成了以上这样。
+
+提醒一下： huggingface 上有非量化版的 deepseek-v3.2 模型。如果你对 w8a8 做反量化，反量化成 BF16 ，是不是反倒不如直接从 deepseek-v3.2 模型来做裁专家？不过，huggingface上的这些模型应该是针对GPU的，针对华为昇腾NPU不知道有什么差异。
+
+此外，vllm-ascend 官方有这几个模型：
+1. https://www.modelscope.cn/models/vllm-ascend/DeepSeek-V3.2-W8A8-Pruning
+2. https://www.modelscope.cn/models/vllm-ascend/DeepSeek-V3.2-4layers
+3. https://www.modelscope.cn/models/vllm-ascend/DeepSeek-V3.2-W8A8
+
+我的 DeepSeek-V3.2-W8A8 就是从 链接3中下载的。
+
+我估计链接1和链接2的模型不一定能说人话，可能只是 vllm-ascend 开发者做的让人用较少的卡模型用的，并不保证模型能说人话。
+
+现在，你决定还是按照你规划的路线做？还是从网上别的模型中找找方法？实在不行我可以用 vllm-ascend 跑跑 链接1和链接2 的模型，看看能不能说人话，如果能，我们再去把它移植到 nano-vllm-ascend 上？
+
