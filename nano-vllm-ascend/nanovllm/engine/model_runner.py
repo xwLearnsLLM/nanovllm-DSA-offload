@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the Nano-vLLM project
 
 
+import os
 import pickle
 from multiprocessing.shared_memory import SharedMemory
 from multiprocessing.synchronize import Event
@@ -21,6 +22,13 @@ from nanovllm.utils.loader import load_model
 from nanovllm.utils.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() in ("1", "true", "yes", "on")
 
 
 class ModelRunner:
@@ -508,7 +516,11 @@ class ModelRunner:
             model_kwargs["sequence_lengths"] = sequence_lengths
             model_kwargs["vision_slices_per_seq"] = vision_slices_per_seq
         execute_tokens = len(input_ids) if is_prefill else get_context().real_bs
-        logger.info(f"{'prefill' if is_prefill else 'decode'} execute tokens: {execute_tokens}")
+        if _env_flag("NANOVLLM_LOG_EXECUTE_TOKENS", False):
+            logger.info(
+                f"{'prefill' if is_prefill else 'decode'} execute tokens: "
+                f"{execute_tokens}"
+            )
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
             return self.model.compute_logits(self.model(input_ids, positions, **model_kwargs))
         else:

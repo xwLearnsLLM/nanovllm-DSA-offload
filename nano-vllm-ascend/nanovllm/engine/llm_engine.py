@@ -298,34 +298,86 @@ class LLMEngine:
             sampling_params: SamplingParams | list[SamplingParams],
             use_tqdm: bool = True,
     ) -> list[str]:
+        total_prompts = len(prompts)
         if use_tqdm:
-            pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True)
+            pbar = tqdm(
+                total=total_prompts,
+                desc="Processed prompts",
+                dynamic_ncols=True,
+                postfix=(
+                    f"est. speed input: {0:.2f} toks/s, output: {0:.2f} toks/s"
+                ),
+            )
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
         for prompt, sp in zip(prompts, sampling_params):
             self.add_request(prompt, sp)
         outputs = {}
-        prefill_throughput = decode_throughput = 0.
+        total_input_tokens = 0
+        total_output_tokens = 0
+        total_start = perf_counter()
+        engine_prefill_time = 0.0
+        engine_decode_time = 0.0
+        engine_prefill_tokens = 0
+        engine_decode_tokens = 0
+        prefill_steps = 0
+        decode_steps = 0
         while not self.is_finished():
-            t = perf_counter()
+            step_start = perf_counter()
             output, num_tokens = self.step()
-            if use_tqdm:
-                if num_tokens > 0:
-                    prefill_throughput = num_tokens / (perf_counter() - t)
-                else:
-                    decode_throughput = -num_tokens / (perf_counter() - t)
-                pbar.set_postfix({
-                    "Prefill": f"{int(prefill_throughput)}tok/s",
-                    "Decode": f"{int(decode_throughput)}tok/s",
-                })
+            step_elapsed = perf_counter() - step_start
+            if num_tokens > 0:
+                prefill_steps += 1
+                engine_prefill_tokens += num_tokens
+                engine_prefill_time += step_elapsed
+            else:
+                decode_steps += 1
+                engine_decode_tokens += -num_tokens
+                engine_decode_time += step_elapsed
             for seq_id, token_ids, prompt_len, cache_tokens in output:
                 outputs[seq_id] = (token_ids, prompt_len, cache_tokens)
                 if use_tqdm:
+                    total_input_tokens += prompt_len
+                    total_output_tokens += len(token_ids)
+                    elapsed = pbar.format_dict.get("elapsed")
+                    if not elapsed:
+                        elapsed = perf_counter() - total_start
+                    elapsed = max(elapsed, 1e-9)
+                    pbar.set_postfix_str(
+                        f"est. speed input: {total_input_tokens / elapsed:.2f} "
+                        f"toks/s, output: {total_output_tokens / elapsed:.2f} toks/s"
+                    )
                     pbar.update(1)
+            if use_tqdm and pbar.n == total_prompts:
+                pbar.refresh()
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
         outputs = [{"text": self._decode_token_ids(token_ids), "token_ids": token_ids, "prompt_len": prompt_len,
                     "cache_tokens": cache_tokens} for
                    token_ids, prompt_len, cache_tokens in outputs]
+        if self._is_true_env("NANOVLLM_PERF_SUMMARY", False):
+            elapsed = max(perf_counter() - total_start, 1e-9)
+            logger.info(
+                "Perf summary: requests=%d elapsed=%.2fs "
+                "est_input=%.2f toks/s est_output=%.2f toks/s "
+                "engine_prefill=%.2f toks/s engine_decode=%.2f toks/s "
+                "prefill_steps=%d decode_steps=%d",
+                total_prompts,
+                elapsed,
+                total_input_tokens / elapsed,
+                total_output_tokens / elapsed,
+                (
+                    engine_prefill_tokens / engine_prefill_time
+                    if engine_prefill_time > 0
+                    else 0.0
+                ),
+                (
+                    engine_decode_tokens / engine_decode_time
+                    if engine_decode_time > 0
+                    else 0.0
+                ),
+                prefill_steps,
+                decode_steps,
+            )
         if use_tqdm:
             pbar.close()
         return outputs
@@ -340,32 +392,36 @@ class LLMEngine:
         if use_tqdm:
             pbar = tqdm(
                 total=len(requests),
-                desc="Generating",
+                desc="Processed prompts",
                 dynamic_ncols=True,
+                postfix=(
+                    f"est. speed input: {0:.2f} toks/s, output: {0:.2f} toks/s"
+                ),
             )
 
         self._mm_add_request(processor, requests, sampling_params)
 
         outputs = {}
-        prefill_throughput = decode_throughput = 0.
+        total_input_tokens = 0
+        total_output_tokens = 0
+        total_start = perf_counter()
         while not self.is_finished():
-            t = perf_counter()
             output, num_tokens = self.step()
-            if use_tqdm:
-                if num_tokens > 0:
-                    prefill_throughput = num_tokens / (perf_counter() - t)
-                else:
-                    decode_throughput = -num_tokens / (perf_counter() - t)
-                pbar.set_postfix(
-                    {
-                        "Prefill": f"{int(prefill_throughput)}tok/s",
-                        "Decode": f"{int(decode_throughput)}tok/s",
-                    }
-                )
             for seq_id, token_ids, _, _ in output:
                 outputs[seq_id] = token_ids
                 if use_tqdm:
+                    total_output_tokens += len(token_ids)
+                    elapsed = pbar.format_dict.get("elapsed")
+                    if not elapsed:
+                        elapsed = perf_counter() - total_start
+                    elapsed = max(elapsed, 1e-9)
+                    pbar.set_postfix_str(
+                        f"est. speed input: {total_input_tokens / elapsed:.2f} "
+                        f"toks/s, output: {total_output_tokens / elapsed:.2f} toks/s"
+                    )
                     pbar.update(1)
+            if use_tqdm and pbar.n == len(requests):
+                pbar.refresh()
 
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
         results = self.get_mm_results(outputs)

@@ -1,4 +1,5 @@
 import os
+from time import perf_counter
 
 from nanovllm import LLM, SamplingParams
 
@@ -53,6 +54,25 @@ def maybe_print_debug_outputs(tokenizer, outputs) -> None:
             tokenizer.convert_ids_to_tokens(token_ids),
         )
 
+
+def print_run_summary(
+    run_idx: int,
+    total_runs: int,
+    prompt_token_ids: list[list[int]],
+    outputs,
+    elapsed: float,
+) -> None:
+    total_input_tokens = sum(len(token_ids) for token_ids in prompt_token_ids)
+    total_output_tokens = sum(len(output["token_ids"]) for output in outputs)
+    elapsed = max(elapsed, 1e-9)
+    print(
+        "summary :",
+        f"run {run_idx}/{total_runs}, "
+        f"elapsed={elapsed:.2f}s, "
+        f"input={total_input_tokens / elapsed:.2f} toks/s, "
+        f"output={total_output_tokens / elapsed:.2f} toks/s",
+    )
+
 if __name__ == '__main__' :
     prompts = [
         "The capital city of China is",
@@ -69,6 +89,9 @@ if __name__ == '__main__' :
         "NANOVLLM_ENABLE_EXPERT_PARALLEL",
         True,
     )
+    use_tqdm = get_env_bool("NANOVLLM_USE_TQDM", True)
+    warmup_runs = int(os.environ.get("NANOVLLM_WARMUP_RUNS", "0"))
+    bench_runs = int(os.environ.get("NANOVLLM_BENCH_RUNS", "1"))
 
     llm = LLM(
         model=MODEL_PATH,
@@ -86,10 +109,25 @@ if __name__ == '__main__' :
 
     prompt_token_ids = encode_prompts(llm.tokenizer, prompts)
     maybe_print_debug_prompts(llm.tokenizer, prompts, prompt_token_ids)
-    outputs = llm.generate(
-        prompt_token_ids,
-        SamplingParams(temperature=0.02, max_tokens=32),
-    )
+    outputs = None
+    total_runs = max(warmup_runs + bench_runs, 1)
+    for run_idx in range(total_runs):
+        start = perf_counter()
+        current_outputs = llm.generate(
+            prompt_token_ids,
+            SamplingParams(temperature=0.02, max_tokens=32),
+            use_tqdm=use_tqdm,
+        )
+        elapsed = perf_counter() - start
+        print_run_summary(
+            run_idx + 1,
+            total_runs,
+            prompt_token_ids,
+            current_outputs,
+            elapsed,
+        )
+        outputs = current_outputs
+    assert outputs is not None
     maybe_print_debug_outputs(llm.tokenizer, outputs)
 
     for (prompt, output) in zip(prompts, outputs):

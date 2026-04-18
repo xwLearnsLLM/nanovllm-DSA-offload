@@ -20,6 +20,11 @@ class TestLLMEngineSource(unittest.TestCase):
         self.assertIn("add_special_tokens=False", ENGINE_SOURCE)
         self.assertIn("def _encode_string_prompt", ENGINE_SOURCE)
 
+    def test_progress_bar_matches_vllm_style_throughput(self):
+        self.assertIn('desc="Processed prompts"', ENGINE_SOURCE)
+        self.assertIn("est. speed input:", ENGINE_SOURCE)
+        self.assertIn("output: {0:.2f} toks/s", ENGINE_SOURCE)
+
 
 if __name__ == "__main__":
     unittest.main()
