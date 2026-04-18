@@ -6,6 +6,7 @@ import os
 import pickle
 from multiprocessing.shared_memory import SharedMemory
 from multiprocessing.synchronize import Event
+from time import perf_counter
 
 import torch
 import torch.distributed as dist
@@ -66,6 +67,16 @@ class ModelRunner:
         self.model_dtype = embed_module.embed_tokens.weight.dtype
 
         self.sampler = Sampler()
+        self.profile_decode = _env_flag("NANOVLLM_PROFILE_DECODE", False)
+        self.profile_decode_every = max(
+            1,
+            int(os.environ.get("NANOVLLM_PROFILE_DECODE_EVERY", "31")),
+        )
+        self.profile_decode_steps = 0
+        self.profile_decode_tokens = 0
+        self.profile_prepare_time = 0.0
+        self.profile_model_time = 0.0
+        self.profile_sample_time = 0.0
         torch.npu.empty_cache()
         self.allocate_kv_cache()
         if not self.enforce_eager:
@@ -554,8 +565,16 @@ class ModelRunner:
             return self.model.compute_logits(self.compile_decode(input_ids, positions))
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+        def _sync_if_profile():
+            if self.profile_decode and not is_prefill:
+                torch.npu.synchronize()
+
+        _sync_if_profile()
+        prepare_start = perf_counter()
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else (
             self.prepare_decode(seqs) if self.enforce_eager else self.prepare_decode_padding(seqs))
+        _sync_if_profile()
+        prepare_time = perf_counter() - prepare_start
 
         # Track how many freshly decoded tokens each sequence contributes; the
         # model uses these lengths to align partial vision slices with text.
@@ -596,6 +615,8 @@ class ModelRunner:
                     seq.cached_deepstack_tokens = None
 
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        _sync_if_profile()
+        model_start = perf_counter()
         logits = self.run_model(
             input_ids,
             positions,
@@ -603,9 +624,40 @@ class ModelRunner:
             sequence_lengths=sequence_lengths,
             vision_slices_per_seq=vision_slices_per_seq,
         )
+        _sync_if_profile()
+        model_time = perf_counter() - model_start
         _advance_vision_offsets()
 
+        sample_start = perf_counter()
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        sample_time = perf_counter() - sample_start
+        if self.profile_decode and not is_prefill and self.rank == 0:
+            real_bs = get_context().real_bs
+            self.profile_decode_steps += 1
+            self.profile_decode_tokens += int(real_bs)
+            self.profile_prepare_time += prepare_time
+            self.profile_model_time += model_time
+            self.profile_sample_time += sample_time
+            if self.profile_decode_steps % self.profile_decode_every == 0:
+                steps = self.profile_decode_steps
+                tokens = max(self.profile_decode_tokens, 1)
+                total_time = (
+                    self.profile_prepare_time
+                    + self.profile_model_time
+                    + self.profile_sample_time
+                )
+                logger.info(
+                    "Decode profile avg: steps=%d tokens=%d "
+                    "prepare=%.4fs/step model_lm=%.4fs/step "
+                    "sample=%.4fs/step total=%.4fs/step %.2f toks/s",
+                    steps,
+                    tokens,
+                    self.profile_prepare_time / steps,
+                    self.profile_model_time / steps,
+                    self.profile_sample_time / steps,
+                    total_time / steps,
+                    tokens / max(total_time, 1e-9),
+                )
         reset_context()
         return token_ids
 

@@ -20,6 +20,7 @@ def _instantiate_module(module_cls, *args, rank: int, world_size: int, **kwargs)
         stack.enter_context(patch("torch.distributed.is_initialized", return_value=False))
         stack.enter_context(patch("torch.distributed.all_reduce", side_effect=lambda x: x))
         stack.enter_context(patch("torch.distributed.all_gather", side_effect=lambda *args, **kwargs: None))
+        stack.enter_context(patch("torch.distributed.all_gather_into_tensor", side_effect=lambda *args, **kwargs: None))
         return module_cls(*args, **kwargs)
 
 
@@ -113,10 +114,10 @@ class TestEmbedHeadTensorParallel(unittest.TestCase):
         shard_0 = F.linear(last_hidden_states, tp_head_0.weight)
         shard_1 = F.linear(last_hidden_states, tp_head_1.weight)
 
-        def _fake_all_gather(output_tensors, input_tensor):
+        def _fake_all_gather_into_tensor(output_tensor, input_tensor):
             del input_tensor
-            output_tensors[0].copy_(shard_0)
-            output_tensors[1].copy_(shard_1)
+            output_tensor[: shard_0.shape[0]].copy_(shard_0)
+            output_tensor[shard_0.shape[0] :].copy_(shard_1)
 
         set_context(
             True,
@@ -129,7 +130,10 @@ class TestEmbedHeadTensorParallel(unittest.TestCase):
             block_tables=torch.tensor([[0], [1]], dtype=torch.int32),
             block_size=8,
         )
-        with patch("torch.distributed.all_gather", side_effect=_fake_all_gather):
+        with patch(
+            "torch.distributed.all_gather_into_tensor",
+            side_effect=_fake_all_gather_into_tensor,
+        ):
             actual_0 = tp_head_0(hidden_states)
         reset_context()
 
@@ -144,7 +148,10 @@ class TestEmbedHeadTensorParallel(unittest.TestCase):
             block_tables=torch.tensor([[0], [1]], dtype=torch.int32),
             block_size=8,
         )
-        with patch("torch.distributed.all_gather", side_effect=_fake_all_gather):
+        with patch(
+            "torch.distributed.all_gather_into_tensor",
+            side_effect=_fake_all_gather_into_tensor,
+        ):
             actual_1 = tp_head_1(hidden_states)
         reset_context()
 

@@ -20,6 +20,10 @@ class Sampler(nn.Module):
         self.debug_num_seqs = int(
             os.environ.get("NANOVLLM_DEBUG_NUM_SEQS", "2")
         )
+        self.use_gumbel_sampling = (
+            os.environ.get("NANOVLLM_USE_GUMBEL_SAMPLING", "1").lower()
+            in ("1", "true", "yes", "on")
+        )
         self._debug_logged = False
 
     def _maybe_log_topk(
@@ -64,6 +68,12 @@ class Sampler(nn.Module):
             sampled[greedy_mask] = logits[greedy_mask].argmax(dim=-1)
         if (~greedy_mask).any():
             scaled_logits = logits[~greedy_mask] / temperatures[~greedy_mask].unsqueeze(-1)
-            probs = torch.softmax(scaled_logits, dim=-1)
-            sampled[~greedy_mask] = torch.multinomial(probs, num_samples=1).squeeze(-1)
+            if self.use_gumbel_sampling:
+                # Gumbel-max samples from Categorical(logits=scaled_logits)
+                # without materializing a full softmax distribution.
+                gumbel = -torch.empty_like(scaled_logits).exponential_().log()
+                sampled[~greedy_mask] = (scaled_logits + gumbel).argmax(dim=-1)
+            else:
+                probs = torch.softmax(scaled_logits, dim=-1)
+                sampled[~greedy_mask] = torch.multinomial(probs, num_samples=1).squeeze(-1)
         return sampled

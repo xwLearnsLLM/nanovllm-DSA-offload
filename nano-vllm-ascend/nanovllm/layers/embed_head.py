@@ -1,3 +1,5 @@
+import os
+
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -52,6 +54,10 @@ class ParallelLMHead(VocabParallelEmbedding):
     ):
         assert not bias
         super().__init__(num_embeddings, embedding_dim)
+        self.use_all_gather_into_tensor = (
+            os.environ.get("NANOVLLM_USE_ALL_GATHER_INTO_TENSOR", "1").lower()
+            in ("1", "true", "yes", "on")
+        )
 
     def forward(self, x: torch.Tensor):
         context = get_context()
@@ -60,7 +66,21 @@ class ParallelLMHead(VocabParallelEmbedding):
             x = x[last_indices].contiguous()
         logits = F.linear(x, self.weight)
         if self.tp_size > 1:
-            all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)]
-            dist.all_gather(all_logits, logits)
-            logits = torch.cat(all_logits, dim=-1)
+            if self.use_all_gather_into_tensor:
+                gathered = torch.empty(
+                    self.tp_size * logits.shape[0],
+                    logits.shape[1],
+                    dtype=logits.dtype,
+                    device=logits.device,
+                )
+                dist.all_gather_into_tensor(gathered, logits.contiguous())
+                logits = (
+                    gathered.view(self.tp_size, logits.shape[0], logits.shape[1])
+                    .transpose(0, 1)
+                    .reshape(logits.shape[0], self.num_embeddings)
+                )
+            else:
+                all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)]
+                dist.all_gather(all_logits, logits)
+                logits = torch.cat(all_logits, dim=-1)
         return logits
