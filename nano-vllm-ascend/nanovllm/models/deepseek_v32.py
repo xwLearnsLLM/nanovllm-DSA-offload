@@ -1367,11 +1367,25 @@ class DeepseekV32DSAAttention(nn.Module):
             return None
 
         batch_size = ql_nope.shape[0]
-        actual_seq_lengths_query = torch.arange(
+        use_batched_sfa = (
+            batch_size == 1
+            or _env_flag("NANOVLLM_NPU_SFA_BATCHED", False)
+        )
+        batched_actual_seq_lengths_query = torch.arange(
             1,
             batch_size + 1,
             dtype=torch.int32,
             device=ql_nope.device,
+        )
+        single_actual_seq_lengths_query = torch.ones(
+            (1,),
+            dtype=torch.int32,
+            device=ql_nope.device,
+        )
+        actual_seq_lengths_query = (
+            batched_actual_seq_lengths_query
+            if use_batched_sfa
+            else single_actual_seq_lengths_query
         )
         actual_seq_lengths_key = context.context_lens.to(torch.int32)
         raw_block_tables = context.block_tables.to(torch.int32)
@@ -1385,6 +1399,11 @@ class DeepseekV32DSAAttention(nn.Module):
             sfa_index_dtype = self.index_cache.dtype
             q_index_sfa = q_index.to(sfa_index_dtype).contiguous()
             weights_sfa = weights.to(sfa_index_dtype).contiguous()
+            ql_nope_sfa = ql_nope.to(self.ckv_cache.dtype).contiguous()
+            q_pe_sfa = q_pe.to(self.kpe_cache.dtype).contiguous()
+            index_cache_sfa = self.index_cache.unsqueeze(2)
+            ckv_cache_sfa = self.ckv_cache.unsqueeze(2)
+            kpe_cache_sfa = self.kpe_cache.unsqueeze(2)
             if _is_rank0() and not type(self)._sfa_input_summary_logged:
                 query_lens_head = (
                     actual_seq_lengths_query[:8].detach().cpu().tolist()
@@ -1411,18 +1430,18 @@ class DeepseekV32DSAAttention(nn.Module):
                     "weights=%s %s ql_nope=%s %s q_pe=%s %s block_tables=%s "
                     "query_lens=%s query_lens_head=%s context_lens=%s "
                     "context_lens_head=%s raw_block_table0_head=%s "
-                    "block_table0_head=%s "
+                    "block_table0_head=%s mode=%s "
                     "sparse_count=%d config_index_topk=%d",
                     tuple(q_index_sfa.shape),
                     q_index_sfa.dtype,
-                    tuple(self.index_cache.unsqueeze(2).shape),
-                    self.index_cache.dtype,
+                    tuple(index_cache_sfa.shape),
+                    index_cache_sfa.dtype,
                     tuple(weights_sfa.shape),
                     weights_sfa.dtype,
-                    tuple(ql_nope.shape),
-                    ql_nope.dtype,
-                    tuple(q_pe.shape),
-                    q_pe.dtype,
+                    tuple(ql_nope_sfa.shape),
+                    ql_nope_sfa.dtype,
+                    tuple(q_pe_sfa.shape),
+                    q_pe_sfa.dtype,
                     tuple(block_tables.shape),
                     tuple(actual_seq_lengths_query.shape),
                     query_lens_head,
@@ -1430,44 +1449,85 @@ class DeepseekV32DSAAttention(nn.Module):
                     context_lens_head,
                     raw_block_table_head,
                     block_table_head,
+                    "batched" if use_batched_sfa else "per_sequence",
                     self.npu_sfa_sparse_count,
                     self.index_topk,
                 )
                 type(self)._sfa_input_summary_logged = True
-            topk_indices = lightning_indexer(
-                query=q_index_sfa,
-                key=self.index_cache.unsqueeze(2),
-                weights=weights_sfa,
-                actual_seq_lengths_query=actual_seq_lengths_query,
-                actual_seq_lengths_key=actual_seq_lengths_key,
-                block_table=block_tables,
-                layout_query="TND",
-                layout_key="PA_BSND",
-                sparse_count=self.npu_sfa_sparse_count,
-                sparse_mode=3,
-            )
-            if isinstance(topk_indices, tuple):
-                topk_indices = topk_indices[0]
-            latent = sparse_flash_attention(
-                query=ql_nope,
-                key=self.ckv_cache.unsqueeze(2),
-                value=self.ckv_cache.unsqueeze(2),
-                sparse_indices=topk_indices,
-                scale_value=self.scale,
-                sparse_block_size=1,
-                block_table=block_tables,
-                actual_seq_lengths_query=actual_seq_lengths_query,
-                actual_seq_lengths_kv=actual_seq_lengths_key,
-                query_rope=q_pe,
-                key_rope=self.kpe_cache.unsqueeze(2),
-                layout_query="TND",
-                layout_kv="PA_BSND",
-                sparse_mode=3,
-            )
-            if isinstance(latent, tuple):
-                latent = latent[0]
+
+            def _run_sfa(
+                query_index: torch.Tensor,
+                query_weights: torch.Tensor,
+                query_nope: torch.Tensor,
+                query_rope: torch.Tensor,
+                seq_lengths_query: torch.Tensor,
+                seq_lengths_key: torch.Tensor,
+                seq_block_tables: torch.Tensor,
+            ) -> torch.Tensor:
+                topk_indices = lightning_indexer(
+                    query=query_index,
+                    key=index_cache_sfa,
+                    weights=query_weights,
+                    actual_seq_lengths_query=seq_lengths_query,
+                    actual_seq_lengths_key=seq_lengths_key,
+                    block_table=seq_block_tables,
+                    layout_query="TND",
+                    layout_key="PA_BSND",
+                    sparse_count=self.npu_sfa_sparse_count,
+                    sparse_mode=3,
+                )
+                if isinstance(topk_indices, tuple):
+                    topk_indices = topk_indices[0]
+                latent = sparse_flash_attention(
+                    query=query_nope,
+                    key=ckv_cache_sfa,
+                    value=ckv_cache_sfa,
+                    sparse_indices=topk_indices,
+                    scale_value=self.scale,
+                    sparse_block_size=1,
+                    block_table=seq_block_tables,
+                    actual_seq_lengths_query=seq_lengths_query,
+                    actual_seq_lengths_kv=seq_lengths_key,
+                    query_rope=query_rope,
+                    key_rope=kpe_cache_sfa,
+                    layout_query="TND",
+                    layout_kv="PA_BSND",
+                    sparse_mode=3,
+                )
+                if isinstance(latent, tuple):
+                    latent = latent[0]
+                return latent
+
+            if use_batched_sfa:
+                latent = _run_sfa(
+                    q_index_sfa,
+                    weights_sfa,
+                    ql_nope_sfa,
+                    q_pe_sfa,
+                    actual_seq_lengths_query,
+                    actual_seq_lengths_key.contiguous(),
+                    block_tables,
+                )
+            else:
+                latent_parts = []
+                for seq_idx in range(batch_size):
+                    seq_slice = slice(seq_idx, seq_idx + 1)
+                    latent_parts.append(
+                        _run_sfa(
+                            q_index_sfa[seq_slice].contiguous(),
+                            weights_sfa[seq_slice].contiguous(),
+                            ql_nope_sfa[seq_slice].contiguous(),
+                            q_pe_sfa[seq_slice].contiguous(),
+                            single_actual_seq_lengths_query,
+                            actual_seq_lengths_key[seq_slice].contiguous(),
+                            block_tables[seq_slice].contiguous(),
+                        )
+                    )
+                latent = torch.cat(latent_parts, dim=0)
             self._log_sfa_status_once(
-                f"active: lightning={lightning_source} sfa={sfa_source}"
+                "active: "
+                f"mode={'batched' if use_batched_sfa else 'per_sequence'} "
+                f"lightning={lightning_source} sfa={sfa_source}"
             )
             return self._v_up_proj(latent)
         except Exception as exc:
