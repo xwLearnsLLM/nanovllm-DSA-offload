@@ -87,6 +87,12 @@ def _import_vllm_ascend_custom_ops() -> bool:
         import vllm  # noqa: F401  # type: ignore
         import vllm_ascend  # noqa: F401  # type: ignore
         from vllm_ascend import vllm_ascend_C  # noqa: F401  # type: ignore
+        from vllm_ascend.ops.layer_shard_linear import (  # noqa: F401
+            is_hidden_layer,
+            post_process_after_loading_for_shard_weight_series,
+            reach_layer_for_shard_weight_series,
+            register_all_layers_to_shard_weight_series,
+        )
     except Exception as exc:
         _VLLM_ASCEND_OPS_IMPORT_ERROR = repr(exc)
         if _is_rank0():
@@ -99,7 +105,12 @@ def _import_vllm_ascend_custom_ops() -> bool:
     return True
 
 
-def _get_ascend_op(name: str, *, allow_vllm_ascend_import: bool = False):
+def _get_ascend_op(
+    name: str,
+    *,
+    allow_vllm_ascend_import: bool = False,
+    allow_torch_npu: bool = True,
+):
     ascend_ops = getattr(torch.ops, "_C_ascend", None)
     if ascend_ops is not None and hasattr(ascend_ops, name):
         return getattr(ascend_ops, name), "torch.ops._C_ascend"
@@ -107,6 +118,8 @@ def _get_ascend_op(name: str, *, allow_vllm_ascend_import: bool = False):
         ascend_ops = getattr(torch.ops, "_C_ascend", None)
         if ascend_ops is not None and hasattr(ascend_ops, name):
             return getattr(ascend_ops, name), "torch.ops._C_ascend(vllm_ascend_C)"
+    if not allow_torch_npu:
+        return None, None
     try:
         import torch_npu  # type: ignore
     except Exception:
@@ -114,6 +127,15 @@ def _get_ascend_op(name: str, *, allow_vllm_ascend_import: bool = False):
     op = getattr(torch_npu, name, None)
     if op is not None:
         return op, "torch_npu"
+    return None, None
+
+
+def _get_vllm_ascend_op(name: str):
+    if not _import_vllm_ascend_custom_ops():
+        return None, None
+    ascend_ops = getattr(torch.ops, "_C_ascend", None)
+    if ascend_ops is not None and hasattr(ascend_ops, name):
+        return getattr(ascend_ops, name), "torch.ops._C_ascend(vllm_ascend_C)"
     return None, None
 
 
@@ -1348,13 +1370,11 @@ class DeepseekV32DSAAttention(nn.Module):
     ) -> torch.Tensor | None:
         if not self.use_npu_sfa:
             return None
-        lightning_indexer, lightning_source = _get_ascend_op(
-            "npu_lightning_indexer",
-            allow_vllm_ascend_import=True,
+        lightning_indexer, lightning_source = _get_vllm_ascend_op(
+            "npu_lightning_indexer"
         )
-        sparse_flash_attention, sfa_source = _get_ascend_op(
-            "npu_sparse_flash_attention",
-            allow_vllm_ascend_import=True,
+        sparse_flash_attention, sfa_source = _get_vllm_ascend_op(
+            "npu_sparse_flash_attention"
         )
         missing_ops = []
         if lightning_indexer is None:
@@ -1445,7 +1465,7 @@ class DeepseekV32DSAAttention(nn.Module):
                     "query_lens=%s query_lens_head=%s context_lens=%s "
                     "context_lens_head=%s raw_block_table0_head=%s "
                     "block_table0_head=%s mode=%s "
-                    "sparse_count=%d config_index_topk=%d",
+                    "ops=%s/%s sparse_count=%d config_index_topk=%d",
                     tuple(q_index_sfa.shape),
                     q_index_sfa.dtype,
                     tuple(index_cache_sfa.shape),
@@ -1464,6 +1484,8 @@ class DeepseekV32DSAAttention(nn.Module):
                     raw_block_table_head,
                     block_table_head,
                     "batched" if use_batched_sfa else "per_sequence",
+                    lightning_source,
+                    sfa_source,
                     self.npu_sfa_sparse_count,
                     self.index_topk,
                 )
