@@ -938,7 +938,7 @@ class DeepseekV32DSAAttention(nn.Module):
         self.npu_sfa_min_context_len = int(
             os.environ.get(
                 "NANOVLLM_NPU_SFA_MIN_CONTEXT_LEN",
-                str(self.npu_sfa_sparse_count),
+                "0",
             )
         )
         self.layer_id = layer_idx
