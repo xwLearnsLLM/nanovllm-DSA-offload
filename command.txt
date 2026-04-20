@@ -66,10 +66,16 @@ if os.environ.get("VLLM_ASCEND_SFA_PROBE") == "1":
 
         def is_decode_like(*args, **kwargs):
             actual_seq_lengths_query = kwargs.get("actual_seq_lengths_query")
+            query = kwargs.get("query", args[0] if len(args) > 0 else None)
             if actual_seq_lengths_query is None:
                 return False
             try:
-                return actual_seq_lengths_query.numel() > 1
+                num_reqs = actual_seq_lengths_query.numel()
+                return (
+                    query is not None
+                    and query.shape[0] == num_reqs
+                    and int(actual_seq_lengths_query[-1].item()) == num_reqs
+                )
             except Exception:
                 return False
 
@@ -222,61 +228,70 @@ PY
 
 # 3) Run nano on the same short prompts. This should print "NPU SFA input
 # summary" before the current binary-bin failure.
-NANOVLLM_ENABLE_NPU_SFA=1 \
-NANOVLLM_USE_TQDM=0 \
-NANOVLLM_PERF_SUMMARY=1 \
-NANOVLLM_PROFILE_DECODE=1 \
-NANOVLLM_PROFILE_DECODE_EVERY=1 \
-python - <<'PY' 2>&1 | tee logs/71_nano_sfa_inputs.log
+cat >/tmp/nanovllm_sfa_probe_71.py <<'PY'
 import os
 from time import perf_counter
 
 from nanovllm import LLM, SamplingParams
 
+
 MODEL_PATH = "/home/models/Deepseek-V3.2-Pruned-95B-BF/"
 TP_SIZE = 4
-MAX_MODEL_LEN = int(os.environ.get("PROBE_MAX_MODEL_LEN", "4096"))
 
-prompts = [
-    "The capital city of China is",
-    "calculate 2 + 3 * 4 = ",
-    "List all prime numbers < 100: 2, 3, ",
-    "1, 3, 7, 15, 31, ",
-    "Large Language Model is a type of AI model that",
-    "If Tom is shorter than Jerry, Spike is taller than Tom, then the shortest person is",
-    "If a train leaves at 2 PM and takes 3 hours to arrive, it will arrive at",
-]
 
-llm = LLM(
-    model=MODEL_PATH,
-    enforce_eager=True,
-    tensor_parallel_size=TP_SIZE,
-    enable_expert_parallel=True,
-    max_model_len=MAX_MODEL_LEN,
-    max_num_batched_tokens=MAX_MODEL_LEN,
-    max_num_seqs=128,
-    kvcache_block_size=128,
-    skip_warmup=1,
-    trust_remote_code=True,
-    gpu_memory_utilization=0.95,
-)
+def main():
+    max_model_len = int(os.environ.get("PROBE_MAX_MODEL_LEN", "4096"))
+    prompts = [
+        "The capital city of China is",
+        "calculate 2 + 3 * 4 = ",
+        "List all prime numbers < 100: 2, 3, ",
+        "1, 3, 7, 15, 31, ",
+        "Large Language Model is a type of AI model that",
+        "If Tom is shorter than Jerry, Spike is taller than Tom, then the shortest person is",
+        "If a train leaves at 2 PM and takes 3 hours to arrive, it will arrive at",
+    ]
 
-start = perf_counter()
-outputs = llm.generate(
-    prompts,
-    SamplingParams(temperature=0.02, max_tokens=32),
-    use_tqdm=False,
-)
-elapsed = max(perf_counter() - start, 1e-9)
-total_output_tokens = sum(len(output["token_ids"]) for output in outputs)
-print(
-    "summary :",
-    f"run 1/1, elapsed={elapsed:.2f}s, output={total_output_tokens / elapsed:.2f} toks/s",
-)
-for prompt, output in zip(prompts, outputs):
-    print("prompt  :", prompt)
-    print("response:", repr(output["text"]))
+    llm = LLM(
+        model=MODEL_PATH,
+        enforce_eager=True,
+        tensor_parallel_size=TP_SIZE,
+        enable_expert_parallel=True,
+        max_model_len=max_model_len,
+        max_num_batched_tokens=max_model_len,
+        max_num_seqs=128,
+        kvcache_block_size=128,
+        skip_warmup=1,
+        trust_remote_code=True,
+        gpu_memory_utilization=0.95,
+    )
+
+    start = perf_counter()
+    outputs = llm.generate(
+        prompts,
+        SamplingParams(temperature=0.02, max_tokens=32),
+        use_tqdm=False,
+    )
+    elapsed = max(perf_counter() - start, 1e-9)
+    total_output_tokens = sum(len(output["token_ids"]) for output in outputs)
+    print(
+        "summary :",
+        f"run 1/1, elapsed={elapsed:.2f}s, output={total_output_tokens / elapsed:.2f} toks/s",
+    )
+    for prompt, output in zip(prompts, outputs):
+        print("prompt  :", prompt)
+        print("response:", repr(output["text"]))
+
+
+if __name__ == "__main__":
+    main()
 PY
+
+NANOVLLM_ENABLE_NPU_SFA=1 \
+NANOVLLM_USE_TQDM=0 \
+NANOVLLM_PERF_SUMMARY=1 \
+NANOVLLM_PROFILE_DECODE=1 \
+NANOVLLM_PROFILE_DECODE_EVERY=1 \
+python /tmp/nanovllm_sfa_probe_71.py 2>&1 | tee logs/71_nano_sfa_inputs.log
 
 # 4) Extract only the lines I need for the next patch.
 grep -E "VLLM_SFA_PROBE|NPU SFA input summary|NPU SFA decode fast path|failed once|binary bin|AclNN_|Decode profile avg|Perf summary|summary :|Processed prompts" \

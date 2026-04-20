@@ -1374,14 +1374,30 @@ class DeepseekV32DSAAttention(nn.Module):
             device=ql_nope.device,
         )
         actual_seq_lengths_key = context.context_lens.to(torch.int32)
-        block_tables = context.block_tables.to(torch.int32)
+        raw_block_tables = context.block_tables.to(torch.int32)
+        block_tables = torch.where(
+            raw_block_tables >= 0,
+            raw_block_tables + 1,
+            torch.zeros_like(raw_block_tables),
+        ).contiguous()
 
         try:
             sfa_index_dtype = self.index_cache.dtype
             q_index_sfa = q_index.to(sfa_index_dtype).contiguous()
             weights_sfa = weights.to(sfa_index_dtype).contiguous()
             if _is_rank0() and not type(self)._sfa_input_summary_logged:
+                query_lens_head = (
+                    actual_seq_lengths_query[:8].detach().cpu().tolist()
+                )
                 context_lens_head = actual_seq_lengths_key[:8].detach().cpu().tolist()
+                raw_block_table_head = (
+                    raw_block_tables[0, : min(8, raw_block_tables.shape[1])]
+                    .detach()
+                    .cpu()
+                    .tolist()
+                    if raw_block_tables.numel() > 0
+                    else []
+                )
                 block_table_head = (
                     block_tables[0, : min(8, block_tables.shape[1])]
                     .detach()
@@ -1393,7 +1409,9 @@ class DeepseekV32DSAAttention(nn.Module):
                 logger.info(
                     "NPU SFA input summary: q_index=%s %s index_cache=%s %s "
                     "weights=%s %s ql_nope=%s %s q_pe=%s %s block_tables=%s "
-                    "context_lens=%s context_lens_head=%s block_table0_head=%s "
+                    "query_lens=%s query_lens_head=%s context_lens=%s "
+                    "context_lens_head=%s raw_block_table0_head=%s "
+                    "block_table0_head=%s "
                     "sparse_count=%d config_index_topk=%d",
                     tuple(q_index_sfa.shape),
                     q_index_sfa.dtype,
@@ -1406,8 +1424,11 @@ class DeepseekV32DSAAttention(nn.Module):
                     tuple(q_pe.shape),
                     q_pe.dtype,
                     tuple(block_tables.shape),
+                    tuple(actual_seq_lengths_query.shape),
+                    query_lens_head,
                     tuple(actual_seq_lengths_key.shape),
                     context_lens_head,
+                    raw_block_table_head,
                     block_table_head,
                     self.npu_sfa_sparse_count,
                     self.index_topk,

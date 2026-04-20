@@ -540,8 +540,9 @@ class ModelRunner:
                 self.config.max_model_len + self.config.kvcache_block_size - 1
             ) // self.config.kvcache_block_size
             if block_tables.shape[1] < static_max_block_cols:
-                padded_block_tables = torch.zeros(
+                padded_block_tables = torch.full(
                     (len(seqs), static_max_block_cols),
+                    fill_value=-1,
                     dtype=torch.int32,
                     device=self.device,
                 )
