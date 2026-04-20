@@ -1381,10 +1381,20 @@ class DeepseekV32DSAAttention(nn.Module):
             q_index_sfa = q_index.to(sfa_index_dtype).contiguous()
             weights_sfa = weights.to(sfa_index_dtype).contiguous()
             if _is_rank0() and not type(self)._sfa_input_summary_logged:
+                context_lens_head = actual_seq_lengths_key[:8].detach().cpu().tolist()
+                block_table_head = (
+                    block_tables[0, : min(8, block_tables.shape[1])]
+                    .detach()
+                    .cpu()
+                    .tolist()
+                    if block_tables.numel() > 0
+                    else []
+                )
                 logger.info(
                     "NPU SFA input summary: q_index=%s %s index_cache=%s %s "
                     "weights=%s %s ql_nope=%s %s q_pe=%s %s block_tables=%s "
-                    "context_lens=%s sparse_count=%d config_index_topk=%d",
+                    "context_lens=%s context_lens_head=%s block_table0_head=%s "
+                    "sparse_count=%d config_index_topk=%d",
                     tuple(q_index_sfa.shape),
                     q_index_sfa.dtype,
                     tuple(self.index_cache.unsqueeze(2).shape),
@@ -1397,6 +1407,8 @@ class DeepseekV32DSAAttention(nn.Module):
                     q_pe.dtype,
                     tuple(block_tables.shape),
                     tuple(actual_seq_lengths_key.shape),
+                    context_lens_head,
+                    block_table_head,
                     self.npu_sfa_sparse_count,
                     self.index_topk,
                 )

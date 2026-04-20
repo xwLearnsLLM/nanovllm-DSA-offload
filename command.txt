@@ -1,8 +1,212 @@
-# Next round after matching the SFA op input spec more closely.
-# Run from the directory that contains run.py. Send the grep output back.
+# SFA/indexer input parity probe.
+# Run this from the nano-vllm-ascend directory that contains run.py.
+# This probe is runtime-version based: it prints the actual vllm/vllm_ascend
+# package paths on the Ascend machine and wraps both torch.ops._C_ascend and
+# torch_npu SFA/indexer entry points.
 
-# 1) SFA sparse_count=2048, matching vllm-ascend sfa_v1.py and the DSA model path.
-mkdir -p logs && NANOVLLM_ENABLE_NPU_SFA=1 NANOVLLM_USE_TQDM=0 NANOVLLM_WARMUP_RUNS=1 NANOVLLM_BENCH_RUNS=1 NANOVLLM_PERF_SUMMARY=1 NANOVLLM_PROFILE_DECODE=1 python run.py 2>&1 | tee logs/50_sfa_2048_padded_bt_decode.log
+mkdir -p logs
 
-# 2) Extract the lines I need.
-grep -E "NPU SFA input summary|NPU SFA decode fast path|Decode profile avg|Perf summary|summary :|failed once|AclNN_|binary bin|response:" logs/50_sfa_2048_padded_bt_decode.log
+# 1) Install a temporary sitecustomize hook. PYTHONPATH injects it into vllm
+# worker processes too, so we can see the real op arguments used by
+# vllm-ascend 0.15 on that machine, independent of the local 0.14 source tree.
+rm -rf /tmp/nanovllm_vllm_probe
+mkdir -p /tmp/nanovllm_vllm_probe
+cat >/tmp/nanovllm_vllm_probe/sitecustomize.py <<'PY'
+import os
+
+if os.environ.get("VLLM_ASCEND_SFA_PROBE") == "1":
+    try:
+        import torch
+        import torch.distributed as dist
+        import torch_npu
+        import vllm
+        import vllm_ascend
+        from vllm_ascend import vllm_ascend_C  # noqa: F401
+
+        max_prints = int(os.environ.get("VLLM_ASCEND_SFA_PROBE_MAX_PRINTS", "4"))
+        counts = {}
+
+        def rank_info():
+            try:
+                if dist.is_available() and dist.is_initialized():
+                    return dist.get_rank()
+            except Exception:
+                pass
+            return "na"
+
+        def tinfo(x):
+            if x is None:
+                return "None"
+            return f"shape={tuple(x.shape)} dtype={x.dtype} device={x.device}"
+
+        def head(x, n=8):
+            if x is None or not hasattr(x, "numel") or x.numel() == 0:
+                return []
+            try:
+                y = x
+                if y.dim() >= 2:
+                    y = y[0]
+                return y.flatten()[:n].detach().cpu().tolist()
+            except Exception as exc:
+                return f"head_failed={exc!r}"
+
+        def should_print(key):
+            count = counts.get(key, 0)
+            if count >= max_prints:
+                return False
+            counts[key] = count + 1
+            return True
+
+        def log_indexer(source, *args, **kwargs):
+            query = kwargs.get("query", args[0] if len(args) > 0 else None)
+            key = kwargs.get("key", args[1] if len(args) > 1 else None)
+            weights = kwargs.get("weights", args[2] if len(args) > 2 else None)
+            aqlq = kwargs.get("actual_seq_lengths_query")
+            aqlk = kwargs.get("actual_seq_lengths_key")
+            block_table = kwargs.get("block_table")
+            print(
+                "VLLM_SFA_PROBE indexer "
+                f"source={source} pid={os.getpid()} rank={rank_info()} "
+                f"query={tinfo(query)} key={tinfo(key)} weights={tinfo(weights)} "
+                f"aqlq={tinfo(aqlq)} aqlq_head={head(aqlq)} "
+                f"aqlk={tinfo(aqlk)} aqlk_head={head(aqlk)} "
+                f"block_table={tinfo(block_table)} block_table0_head={head(block_table)} "
+                f"sparse_count={kwargs.get('sparse_count')} sparse_mode={kwargs.get('sparse_mode')} "
+                f"layout_query={kwargs.get('layout_query')} layout_key={kwargs.get('layout_key')}",
+                flush=True,
+            )
+
+        def log_sfa(source, *args, **kwargs):
+            query = kwargs.get("query", args[0] if len(args) > 0 else None)
+            key = kwargs.get("key", args[1] if len(args) > 1 else None)
+            value = kwargs.get("value", args[2] if len(args) > 2 else None)
+            sparse_indices = kwargs.get("sparse_indices", args[3] if len(args) > 3 else None)
+            aqlq = kwargs.get("actual_seq_lengths_query")
+            aqlkv = kwargs.get("actual_seq_lengths_kv")
+            block_table = kwargs.get("block_table")
+            query_rope = kwargs.get("query_rope")
+            key_rope = kwargs.get("key_rope")
+            print(
+                "VLLM_SFA_PROBE sfa "
+                f"source={source} pid={os.getpid()} rank={rank_info()} "
+                f"query={tinfo(query)} key={tinfo(key)} value={tinfo(value)} "
+                f"sparse_indices={tinfo(sparse_indices)} sparse_head={head(sparse_indices)} "
+                f"aqlq={tinfo(aqlq)} aqlq_head={head(aqlq)} "
+                f"aqlkv={tinfo(aqlkv)} aqlkv_head={head(aqlkv)} "
+                f"block_table={tinfo(block_table)} block_table0_head={head(block_table)} "
+                f"query_rope={tinfo(query_rope)} key_rope={tinfo(key_rope)} "
+                f"sparse_block_size={kwargs.get('sparse_block_size')} sparse_mode={kwargs.get('sparse_mode')} "
+                f"layout_query={kwargs.get('layout_query')} layout_kv={kwargs.get('layout_kv')}",
+                flush=True,
+            )
+
+        def wrap_indexer(owner, attr, source):
+            if not hasattr(owner, attr):
+                print(f"VLLM_SFA_PROBE missing source={source} attr={attr}", flush=True)
+                return
+            original = getattr(owner, attr)
+
+            def wrapped(*args, **kwargs):
+                if should_print((source, "indexer")):
+                    log_indexer(source, *args, **kwargs)
+                return original(*args, **kwargs)
+
+            setattr(owner, attr, wrapped)
+            print(f"VLLM_SFA_PROBE wrapped source={source} attr={attr}", flush=True)
+
+        def wrap_sfa(owner, attr, source):
+            if not hasattr(owner, attr):
+                print(f"VLLM_SFA_PROBE missing source={source} attr={attr}", flush=True)
+                return
+            original = getattr(owner, attr)
+
+            def wrapped(*args, **kwargs):
+                if should_print((source, "sfa")):
+                    log_sfa(source, *args, **kwargs)
+                return original(*args, **kwargs)
+
+            setattr(owner, attr, wrapped)
+            print(f"VLLM_SFA_PROBE wrapped source={source} attr={attr}", flush=True)
+
+        print(
+            "VLLM_SFA_PROBE installed "
+            f"pid={os.getpid()} rank={rank_info()} "
+            f"torch={getattr(torch, '__version__', 'unknown')} "
+            f"vllm={getattr(vllm, '__version__', 'unknown')} "
+            f"vllm_file={getattr(vllm, '__file__', 'unknown')} "
+            f"vllm_ascend_file={getattr(vllm_ascend, '__file__', 'unknown')}",
+            flush=True,
+        )
+
+        ascend_ops = getattr(torch.ops, "_C_ascend", None)
+        if ascend_ops is not None:
+            wrap_indexer(ascend_ops, "npu_lightning_indexer", "torch.ops._C_ascend")
+            wrap_sfa(ascend_ops, "npu_sparse_flash_attention", "torch.ops._C_ascend")
+        else:
+            print("VLLM_SFA_PROBE missing source=torch.ops._C_ascend", flush=True)
+
+        wrap_indexer(torch_npu, "npu_lightning_indexer", "torch_npu")
+        wrap_sfa(torch_npu, "npu_sparse_flash_attention", "torch_npu")
+    except Exception as exc:
+        print(f"VLLM_SFA_PROBE install_failed pid={os.getpid()} error={exc!r}", flush=True)
+PY
+
+# 2) Run vllm-ascend 0.15 with the same short prompts. Send me the
+# VLLM_SFA_PROBE lines. They tell us which entry point is actually called and
+# what exact argument shapes/dtypes/layout metadata are used.
+PYTHONPATH=/tmp/nanovllm_vllm_probe:${PYTHONPATH:-} \
+VLLM_ASCEND_SFA_PROBE=1 \
+VLLM_ASCEND_SFA_PROBE_MAX_PRINTS=4 \
+VLLM_ASCEND_ENABLE_NZ=0 \
+python - <<'PY' 2>&1 | tee logs/70_vllm_sfa_inputs.log
+from vllm import LLM, SamplingParams
+
+MODEL_PATH = "/home/models/Deepseek-V3.2-Pruned-95B-BF/"
+TP_SIZE = 4
+
+prompts = [
+    "The capital city of China is",
+    "calculate 2 + 3 * 4 = ",
+    "List all prime numbers < 100: 2, 3, ",
+    "1, 3, 7, 15, 31, ",
+    "Large Language Model is a type of AI model that",
+    "If Tom is shorter than Jerry, Spike is taller than Tom, then the shortest person is",
+    "If a train leaves at 2 PM and takes 3 hours to arrive, it will arrive at",
+]
+
+llm = LLM(
+    model=MODEL_PATH,
+    tensor_parallel_size=TP_SIZE,
+    enable_expert_parallel=True,
+    max_model_len=8192,
+    max_num_batched_tokens=8192,
+    gpu_memory_utilization=0.95,
+    enforce_eager=True,
+)
+
+sampling_params = SamplingParams(
+    temperature=0.02,
+    max_tokens=32,
+)
+
+outputs = llm.generate(prompts, sampling_params)
+outputs = llm.generate(prompts, sampling_params)
+for prompt, out in zip(prompts, outputs):
+    print("prompt  :", prompt)
+    print("response:", repr(out.outputs[0].text))
+PY
+
+# 3) Run nano on the same short prompts. This should print "NPU SFA input
+# summary" before the current binary-bin failure.
+NANOVLLM_ENABLE_NPU_SFA=1 \
+NANOVLLM_USE_TQDM=0 \
+NANOVLLM_WARMUP_RUNS=0 \
+NANOVLLM_BENCH_RUNS=1 \
+NANOVLLM_PERF_SUMMARY=1 \
+NANOVLLM_PROFILE_DECODE=1 \
+NANOVLLM_PROFILE_DECODE_EVERY=1 \
+python run.py 2>&1 | tee logs/71_nano_sfa_inputs.log
+
+# 4) Extract only the lines I need for the next patch.
+grep -E "VLLM_SFA_PROBE|NPU SFA input summary|NPU SFA decode fast path|failed once|binary bin|AclNN_|Decode profile avg|Perf summary|summary :|Processed prompts" \
+    logs/70_vllm_sfa_inputs.log logs/71_nano_sfa_inputs.log
