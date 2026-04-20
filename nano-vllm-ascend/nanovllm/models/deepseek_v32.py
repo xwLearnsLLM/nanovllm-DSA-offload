@@ -1438,6 +1438,43 @@ class DeepseekV32DSAAttention(nn.Module):
             index_cache_sfa = self.index_cache.unsqueeze(2)
             ckv_cache_sfa = self.ckv_cache.unsqueeze(2)
             kpe_cache_sfa = self.kpe_cache.unsqueeze(2)
+            trace_ops = _env_flag("NANOVLLM_TRACE_NPU_SFA_OPS", False)
+            trace_limit = int(
+                os.environ.get("NANOVLLM_TRACE_NPU_SFA_LIMIT", "8")
+            )
+
+            def _trace_rank() -> int:
+                try:
+                    return dist.get_rank() if dist.is_initialized() else -1
+                except Exception:
+                    return -1
+
+            def _trace_tensor(name: str, tensor: torch.Tensor | None) -> str:
+                if tensor is None:
+                    return f"{name}=None"
+                return (
+                    f"{name}=shape={tuple(tensor.shape)} "
+                    f"dtype={tensor.dtype} device={tensor.device}"
+                )
+
+            def _trace_head(tensor: torch.Tensor | None, limit: int = 8):
+                if tensor is None or tensor.numel() == 0:
+                    return []
+                try:
+                    value = tensor
+                    if value.dim() >= 2:
+                        value = value[0]
+                    return value.flatten()[:limit].detach().cpu().tolist()
+                except Exception as exc:
+                    return f"head_failed={exc!r}"
+
+            def _trace_print(message: str) -> None:
+                if trace_ops:
+                    print(
+                        f"NANOVLLM_SFA_TRACE rank={_trace_rank()} {message}",
+                        flush=True,
+                    )
+
             if _is_rank0() and not type(self)._sfa_input_summary_logged:
                 query_lens_head = (
                     actual_seq_lengths_query[:8].detach().cpu().tolist()
@@ -1499,7 +1536,22 @@ class DeepseekV32DSAAttention(nn.Module):
                 seq_lengths_query: torch.Tensor,
                 seq_lengths_key: torch.Tensor,
                 seq_block_tables: torch.Tensor,
+                seq_idx: int | str,
             ) -> torch.Tensor:
+                _trace_print(
+                    "before_indexer "
+                    f"seq={seq_idx} "
+                    f"{_trace_tensor('query', query_index)} "
+                    f"{_trace_tensor('key', index_cache_sfa)} "
+                    f"{_trace_tensor('weights', query_weights)} "
+                    f"{_trace_tensor('aqlq', seq_lengths_query)} "
+                    f"aqlq_head={_trace_head(seq_lengths_query)} "
+                    f"{_trace_tensor('aqlk', seq_lengths_key)} "
+                    f"aqlk_head={_trace_head(seq_lengths_key)} "
+                    f"{_trace_tensor('block_table', seq_block_tables)} "
+                    f"block_head={_trace_head(seq_block_tables)} "
+                    f"sparse_count={self.npu_sfa_sparse_count}"
+                )
                 topk_indices = lightning_indexer(
                     query=query_index,
                     key=index_cache_sfa,
@@ -1512,8 +1564,25 @@ class DeepseekV32DSAAttention(nn.Module):
                     sparse_count=self.npu_sfa_sparse_count,
                     sparse_mode=3,
                 )
+                if trace_ops:
+                    torch.npu.synchronize()
                 if isinstance(topk_indices, tuple):
                     topk_indices = topk_indices[0]
+                _trace_print(
+                    "after_indexer "
+                    f"seq={seq_idx} "
+                    f"{_trace_tensor('topk', topk_indices)} "
+                    f"topk_head={_trace_head(topk_indices, trace_limit)}"
+                )
+                _trace_print(
+                    "before_sfa "
+                    f"seq={seq_idx} "
+                    f"{_trace_tensor('query', query_nope)} "
+                    f"{_trace_tensor('key', ckv_cache_sfa)} "
+                    f"{_trace_tensor('sparse_indices', topk_indices)} "
+                    f"{_trace_tensor('query_rope', query_rope)} "
+                    f"{_trace_tensor('key_rope', kpe_cache_sfa)}"
+                )
                 latent = sparse_flash_attention(
                     query=query_nope,
                     key=ckv_cache_sfa,
@@ -1530,8 +1599,14 @@ class DeepseekV32DSAAttention(nn.Module):
                     layout_kv="PA_BSND",
                     sparse_mode=3,
                 )
+                if trace_ops:
+                    torch.npu.synchronize()
                 if isinstance(latent, tuple):
                     latent = latent[0]
+                _trace_print(
+                    "after_sfa "
+                    f"seq={seq_idx} {_trace_tensor('latent', latent)}"
+                )
                 return latent
 
             if use_batched_sfa:
@@ -1543,6 +1618,7 @@ class DeepseekV32DSAAttention(nn.Module):
                     actual_seq_lengths_query,
                     actual_seq_lengths_key.contiguous(),
                     block_tables,
+                    "batched",
                 )
             else:
                 latent_parts = []
@@ -1557,6 +1633,7 @@ class DeepseekV32DSAAttention(nn.Module):
                             single_actual_seq_lengths_query,
                             actual_seq_lengths_key[seq_slice].contiguous(),
                             block_tables[seq_slice].contiguous(),
+                            seq_idx,
                         )
                     )
                 latent = torch.cat(latent_parts, dim=0)
