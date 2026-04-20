@@ -935,6 +935,12 @@ class DeepseekV32DSAAttention(nn.Module):
         self.npu_sfa_sparse_count = int(
             os.environ.get("NANOVLLM_NPU_SFA_SPARSE_COUNT", "2048")
         )
+        self.npu_sfa_min_context_len = int(
+            os.environ.get(
+                "NANOVLLM_NPU_SFA_MIN_CONTEXT_LEN",
+                str(self.npu_sfa_sparse_count),
+            )
+        )
         self.layer_id = layer_idx
         self.scale = self.qk_head_dim ** -0.5
         if config.rope_parameters.get("rope_type") == "deepseek_yarn":
@@ -1388,6 +1394,14 @@ class DeepseekV32DSAAttention(nn.Module):
             else single_actual_seq_lengths_query
         )
         actual_seq_lengths_key = context.context_lens.to(torch.int32)
+        max_context_len = int(actual_seq_lengths_key.max().item())
+        if max_context_len < self.npu_sfa_min_context_len:
+            self._log_sfa_status_once(
+                "skipped: "
+                f"short_context max={max_context_len} "
+                f"min={self.npu_sfa_min_context_len}"
+            )
+            return None
         raw_block_tables = context.block_tables.to(torch.int32)
         block_tables = torch.where(
             raw_block_tables >= 0,
