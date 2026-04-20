@@ -25,12 +25,22 @@ class Block:
 
 class BlockManager:
 
-    def __init__(self, num_blocks: int, block_size: int, non_cache_token_ids: list[int] | None = None):
+    def __init__(
+        self,
+        num_blocks: int,
+        block_size: int,
+        non_cache_token_ids: list[int] | None = None,
+        reserve_null_block: bool = False,
+    ):
         self.block_size = block_size
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         self.hash_to_block_id: dict[int, int] = dict()
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         self.used_block_ids: set[int] = set()
+        self.null_block_id = None
+        if reserve_null_block:
+            assert num_blocks > 1, "Need at least two cache blocks to reserve block 0."
+            self.null_block_id = self.free_block_ids.popleft()
         # Tokens in this set should never trigger cache hits because their
         # embeddings depend on per-request image features.
         self.non_cache_token_ids: set[int] = set(non_cache_token_ids or [])

@@ -1,8 +1,16 @@
 from collections import deque
+import os
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence, SequenceStatus, FinishReason
 from nanovllm.engine.block_manager import BlockManager
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() in ("1", "true", "yes", "on")
 
 
 class Scheduler:
@@ -11,8 +19,9 @@ class Scheduler:
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
-        # dummy_slot block_num=1891 max_num_seq=4 seq=3 [[0,10],[1,11],[2,19],[1890,0]]
-        # self.block_manager = BlockManager(config.num_kvcache_blocks - 1, config.kvcache_block_size)
+        # Keep the last physical block for padded dummy slots. When SFA is
+        # enabled, also keep block 0 as the null block to match vLLM's
+        # paged-cache convention used by the Ascend SFA kernels.
         non_cache_token_ids: list[int] = []
         if config.is_multimodal and config.hf_config is not None:
             for attr in (
@@ -27,6 +36,7 @@ class Scheduler:
             config.num_kvcache_blocks - 1,
             config.kvcache_block_size,
             non_cache_token_ids=non_cache_token_ids,
+            reserve_null_block=_env_flag("NANOVLLM_ENABLE_NPU_SFA", False),
         )
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()

@@ -83,6 +83,7 @@ def _import_vllm_ascend_custom_ops() -> bool:
     if _VLLM_ASCEND_OPS_IMPORT_ERROR is not None:
         return False
     try:
+        os.environ.setdefault("VLLM_ASCEND_ENABLE_NZ", "0")
         import torch_npu  # noqa: F401  # type: ignore
         import vllm  # noqa: F401  # type: ignore
         import vllm_ascend  # noqa: F401  # type: ignore
@@ -1423,9 +1424,19 @@ class DeepseekV32DSAAttention(nn.Module):
             )
             return None
         raw_block_tables = context.block_tables.to(torch.int32)
+        valid_block_tables = raw_block_tables >= 0
+        block_table_offset = 0
+        if bool(valid_block_tables.any().item()):
+            min_block_id = int(raw_block_tables[valid_block_tables].min().item())
+            # vLLM reserves physical block 0 as the null block. Older Nano
+            # allocations started at block 0, so keep a compatibility offset.
+            if min_block_id == 0:
+                block_table_offset = int(
+                    os.environ.get("NANOVLLM_NPU_SFA_BLOCK_TABLE_OFFSET", "1")
+                )
         block_tables = torch.where(
-            raw_block_tables >= 0,
-            raw_block_tables + 1,
+            valid_block_tables,
+            raw_block_tables + block_table_offset,
             torch.zeros_like(raw_block_tables),
         ).contiguous()
 
@@ -1501,7 +1512,7 @@ class DeepseekV32DSAAttention(nn.Module):
                     "weights=%s %s ql_nope=%s %s q_pe=%s %s block_tables=%s "
                     "query_lens=%s query_lens_head=%s context_lens=%s "
                     "context_lens_head=%s raw_block_table0_head=%s "
-                    "block_table0_head=%s mode=%s "
+                    "block_table0_head=%s block_table_offset=%d mode=%s "
                     "ops=%s/%s sparse_count=%d config_index_topk=%d",
                     tuple(q_index_sfa.shape),
                     q_index_sfa.dtype,
@@ -1520,6 +1531,7 @@ class DeepseekV32DSAAttention(nn.Module):
                     context_lens_head,
                     raw_block_table_head,
                     block_table_head,
+                    block_table_offset,
                     "batched" if use_batched_sfa else "per_sequence",
                     lightning_source,
                     sfa_source,
