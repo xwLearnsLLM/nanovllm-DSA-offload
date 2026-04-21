@@ -939,6 +939,7 @@ class DeepseekV32Indexer(nn.Module):
 class DeepseekV32DSAAttention(nn.Module):
     _sfa_status_messages: set[str] = set()
     _sfa_input_summary_logged = False
+    _sfa_dumped_keys: set[tuple[int, int, int]] = set()
 
     def __init__(self, config: DeepseekV32Config, layer_idx: int) -> None:
         super().__init__()
@@ -1486,6 +1487,64 @@ class DeepseekV32DSAAttention(nn.Module):
                         flush=True,
                     )
 
+            def _maybe_dump_sfa_inputs(
+                query_nope: torch.Tensor,
+                query_rope: torch.Tensor,
+                seq_lengths_query: torch.Tensor,
+                seq_lengths_key: torch.Tensor,
+                seq_block_tables: torch.Tensor,
+                topk_indices: torch.Tensor,
+                seq_idx: int | str,
+            ) -> None:
+                dump_dir = os.environ.get("NANOVLLM_DUMP_NPU_SFA_INPUTS")
+                if not dump_dir:
+                    return
+                rank = _trace_rank()
+                dump_rank = int(os.environ.get("NANOVLLM_DUMP_NPU_SFA_RANK", "0"))
+                dump_layer = int(
+                    os.environ.get("NANOVLLM_DUMP_NPU_SFA_LAYER", str(self.layer_id))
+                )
+                if dump_rank >= 0 and rank != dump_rank:
+                    return
+                if dump_layer >= 0 and self.layer_id != dump_layer:
+                    return
+                try:
+                    seq_key = int(seq_idx)
+                except Exception:
+                    seq_key = -1
+                key = (rank, self.layer_id, seq_key)
+                if key in type(self)._sfa_dumped_keys:
+                    return
+                type(self)._sfa_dumped_keys.add(key)
+                os.makedirs(dump_dir, exist_ok=True)
+                path = os.path.join(
+                    dump_dir,
+                    f"sfa_rank{rank}_layer{self.layer_id}_seq{seq_idx}.pt",
+                )
+                torch.save(
+                    {
+                        "rank": rank,
+                        "layer_id": self.layer_id,
+                        "seq_idx": seq_idx,
+                        "scale_value": float(self.scale),
+                        "sparse_block_size": 1,
+                        "sparse_mode": 3,
+                        "layout_query": "TND",
+                        "layout_kv": "PA_BSND",
+                        "query": query_nope.detach().cpu(),
+                        "query_rope": query_rope.detach().cpu(),
+                        "key": ckv_cache_sfa.detach().cpu(),
+                        "value": ckv_cache_sfa.detach().cpu(),
+                        "key_rope": kpe_cache_sfa.detach().cpu(),
+                        "sparse_indices": topk_indices.detach().cpu(),
+                        "block_table": seq_block_tables.detach().cpu(),
+                        "actual_seq_lengths_query": seq_lengths_query.detach().cpu(),
+                        "actual_seq_lengths_kv": seq_lengths_key.detach().cpu(),
+                    },
+                    path,
+                )
+                _trace_print(f"dumped_sfa_inputs path={path}")
+
             if _is_rank0() and not type(self)._sfa_input_summary_logged:
                 query_lens_head = (
                     actual_seq_lengths_query[:8].detach().cpu().tolist()
@@ -1595,6 +1654,20 @@ class DeepseekV32DSAAttention(nn.Module):
                     f"{_trace_tensor('query_rope', query_rope)} "
                     f"{_trace_tensor('key_rope', kpe_cache_sfa)}"
                 )
+                _maybe_dump_sfa_inputs(
+                    query_nope,
+                    query_rope,
+                    seq_lengths_query,
+                    seq_lengths_key,
+                    seq_block_tables,
+                    topk_indices,
+                    seq_idx,
+                )
+                if (
+                    os.environ.get("NANOVLLM_DUMP_NPU_SFA_INPUTS")
+                    and _env_flag("NANOVLLM_DUMP_NPU_SFA_ONLY", False)
+                ):
+                    raise RuntimeError("NPU SFA input dump requested")
                 latent = sparse_flash_attention(
                     query=query_nope,
                     key=ckv_cache_sfa,

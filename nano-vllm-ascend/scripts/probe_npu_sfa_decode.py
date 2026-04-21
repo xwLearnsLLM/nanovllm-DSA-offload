@@ -38,8 +38,108 @@ def _head(tensor: torch.Tensor, limit: int = 16) -> list[int | float]:
 def _desc(name: str, tensor: torch.Tensor) -> str:
     return (
         f"{name}=shape={tuple(tensor.shape)} "
-        f"dtype={tensor.dtype} device={tensor.device}"
+        f"dtype={tensor.dtype} device={tensor.device} "
+        f"contiguous={tensor.is_contiguous()}"
     )
+
+
+def _stats(name: str, tensor: torch.Tensor) -> str:
+    if not torch.is_floating_point(tensor):
+        return (
+            f"{name}: min={int(tensor.min().item())} "
+            f"max={int(tensor.max().item())}"
+        )
+    value = tensor.float()
+    finite = torch.isfinite(value)
+    finite_count = int(finite.sum().item())
+    total = int(value.numel())
+    if finite_count == 0:
+        return f"{name}: finite=0/{total}"
+    finite_value = value[finite]
+    return (
+        f"{name}: finite={finite_count}/{total} "
+        f"min={float(finite_value.min().item()):.6g} "
+        f"max={float(finite_value.max().item()):.6g}"
+    )
+
+
+def _to_device(payload: dict, name: str, device: torch.device) -> torch.Tensor:
+    value = payload[name]
+    if not isinstance(value, torch.Tensor):
+        raise TypeError(f"{name} in dump is not a tensor: {type(value)!r}")
+    return value.to(device=device).contiguous()
+
+
+def replay_dump(path: str, device: torch.device) -> None:
+    payload = torch.load(path, map_location="cpu")
+    query = _to_device(payload, "query", device)
+    key = _to_device(payload, "key", device)
+    value = _to_device(payload, "value", device)
+    sparse_indices = _to_device(payload, "sparse_indices", device)
+    block_table = _to_device(payload, "block_table", device)
+    actual_seq_lengths_query = _to_device(
+        payload, "actual_seq_lengths_query", device
+    )
+    actual_seq_lengths_kv = _to_device(payload, "actual_seq_lengths_kv", device)
+    query_rope = _to_device(payload, "query_rope", device)
+    key_rope = _to_device(payload, "key_rope", device)
+    scale_value = float(payload.get("scale_value", 0.1352337788608801))
+    sparse_block_size = int(payload.get("sparse_block_size", 1))
+    sparse_mode = int(payload.get("sparse_mode", 3))
+    layout_query = str(payload.get("layout_query", "TND"))
+    layout_kv = str(payload.get("layout_kv", "PA_BSND"))
+
+    print(
+        "PROBE dump_metadata "
+        f"rank={payload.get('rank')} "
+        f"layer_id={payload.get('layer_id')} "
+        f"seq_idx={payload.get('seq_idx')} "
+        f"scale_value={scale_value}",
+        flush=True,
+    )
+    for name, tensor in (
+        ("query", query),
+        ("key", key),
+        ("value", value),
+        ("sparse_indices", sparse_indices),
+        ("block_table", block_table),
+        ("actual_seq_lengths_query", actual_seq_lengths_query),
+        ("actual_seq_lengths_kv", actual_seq_lengths_kv),
+        ("query_rope", query_rope),
+        ("key_rope", key_rope),
+    ):
+        print(f"PROBE dump_tensor {_desc(name, tensor)}", flush=True)
+        print(f"PROBE dump_stats {_stats(name, tensor.detach().cpu())}", flush=True)
+
+    print(
+        "PROBE before_sfa_dump "
+        f"{_desc('query', query)} "
+        f"{_desc('key', key)} "
+        f"{_desc('sparse_indices', sparse_indices)} "
+        f"sparse_head={_head(sparse_indices)} "
+        f"block_head={_head(block_table)}",
+        flush=True,
+    )
+    out = torch.ops._C_ascend.npu_sparse_flash_attention(
+        query=query,
+        key=key,
+        value=value,
+        sparse_indices=sparse_indices,
+        scale_value=scale_value,
+        sparse_block_size=sparse_block_size,
+        actual_seq_lengths_query=actual_seq_lengths_query,
+        actual_seq_lengths_kv=actual_seq_lengths_kv,
+        block_table=block_table,
+        query_rope=query_rope,
+        key_rope=key_rope,
+        layout_query=layout_query,
+        layout_kv=layout_kv,
+        sparse_mode=sparse_mode,
+    )
+    if isinstance(out, tuple):
+        out = out[0]
+    torch.npu.synchronize()
+    print(f"PROBE after_sfa_dump {_desc('out', out)}", flush=True)
 
 
 def main() -> None:
@@ -51,10 +151,18 @@ def main() -> None:
     parser.add_argument("--sparse-count", type=int, default=2048)
     parser.add_argument("--device", default="npu:0")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--dump-path",
+        help="Replay a Nano NANOVLLM_DUMP_NPU_SFA_INPUTS .pt file.",
+    )
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
+    if args.dump_path:
+        replay_dump(args.dump_path, device)
+        return
+
     blocks_needed = (args.seq_len + args.block_size - 1) // args.block_size
     if blocks_needed + 1 > args.cache_blocks:
         raise ValueError(
