@@ -360,31 +360,49 @@ class ModelRunner:
             "Failed to allocate any DeepSeek DSA cache blocks due to "
             "insufficient memory."
         )
+        use_sfa_cache_layout = _env_flag("NANOVLLM_ENABLE_NPU_SFA", False)
 
-        ckv_shape = (
-            num_layers,
-            config.num_kvcache_blocks,
-            self.block_size,
-            kv_lora_rank,
-        )
-        kpe_shape = (
-            num_layers,
-            config.num_kvcache_blocks,
-            self.block_size,
-            rope_dim,
-        )
-        index_shape = (
-            num_layers,
-            config.num_kvcache_blocks,
-            self.block_size,
-            index_dim,
-        )
-        ckv_cache = torch.empty(ckv_shape, dtype=cache_dtype, device=self.device)
-        kpe_cache = torch.empty(kpe_shape, dtype=cache_dtype, device=self.device)
-        index_cache = torch.empty(index_shape, dtype=cache_dtype, device=self.device)
-        ckv_cache.zero_()
-        kpe_cache.zero_()
-        index_cache.zero_()
+        if use_sfa_cache_layout:
+            ckv_shape = (
+                num_layers,
+                config.num_kvcache_blocks,
+                self.block_size,
+                1,
+                kv_lora_rank,
+            )
+            kpe_shape = (
+                num_layers,
+                config.num_kvcache_blocks,
+                self.block_size,
+                1,
+                rope_dim,
+            )
+            index_shape = (
+                num_layers,
+                config.num_kvcache_blocks,
+                self.block_size,
+                1,
+                index_dim,
+            )
+        else:
+            ckv_shape = (
+                num_layers,
+                config.num_kvcache_blocks,
+                self.block_size,
+                kv_lora_rank,
+            )
+            kpe_shape = (
+                num_layers,
+                config.num_kvcache_blocks,
+                self.block_size,
+                rope_dim,
+            )
+            index_shape = (
+                num_layers,
+                config.num_kvcache_blocks,
+                self.block_size,
+                index_dim,
+            )
         self._log_cache_allocation(
             total=total,
             used=used,
@@ -396,13 +414,37 @@ class ModelRunner:
                 ("DeepSeek index cache", index_shape),
             ],
         )
-        for module in self.model.modules():
-            if hasattr(module, "assign_dsa_cache") and hasattr(module, "layer_id"):
-                module.assign_dsa_cache(
-                    ckv_cache[module.layer_id],
-                    kpe_cache[module.layer_id],
-                    index_cache[module.layer_id],
-                )
+        if use_sfa_cache_layout:
+            layer_shapes = (ckv_shape[1:], kpe_shape[1:], index_shape[1:])
+            for module in self.model.modules():
+                if hasattr(module, "assign_dsa_cache") and hasattr(module, "layer_id"):
+                    ckv_cache = torch.empty(
+                        layer_shapes[0], dtype=cache_dtype, device=self.device
+                    )
+                    kpe_cache = torch.empty(
+                        layer_shapes[1], dtype=cache_dtype, device=self.device
+                    )
+                    index_cache = torch.empty(
+                        layer_shapes[2], dtype=cache_dtype, device=self.device
+                    )
+                    ckv_cache.zero_()
+                    kpe_cache.zero_()
+                    index_cache.zero_()
+                    module.assign_dsa_cache(ckv_cache, kpe_cache, index_cache)
+        else:
+            ckv_cache = torch.empty(ckv_shape, dtype=cache_dtype, device=self.device)
+            kpe_cache = torch.empty(kpe_shape, dtype=cache_dtype, device=self.device)
+            index_cache = torch.empty(index_shape, dtype=cache_dtype, device=self.device)
+            ckv_cache.zero_()
+            kpe_cache.zero_()
+            index_cache.zero_()
+            for module in self.model.modules():
+                if hasattr(module, "assign_dsa_cache") and hasattr(module, "layer_id"):
+                    module.assign_dsa_cache(
+                        ckv_cache[module.layer_id],
+                        kpe_cache[module.layer_id],
+                        index_cache[module.layer_id],
+                    )
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)

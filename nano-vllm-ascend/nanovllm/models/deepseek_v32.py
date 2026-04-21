@@ -1447,9 +1447,33 @@ class DeepseekV32DSAAttention(nn.Module):
             weights_sfa = weights.to(sfa_index_dtype).contiguous()
             ql_nope_sfa = ql_nope.to(self.ckv_cache.dtype).contiguous()
             q_pe_sfa = q_pe.to(self.kpe_cache.dtype).contiguous()
-            index_cache_sfa = self.index_cache.unsqueeze(2)
-            ckv_cache_sfa = self.ckv_cache.unsqueeze(2)
-            kpe_cache_sfa = self.kpe_cache.unsqueeze(2)
+            materialize_cache_default = not (
+                self.index_cache.dim() == 4
+                and self.ckv_cache.dim() == 4
+                and self.kpe_cache.dim() == 4
+            )
+            materialize_cache = _env_flag(
+                "NANOVLLM_NPU_SFA_MATERIALIZE_CACHE",
+                materialize_cache_default,
+            )
+
+            def _as_pa_bsnd_cache(cache: torch.Tensor) -> torch.Tensor:
+                if cache.dim() == 4:
+                    result = cache
+                elif cache.dim() == 3:
+                    result = cache.unsqueeze(2)
+                else:
+                    raise RuntimeError(
+                        "DeepSeek DSA cache must be 3D BSND-without-head or "
+                        f"4D PA_BSND, got shape={tuple(cache.shape)}"
+                    )
+                if materialize_cache:
+                    result = result.clone(memory_format=torch.contiguous_format)
+                return result
+
+            index_cache_sfa = _as_pa_bsnd_cache(self.index_cache)
+            ckv_cache_sfa = _as_pa_bsnd_cache(self.ckv_cache)
+            kpe_cache_sfa = _as_pa_bsnd_cache(self.kpe_cache)
             trace_ops = _env_flag("NANOVLLM_TRACE_NPU_SFA_OPS", False)
             trace_limit = int(
                 os.environ.get("NANOVLLM_TRACE_NPU_SFA_LIMIT", "8")
@@ -1466,7 +1490,10 @@ class DeepseekV32DSAAttention(nn.Module):
                     return f"{name}=None"
                 return (
                     f"{name}=shape={tuple(tensor.shape)} "
-                    f"dtype={tensor.dtype} device={tensor.device}"
+                    f"dtype={tensor.dtype} device={tensor.device} "
+                    f"stride={tensor.stride()} "
+                    f"storage_offset={tensor.storage_offset()} "
+                    f"base={tensor._base is not None}"
                 )
 
             def _trace_head(tensor: torch.Tensor | None, limit: int = 8):
