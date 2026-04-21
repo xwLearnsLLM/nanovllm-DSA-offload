@@ -14,11 +14,14 @@ stage marker tells which op was executing.
 from __future__ import annotations
 
 import argparse
+import glob
 import os
 
 os.environ.setdefault("VLLM_ASCEND_ENABLE_NZ", "0")
 
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 import torch_npu  # type: ignore  # noqa: F401
 import vllm  # type: ignore  # noqa: F401
 import vllm_ascend  # type: ignore  # noqa: F401
@@ -70,24 +73,28 @@ def _to_device(payload: dict, name: str, device: torch.device) -> torch.Tensor:
     return value.to(device=device).contiguous()
 
 
-def replay_dump(path: str, device: torch.device) -> None:
+def _load_dump(path: str, device: torch.device) -> tuple[dict, dict[str, torch.Tensor]]:
     payload = torch.load(path, map_location="cpu")
-    query = _to_device(payload, "query", device)
-    key = _to_device(payload, "key", device)
-    value = _to_device(payload, "value", device)
-    sparse_indices = _to_device(payload, "sparse_indices", device)
-    block_table = _to_device(payload, "block_table", device)
-    actual_seq_lengths_query = _to_device(
-        payload, "actual_seq_lengths_query", device
-    )
-    actual_seq_lengths_kv = _to_device(payload, "actual_seq_lengths_kv", device)
-    query_rope = _to_device(payload, "query_rope", device)
-    key_rope = _to_device(payload, "key_rope", device)
+    tensors = {
+        "query": _to_device(payload, "query", device),
+        "key": _to_device(payload, "key", device),
+        "value": _to_device(payload, "value", device),
+        "sparse_indices": _to_device(payload, "sparse_indices", device),
+        "block_table": _to_device(payload, "block_table", device),
+        "actual_seq_lengths_query": _to_device(
+            payload, "actual_seq_lengths_query", device
+        ),
+        "actual_seq_lengths_kv": _to_device(
+            payload, "actual_seq_lengths_kv", device
+        ),
+        "query_rope": _to_device(payload, "query_rope", device),
+        "key_rope": _to_device(payload, "key_rope", device),
+    }
+    return payload, tensors
+
+
+def _print_dump(payload: dict, tensors: dict[str, torch.Tensor]) -> None:
     scale_value = float(payload.get("scale_value", 0.1352337788608801))
-    sparse_block_size = int(payload.get("sparse_block_size", 1))
-    sparse_mode = int(payload.get("sparse_mode", 3))
-    layout_query = str(payload.get("layout_query", "TND"))
-    layout_kv = str(payload.get("layout_kv", "PA_BSND"))
 
     print(
         "PROBE dump_metadata "
@@ -97,22 +104,44 @@ def replay_dump(path: str, device: torch.device) -> None:
         f"scale_value={scale_value}",
         flush=True,
     )
-    for name, tensor in (
-        ("query", query),
-        ("key", key),
-        ("value", value),
-        ("sparse_indices", sparse_indices),
-        ("block_table", block_table),
-        ("actual_seq_lengths_query", actual_seq_lengths_query),
-        ("actual_seq_lengths_kv", actual_seq_lengths_kv),
-        ("query_rope", query_rope),
-        ("key_rope", key_rope),
+    for name in (
+        "query",
+        "key",
+        "value",
+        "sparse_indices",
+        "block_table",
+        "actual_seq_lengths_query",
+        "actual_seq_lengths_kv",
+        "query_rope",
+        "key_rope",
     ):
+        tensor = tensors[name]
         print(f"PROBE dump_tensor {_desc(name, tensor)}", flush=True)
         print(f"PROBE dump_stats {_stats(name, tensor.detach().cpu())}", flush=True)
 
+
+def _run_sfa_dump(
+    payload: dict,
+    tensors: dict[str, torch.Tensor],
+    prefix: str = "PROBE",
+) -> torch.Tensor:
+    scale_value = float(payload.get("scale_value", 0.1352337788608801))
+    sparse_block_size = int(payload.get("sparse_block_size", 1))
+    sparse_mode = int(payload.get("sparse_mode", 3))
+    layout_query = str(payload.get("layout_query", "TND"))
+    layout_kv = str(payload.get("layout_kv", "PA_BSND"))
+    query = tensors["query"]
+    key = tensors["key"]
+    value = tensors["value"]
+    sparse_indices = tensors["sparse_indices"]
+    block_table = tensors["block_table"]
+    actual_seq_lengths_query = tensors["actual_seq_lengths_query"]
+    actual_seq_lengths_kv = tensors["actual_seq_lengths_kv"]
+    query_rope = tensors["query_rope"]
+    key_rope = tensors["key_rope"]
+
     print(
-        "PROBE before_sfa_dump "
+        f"{prefix} before_sfa_dump "
         f"{_desc('query', query)} "
         f"{_desc('key', key)} "
         f"{_desc('sparse_indices', sparse_indices)} "
@@ -139,7 +168,73 @@ def replay_dump(path: str, device: torch.device) -> None:
     if isinstance(out, tuple):
         out = out[0]
     torch.npu.synchronize()
-    print(f"PROBE after_sfa_dump {_desc('out', out)}", flush=True)
+    print(f"{prefix} after_sfa_dump {_desc('out', out)}", flush=True)
+    return out
+
+
+def replay_dump(path: str, device: torch.device) -> None:
+    payload, tensors = _load_dump(path, device)
+    _print_dump(payload, tensors)
+    _run_sfa_dump(payload, tensors)
+
+
+def _dump_path_for_rank(dump_dir: str, rank: int) -> str:
+    pattern = os.path.join(dump_dir, f"sfa_rank{rank}_layer*_seq*.pt")
+    matches = sorted(glob.glob(pattern))
+    if not matches:
+        raise FileNotFoundError(f"no dump file matched {pattern}")
+    return matches[0]
+
+
+def _worker_replay_dump_dir(
+    rank: int,
+    world_size: int,
+    dump_dir: str,
+    init_method: str,
+    use_dist: bool,
+    repeats: int,
+) -> None:
+    device = torch.device(f"npu:{rank}")
+    torch.npu.set_device(rank)
+    if use_dist:
+        dist.init_process_group(
+            backend="hccl",
+            init_method=init_method,
+            world_size=world_size,
+            rank=rank,
+        )
+    path = _dump_path_for_rank(dump_dir, rank)
+    payload, tensors = _load_dump(path, device)
+    print(
+        f"PROBE_MP rank={rank} loaded path={path} "
+        f"query={tuple(tensors['query'].shape)} key={tuple(tensors['key'].shape)}",
+        flush=True,
+    )
+    for i in range(repeats):
+        if use_dist:
+            dist.barrier()
+        _run_sfa_dump(payload, tensors, prefix=f"PROBE_MP rank={rank} iter={i}")
+        if use_dist:
+            dist.barrier()
+    if use_dist:
+        dist.destroy_process_group()
+    print(f"PROBE_MP rank={rank} done", flush=True)
+
+
+def replay_dump_dir(
+    dump_dir: str,
+    world_size: int,
+    hccl_port: int,
+    use_dist: bool,
+    repeats: int,
+) -> None:
+    init_method = f"tcp://127.0.0.1:{hccl_port}"
+    mp.spawn(
+        _worker_replay_dump_dir,
+        args=(world_size, dump_dir, init_method, use_dist, repeats),
+        nprocs=world_size,
+        join=True,
+    )
 
 
 def main() -> None:
@@ -155,10 +250,31 @@ def main() -> None:
         "--dump-path",
         help="Replay a Nano NANOVLLM_DUMP_NPU_SFA_INPUTS .pt file.",
     )
+    parser.add_argument(
+        "--dump-dir",
+        help="Replay one dumped file per rank concurrently.",
+    )
+    parser.add_argument("--world-size", type=int, default=4)
+    parser.add_argument("--hccl-port", type=int, default=28089)
+    parser.add_argument("--repeats", type=int, default=1)
+    parser.add_argument(
+        "--no-dist",
+        action="store_true",
+        help="Do not initialize HCCL for --dump-dir replay.",
+    )
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
+    if args.dump_dir:
+        replay_dump_dir(
+            args.dump_dir,
+            args.world_size,
+            args.hccl_port,
+            not args.no_dist,
+            args.repeats,
+        )
+        return
     if args.dump_path:
         replay_dump(args.dump_path, device)
         return

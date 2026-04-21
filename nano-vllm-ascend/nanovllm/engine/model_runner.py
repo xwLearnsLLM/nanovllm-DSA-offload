@@ -74,10 +74,10 @@ class ModelRunner:
         self.device = config.device
         self.model_type = self.hf_config.model_type
 
-        dist.init_process_group("hccl", f"tcp://localhost:{config.hccl_port}", world_size=self.world_size, rank=rank)
         torch.npu.set_device(rank)
         if _env_flag("NANOVLLM_ENABLE_NPU_SFA", False):
             _register_vllm_ascend_custom_ops()
+        dist.init_process_group("hccl", f"tcp://localhost:{config.hccl_port}", world_size=self.world_size, rank=rank)
         default_dtype = torch.get_default_dtype()
 
         torch_dtype = self._set_torch_dtype(self.hf_config)
