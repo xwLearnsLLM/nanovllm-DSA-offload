@@ -41,6 +41,26 @@ def _import_torchair():
     return torchair
 
 
+def _register_vllm_ascend_custom_ops() -> bool:
+    os.environ.setdefault("VLLM_ASCEND_ENABLE_NZ", "0")
+    try:
+        import torch_npu  # noqa: F401  # type: ignore
+        import vllm  # noqa: F401  # type: ignore
+        import vllm_ascend  # noqa: F401  # type: ignore
+        from vllm_ascend import vllm_ascend_C  # noqa: F401  # type: ignore
+        from vllm_ascend.ops.layer_shard_linear import (  # noqa: F401
+            is_hidden_layer,
+            post_process_after_loading_for_shard_weight_series,
+            reach_layer_for_shard_weight_series,
+            register_all_layers_to_shard_weight_series,
+        )
+    except Exception as exc:
+        logger.warning("Failed to register vLLM-Ascend custom ops early: %r", exc)
+        return False
+    logger.info("Registered vLLM-Ascend custom ops early for Nano SFA.")
+    return True
+
+
 class ModelRunner:
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
@@ -56,6 +76,8 @@ class ModelRunner:
 
         dist.init_process_group("hccl", f"tcp://localhost:{config.hccl_port}", world_size=self.world_size, rank=rank)
         torch.npu.set_device(rank)
+        if _env_flag("NANOVLLM_ENABLE_NPU_SFA", False):
+            _register_vllm_ascend_custom_ops()
         default_dtype = torch.get_default_dtype()
 
         torch_dtype = self._set_torch_dtype(self.hf_config)
