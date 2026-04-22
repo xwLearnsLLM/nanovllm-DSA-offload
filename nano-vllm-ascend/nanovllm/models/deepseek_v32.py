@@ -521,8 +521,7 @@ class DeepseekV32SparseMoeBlock(nn.Module):
             1,
             int(os.environ.get("NANOVLLM_PROFILE_MOE_DETAIL_EVERY", "31")),
         )
-        self.profile_moe_steps = 0
-        self.profile_moe_times = {
+        moe_profile_template = {
             "shared": 0.0,
             "gate": 0.0,
             "topk": 0.0,
@@ -531,7 +530,12 @@ class DeepseekV32SparseMoeBlock(nn.Module):
             "all_reduce": 0.0,
             "total": 0.0,
         }
-        self.profile_moe_experts = 0
+        self.profile_moe_steps = {"prefill": 0, "decode": 0}
+        self.profile_moe_times = {
+            "prefill": moe_profile_template.copy(),
+            "decode": moe_profile_template.copy(),
+        }
+        self.profile_moe_experts = {"prefill": 0, "decode": 0}
 
         self.gate = ReplicatedLinear(self.hidden_size, self.num_experts, bias=False)
         if getattr(config, "topk_method", None) == "noaux_tc":
@@ -731,13 +735,15 @@ class DeepseekV32SparseMoeBlock(nn.Module):
 
     def _forward_profiled(self, hidden_states: torch.Tensor) -> torch.Tensor:
         device = hidden_states.device
+        phase = "prefill" if get_context().is_prefill else "decode"
+        phase_times = self.profile_moe_times[phase]
 
         def _record(name: str, fn):
             _profile_sync(device)
             start = perf_counter()
             output = fn()
             _profile_sync(device)
-            self.profile_moe_times[name] += perf_counter() - start
+            phase_times[name] += perf_counter() - start
             return output
 
         _profile_sync(device)
@@ -798,33 +804,34 @@ class DeepseekV32SparseMoeBlock(nn.Module):
             _record("all_reduce", lambda: dist.all_reduce(final_hidden_states))
 
         _profile_sync(device)
-        self.profile_moe_times["total"] += perf_counter() - total_start
-        self.profile_moe_steps += 1
-        self.profile_moe_experts += len(expert_indices)
+        phase_times["total"] += perf_counter() - total_start
+        self.profile_moe_steps[phase] += 1
+        self.profile_moe_experts[phase] += len(expert_indices)
+        steps = self.profile_moe_steps[phase]
         if (
             _is_rank0()
-            and self.profile_moe_steps % self.profile_moe_every == 0
+            and (phase == "prefill" or steps % self.profile_moe_every == 0)
         ):
-            steps = self.profile_moe_steps
             logger.info(
-                "MoE detail avg: layer=%d steps=%d experts=%.2f "
+                "MoE detail avg: phase=%s layer=%d steps=%d experts=%.2f "
                 "shared=%.4fs gate=%.4fs topk=%.4fs route_setup=%.4fs "
                 "experts=%.4fs all_reduce=%.4fs total=%.4fs",
+                phase,
                 self.layer_idx,
                 steps,
-                self.profile_moe_experts / steps,
-                self.profile_moe_times["shared"] / steps,
-                self.profile_moe_times["gate"] / steps,
-                self.profile_moe_times["topk"] / steps,
-                self.profile_moe_times["route_setup"] / steps,
-                self.profile_moe_times["experts"] / steps,
-                self.profile_moe_times["all_reduce"] / steps,
-                self.profile_moe_times["total"] / steps,
+                self.profile_moe_experts[phase] / steps,
+                phase_times["shared"] / steps,
+                phase_times["gate"] / steps,
+                phase_times["topk"] / steps,
+                phase_times["route_setup"] / steps,
+                phase_times["experts"] / steps,
+                phase_times["all_reduce"] / steps,
+                phase_times["total"] / steps,
             )
         return final_hidden_states.view(sequence_length, hidden_dim)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.profile_moe_detail and not get_context().is_prefill:
+        if self.profile_moe_detail:
             return self._forward_profiled(hidden_states)
         sequence_length, hidden_dim = hidden_states.shape
         self._maybe_trace_inputs(hidden_states)
@@ -1032,8 +1039,7 @@ class DeepseekV32DSAAttention(nn.Module):
             1,
             int(os.environ.get("NANOVLLM_PROFILE_ATTENTION_DETAIL_EVERY", "31")),
         )
-        self.profile_attention_steps = 0
-        self.profile_attention_times = {
+        attention_profile_template = {
             "q_a": 0.0,
             "q_b": 0.0,
             "kv_a": 0.0,
@@ -1044,6 +1050,11 @@ class DeepseekV32DSAAttention(nn.Module):
             "dsa": 0.0,
             "o_proj": 0.0,
             "total": 0.0,
+        }
+        self.profile_attention_steps = {"prefill": 0, "decode": 0}
+        self.profile_attention_times = {
+            "prefill": attention_profile_template.copy(),
+            "decode": attention_profile_template.copy(),
         }
 
     def assign_dsa_cache(
@@ -1442,13 +1453,16 @@ class DeepseekV32DSAAttention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         device = hidden_states.device
+        context = get_context()
+        phase = "prefill" if context.is_prefill else "decode"
+        phase_times = self.profile_attention_times[phase]
 
         def _record(name: str, fn):
             _profile_sync(device)
             start = perf_counter()
             output = fn()
             _profile_sync(device)
-            self.profile_attention_times[name] += perf_counter() - start
+            phase_times[name] += perf_counter() - start
             return output
 
         _profile_sync(device)
@@ -1496,37 +1510,40 @@ class DeepseekV32DSAAttention(nn.Module):
         )
         _record("store_cache", lambda: self._store_cache(ckv, k_pe, index_k))
         ql_nope = _record("q_up", lambda: self._q_nope_up_proj(q_nope))
-        attn_output = _record(
-            "dsa",
-            lambda: self._decode_forward(ql_nope, q_pe, q_index, weights),
-        )
+        def _dsa_forward():
+            if context.is_prefill:
+                return self._prefill_forward(ql_nope, q_pe, q_index, weights)
+            return self._decode_forward(ql_nope, q_pe, q_index, weights)
+
+        attn_output = _record("dsa", _dsa_forward)
         output = _record("o_proj", lambda: self.o_proj(attn_output))
 
         _profile_sync(device)
-        self.profile_attention_times["total"] += perf_counter() - total_start
-        self.profile_attention_steps += 1
+        phase_times["total"] += perf_counter() - total_start
+        self.profile_attention_steps[phase] += 1
+        steps = self.profile_attention_steps[phase]
         if (
             _is_rank0()
-            and self.profile_attention_steps % self.profile_attention_every == 0
+            and (phase == "prefill" or steps % self.profile_attention_every == 0)
         ):
-            steps = self.profile_attention_steps
             logger.info(
-                "Attention detail avg: layer=%d steps=%d q_a=%.4fs "
+                "Attention detail avg: phase=%s layer=%d steps=%d q_a=%.4fs "
                 "q_b=%.4fs kv_a=%.4fs kv_norm_rope=%.4fs indexer=%.4fs "
                 "store_cache=%.4fs q_up=%.4fs dsa=%.4fs o_proj=%.4fs "
                 "total=%.4fs",
+                phase,
                 self.layer_id,
                 steps,
-                self.profile_attention_times["q_a"] / steps,
-                self.profile_attention_times["q_b"] / steps,
-                self.profile_attention_times["kv_a"] / steps,
-                self.profile_attention_times["kv_norm_rope"] / steps,
-                self.profile_attention_times["indexer"] / steps,
-                self.profile_attention_times["store_cache"] / steps,
-                self.profile_attention_times["q_up"] / steps,
-                self.profile_attention_times["dsa"] / steps,
-                self.profile_attention_times["o_proj"] / steps,
-                self.profile_attention_times["total"] / steps,
+                phase_times["q_a"] / steps,
+                phase_times["q_b"] / steps,
+                phase_times["kv_a"] / steps,
+                phase_times["kv_norm_rope"] / steps,
+                phase_times["indexer"] / steps,
+                phase_times["store_cache"] / steps,
+                phase_times["q_up"] / steps,
+                phase_times["dsa"] / steps,
+                phase_times["o_proj"] / steps,
+                phase_times["total"] / steps,
             )
         return output
 
@@ -1537,7 +1554,7 @@ class DeepseekV32DSAAttention(nn.Module):
     ) -> torch.Tensor:
         if self.w_uk_t is None or self.w_uv is None:
             self.post_load_prepare()
-        if self.profile_attention_detail and not get_context().is_prefill:
+        if self.profile_attention_detail:
             return self._forward_profiled(positions, hidden_states)
 
         q_c = self.q_a_layernorm(self.q_a_proj(hidden_states))
