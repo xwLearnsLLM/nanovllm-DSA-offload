@@ -27,6 +27,7 @@ from nanovllm.utils.logger import init_logger
 
 logger = init_logger(__name__)
 BMM_TRANS_MAX_SUPPORTED_TOKENS = 1024
+PREFILL_MLA_CHUNK_SIZE = 256
 _VLLM_ASCEND_OPS_REGISTERED = False
 _VLLM_ASCEND_OPS_IMPORT_ERROR: str | None = None
 
@@ -1283,13 +1284,29 @@ class DeepseekV32DSAAttention(nn.Module):
         q_index: torch.Tensor,
         weights: torch.Tensor,
     ) -> torch.Tensor:
+        del q_index, weights
         context = get_context()
         cu_seqlens = context.cu_seqlens_q.to(torch.long).tolist()
         slot_mapping = context.slot_mapping.to(torch.long)
-        outputs: list[torch.Tensor] = []
+        if slot_mapping.dim() == 2:
+            slot_mapping = (
+                slot_mapping[:, 0] * self.block_size
+                + slot_mapping[:, 1]
+            )
+        outputs = torch.empty(
+            (
+                ql_nope.shape[0],
+                self.num_local_heads * self.v_head_dim,
+            ),
+            dtype=ql_nope.dtype,
+            device=ql_nope.device,
+        )
         for seq_idx in range(len(cu_seqlens) - 1):
             seq_start = cu_seqlens[seq_idx]
             seq_end = cu_seqlens[seq_idx + 1]
+            seq_len = seq_end - seq_start
+            if seq_len <= 0:
+                continue
             seq_slots = slot_mapping[seq_start:seq_end]
             seq_ckv = self.ckv_cache.view(-1, self.kv_lora_rank).index_select(
                 0, seq_slots
@@ -1297,25 +1314,72 @@ class DeepseekV32DSAAttention(nn.Module):
             seq_kpe = self.kpe_cache.view(-1, self.qk_rope_head_dim).index_select(
                 0, seq_slots
             )
-            seq_index = self.index_cache.view(-1, self.indexer.head_dim).index_select(
-                0, seq_slots
+            seq_output = self._prefill_mla_full_attention_sequence(
+                ql_nope[seq_start:seq_end],
+                q_pe[seq_start:seq_end],
+                seq_ckv,
+                seq_kpe,
             )
-            for token_idx in range(seq_end - seq_start):
-                selected = self._compute_topk_indices(
-                    q_index[seq_start + token_idx],
-                    weights[seq_start + token_idx],
-                    seq_index,
-                    token_idx + 1,
+            outputs[seq_start:seq_end] = seq_output
+        return outputs
+
+    def _prefill_mla_full_attention_sequence(
+        self,
+        ql_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        seq_ckv: torch.Tensor,
+        seq_kpe: torch.Tensor,
+    ) -> torch.Tensor:
+        seq_len = int(ql_nope.shape[0])
+        latent = torch.empty(
+            (
+                seq_len,
+                self.num_local_heads,
+                self.kv_lora_rank,
+            ),
+            dtype=seq_ckv.dtype,
+            device=seq_ckv.device,
+        )
+        key_nope_t = seq_ckv.float().transpose(0, 1).contiguous()
+        key_rope_t = seq_kpe.float().transpose(0, 1).contiguous()
+        value = seq_ckv.unsqueeze(0).expand(self.num_local_heads, -1, -1)
+        key_positions = torch.arange(seq_len, device=ql_nope.device)
+        for chunk_start in range(0, seq_len, PREFILL_MLA_CHUNK_SIZE):
+            chunk_end = min(chunk_start + PREFILL_MLA_CHUNK_SIZE, seq_len)
+            query_nope = (
+                ql_nope[chunk_start:chunk_end]
+                .transpose(0, 1)
+                .contiguous()
+                .float()
+            )
+            query_rope = (
+                q_pe[chunk_start:chunk_end]
+                .transpose(0, 1)
+                .contiguous()
+                .float()
+            )
+            scores = torch.bmm(
+                query_nope,
+                key_nope_t.unsqueeze(0).expand(self.num_local_heads, -1, -1),
+            )
+            scores.add_(
+                torch.bmm(
+                    query_rope,
+                    key_rope_t.unsqueeze(0).expand(self.num_local_heads, -1, -1),
                 )
-                outputs.append(
-                    self._sparse_attention_single(
-                        ql_nope[seq_start + token_idx],
-                        q_pe[seq_start + token_idx],
-                        seq_ckv.index_select(0, selected),
-                        seq_kpe.index_select(0, selected),
-                    )
-                )
-        return torch.stack(outputs, dim=0)
+            )
+            scores.mul_(self.scale)
+            query_positions = torch.arange(
+                chunk_start,
+                chunk_end,
+                device=ql_nope.device,
+            )
+            causal_mask = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
+            scores = scores.masked_fill(~causal_mask.unsqueeze(0), float("-inf"))
+            probs = torch.softmax(scores, dim=-1).to(seq_ckv.dtype)
+            latent_chunk = torch.bmm(probs, value)
+            latent[chunk_start:chunk_end] = latent_chunk.transpose(0, 1)
+        return self._v_up_proj(latent)
 
     def _decode_forward_loop(
         self,
@@ -1510,12 +1574,12 @@ class DeepseekV32DSAAttention(nn.Module):
         )
         _record("store_cache", lambda: self._store_cache(ckv, k_pe, index_k))
         ql_nope = _record("q_up", lambda: self._q_nope_up_proj(q_nope))
-        def _dsa_forward():
+        def _attention_forward():
             if context.is_prefill:
                 return self._prefill_forward(ql_nope, q_pe, q_index, weights)
             return self._decode_forward(ql_nope, q_pe, q_index, weights)
 
-        attn_output = _record("dsa", _dsa_forward)
+        attn_output = _record("dsa", _attention_forward)
         output = _record("o_proj", lambda: self.o_proj(attn_output))
 
         _profile_sync(device)
@@ -1529,7 +1593,7 @@ class DeepseekV32DSAAttention(nn.Module):
             logger.info(
                 "Attention detail avg: phase=%s layer=%d steps=%d q_a=%.4fs "
                 "q_b=%.4fs kv_a=%.4fs kv_norm_rope=%.4fs indexer=%.4fs "
-                "store_cache=%.4fs q_up=%.4fs dsa=%.4fs o_proj=%.4fs "
+                "store_cache=%.4fs q_up=%.4fs attn=%.4fs o_proj=%.4fs "
                 "total=%.4fs",
                 phase,
                 self.layer_id,
