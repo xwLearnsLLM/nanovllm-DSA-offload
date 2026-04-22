@@ -19,9 +19,9 @@ class Scheduler:
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
-        # Keep the last physical block for padded dummy slots. When SFA is
-        # enabled, also keep block 0 as the null block to match vLLM's
-        # paged-cache convention used by the Ascend SFA kernels.
+        # Keep the last physical block for padded dummy slots. When the NPU
+        # indexer is enabled, also keep block 0 as the null block to match
+        # vLLM's paged-cache convention used by the Ascend kernels.
         non_cache_token_ids: list[int] = []
         if config.is_multimodal and config.hf_config is not None:
             for attr in (
@@ -36,7 +36,7 @@ class Scheduler:
             config.num_kvcache_blocks - 1,
             config.kvcache_block_size,
             non_cache_token_ids=non_cache_token_ids,
-            reserve_null_block=_env_flag("NANOVLLM_ENABLE_NPU_SFA", False),
+            reserve_null_block=_env_flag("NANOVLLM_ENABLE_NPU_INDEXER", False),
         )
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()

@@ -937,9 +937,6 @@ class DeepseekV32Indexer(nn.Module):
 
 
 class DeepseekV32DSAAttention(nn.Module):
-    _sfa_status_messages: set[str] = set()
-    _sfa_input_summary_logged = False
-    _sfa_dumped_keys: set[tuple[int, int, int]] = set()
 
     def __init__(self, config: DeepseekV32Config, layer_idx: int) -> None:
         super().__init__()
@@ -956,15 +953,6 @@ class DeepseekV32DSAAttention(nn.Module):
         self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         self.v_head_dim = int(config.v_head_dim)
         self.index_topk = int(config.index_topk)
-        self.npu_sfa_sparse_count = int(
-            os.environ.get("NANOVLLM_NPU_SFA_SPARSE_COUNT", "2048")
-        )
-        self.npu_sfa_min_context_len = int(
-            os.environ.get(
-                "NANOVLLM_NPU_SFA_MIN_CONTEXT_LEN",
-                "0",
-            )
-        )
         self.layer_id = layer_idx
         self.scale = self.qk_head_dim ** -0.5
         if config.rope_parameters.get("rope_type") == "deepseek_yarn":
@@ -1028,13 +1016,11 @@ class DeepseekV32DSAAttention(nn.Module):
         self.index_cache = torch.tensor([])
         self.w_uk_t = None
         self.w_uv = None
-        self.use_npu_sfa = _env_flag("NANOVLLM_ENABLE_NPU_SFA", False)
+        self.use_npu_indexer = _env_flag("NANOVLLM_ENABLE_NPU_INDEXER", False)
         self.use_batch_matmul_transpose = not _env_flag(
             "NANOVLLM_DISABLE_BATCH_MATMUL_TRANSPOSE",
             False,
         )
-        self._npu_sfa_failure_logged = False
-        self._npu_sfa_status_logged = False
         self.profile_attention_detail = (
             _env_flag("NANOVLLM_PROFILE_ATTENTION_DETAIL", False)
             and _profile_layer_selected(
@@ -1152,6 +1138,77 @@ class DeepseekV32DSAAttention(nn.Module):
         topk = min(self.index_topk, valid_len)
         return torch.topk(scores, k=topk, dim=-1).indices
 
+    def _npu_indexer_cache(self) -> torch.Tensor:
+        if self.index_cache.dim() == 4:
+            return self.index_cache
+        if self.index_cache.dim() == 3:
+            return self.index_cache.unsqueeze(2)
+        raise RuntimeError(
+            "DeepSeek index cache must be 3D or PA_BSND 4D, "
+            f"got shape={tuple(self.index_cache.shape)}"
+        )
+
+    def _npu_indexer_block_table(self, block_table_row: torch.Tensor) -> torch.Tensor:
+        block_table = block_table_row.to(dtype=torch.int32)
+        block_table = torch.where(
+            block_table >= 0,
+            block_table,
+            torch.zeros_like(block_table),
+        )
+        return block_table.unsqueeze(0).contiguous()
+
+    def _compute_npu_indexer_indices(
+        self,
+        q_index: torch.Tensor,
+        weights: torch.Tensor,
+        block_table_row: torch.Tensor,
+        valid_len: int,
+    ) -> torch.Tensor:
+        lightning_indexer, _ = _get_vllm_ascend_op("npu_lightning_indexer")
+        if lightning_indexer is None:
+            raise RuntimeError(
+                "NANOVLLM_ENABLE_NPU_INDEXER=1 but "
+                "torch.ops._C_ascend.npu_lightning_indexer is unavailable"
+            )
+        device = q_index.device
+        seq_lengths_query = torch.ones((1,), dtype=torch.int32, device=device)
+        seq_lengths_key = torch.tensor([valid_len], dtype=torch.int32, device=device)
+        topk_indices = lightning_indexer(
+            query=q_index.unsqueeze(0).to(self.index_cache.dtype).contiguous(),
+            key=self._npu_indexer_cache(),
+            weights=weights.unsqueeze(0).to(self.index_cache.dtype).contiguous(),
+            actual_seq_lengths_query=seq_lengths_query,
+            actual_seq_lengths_key=seq_lengths_key,
+            block_table=self._npu_indexer_block_table(block_table_row),
+            layout_query="TND",
+            layout_key="PA_BSND",
+            sparse_count=self.index_topk,
+            sparse_mode=3,
+        )
+        if isinstance(topk_indices, tuple):
+            topk_indices = topk_indices[0]
+        topk = min(self.index_topk, valid_len)
+        return topk_indices.flatten()[:topk].to(torch.long)
+
+    def _select_topk_indices(
+        self,
+        q_index: torch.Tensor,
+        weights: torch.Tensor,
+        key_cache: torch.Tensor,
+        valid_len: int,
+        block_table_row: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if self.use_npu_indexer:
+            if block_table_row is None:
+                raise RuntimeError("NPU indexer requires a decode block table.")
+            return self._compute_npu_indexer_indices(
+                q_index,
+                weights,
+                block_table_row,
+                valid_len,
+            )
+        return self._compute_topk_indices(q_index, weights, key_cache, valid_len)
+
     def _sparse_attention_single(
         self,
         ql_nope: torch.Tensor,
@@ -1207,12 +1264,6 @@ class DeepseekV32DSAAttention(nn.Module):
         latent_by_head = latent.transpose(0, 1).contiguous()
         output = torch.bmm(latent_by_head, self.w_uv)
         return output.transpose(0, 1).reshape(num_tokens, -1)
-
-    def _log_sfa_status_once(self, message: str) -> None:
-        messages = type(self)._sfa_status_messages
-        if _is_rank0() and message not in messages:
-            logger.info("NPU SFA decode fast path %s", message)
-            messages.add(message)
 
     def _prefill_forward(
         self,
@@ -1278,11 +1329,12 @@ class DeepseekV32DSAAttention(nn.Module):
             seq_index = self.index_cache.view(-1, self.indexer.head_dim).index_select(
                 0, seq_slots
             )
-            selected = self._compute_topk_indices(
+            selected = self._select_topk_indices(
                 q_index[seq_idx],
                 weights[seq_idx],
                 seq_index,
                 seq_len,
+                context.block_tables[seq_idx],
             )
             outputs.append(
                 self._sparse_attention_single(
@@ -1363,410 +1415,6 @@ class DeepseekV32DSAAttention(nn.Module):
         latent = torch.einsum("bhs,bsl->bhl", probs, selected_ckv)
         return self._v_up_proj(latent)
 
-    def _decode_forward_npu_sfa(
-        self,
-        ql_nope: torch.Tensor,
-        q_pe: torch.Tensor,
-        q_index: torch.Tensor,
-        weights: torch.Tensor,
-    ) -> torch.Tensor | None:
-        if not self.use_npu_sfa:
-            return None
-        lightning_indexer, lightning_source = _get_vllm_ascend_op(
-            "npu_lightning_indexer"
-        )
-        sparse_flash_attention, sfa_source = _get_vllm_ascend_op(
-            "npu_sparse_flash_attention"
-        )
-        missing_ops = []
-        if lightning_indexer is None:
-            missing_ops.append("npu_lightning_indexer")
-        if sparse_flash_attention is None:
-            missing_ops.append("npu_sparse_flash_attention")
-        if missing_ops:
-            self._log_sfa_status_once(
-                f"unavailable: missing_ops={','.join(missing_ops)}"
-            )
-            return None
-
-        context = get_context()
-        if context.block_tables is None or context.context_lens is None:
-            self._log_sfa_status_once("unavailable: missing decode metadata")
-            return None
-
-        batch_size = ql_nope.shape[0]
-        use_batched_sfa = (
-            batch_size == 1
-            or _env_flag("NANOVLLM_NPU_SFA_BATCHED", False)
-        )
-        batched_actual_seq_lengths_query = torch.arange(
-            1,
-            batch_size + 1,
-            dtype=torch.int32,
-            device=ql_nope.device,
-        )
-        single_actual_seq_lengths_query = torch.ones(
-            (1,),
-            dtype=torch.int32,
-            device=ql_nope.device,
-        )
-        actual_seq_lengths_query = (
-            batched_actual_seq_lengths_query
-            if use_batched_sfa
-            else single_actual_seq_lengths_query
-        )
-        actual_seq_lengths_key = context.context_lens.to(torch.int32)
-        max_context_len = int(actual_seq_lengths_key.max().item())
-        if max_context_len < self.npu_sfa_min_context_len:
-            self._log_sfa_status_once(
-                "skipped: "
-                f"short_context max={max_context_len} "
-                f"min={self.npu_sfa_min_context_len}"
-            )
-            return None
-        raw_block_tables = context.block_tables.to(torch.int32)
-        valid_block_tables = raw_block_tables >= 0
-        block_table_offset = 0
-        if bool(valid_block_tables.any().item()):
-            min_block_id = int(raw_block_tables[valid_block_tables].min().item())
-            # vLLM reserves physical block 0 as the null block. Older Nano
-            # allocations started at block 0, so keep a compatibility offset.
-            if min_block_id == 0:
-                block_table_offset = int(
-                    os.environ.get("NANOVLLM_NPU_SFA_BLOCK_TABLE_OFFSET", "1")
-                )
-        block_tables = torch.where(
-            valid_block_tables,
-            raw_block_tables + block_table_offset,
-            torch.zeros_like(raw_block_tables),
-        ).contiguous()
-
-        try:
-            sfa_index_dtype = self.index_cache.dtype
-            q_index_sfa = q_index.to(sfa_index_dtype).contiguous()
-            weights_sfa = weights.to(sfa_index_dtype).contiguous()
-            ql_nope_sfa = ql_nope.to(self.ckv_cache.dtype).contiguous()
-            q_pe_sfa = q_pe.to(self.kpe_cache.dtype).contiguous()
-            materialize_cache_default = not (
-                self.index_cache.dim() == 4
-                and self.ckv_cache.dim() == 4
-                and self.kpe_cache.dim() == 4
-            )
-            materialize_cache = _env_flag(
-                "NANOVLLM_NPU_SFA_MATERIALIZE_CACHE",
-                materialize_cache_default,
-            )
-
-            def _as_pa_bsnd_cache(cache: torch.Tensor) -> torch.Tensor:
-                if cache.dim() == 4:
-                    result = cache
-                elif cache.dim() == 3:
-                    result = cache.unsqueeze(2)
-                else:
-                    raise RuntimeError(
-                        "DeepSeek DSA cache must be 3D BSND-without-head or "
-                        f"4D PA_BSND, got shape={tuple(cache.shape)}"
-                    )
-                if materialize_cache:
-                    result = result.clone(memory_format=torch.contiguous_format)
-                return result
-
-            index_cache_sfa = _as_pa_bsnd_cache(self.index_cache)
-            ckv_cache_sfa = _as_pa_bsnd_cache(self.ckv_cache)
-            kpe_cache_sfa = _as_pa_bsnd_cache(self.kpe_cache)
-            trace_ops = _env_flag("NANOVLLM_TRACE_NPU_SFA_OPS", False)
-            trace_limit = int(
-                os.environ.get("NANOVLLM_TRACE_NPU_SFA_LIMIT", "8")
-            )
-
-            def _trace_rank() -> int:
-                try:
-                    return dist.get_rank() if dist.is_initialized() else -1
-                except Exception:
-                    return -1
-
-            def _trace_tensor(name: str, tensor: torch.Tensor | None) -> str:
-                if tensor is None:
-                    return f"{name}=None"
-                return (
-                    f"{name}=shape={tuple(tensor.shape)} "
-                    f"dtype={tensor.dtype} device={tensor.device} "
-                    f"stride={tensor.stride()} "
-                    f"storage_offset={tensor.storage_offset()} "
-                    f"base={tensor._base is not None}"
-                )
-
-            def _trace_head(tensor: torch.Tensor | None, limit: int = 8):
-                if tensor is None or tensor.numel() == 0:
-                    return []
-                try:
-                    value = tensor
-                    if value.dim() >= 2:
-                        value = value[0]
-                    return value.flatten()[:limit].detach().cpu().tolist()
-                except Exception as exc:
-                    return f"head_failed={exc!r}"
-
-            def _trace_print(message: str) -> None:
-                if trace_ops:
-                    print(
-                        f"NANOVLLM_SFA_TRACE rank={_trace_rank()} {message}",
-                        flush=True,
-                    )
-
-            def _maybe_dump_sfa_inputs(
-                query_nope: torch.Tensor,
-                query_rope: torch.Tensor,
-                seq_lengths_query: torch.Tensor,
-                seq_lengths_key: torch.Tensor,
-                seq_block_tables: torch.Tensor,
-                topk_indices: torch.Tensor,
-                seq_idx: int | str,
-            ) -> None:
-                dump_dir = os.environ.get("NANOVLLM_DUMP_NPU_SFA_INPUTS")
-                if not dump_dir:
-                    return
-                rank = _trace_rank()
-                dump_rank = int(os.environ.get("NANOVLLM_DUMP_NPU_SFA_RANK", "0"))
-                dump_layer = int(
-                    os.environ.get("NANOVLLM_DUMP_NPU_SFA_LAYER", str(self.layer_id))
-                )
-                if dump_rank >= 0 and rank != dump_rank:
-                    return
-                if dump_layer >= 0 and self.layer_id != dump_layer:
-                    return
-                try:
-                    seq_key = int(seq_idx)
-                except Exception:
-                    seq_key = -1
-                key = (rank, self.layer_id, seq_key)
-                if key in type(self)._sfa_dumped_keys:
-                    return
-                type(self)._sfa_dumped_keys.add(key)
-                os.makedirs(dump_dir, exist_ok=True)
-                path = os.path.join(
-                    dump_dir,
-                    f"sfa_rank{rank}_layer{self.layer_id}_seq{seq_idx}.pt",
-                )
-                torch.save(
-                    {
-                        "rank": rank,
-                        "layer_id": self.layer_id,
-                        "seq_idx": seq_idx,
-                        "scale_value": float(self.scale),
-                        "sparse_block_size": 1,
-                        "sparse_mode": 3,
-                        "layout_query": "TND",
-                        "layout_kv": "PA_BSND",
-                        "query": query_nope.detach().cpu(),
-                        "query_rope": query_rope.detach().cpu(),
-                        "key": ckv_cache_sfa.detach().cpu(),
-                        "value": ckv_cache_sfa.detach().cpu(),
-                        "key_rope": kpe_cache_sfa.detach().cpu(),
-                        "sparse_indices": topk_indices.detach().cpu(),
-                        "block_table": seq_block_tables.detach().cpu(),
-                        "actual_seq_lengths_query": seq_lengths_query.detach().cpu(),
-                        "actual_seq_lengths_kv": seq_lengths_key.detach().cpu(),
-                    },
-                    path,
-                )
-                _trace_print(f"dumped_sfa_inputs path={path}")
-
-            if _is_rank0() and not type(self)._sfa_input_summary_logged:
-                query_lens_head = (
-                    actual_seq_lengths_query[:8].detach().cpu().tolist()
-                )
-                context_lens_head = actual_seq_lengths_key[:8].detach().cpu().tolist()
-                raw_block_table_head = (
-                    raw_block_tables[0, : min(8, raw_block_tables.shape[1])]
-                    .detach()
-                    .cpu()
-                    .tolist()
-                    if raw_block_tables.numel() > 0
-                    else []
-                )
-                block_table_head = (
-                    block_tables[0, : min(8, block_tables.shape[1])]
-                    .detach()
-                    .cpu()
-                    .tolist()
-                    if block_tables.numel() > 0
-                    else []
-                )
-                logger.info(
-                    "NPU SFA input summary: q_index=%s %s index_cache=%s %s "
-                    "weights=%s %s ql_nope=%s %s q_pe=%s %s block_tables=%s "
-                    "query_lens=%s query_lens_head=%s context_lens=%s "
-                    "context_lens_head=%s raw_block_table0_head=%s "
-                    "block_table0_head=%s block_table_offset=%d mode=%s "
-                    "ops=%s/%s sparse_count=%d config_index_topk=%d",
-                    tuple(q_index_sfa.shape),
-                    q_index_sfa.dtype,
-                    tuple(index_cache_sfa.shape),
-                    index_cache_sfa.dtype,
-                    tuple(weights_sfa.shape),
-                    weights_sfa.dtype,
-                    tuple(ql_nope_sfa.shape),
-                    ql_nope_sfa.dtype,
-                    tuple(q_pe_sfa.shape),
-                    q_pe_sfa.dtype,
-                    tuple(block_tables.shape),
-                    tuple(actual_seq_lengths_query.shape),
-                    query_lens_head,
-                    tuple(actual_seq_lengths_key.shape),
-                    context_lens_head,
-                    raw_block_table_head,
-                    block_table_head,
-                    block_table_offset,
-                    "batched" if use_batched_sfa else "per_sequence",
-                    lightning_source,
-                    sfa_source,
-                    self.npu_sfa_sparse_count,
-                    self.index_topk,
-                )
-                type(self)._sfa_input_summary_logged = True
-
-            def _run_sfa(
-                query_index: torch.Tensor,
-                query_weights: torch.Tensor,
-                query_nope: torch.Tensor,
-                query_rope: torch.Tensor,
-                seq_lengths_query: torch.Tensor,
-                seq_lengths_key: torch.Tensor,
-                seq_block_tables: torch.Tensor,
-                seq_idx: int | str,
-            ) -> torch.Tensor:
-                _trace_print(
-                    "before_indexer "
-                    f"seq={seq_idx} "
-                    f"{_trace_tensor('query', query_index)} "
-                    f"{_trace_tensor('key', index_cache_sfa)} "
-                    f"{_trace_tensor('weights', query_weights)} "
-                    f"{_trace_tensor('aqlq', seq_lengths_query)} "
-                    f"aqlq_head={_trace_head(seq_lengths_query)} "
-                    f"{_trace_tensor('aqlk', seq_lengths_key)} "
-                    f"aqlk_head={_trace_head(seq_lengths_key)} "
-                    f"{_trace_tensor('block_table', seq_block_tables)} "
-                    f"block_head={_trace_head(seq_block_tables)} "
-                    f"sparse_count={self.npu_sfa_sparse_count}"
-                )
-                topk_indices = lightning_indexer(
-                    query=query_index,
-                    key=index_cache_sfa,
-                    weights=query_weights,
-                    actual_seq_lengths_query=seq_lengths_query,
-                    actual_seq_lengths_key=seq_lengths_key,
-                    block_table=seq_block_tables,
-                    layout_query="TND",
-                    layout_key="PA_BSND",
-                    sparse_count=self.npu_sfa_sparse_count,
-                    sparse_mode=3,
-                )
-                if trace_ops:
-                    torch.npu.synchronize()
-                if isinstance(topk_indices, tuple):
-                    topk_indices = topk_indices[0]
-                _trace_print(
-                    "after_indexer "
-                    f"seq={seq_idx} "
-                    f"{_trace_tensor('topk', topk_indices)} "
-                    f"topk_head={_trace_head(topk_indices, trace_limit)}"
-                )
-                _trace_print(
-                    "before_sfa "
-                    f"seq={seq_idx} "
-                    f"{_trace_tensor('query', query_nope)} "
-                    f"{_trace_tensor('key', ckv_cache_sfa)} "
-                    f"{_trace_tensor('sparse_indices', topk_indices)} "
-                    f"{_trace_tensor('query_rope', query_rope)} "
-                    f"{_trace_tensor('key_rope', kpe_cache_sfa)}"
-                )
-                _maybe_dump_sfa_inputs(
-                    query_nope,
-                    query_rope,
-                    seq_lengths_query,
-                    seq_lengths_key,
-                    seq_block_tables,
-                    topk_indices,
-                    seq_idx,
-                )
-                if (
-                    os.environ.get("NANOVLLM_DUMP_NPU_SFA_INPUTS")
-                    and _env_flag("NANOVLLM_DUMP_NPU_SFA_ONLY", False)
-                ):
-                    raise RuntimeError("NPU SFA input dump requested")
-                latent = sparse_flash_attention(
-                    query=query_nope,
-                    key=ckv_cache_sfa,
-                    value=ckv_cache_sfa,
-                    sparse_indices=topk_indices,
-                    scale_value=self.scale,
-                    sparse_block_size=1,
-                    block_table=seq_block_tables,
-                    actual_seq_lengths_query=seq_lengths_query,
-                    actual_seq_lengths_kv=seq_lengths_key,
-                    query_rope=query_rope,
-                    key_rope=kpe_cache_sfa,
-                    layout_query="TND",
-                    layout_kv="PA_BSND",
-                    sparse_mode=3,
-                )
-                if trace_ops:
-                    torch.npu.synchronize()
-                if isinstance(latent, tuple):
-                    latent = latent[0]
-                _trace_print(
-                    "after_sfa "
-                    f"seq={seq_idx} {_trace_tensor('latent', latent)}"
-                )
-                return latent
-
-            if use_batched_sfa:
-                latent = _run_sfa(
-                    q_index_sfa,
-                    weights_sfa,
-                    ql_nope_sfa,
-                    q_pe_sfa,
-                    actual_seq_lengths_query,
-                    actual_seq_lengths_key.contiguous(),
-                    block_tables,
-                    "batched",
-                )
-            else:
-                latent_parts = []
-                for seq_idx in range(batch_size):
-                    seq_slice = slice(seq_idx, seq_idx + 1)
-                    latent_parts.append(
-                        _run_sfa(
-                            q_index_sfa[seq_slice].contiguous(),
-                            weights_sfa[seq_slice].contiguous(),
-                            ql_nope_sfa[seq_slice].contiguous(),
-                            q_pe_sfa[seq_slice].contiguous(),
-                            single_actual_seq_lengths_query,
-                            actual_seq_lengths_key[seq_slice].contiguous(),
-                            block_tables[seq_slice].contiguous(),
-                            seq_idx,
-                        )
-                    )
-                latent = torch.cat(latent_parts, dim=0)
-            self._log_sfa_status_once(
-                "active: "
-                f"mode={'batched' if use_batched_sfa else 'per_sequence'} "
-                f"lightning={lightning_source} sfa={sfa_source}"
-            )
-            return self._v_up_proj(latent)
-        except Exception as exc:
-            messages = type(self)._sfa_status_messages
-            if _is_rank0() and "failed" not in messages:
-                logger.warning(
-                    "NPU SFA decode fast path failed once; falling back to "
-                    "PyTorch DSA attention. error=%r",
-                    exc,
-                )
-                messages.add("failed")
-            self.use_npu_sfa = False
-            return None
-
     def _decode_forward(
         self,
         ql_nope: torch.Tensor,
@@ -1775,14 +1423,8 @@ class DeepseekV32DSAAttention(nn.Module):
         weights: torch.Tensor,
     ) -> torch.Tensor:
         context = get_context()
-        npu_sfa_output = self._decode_forward_npu_sfa(
-            ql_nope,
-            q_pe,
-            q_index,
-            weights,
-        )
-        if npu_sfa_output is not None:
-            return npu_sfa_output
+        if self.use_npu_indexer:
+            return self._decode_forward_loop(ql_nope, q_pe, q_index, weights)
         if context.decode_slots is not None and context.decode_mask is not None:
             return self._decode_forward_vectorized(
                 ql_nope,

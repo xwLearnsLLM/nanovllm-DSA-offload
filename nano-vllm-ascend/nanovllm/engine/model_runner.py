@@ -57,7 +57,7 @@ def _register_vllm_ascend_custom_ops() -> bool:
     except Exception as exc:
         logger.warning("Failed to register vLLM-Ascend custom ops early: %r", exc)
         return False
-    logger.info("Registered vLLM-Ascend custom ops early for Nano SFA.")
+    logger.info("Registered vLLM-Ascend custom ops early for Nano NPU indexer.")
     return True
 
 
@@ -75,7 +75,7 @@ class ModelRunner:
         self.model_type = self.hf_config.model_type
 
         torch.npu.set_device(rank)
-        if _env_flag("NANOVLLM_ENABLE_NPU_SFA", False):
+        if _env_flag("NANOVLLM_ENABLE_NPU_INDEXER", False):
             _register_vllm_ascend_custom_ops()
         dist.init_process_group("hccl", f"tcp://localhost:{config.hccl_port}", world_size=self.world_size, rank=rank)
         default_dtype = torch.get_default_dtype()
@@ -360,9 +360,9 @@ class ModelRunner:
             "Failed to allocate any DeepSeek DSA cache blocks due to "
             "insufficient memory."
         )
-        use_sfa_cache_layout = _env_flag("NANOVLLM_ENABLE_NPU_SFA", False)
+        use_indexer_cache_layout = _env_flag("NANOVLLM_ENABLE_NPU_INDEXER", False)
 
-        if use_sfa_cache_layout:
+        if use_indexer_cache_layout:
             ckv_shape = (
                 num_layers,
                 config.num_kvcache_blocks,
@@ -414,7 +414,7 @@ class ModelRunner:
                 ("DeepSeek index cache", index_shape),
             ],
         )
-        if use_sfa_cache_layout:
+        if use_indexer_cache_layout:
             layer_shapes = (ckv_shape[1:], kpe_shape[1:], index_shape[1:])
             for module in self.model.modules():
                 if hasattr(module, "assign_dsa_cache") and hasattr(module, "layer_id"):
@@ -599,7 +599,7 @@ class ModelRunner:
             pin_memory=True,
         ).to(self.device, non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        if _env_flag("NANOVLLM_ENABLE_NPU_SFA", False):
+        if _env_flag("NANOVLLM_ENABLE_NPU_INDEXER", False):
             static_max_block_cols = (
                 self.config.max_model_len + self.config.kvcache_block_size - 1
             ) // self.config.kvcache_block_size
