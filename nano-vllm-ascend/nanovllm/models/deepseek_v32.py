@@ -39,6 +39,19 @@ def _prepend_env_path(name: str, path: str) -> None:
         os.environ[name] = f"{path}{os.pathsep}{current}" if current else path
 
 
+def _dedupe_env_path(name: str) -> None:
+    current = os.environ.get(name, "")
+    parts = []
+    seen = set()
+    for part in current.split(os.pathsep):
+        if not part or part in seen:
+            continue
+        seen.add(part)
+        parts.append(part)
+    if parts:
+        os.environ[name] = os.pathsep.join(parts)
+
+
 def _ensure_vllm_ascend_custom_opp_path(vllm_ascend_module) -> None:
     package_dir = os.path.dirname(os.path.realpath(vllm_ascend_module.__file__))
     custom_opp_path = os.path.join(
@@ -55,6 +68,7 @@ def _ensure_vllm_ascend_custom_opp_path(vllm_ascend_module) -> None:
         NPUPlatform.import_kernels()
     except Exception:
         pass
+    _dedupe_env_path("ASCEND_CUSTOM_OPP_PATH")
 
 
 def _env_flag(name: str, default: bool = False) -> bool:

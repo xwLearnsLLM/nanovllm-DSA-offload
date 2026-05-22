@@ -12,7 +12,7 @@ import torch
 import torch_npu
 from torch import Tensor
 from tqdm.auto import tqdm
-from transformers import AutoTokenizer, LlamaTokenizerFast
+from transformers import AutoTokenizer, LlamaTokenizerFast, PreTrainedTokenizerFast
 import torch.multiprocessing as mp
 
 from nanovllm.config import Config
@@ -151,10 +151,20 @@ class LLMEngine:
 
     @classmethod
     def _load_tokenizer(cls, config: Config):
+        if getattr(config.hf_config, "model_type", None) == "deepseek_v32":
+            tokenizer = PreTrainedTokenizerFast.from_pretrained(
+                config.model,
+                trust_remote_code=config.trust_remote_code,
+            )
+            if not getattr(tokenizer, "chat_template", None):
+                tokenizer.chat_template = DEEPSEEK_V32_CHAT_TEMPLATE
+            return tokenizer
+
         try:
             tokenizer = AutoTokenizer.from_pretrained(
                 config.model,
                 use_fast=True,
+                config=config.hf_config,
                 **cls._tokenizer_load_kwargs(config),
             )
         except Exception:
