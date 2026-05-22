@@ -149,3 +149,9 @@ root@atlas-800t-29:/data/wangxuan# cat /data/model/DeepSeek-V3.2-W8A8-Pruning/to
 
 
 如上，我先 repair 了一下，然后跑 vllm ascend 爆了一样的错误。然后我打印了 transformers 版本和 /data/model/DeepSeek-V3.2-W8A8-Pruning/tokenizer_config.json
+
+
+
+
+
+此外，当前代码有太多的兜底，先做一波清理吧，把你觉得真正的主路径留出来。

@@ -32,29 +32,42 @@ python -m py_compile \
   2>&1 | tee "$LOG_DIR/00_py_compile.log"
 
 
-# 1. Standalone SFA prefill probe with random tensors.
-# This does not load the full model. It only checks torch_npu/vllm-ascend/vllm_ascend_C
-# and the SFA input layout that DeepSeekV32DSAAttention will use.
+# 1. Standalone SFA prefill probe with synthetic sparse indices.
+# This skips LightningIndexerVllm first, so we can check the prefill SFA kernel itself.
 ASCEND_RT_VISIBLE_DEVICES=$DEVICES \
 python scripts/probe_deepseek_v32_sfa_attention.py \
   --phase prefill \
   --seq-len 2048 \
   --batch-size 1 \
   --device npu:0 \
-  2>&1 | tee "$LOG_DIR/01_probe_prefill_2k.log"
+  --skip-indexer \
+  2>&1 | tee "$LOG_DIR/01_probe_prefill_2k_sfa_only.log"
 
 
-# 2. Standalone SFA decode probe with random tensors.
+# 2. Standalone SFA prefill probe with LightningIndexerVllm + SFA.
+# The probe now sets ASCEND_CUSTOM_OPP_PATH and prints it in "PROBE env".
+ASCEND_RT_VISIBLE_DEVICES=$DEVICES \
+python scripts/probe_deepseek_v32_sfa_attention.py \
+  --phase prefill \
+  --seq-len 2048 \
+  --batch-size 1 \
+  --device npu:0 \
+  --indexer-op auto \
+  2>&1 | tee "$LOG_DIR/02_probe_prefill_2k_indexer_sfa.log"
+
+
+# 3. Standalone SFA decode probe with LightningIndexerVllm + SFA.
 ASCEND_RT_VISIBLE_DEVICES=$DEVICES \
 python scripts/probe_deepseek_v32_sfa_attention.py \
   --phase decode \
   --seq-len 2048 \
   --batch-size 4 \
   --device npu:0 \
-  2>&1 | tee "$LOG_DIR/02_probe_decode_2k_bs4.log"
+  --indexer-op auto \
+  2>&1 | tee "$LOG_DIR/03_probe_decode_2k_bs4.log"
 
 
-# 3. Full-model short prefill correctness check.
+# 4. Full-model short prefill correctness check.
 # Keep this short because NANOVLLM_COMPARE_NPU_SFA_PREFILL=1 also runs the PyTorch MLA reference.
 # Expected: no exception, and log lines containing "NPU SFA compare prefill".
 ASCEND_RT_VISIBLE_DEVICES=$DEVICES \
@@ -71,10 +84,10 @@ NANOVLLM_MAX_NUM_SEQS=2 \
 NANOVLLM_MAX_GEN_TOKENS=1 \
 NANOVLLM_SKIP_WARMUP=1 \
 python example/example.py \
-  2>&1 | tee "$LOG_DIR/03_short_prefill_compare.log"
+  2>&1 | tee "$LOG_DIR/04_short_prefill_compare.log"
 
 
-# 4. Long prefill main path: SFA prefill + SFA decode, generate only 1 token.
+# 5. Long prefill main path: SFA prefill + SFA decode, generate only 1 token.
 # This is the run we need before debugging decode indexer/SFA behavior.
 # Do not enable compare here; the dense PyTorch reference is exactly what makes long prefill painful.
 ASCEND_RT_VISIBLE_DEVICES=$DEVICES \
@@ -94,10 +107,10 @@ NANOVLLM_MAX_NUM_SEQS=1 \
 NANOVLLM_MAX_GEN_TOKENS=1 \
 NANOVLLM_SKIP_WARMUP=1 \
 python example/example.py \
-  2>&1 | tee "$LOG_DIR/04_long_prefill_sfa_decode1.log"
+  2>&1 | tee "$LOG_DIR/05_long_prefill_sfa_decode1.log"
 
 
-# 5. Optional: replay one dumped SFA call directly through the standalone probe.
+# 6. Optional: replay one dumped SFA call directly through the standalone probe.
 # This is useful if the full-model run fails inside SFA and we need a small reproducer.
 DUMP_FILE=$(find "$LOG_DIR/dumps" -name 'sfa_rank*_layer*_seq*.pt' | head -n 1 || true)
 if [ -n "$DUMP_FILE" ]; then
@@ -106,22 +119,23 @@ if [ -n "$DUMP_FILE" ]; then
   python scripts/probe_deepseek_v32_sfa_attention.py \
     --replay-dump "$DUMP_FILE" \
     --device npu:0 \
-    2>&1 | tee "$LOG_DIR/05_replay_dump.log"
+    2>&1 | tee "$LOG_DIR/06_replay_dump.log"
 else
-  echo "No SFA dump file found under $LOG_DIR/dumps" | tee "$LOG_DIR/05_replay_dump.log"
+  echo "No SFA dump file found under $LOG_DIR/dumps" | tee "$LOG_DIR/06_replay_dump.log"
 fi
 
 
-# 6. Collect high-signal lines to paste back.
+# 7. Collect high-signal lines to paste back.
 grep -E \
   "PROBE |NPU SFA input summary|NPU SFA compare|NPU SFA .*failed|Dumped NPU SFA|Traceback|RuntimeError|ERROR|Prompt:|text:" \
   "$LOG_DIR"/*.log \
   2>&1 | tee "$LOG_DIR/99_key_lines.log"
 
 echo "Done. Please paste back:"
-echo "  $LOG_DIR/01_probe_prefill_2k.log"
-echo "  $LOG_DIR/02_probe_decode_2k_bs4.log"
-echo "  $LOG_DIR/03_short_prefill_compare.log"
-echo "  $LOG_DIR/04_long_prefill_sfa_decode1.log"
-echo "  $LOG_DIR/05_replay_dump.log"
+echo "  $LOG_DIR/01_probe_prefill_2k_sfa_only.log"
+echo "  $LOG_DIR/02_probe_prefill_2k_indexer_sfa.log"
+echo "  $LOG_DIR/03_probe_decode_2k_bs4.log"
+echo "  $LOG_DIR/04_short_prefill_compare.log"
+echo "  $LOG_DIR/05_long_prefill_sfa_decode1.log"
+echo "  $LOG_DIR/06_replay_dump.log"
 echo "  $LOG_DIR/99_key_lines.log"

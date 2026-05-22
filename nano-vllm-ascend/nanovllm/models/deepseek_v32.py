@@ -32,6 +32,31 @@ _VLLM_ASCEND_OPS_REGISTERED = False
 _VLLM_ASCEND_OPS_IMPORT_ERROR: str | None = None
 
 
+def _prepend_env_path(name: str, path: str) -> None:
+    current = os.environ.get(name, "")
+    parts = [part for part in current.split(os.pathsep) if part]
+    if path not in parts:
+        os.environ[name] = f"{path}{os.pathsep}{current}" if current else path
+
+
+def _ensure_vllm_ascend_custom_opp_path(vllm_ascend_module) -> None:
+    package_dir = os.path.dirname(os.path.realpath(vllm_ascend_module.__file__))
+    custom_opp_path = os.path.join(
+        package_dir,
+        "_cann_ops_custom",
+        "vendors",
+        "vllm-ascend",
+    )
+    if os.path.exists(custom_opp_path):
+        _prepend_env_path("ASCEND_CUSTOM_OPP_PATH", custom_opp_path)
+    try:
+        from vllm_ascend.platform import NPUPlatform  # type: ignore
+
+        NPUPlatform.import_kernels()
+    except Exception:
+        pass
+
+
 def _env_flag(name: str, default: bool = False) -> bool:
     value = os.environ.get(name)
     if value is None:
@@ -97,7 +122,9 @@ def _import_vllm_ascend_custom_ops() -> bool:
         os.environ.setdefault("VLLM_ASCEND_ENABLE_NZ", "0")
         import torch_npu  # noqa: F401  # type: ignore
         import vllm  # noqa: F401  # type: ignore
-        import vllm_ascend  # noqa: F401  # type: ignore
+        import vllm_ascend  # type: ignore
+
+        _ensure_vllm_ascend_custom_opp_path(vllm_ascend)
         from vllm_ascend import vllm_ascend_C  # noqa: F401  # type: ignore
         from vllm_ascend.ops.layer_shard_linear import (  # noqa: F401
             is_hidden_layer,
@@ -1062,6 +1089,12 @@ class DeepseekV32DSAAttention(nn.Module):
         self.sfa_dump_count = 0
         self.log_npu_sfa_inputs = _env_flag("NANOVLLM_LOG_NPU_SFA_INPUTS", False)
         self._npu_sfa_logged = {"prefill": False, "decode": False}
+        self.npu_indexer_op = os.environ.get(
+            "NANOVLLM_NPU_INDEXER_OP",
+            "auto",
+        ).strip().lower()
+        if self.npu_indexer_op not in ("auto", "vllm-ascend", "torch-npu"):
+            self.npu_indexer_op = "auto"
         self.use_batch_matmul_transpose = not _env_flag(
             "NANOVLLM_DISABLE_BATCH_MATMUL_TRANSPOSE",
             False,
@@ -1383,28 +1416,81 @@ class DeepseekV32DSAAttention(nn.Module):
         actual_seq_lengths_key: torch.Tensor,
         block_table: torch.Tensor,
     ) -> torch.Tensor:
-        lightning_indexer, _ = _get_ascend_op(
-            "npu_lightning_indexer",
-            allow_vllm_ascend_import=True,
+        query = q_index.to(self.index_cache.dtype).contiguous()
+        key = self._npu_pa_bsnd_cache(
+            self.index_cache,
+            self.indexer.head_dim,
+            "index",
         )
-        if lightning_indexer is None:
-            raise RuntimeError("npu_lightning_indexer is unavailable")
-        topk_indices = lightning_indexer(
-            query=q_index.to(self.index_cache.dtype).contiguous(),
-            key=self._npu_pa_bsnd_cache(
-                self.index_cache,
-                self.indexer.head_dim,
-                "index",
-            ),
-            weights=weights.to(self.index_cache.dtype).contiguous(),
-            actual_seq_lengths_query=actual_seq_lengths_query.contiguous(),
-            actual_seq_lengths_key=actual_seq_lengths_key.contiguous(),
-            block_table=block_table,
-            layout_query="TND",
-            layout_key="PA_BSND",
-            sparse_count=self.sfa_sparse_count,
-            sparse_mode=3,
-        )
+        weights = weights.to(self.index_cache.dtype).contiguous()
+        actual_seq_lengths_query = actual_seq_lengths_query.contiguous()
+        actual_seq_lengths_key = actual_seq_lengths_key.contiguous()
+
+        def call_vllm_ascend() -> torch.Tensor:
+            lightning_indexer, _ = _get_ascend_op(
+                "npu_lightning_indexer",
+                allow_vllm_ascend_import=True,
+                allow_torch_npu=False,
+            )
+            if lightning_indexer is None:
+                raise RuntimeError("npu_lightning_indexer is unavailable")
+            return lightning_indexer(
+                query=query,
+                key=key,
+                weights=weights,
+                actual_seq_lengths_query=actual_seq_lengths_query,
+                actual_seq_lengths_key=actual_seq_lengths_key,
+                block_table=block_table,
+                layout_query="TND",
+                layout_key="PA_BSND",
+                sparse_count=self.sfa_sparse_count,
+                sparse_mode=3,
+            )
+
+        def call_torch_npu() -> torch.Tensor:
+            try:
+                import torch_npu  # type: ignore
+            except Exception:
+                lightning_indexer = None
+            else:
+                lightning_indexer = getattr(torch_npu, "npu_lightning_indexer", None)
+            if lightning_indexer is None:
+                raise RuntimeError("torch_npu.npu_lightning_indexer is unavailable")
+            return lightning_indexer(
+                query=query,
+                key=key,
+                weights=weights,
+                actual_seq_lengths_query=actual_seq_lengths_query,
+                actual_seq_lengths_key=actual_seq_lengths_key,
+                block_table=block_table,
+                layout_query="TND",
+                layout_key="PA_BSND",
+                sparse_count=self.sfa_sparse_count,
+                sparse_mode=3,
+            )
+
+        if self.npu_indexer_op == "torch-npu":
+            topk_indices = call_torch_npu()
+        elif self.npu_indexer_op == "vllm-ascend":
+            topk_indices = call_vllm_ascend()
+        else:
+            try:
+                topk_indices = call_vllm_ascend()
+            except RuntimeError as exc:
+                message = str(exc)
+                if (
+                    "LightningIndexerVllm" not in message
+                    and "npu_lightning_indexer" not in message
+                    and "aclnnLightningIndexerVllm" not in message
+                ):
+                    raise
+                if _is_rank0():
+                    logger.warning(
+                        "NPU lightning indexer via vllm-ascend failed; "
+                        "retrying torch_npu path: %s",
+                        message.splitlines()[0],
+                    )
+                topk_indices = call_torch_npu()
         if isinstance(topk_indices, tuple):
             topk_indices = topk_indices[0]
         return topk_indices

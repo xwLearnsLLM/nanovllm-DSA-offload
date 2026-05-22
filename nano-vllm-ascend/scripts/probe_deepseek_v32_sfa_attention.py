@@ -23,11 +23,55 @@ import torch
 os.environ.setdefault("VLLM_ASCEND_ENABLE_NZ", "0")
 
 
+def _prepend_env_path(name: str, path: str) -> None:
+    current = os.environ.get(name, "")
+    parts = [part for part in current.split(os.pathsep) if part]
+    if path not in parts:
+        os.environ[name] = f"{path}{os.pathsep}{current}" if current else path
+
+
+def _ensure_vllm_ascend_custom_opp_path(vllm_ascend_module) -> str | None:
+    package_dir = os.path.dirname(os.path.realpath(vllm_ascend_module.__file__))
+    custom_opp_path = os.path.join(
+        package_dir,
+        "_cann_ops_custom",
+        "vendors",
+        "vllm-ascend",
+    )
+    if os.path.exists(custom_opp_path):
+        _prepend_env_path("ASCEND_CUSTOM_OPP_PATH", custom_opp_path)
+    try:
+        from vllm_ascend.platform import NPUPlatform  # type: ignore
+
+        NPUPlatform.import_kernels()
+    except Exception as exc:
+        print(f"PROBE warning import_kernels failed: {exc!r}", flush=True)
+    return custom_opp_path if os.path.exists(custom_opp_path) else None
+
+
 def _register_ascend_ops() -> None:
     import torch_npu  # type: ignore  # noqa: F401
     import vllm  # type: ignore  # noqa: F401
     import vllm_ascend  # type: ignore  # noqa: F401
+
+    custom_opp_path = _ensure_vllm_ascend_custom_opp_path(vllm_ascend)
     from vllm_ascend import vllm_ascend_C  # type: ignore  # noqa: F401
+    from vllm_ascend.ops.layer_shard_linear import (  # type: ignore  # noqa: F401
+        is_hidden_layer,
+        post_process_after_loading_for_shard_weight_series,
+        reach_layer_for_shard_weight_series,
+        register_all_layers_to_shard_weight_series,
+    )
+
+    print(
+        "PROBE env "
+        f"torch_npu={getattr(torch_npu, '__file__', None)} "
+        f"vllm={getattr(vllm, '__file__', None)} "
+        f"vllm_ascend={getattr(vllm_ascend, '__file__', None)} "
+        f"custom_opp_path={custom_opp_path} "
+        f"ASCEND_CUSTOM_OPP_PATH={os.environ.get('ASCEND_CUSTOM_OPP_PATH', '')}",
+        flush=True,
+    )
 
 
 def _desc(name: str, tensor: torch.Tensor) -> str:
@@ -70,6 +114,132 @@ def _to_device(payload: dict, name: str, device: torch.device) -> torch.Tensor:
     return value.to(device=device).contiguous()
 
 
+def _call_vllm_ascend_indexer(
+    *,
+    q_index: torch.Tensor,
+    index_cache: torch.Tensor,
+    weights: torch.Tensor,
+    actual_seq_lengths_query: torch.Tensor,
+    actual_seq_lengths_key: torch.Tensor,
+    block_table: torch.Tensor,
+    sparse_count: int,
+) -> torch.Tensor:
+    return torch.ops._C_ascend.npu_lightning_indexer(
+        query=q_index,
+        key=index_cache,
+        weights=weights,
+        actual_seq_lengths_query=actual_seq_lengths_query,
+        actual_seq_lengths_key=actual_seq_lengths_key,
+        block_table=block_table,
+        layout_query="TND",
+        layout_key="PA_BSND",
+        sparse_count=sparse_count,
+        sparse_mode=3,
+    )
+
+
+def _call_torch_npu_indexer(
+    *,
+    q_index: torch.Tensor,
+    index_cache: torch.Tensor,
+    weights: torch.Tensor,
+    actual_seq_lengths_query: torch.Tensor,
+    actual_seq_lengths_key: torch.Tensor,
+    block_table: torch.Tensor,
+    sparse_count: int,
+) -> torch.Tensor:
+    import torch_npu  # type: ignore
+
+    topk = torch_npu.npu_lightning_indexer(
+        query=q_index,
+        key=index_cache,
+        weights=weights,
+        actual_seq_lengths_query=actual_seq_lengths_query,
+        actual_seq_lengths_key=actual_seq_lengths_key,
+        block_table=block_table,
+        layout_query="TND",
+        layout_key="PA_BSND",
+        sparse_count=sparse_count,
+        sparse_mode=3,
+    )
+    if isinstance(topk, tuple):
+        topk = topk[0]
+    return topk
+
+
+def _run_indexer(
+    *,
+    indexer_op: str,
+    q_index: torch.Tensor,
+    index_cache: torch.Tensor,
+    weights: torch.Tensor,
+    actual_seq_lengths_query: torch.Tensor,
+    actual_seq_lengths_key: torch.Tensor,
+    block_table: torch.Tensor,
+    sparse_count: int,
+) -> torch.Tensor:
+    kwargs = dict(
+        q_index=q_index,
+        index_cache=index_cache,
+        weights=weights,
+        actual_seq_lengths_query=actual_seq_lengths_query,
+        actual_seq_lengths_key=actual_seq_lengths_key,
+        block_table=block_table,
+        sparse_count=sparse_count,
+    )
+    if indexer_op == "torch-npu":
+        return _call_torch_npu_indexer(**kwargs)
+    if indexer_op == "vllm-ascend":
+        return _call_vllm_ascend_indexer(**kwargs)
+
+    try:
+        return _call_vllm_ascend_indexer(**kwargs)
+    except RuntimeError as exc:
+        message = str(exc)
+        if (
+            "LightningIndexerVllm" not in message
+            and "npu_lightning_indexer" not in message
+            and "aclnnLightningIndexerVllm" not in message
+        ):
+            raise
+        print(
+            "PROBE indexer_vllm_ascend_failed_try_torch_npu "
+            f"error={message.splitlines()[0]}",
+            flush=True,
+        )
+        return _call_torch_npu_indexer(**kwargs)
+
+
+def _build_sparse_indices_from_block_table(
+    *,
+    query: torch.Tensor,
+    block_table: torch.Tensor,
+    actual_seq_lengths_query: torch.Tensor,
+    actual_seq_lengths_key: torch.Tensor,
+    sparse_count: int,
+    block_size: int,
+) -> torch.Tensor:
+    topk = torch.empty(
+        query.shape[0],
+        1,
+        sparse_count,
+        dtype=torch.int32,
+        device=query.device,
+    )
+    query_ends = actual_seq_lengths_query.detach().cpu().tolist()
+    key_lens = actual_seq_lengths_key.detach().cpu().tolist()
+    query_start = 0
+    for batch_idx, query_end in enumerate(query_ends):
+        key_len = int(key_lens[batch_idx])
+        num_blocks = max(1, (key_len + block_size - 1) // block_size)
+        valid_blocks = block_table[batch_idx, :num_blocks].to(torch.int32)
+        repeat = (sparse_count + valid_blocks.numel() - 1) // valid_blocks.numel()
+        indices = valid_blocks.repeat(repeat)[:sparse_count].contiguous()
+        topk[query_start:int(query_end), 0, :] = indices
+        query_start = int(query_end)
+    return topk
+
+
 def _run_ops(
     *,
     q_index: torch.Tensor,
@@ -84,6 +254,9 @@ def _run_ops(
     actual_seq_lengths_key: torch.Tensor,
     sparse_count: int,
     scale_value: float,
+    block_size: int,
+    indexer_op: str,
+    skip_indexer: bool,
 ) -> torch.Tensor:
     print(
         "PROBE before_indexer "
@@ -97,24 +270,33 @@ def _run_ops(
         flush=True,
     )
     start = perf_counter()
-    topk = torch.ops._C_ascend.npu_lightning_indexer(
-        query=q_index,
-        key=index_cache,
-        weights=weights,
-        actual_seq_lengths_query=actual_seq_lengths_query,
-        actual_seq_lengths_key=actual_seq_lengths_key,
-        block_table=block_table,
-        layout_query="TND",
-        layout_key="PA_BSND",
-        sparse_count=sparse_count,
-        sparse_mode=3,
-    )
-    if isinstance(topk, tuple):
-        topk = topk[0]
-    torch.npu.synchronize()
+    if skip_indexer:
+        topk = _build_sparse_indices_from_block_table(
+            query=ql_nope,
+            block_table=block_table,
+            actual_seq_lengths_query=actual_seq_lengths_query,
+            actual_seq_lengths_key=actual_seq_lengths_key,
+            sparse_count=sparse_count,
+            block_size=block_size,
+        )
+    else:
+        topk = _run_indexer(
+            indexer_op=indexer_op,
+            q_index=q_index,
+            index_cache=index_cache,
+            weights=weights,
+            actual_seq_lengths_query=actual_seq_lengths_query,
+            actual_seq_lengths_key=actual_seq_lengths_key,
+            block_table=block_table,
+            sparse_count=sparse_count,
+        )
+        if isinstance(topk, tuple):
+            topk = topk[0]
+        torch.npu.synchronize()
     print(
         "PROBE after_indexer "
         f"elapsed={perf_counter() - start:.4f}s "
+        f"source={'synthetic' if skip_indexer else indexer_op} "
         f"{_desc('topk', topk)} topk_head={_head(topk)} "
         f"{_stats('topk', topk.detach().cpu())}",
         flush=True,
@@ -217,8 +399,9 @@ def build_random_case(args: argparse.Namespace, device: torch.device) -> dict:
     block_cols = args.block_cols or blocks_per_seq
     if block_cols < blocks_per_seq:
         raise ValueError("--block-cols must cover the sequence length.")
-    num_blocks = args.num_blocks or (args.batch_size * blocks_per_seq)
-    if num_blocks < args.batch_size * blocks_per_seq:
+    needed_blocks = args.block_id_base + args.batch_size * blocks_per_seq
+    num_blocks = args.num_blocks or needed_blocks
+    if num_blocks < needed_blocks:
         raise ValueError("--num-blocks is too small for the requested batch.")
 
     block_table = torch.zeros(
@@ -228,7 +411,7 @@ def build_random_case(args: argparse.Namespace, device: torch.device) -> dict:
         device=device,
     )
     for batch_idx in range(args.batch_size):
-        start = batch_idx * blocks_per_seq
+        start = args.block_id_base + batch_idx * blocks_per_seq
         block_table[batch_idx, :blocks_per_seq] = torch.arange(
             start,
             start + blocks_per_seq,
@@ -326,6 +509,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--block-size", type=int, default=128)
     parser.add_argument("--block-cols", type=int)
     parser.add_argument("--num-blocks", type=int)
+    parser.add_argument("--block-id-base", type=int, default=1)
     parser.add_argument("--sparse-count", type=int, default=2048)
     parser.add_argument("--device", default="npu:0")
     parser.add_argument("--dtype", default="bfloat16")
@@ -336,6 +520,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--index-heads", type=int, default=64)
     parser.add_argument("--index-head-dim", type=int, default=128)
     parser.add_argument("--scale-value", type=float, default=0.1352337788608801)
+    parser.add_argument(
+        "--indexer-op",
+        choices=("auto", "vllm-ascend", "torch-npu"),
+        default="auto",
+    )
+    parser.add_argument(
+        "--skip-indexer",
+        action="store_true",
+        help="Generate sparse_indices from block_table and only run SFA.",
+    )
     parser.add_argument("--replay-dump")
     return parser.parse_args()
 
@@ -364,6 +558,9 @@ def main() -> None:
         actual_seq_lengths_key=tensors["actual_seq_lengths_key"],
         sparse_count=args.sparse_count,
         scale_value=args.scale_value,
+        block_size=args.block_size,
+        indexer_op=args.indexer_op,
+        skip_indexer=args.skip_indexer,
     )
 
 
