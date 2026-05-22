@@ -1,141 +1,52 @@
-# Ascend verification commands for DeepSeek V3.2 SFA path
+# DeepSeek V3.2 SFA 手动验证命令
 #
-# Usage:
-#   1. Copy this file to the Ascend machine if it is not already there.
-#   2. Adjust REPO, MODEL, TP_SIZE, and DEVICES below.
-#   3. Run commands from top to bottom.
-#   4. Paste back the generated logs, especially grep output from the last step.
-
-set -e
-
-REPO=/data/wangxuan/nano-vllm-ascend-KVstar-DSA/nano-vllm-ascend
-MODEL=/data/model/DeepSeek-V3.2
-TP_SIZE=2
-DEVICES=0,1
-
-cd "$REPO"
-
-LOG_DIR=logs/sfa_$(date +%Y%m%d_%H%M%S)
-mkdir -p "$LOG_DIR"
-
-echo "REPO=$REPO"
-echo "MODEL=$MODEL"
-echo "TP_SIZE=$TP_SIZE"
-echo "DEVICES=$DEVICES"
-echo "LOG_DIR=$LOG_DIR"
+# 逐条手动运行，不要直接 sh command.txt。
+# 下面的路径和卡号先按实际机器修改：
+#   REPO:   /home/w00916487/nano-vllm-ascend-KVstar-DSA/nano-vllm-ascend
+#   MODEL:  /data/model/DeepSeek-V3.2
+#   DEVICES: 0,1
+#   TP_SIZE: 2
 
 
-# 0. Basic syntax check. This catches bad sync/copy before spending NPU time.
-python -m py_compile \
-  nanovllm/models/deepseek_v32.py \
-  scripts/probe_deepseek_v32_sfa_attention.py \
-  2>&1 | tee "$LOG_DIR/00_py_compile.log"
+# 0. 进入 nano-vllm-ascend 目录，并准备日志目录
+cd /home/w00916487/nano-vllm-ascend-KVstar-DSA/nano-vllm-ascend
+mkdir -p logs/sfa_manual
 
 
-# 1. Standalone SFA prefill probe with synthetic sparse indices.
-# This skips LightningIndexerVllm first, so we can check the prefill SFA kernel itself.
-ASCEND_RT_VISIBLE_DEVICES=$DEVICES \
-python scripts/probe_deepseek_v32_sfa_attention.py \
-  --phase prefill \
-  --seq-len 2048 \
-  --batch-size 1 \
-  --device npu:0 \
-  --skip-indexer \
-  2>&1 | tee "$LOG_DIR/01_probe_prefill_2k_sfa_only.log"
+# 1. 语法检查
+python -m py_compile nanovllm/models/deepseek_v32.py scripts/probe_deepseek_v32_sfa_attention.py 2>&1 | tee logs/sfa_manual/00_py_compile.log
 
 
-# 2. Standalone SFA prefill probe with LightningIndexerVllm + SFA.
-# The probe now sets ASCEND_CUSTOM_OPP_PATH and prints it in "PROBE env".
-ASCEND_RT_VISIBLE_DEVICES=$DEVICES \
-python scripts/probe_deepseek_v32_sfa_attention.py \
-  --phase prefill \
-  --seq-len 2048 \
-  --batch-size 1 \
-  --device npu:0 \
-  --indexer-op auto \
-  2>&1 | tee "$LOG_DIR/02_probe_prefill_2k_indexer_sfa.log"
+# 2. standalone prefill：npu_lightning_indexer + npu_sparse_flash_attention
+ASCEND_RT_VISIBLE_DEVICES=0,1 python scripts/probe_deepseek_v32_sfa_attention.py --phase prefill --seq-len 2048 --batch-size 1 --device npu:0 2>&1 | tee logs/sfa_manual/01_probe_prefill_2k.log
 
 
-# 3. Standalone SFA decode probe with LightningIndexerVllm + SFA.
-ASCEND_RT_VISIBLE_DEVICES=$DEVICES \
-python scripts/probe_deepseek_v32_sfa_attention.py \
-  --phase decode \
-  --seq-len 2048 \
-  --batch-size 4 \
-  --device npu:0 \
-  --indexer-op auto \
-  2>&1 | tee "$LOG_DIR/03_probe_decode_2k_bs4.log"
+# 3. standalone decode：npu_lightning_indexer + npu_sparse_flash_attention
+ASCEND_RT_VISIBLE_DEVICES=0,1 python scripts/probe_deepseek_v32_sfa_attention.py --phase decode --seq-len 2048 --batch-size 4 --device npu:0 2>&1 | tee logs/sfa_manual/02_probe_decode_2k_bs4.log
 
 
-# 4. Full-model short prefill correctness check.
-# Keep this short because NANOVLLM_COMPARE_NPU_SFA_PREFILL=1 also runs the PyTorch MLA reference.
-# Expected: no exception, and log lines containing "NPU SFA compare prefill".
-ASCEND_RT_VISIBLE_DEVICES=$DEVICES \
-NANOVLLM_MODEL="$MODEL" \
-NANOVLLM_TP_SIZE=$TP_SIZE \
-NANOVLLM_ENABLE_NPU_SFA_PREFILL=1 \
-NANOVLLM_COMPARE_NPU_SFA_PREFILL=1 \
-NANOVLLM_NPU_SFA_SPARSE_COUNT=256 \
-NANOVLLM_LOG_NPU_SFA_INPUTS=1 \
-NANOVLLM_NPU_SFA_STRICT=1 \
-NANOVLLM_MAX_MODEL_LEN=256 \
-NANOVLLM_MAX_BATCHED_TOKENS=512 \
-NANOVLLM_MAX_NUM_SEQS=2 \
-NANOVLLM_MAX_GEN_TOKENS=1 \
-NANOVLLM_SKIP_WARMUP=1 \
-python example/example.py \
-  2>&1 | tee "$LOG_DIR/04_short_prefill_compare.log"
+# 4. full-model 短序列 prefill 正确性对比
+# 短序列才开 NANOVLLM_COMPARE_NPU_SFA_PREFILL=1，因为它会同时跑 PyTorch MLA reference。
+ASCEND_RT_VISIBLE_DEVICES=0,1 NANOVLLM_MODEL=/data/model/DeepSeek-V3.2 NANOVLLM_TP_SIZE=2 NANOVLLM_ENABLE_NPU_SFA_PREFILL=1 NANOVLLM_COMPARE_NPU_SFA_PREFILL=1 NANOVLLM_NPU_SFA_SPARSE_COUNT=256 NANOVLLM_LOG_NPU_SFA_INPUTS=1 NANOVLLM_NPU_SFA_STRICT=1 NANOVLLM_MAX_MODEL_LEN=256 NANOVLLM_MAX_BATCHED_TOKENS=512 NANOVLLM_MAX_NUM_SEQS=2 NANOVLLM_MAX_GEN_TOKENS=1 NANOVLLM_SKIP_WARMUP=1 python example/example.py 2>&1 | tee logs/sfa_manual/03_short_prefill_compare.log
 
 
-# 5. Long prefill main path: SFA prefill + SFA decode, generate only 1 token.
-# This is the run we need before debugging decode indexer/SFA behavior.
-# Do not enable compare here; the dense PyTorch reference is exactly what makes long prefill painful.
-ASCEND_RT_VISIBLE_DEVICES=$DEVICES \
-NANOVLLM_MODEL="$MODEL" \
-NANOVLLM_TP_SIZE=$TP_SIZE \
-NANOVLLM_ENABLE_NPU_SFA_PREFILL=1 \
-NANOVLLM_ENABLE_NPU_SFA_DECODE=1 \
-NANOVLLM_NPU_SFA_SPARSE_COUNT=2048 \
-NANOVLLM_LOG_NPU_SFA_INPUTS=1 \
-NANOVLLM_DUMP_NPU_SFA_INPUTS="$LOG_DIR/dumps" \
-NANOVLLM_DUMP_NPU_SFA_MAX_CALLS=1 \
-NANOVLLM_NPU_SFA_STRICT=1 \
-NANOVLLM_PROFILE_LAYER_IDS=0 \
-NANOVLLM_MAX_MODEL_LEN=2048 \
-NANOVLLM_MAX_BATCHED_TOKENS=2048 \
-NANOVLLM_MAX_NUM_SEQS=1 \
-NANOVLLM_MAX_GEN_TOKENS=1 \
-NANOVLLM_SKIP_WARMUP=1 \
-python example/example.py \
-  2>&1 | tee "$LOG_DIR/05_long_prefill_sfa_decode1.log"
+# 5. full-model 长序列主路径：SFA prefill + SFA decode，只生成 1 token
+# 这里不要开 compare，否则又会被 dense MLA reference 拖慢。
+ASCEND_RT_VISIBLE_DEVICES=0,1 NANOVLLM_MODEL=/data/model/DeepSeek-V3.2 NANOVLLM_TP_SIZE=2 NANOVLLM_ENABLE_NPU_SFA_PREFILL=1 NANOVLLM_ENABLE_NPU_SFA_DECODE=1 NANOVLLM_NPU_SFA_SPARSE_COUNT=2048 NANOVLLM_LOG_NPU_SFA_INPUTS=1 NANOVLLM_DUMP_NPU_SFA_INPUTS=logs/sfa_manual/dumps NANOVLLM_DUMP_NPU_SFA_MAX_CALLS=1 NANOVLLM_NPU_SFA_STRICT=1 NANOVLLM_PROFILE_LAYER_IDS=0 NANOVLLM_MAX_MODEL_LEN=2048 NANOVLLM_MAX_BATCHED_TOKENS=2048 NANOVLLM_MAX_NUM_SEQS=1 NANOVLLM_MAX_GEN_TOKENS=1 NANOVLLM_SKIP_WARMUP=1 python example/example.py 2>&1 | tee logs/sfa_manual/04_long_prefill_sfa_decode1.log
 
 
-# 6. Optional: replay one dumped SFA call directly through the standalone probe.
-# This is useful if the full-model run fails inside SFA and we need a small reproducer.
-DUMP_FILE=$(find "$LOG_DIR/dumps" -name 'sfa_rank*_layer*_seq*.pt' | head -n 1 || true)
-if [ -n "$DUMP_FILE" ]; then
-  echo "Replaying dump: $DUMP_FILE"
-  ASCEND_RT_VISIBLE_DEVICES=$DEVICES \
-  python scripts/probe_deepseek_v32_sfa_attention.py \
-    --replay-dump "$DUMP_FILE" \
-    --device npu:0 \
-    2>&1 | tee "$LOG_DIR/06_replay_dump.log"
-else
-  echo "No SFA dump file found under $LOG_DIR/dumps" | tee "$LOG_DIR/06_replay_dump.log"
-fi
+# 6. 如果第 5 步生成了 dump，可以挑一个 dump 单独 replay
+find logs/sfa_manual/dumps -name 'sfa_rank*_layer*_seq*.pt' | head -n 5
+ASCEND_RT_VISIBLE_DEVICES=0,1 python scripts/probe_deepseek_v32_sfa_attention.py --replay-dump logs/sfa_manual/dumps/把这里替换成实际dump文件名.pt --device npu:0 2>&1 | tee logs/sfa_manual/05_replay_dump.log
 
 
-# 7. Collect high-signal lines to paste back.
-grep -E \
-  "PROBE |NPU SFA input summary|NPU SFA compare|NPU SFA .*failed|Dumped NPU SFA|Traceback|RuntimeError|ERROR|Prompt:|text:" \
-  "$LOG_DIR"/*.log \
-  2>&1 | tee "$LOG_DIR/99_key_lines.log"
+# 7. 提取关键日志行
+grep -E "PROBE |NPU SFA input summary|NPU SFA compare|NPU SFA .*failed|Dumped NPU SFA|Traceback|RuntimeError|ERROR|Prompt:|text:" logs/sfa_manual/*.log 2>&1 | tee logs/sfa_manual/99_key_lines.log
 
-echo "Done. Please paste back:"
-echo "  $LOG_DIR/01_probe_prefill_2k_sfa_only.log"
-echo "  $LOG_DIR/02_probe_prefill_2k_indexer_sfa.log"
-echo "  $LOG_DIR/03_probe_decode_2k_bs4.log"
-echo "  $LOG_DIR/04_short_prefill_compare.log"
-echo "  $LOG_DIR/05_long_prefill_sfa_decode1.log"
-echo "  $LOG_DIR/06_replay_dump.log"
-echo "  $LOG_DIR/99_key_lines.log"
+
+# 8. 请把这些日志贴回来
+cat logs/sfa_manual/01_probe_prefill_2k.log
+cat logs/sfa_manual/02_probe_decode_2k_bs4.log
+cat logs/sfa_manual/03_short_prefill_compare.log
+cat logs/sfa_manual/04_long_prefill_sfa_decode1.log
+cat logs/sfa_manual/99_key_lines.log
