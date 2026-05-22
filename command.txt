@@ -1,50 +1,52 @@
-# DeepSeek V3.2 SFA 手动验证命令
+# DeepSeek V3.2 SFA manual validation commands.
 #
-# 逐条手动运行，不要直接 sh command.txt。
-# 下面的路径和卡号先按实际机器修改：
-#   REPO:   /home/w00916487/nano-vllm-ascend-KVstar-DSA/nano-vllm-ascend
-#   MODEL:  /home/models/Deepseek-V3.2-Pruned-95B-BF/
-#   DEVICES: 0,1,2,3
-#   TP_SIZE: 4
+# Run these commands manually, one by one. This file is not meant to be
+# executed as a shell script.
+#
+# Assumptions:
+#   repo:   /home/w00916487/nano-vllm-ascend-KVstar-DSA/nano-vllm-ascend
+#   model:  /home/models/Deepseek-V3.2-Pruned-95B-BF/
+#   cards:  0,1,2,3
+#   tp:     4
 
 
-# 0. 进入 nano-vllm-ascend 目录，并准备日志目录
+# 0. Enter repo and prepare log dir.
 cd /home/w00916487/nano-vllm-ascend-KVstar-DSA/nano-vllm-ascend
 mkdir -p logs/sfa_manual
 
 
-# 1. 语法检查
-python -m py_compile nanovllm/models/deepseek_v32.py scripts/probe_deepseek_v32_sfa_attention.py 2>&1 | tee logs/sfa_manual/00_py_compile.log
+# 1. Syntax check.
+python -m py_compile nanovllm/models/deepseek_v32.py nanovllm/engine/llm_engine.py scripts/probe_deepseek_v32_sfa_attention.py example/example.py 2>&1 | tee logs/sfa_manual/00_py_compile.log
 
 
-# 2. standalone prefill：npu_lightning_indexer + npu_sparse_flash_attention
+# 2. Standalone prefill: npu_lightning_indexer + npu_sparse_flash_attention.
 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python scripts/probe_deepseek_v32_sfa_attention.py --phase prefill --seq-len 2048 --batch-size 1 --device npu:0 2>&1 | tee logs/sfa_manual/01_probe_prefill_2k.log
 
 
-# 3. standalone decode：npu_lightning_indexer + npu_sparse_flash_attention
+# 3. Standalone decode: npu_lightning_indexer + npu_sparse_flash_attention.
 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python scripts/probe_deepseek_v32_sfa_attention.py --phase decode --seq-len 2048 --batch-size 4 --device npu:0 2>&1 | tee logs/sfa_manual/02_probe_decode_2k_bs4.log
 
 
-# 4. full-model 短序列 prefill 正确性对比
-# 短序列才开 NANOVLLM_COMPARE_NPU_SFA_PREFILL=1，因为它会同时跑 PyTorch MLA reference。
-ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=4 NANOVLLM_ENABLE_NPU_SFA_PREFILL=1 NANOVLLM_COMPARE_NPU_SFA_PREFILL=1 NANOVLLM_NPU_SFA_SPARSE_COUNT=256 NANOVLLM_LOG_NPU_SFA_INPUTS=1 NANOVLLM_NPU_SFA_STRICT=1 NANOVLLM_MAX_MODEL_LEN=256 NANOVLLM_MAX_BATCHED_TOKENS=512 NANOVLLM_MAX_NUM_SEQS=2 NANOVLLM_MAX_GEN_TOKENS=1 NANOVLLM_SKIP_WARMUP=1 python example/example.py 2>&1 | tee logs/sfa_manual/03_short_prefill_compare.log
+# 4. Full-model short prefill correctness check.
+# Keep compare enabled only for short prompts; it also runs the PyTorch MLA reference.
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=4 NANOVLLM_ENABLE_NPU_SFA_PREFILL=1 NANOVLLM_COMPARE_NPU_SFA_PREFILL=1 NANOVLLM_NPU_SFA_SPARSE_COUNT=256 NANOVLLM_LOG_NPU_SFA_INPUTS=1 NANOVLLM_LOG_NPU_SFA_TIMING=1 NANOVLLM_NPU_SFA_STRICT=1 NANOVLLM_PROFILE_LAYER_IDS=0 NANOVLLM_MAX_MODEL_LEN=256 NANOVLLM_MAX_BATCHED_TOKENS=512 NANOVLLM_MAX_NUM_SEQS=2 NANOVLLM_MAX_GEN_TOKENS=1 NANOVLLM_SKIP_WARMUP=1 python example/example.py 2>&1 | tee logs/sfa_manual/03_short_prefill_compare.log
 
 
-# 5. full-model 长序列主路径：SFA prefill + SFA decode，只生成 1 token
-# 这里不要开 compare，否则又会被 dense MLA reference 拖慢。
-ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=4 NANOVLLM_ENABLE_NPU_SFA_PREFILL=1 NANOVLLM_ENABLE_NPU_SFA_DECODE=1 NANOVLLM_NPU_SFA_SPARSE_COUNT=2048 NANOVLLM_LOG_NPU_SFA_INPUTS=1 NANOVLLM_DUMP_NPU_SFA_INPUTS=logs/sfa_manual/dumps NANOVLLM_DUMP_NPU_SFA_MAX_CALLS=1 NANOVLLM_NPU_SFA_STRICT=1 NANOVLLM_PROFILE_LAYER_IDS=0 NANOVLLM_MAX_MODEL_LEN=2048 NANOVLLM_MAX_BATCHED_TOKENS=2048 NANOVLLM_MAX_NUM_SEQS=1 NANOVLLM_MAX_GEN_TOKENS=1 NANOVLLM_SKIP_WARMUP=1 python example/example.py 2>&1 | tee logs/sfa_manual/04_long_prefill_sfa_decode1.log
+# 5. Full-model long path: one exact 2048-token prompt, SFA prefill + SFA decode, generate 1 token.
+# Do not enable compare here, otherwise the dense MLA reference will dominate runtime.
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=4 NANOVLLM_ENABLE_NPU_SFA_PREFILL=1 NANOVLLM_ENABLE_NPU_SFA_DECODE=1 NANOVLLM_NPU_SFA_SPARSE_COUNT=2048 NANOVLLM_LOG_NPU_SFA_INPUTS=1 NANOVLLM_LOG_NPU_SFA_TIMING=1 NANOVLLM_DUMP_NPU_SFA_INPUTS=logs/sfa_manual/dumps NANOVLLM_DUMP_NPU_SFA_MAX_CALLS=1 NANOVLLM_NPU_SFA_STRICT=1 NANOVLLM_PROFILE_LAYER_IDS=0 NANOVLLM_LONG_PROMPT_TOKENS=2048 NANOVLLM_MAX_MODEL_LEN=2176 NANOVLLM_MAX_BATCHED_TOKENS=2048 NANOVLLM_MAX_NUM_SEQS=1 NANOVLLM_MAX_GEN_TOKENS=1 NANOVLLM_SKIP_WARMUP=1 python example/example.py 2>&1 | tee logs/sfa_manual/04_long_prefill_sfa_decode1.log
 
 
-# 6. 如果第 5 步生成了 dump，可以挑一个 dump 单独 replay
+# 6. If step 5 created dumps, pick one actual path and replay it.
 find logs/sfa_manual/dumps -name 'sfa_rank*_layer*_seq*.pt' | head -n 5
-ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python scripts/probe_deepseek_v32_sfa_attention.py --replay-dump logs/sfa_manual/dumps/把这里替换成实际dump文件名.pt --device npu:0 2>&1 | tee logs/sfa_manual/05_replay_dump.log
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python scripts/probe_deepseek_v32_sfa_attention.py --replay-dump logs/sfa_manual/dumps/REPLACE_WITH_ACTUAL_DUMP.pt --device npu:0 2>&1 | tee logs/sfa_manual/05_replay_dump.log
 
 
-# 7. 提取关键日志行
-grep -E "PROBE |NPU SFA input summary|NPU SFA compare|NPU SFA .*failed|Dumped NPU SFA|Traceback|RuntimeError|ERROR|Prompt:|text:" logs/sfa_manual/*.log 2>&1 | tee logs/sfa_manual/99_key_lines.log
+# 7. Extract key lines.
+grep -E "PROBE |built long prompt|NPU SFA input summary|NPU SFA timing|NPU SFA compare|NPU SFA .*failed|Dumped NPU SFA|Traceback|RuntimeError|ERROR|Prompt:|prompt len:|text:" logs/sfa_manual/*.log 2>&1 | tee logs/sfa_manual/99_key_lines.log
 
 
-# 8. 请把这些日志贴回来
+# 8. Paste these logs back.
 cat logs/sfa_manual/01_probe_prefill_2k.log
 cat logs/sfa_manual/02_probe_decode_2k_bs4.log
 cat logs/sfa_manual/03_short_prefill_compare.log

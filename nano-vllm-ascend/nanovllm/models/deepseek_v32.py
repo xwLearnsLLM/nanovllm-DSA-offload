@@ -95,6 +95,13 @@ def _is_rank0() -> bool:
         return True
 
 
+def _rank_id() -> int:
+    try:
+        return dist.get_rank() if dist.is_initialized() else 0
+    except Exception:
+        return 0
+
+
 def _profile_sync(device: torch.device) -> None:
     if device.type == "npu":
         torch.npu.synchronize()
@@ -1092,6 +1099,10 @@ class DeepseekV32DSAAttention(nn.Module):
         self.sfa_dump_max_calls = _env_int("NANOVLLM_DUMP_NPU_SFA_MAX_CALLS", 1)
         self.sfa_dump_count = 0
         self.log_npu_sfa_inputs = _env_flag("NANOVLLM_LOG_NPU_SFA_INPUTS", False)
+        self.log_npu_sfa_timing = _env_flag(
+            "NANOVLLM_LOG_NPU_SFA_TIMING",
+            False,
+        ) and _profile_layer_selected(self.layer_id, self.num_layers)
         self._npu_sfa_logged = {"prefill": False, "decode": False}
         self.use_batch_matmul_transpose = not _env_flag(
             "NANOVLLM_DISABLE_BATCH_MATMUL_TRANSPOSE",
@@ -1275,6 +1286,18 @@ class DeepseekV32DSAAttention(nn.Module):
             f"{name}=shape={tuple(tensor.shape)} dtype={tensor.dtype} "
             f"device={tensor.device} contiguous={tensor.is_contiguous()}"
         )
+
+    @staticmethod
+    def _tensor_range_desc(name: str, tensor: torch.Tensor) -> str:
+        desc = DeepseekV32DSAAttention._tensor_desc(name, tensor)
+        if tensor.numel() == 0:
+            return f"{desc} empty=True"
+        try:
+            min_value = tensor.min().item()
+            max_value = tensor.max().item()
+        except Exception as exc:
+            return f"{desc} range_error={exc!r}"
+        return f"{desc} min={min_value:.6g} max={max_value:.6g}"
 
     def _maybe_log_npu_sfa_inputs(
         self,
@@ -1541,6 +1564,10 @@ class DeepseekV32DSAAttention(nn.Module):
             dtype=torch.int32,
             device=ql_nope.device,
         ).contiguous()
+        log_timing = self.log_npu_sfa_timing
+        if log_timing:
+            _profile_sync(ql_nope.device)
+            start = perf_counter()
         topk_indices = self._npu_lightning_indexer(
             q_index,
             weights,
@@ -1548,6 +1575,22 @@ class DeepseekV32DSAAttention(nn.Module):
             actual_seq_lengths_key,
             block_table,
         )
+        if log_timing:
+            _profile_sync(ql_nope.device)
+            logger.info(
+                "NPU SFA timing: rank=%d phase=%s layer=%d op=indexer "
+                "elapsed=%.6fs %s actual_seq_lengths_query=%s "
+                "actual_seq_lengths_key=%s block_table_shape=%s",
+                _rank_id(),
+                phase,
+                self.layer_id,
+                perf_counter() - start,
+                self._tensor_range_desc("topk_indices", topk_indices),
+                actual_seq_lengths_query.detach().cpu().tolist(),
+                actual_seq_lengths_key.detach().cpu().tolist(),
+                tuple(block_table.shape),
+            )
+            start = perf_counter()
         latent = self._npu_sparse_flash_attention(
             ql_nope,
             q_pe,
@@ -1557,7 +1600,31 @@ class DeepseekV32DSAAttention(nn.Module):
             block_table,
             phase,
         )
-        return self._v_up_proj(latent)
+        if log_timing:
+            _profile_sync(ql_nope.device)
+            logger.info(
+                "NPU SFA timing: rank=%d phase=%s layer=%d op=sfa "
+                "elapsed=%.6fs %s",
+                _rank_id(),
+                phase,
+                self.layer_id,
+                perf_counter() - start,
+                self._tensor_range_desc("latent", latent),
+            )
+            start = perf_counter()
+        output = self._v_up_proj(latent)
+        if log_timing:
+            _profile_sync(output.device)
+            logger.info(
+                "NPU SFA timing: rank=%d phase=%s layer=%d op=v_up "
+                "elapsed=%.6fs %s",
+                _rank_id(),
+                phase,
+                self.layer_id,
+                perf_counter() - start,
+                self._tensor_range_desc("output", output),
+            )
+        return output
 
     def _compute_npu_indexer_indices(
         self,

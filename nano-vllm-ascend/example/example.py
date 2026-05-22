@@ -98,6 +98,42 @@ def format_prompts(prompts: list[str], use_deepseek_chat: bool) -> list[str]:
     ]
 
 
+def build_long_prompt_token_ids(
+    tokenizer,
+    target_len: int,
+    *,
+    use_deepseek_chat: bool,
+    add_bos: bool,
+) -> list[int]:
+    if target_len <= 0:
+        raise ValueError("target_len must be positive.")
+
+    prefix_text = DEEPSEEK_USER_TOKEN if use_deepseek_chat else ""
+    suffix_text = DEEPSEEK_ASSISTANT_TOKEN if use_deepseek_chat else ""
+    prefix_ids = tokenizer.encode(prefix_text, add_special_tokens=False)
+    suffix_ids = tokenizer.encode(suffix_text, add_special_tokens=False)
+    bos_token_id = tokenizer.bos_token_id
+    if add_bos and bos_token_id is not None:
+        prefix_ids = [bos_token_id] + prefix_ids
+
+    body_len = target_len - len(prefix_ids) - len(suffix_ids)
+    if body_len <= 0:
+        raise ValueError(
+            "NANOVLLM_LONG_PROMPT_TOKENS is too small for the prompt wrapper."
+        )
+
+    seed = (
+        "DeepSeek sparse attention validation. "
+        "This repeated sentence builds a deterministic long prefill prompt. "
+    )
+    body = seed
+    body_ids = tokenizer.encode(body, add_special_tokens=False)
+    while len(body_ids) < body_len:
+        body += seed
+        body_ids = tokenizer.encode(body, add_special_tokens=False)
+    return prefix_ids + body_ids[:body_len] + suffix_ids
+
+
 def main():
     model_path = resolve_model_path()
     ensure_bf16_export(model_path)
@@ -127,6 +163,7 @@ def main():
     )
     skip_warmup = get_env_bool("NANOVLLM_SKIP_WARMUP", True)
     use_deepseek_chat = get_env_bool("NANOVLLM_USE_DEEPSEEK_CHAT", True)
+    long_prompt_tokens = get_env_int("NANOVLLM_LONG_PROMPT_TOKENS", 0)
     add_bos_env = os.environ.get("NANOVLLM_ADD_BOS")
     if add_bos_env is None:
         add_bos = use_deepseek_chat
@@ -164,7 +201,8 @@ def main():
         "example config: tp=%s, max_model_len=%s, max_num_batched_tokens=%s, "
         "max_num_seqs=%s, kvcache_block_size=%s, skip_warmup=%s, "
         "max_gen_tokens=%s, temperature=%s, use_deepseek_chat=%s, add_bos=%s, "
-        "enable_expert_parallel=%s, gpu_memory_utilization=%s, tokenizer_path=%s",
+        "enable_expert_parallel=%s, gpu_memory_utilization=%s, tokenizer_path=%s, "
+        "long_prompt_tokens=%s",
         tensor_parallel_size,
         max_model_len,
         max_num_batched_tokens,
@@ -178,19 +216,46 @@ def main():
         enable_expert_parallel,
         gpu_memory_utilization,
         tokenizer_path,
+        long_prompt_tokens,
     )
 
-    prompts = [
-        "Answer briefly: what is 2 + 3 * 4?",
-        "Explain sparse attention in one short paragraph.",
-        "Translate 'hello world' into Chinese.",
-    ]
-    formatted_prompts = format_prompts(prompts, use_deepseek_chat)
-    prompt_token_ids = encode_plain_prompts(
-        prompt_tokenizer,
-        formatted_prompts,
-        add_bos=add_bos,
-    )
+    if long_prompt_tokens > 0:
+        if long_prompt_tokens > max_model_len:
+            raise ValueError(
+                "NANOVLLM_LONG_PROMPT_TOKENS must be <= NANOVLLM_MAX_MODEL_LEN."
+            )
+        if long_prompt_tokens > max_num_batched_tokens:
+            raise ValueError(
+                "NANOVLLM_LONG_PROMPT_TOKENS must be <= "
+                "NANOVLLM_MAX_BATCHED_TOKENS."
+            )
+        prompts = [f"<long prompt: {long_prompt_tokens} tokens>"]
+        prompt_token_ids = [
+            build_long_prompt_token_ids(
+                prompt_tokenizer,
+                long_prompt_tokens,
+                use_deepseek_chat=use_deepseek_chat,
+                add_bos=add_bos,
+            )
+        ]
+        logger.info(
+            "built long prompt token ids: requested=%s actual=%s first_ids=%s",
+            long_prompt_tokens,
+            len(prompt_token_ids[0]),
+            prompt_token_ids[0][:16],
+        )
+    else:
+        prompts = [
+            "Answer briefly: what is 2 + 3 * 4?",
+            "Explain sparse attention in one short paragraph.",
+            "Translate 'hello world' into Chinese.",
+        ]
+        formatted_prompts = format_prompts(prompts, use_deepseek_chat)
+        prompt_token_ids = encode_plain_prompts(
+            prompt_tokenizer,
+            formatted_prompts,
+            add_bos=add_bos,
+        )
 
     outputs = llm.generate(prompt_token_ids, sampling_params, use_tqdm=False)
     for prompt, prompt_ids, output in zip(prompts, prompt_token_ids, outputs):
