@@ -360,7 +360,11 @@ class ModelRunner:
             "Failed to allocate any DeepSeek DSA cache blocks due to "
             "insufficient memory."
         )
-        use_indexer_cache_layout = _env_flag("NANOVLLM_ENABLE_NPU_INDEXER", False)
+        use_indexer_cache_layout = (
+            _env_flag("NANOVLLM_ENABLE_NPU_INDEXER", False)
+            or _env_flag("NANOVLLM_ENABLE_NPU_SFA_PREFILL", False)
+            or _env_flag("NANOVLLM_ENABLE_NPU_SFA_DECODE", False)
+        )
 
         if use_indexer_cache_layout:
             ckv_shape = (

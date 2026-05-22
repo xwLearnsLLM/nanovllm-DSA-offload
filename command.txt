@@ -1,298 +1,127 @@
-# SFA/indexer input parity probe.
-# Run this from the nano-vllm-ascend directory that contains run.py.
-# This probe is runtime-version based: it prints the actual vllm/vllm_ascend
-# package paths on the Ascend machine and wraps both torch.ops._C_ascend and
-# torch_npu SFA/indexer entry points.
+# Ascend verification commands for DeepSeek V3.2 SFA path
+#
+# Usage:
+#   1. Copy this file to the Ascend machine if it is not already there.
+#   2. Adjust REPO, MODEL, TP_SIZE, and DEVICES below.
+#   3. Run commands from top to bottom.
+#   4. Paste back the generated logs, especially grep output from the last step.
 
-mkdir -p logs
-PROBE_MAX_MODEL_LEN=${PROBE_MAX_MODEL_LEN:-4096}
+set -e
 
-# 1) Install a temporary sitecustomize hook. PYTHONPATH injects it into vllm
-# worker processes too, so we can see the real op arguments used by
-# vllm-ascend 0.15 on that machine, independent of the local 0.14 source tree.
-rm -rf /tmp/nanovllm_vllm_probe
-mkdir -p /tmp/nanovllm_vllm_probe
-cat >/tmp/nanovllm_vllm_probe/sitecustomize.py <<'PY'
-import os
+REPO=/data/wangxuan/nano-vllm-ascend-KVstar-DSA/nano-vllm-ascend
+MODEL=/data/model/DeepSeek-V3.2
+TP_SIZE=2
+DEVICES=0,1
 
-if os.environ.get("VLLM_ASCEND_SFA_PROBE") == "1":
-    try:
-        import torch
-        import torch.distributed as dist
-        import torch_npu
-        import vllm
-        import vllm_ascend
-        from vllm_ascend import vllm_ascend_C  # noqa: F401
+cd "$REPO"
 
-        max_prints = int(os.environ.get("VLLM_ASCEND_SFA_PROBE_MAX_PRINTS", "4"))
-        only_decode = os.environ.get("VLLM_ASCEND_SFA_PROBE_ONLY_DECODE", "0").lower() in (
-            "1",
-            "true",
-            "yes",
-            "on",
-        )
-        counts = {}
+LOG_DIR=logs/sfa_$(date +%Y%m%d_%H%M%S)
+mkdir -p "$LOG_DIR"
 
-        def rank_info():
-            try:
-                if dist.is_available() and dist.is_initialized():
-                    return dist.get_rank()
-            except Exception:
-                pass
-            return "na"
-
-        def tinfo(x):
-            if x is None:
-                return "None"
-            return f"shape={tuple(x.shape)} dtype={x.dtype} device={x.device}"
-
-        def head(x, n=8):
-            if x is None or not hasattr(x, "numel") or x.numel() == 0:
-                return []
-            try:
-                y = x
-                if y.dim() >= 2:
-                    y = y[0]
-                return y.flatten()[:n].detach().cpu().tolist()
-            except Exception as exc:
-                return f"head_failed={exc!r}"
-
-        def should_print(key):
-            count = counts.get(key, 0)
-            if count >= max_prints:
-                return False
-            counts[key] = count + 1
-            return True
-
-        def is_decode_like(*args, **kwargs):
-            actual_seq_lengths_query = kwargs.get("actual_seq_lengths_query")
-            query = kwargs.get("query", args[0] if len(args) > 0 else None)
-            if actual_seq_lengths_query is None:
-                return False
-            try:
-                num_reqs = actual_seq_lengths_query.numel()
-                return (
-                    query is not None
-                    and query.shape[0] == num_reqs
-                    and int(actual_seq_lengths_query[-1].item()) == num_reqs
-                )
-            except Exception:
-                return False
-
-        def log_indexer(source, *args, **kwargs):
-            query = kwargs.get("query", args[0] if len(args) > 0 else None)
-            key = kwargs.get("key", args[1] if len(args) > 1 else None)
-            weights = kwargs.get("weights", args[2] if len(args) > 2 else None)
-            aqlq = kwargs.get("actual_seq_lengths_query")
-            aqlk = kwargs.get("actual_seq_lengths_key")
-            block_table = kwargs.get("block_table")
-            print(
-                "VLLM_SFA_PROBE indexer "
-                f"source={source} pid={os.getpid()} rank={rank_info()} "
-                f"query={tinfo(query)} key={tinfo(key)} weights={tinfo(weights)} "
-                f"aqlq={tinfo(aqlq)} aqlq_head={head(aqlq)} "
-                f"aqlk={tinfo(aqlk)} aqlk_head={head(aqlk)} "
-                f"block_table={tinfo(block_table)} block_table0_head={head(block_table)} "
-                f"sparse_count={kwargs.get('sparse_count')} sparse_mode={kwargs.get('sparse_mode')} "
-                f"layout_query={kwargs.get('layout_query')} layout_key={kwargs.get('layout_key')}",
-                flush=True,
-            )
-
-        def log_sfa(source, *args, **kwargs):
-            query = kwargs.get("query", args[0] if len(args) > 0 else None)
-            key = kwargs.get("key", args[1] if len(args) > 1 else None)
-            value = kwargs.get("value", args[2] if len(args) > 2 else None)
-            sparse_indices = kwargs.get("sparse_indices", args[3] if len(args) > 3 else None)
-            aqlq = kwargs.get("actual_seq_lengths_query")
-            aqlkv = kwargs.get("actual_seq_lengths_kv")
-            block_table = kwargs.get("block_table")
-            query_rope = kwargs.get("query_rope")
-            key_rope = kwargs.get("key_rope")
-            print(
-                "VLLM_SFA_PROBE sfa "
-                f"source={source} pid={os.getpid()} rank={rank_info()} "
-                f"query={tinfo(query)} key={tinfo(key)} value={tinfo(value)} "
-                f"sparse_indices={tinfo(sparse_indices)} sparse_head={head(sparse_indices)} "
-                f"aqlq={tinfo(aqlq)} aqlq_head={head(aqlq)} "
-                f"aqlkv={tinfo(aqlkv)} aqlkv_head={head(aqlkv)} "
-                f"block_table={tinfo(block_table)} block_table0_head={head(block_table)} "
-                f"query_rope={tinfo(query_rope)} key_rope={tinfo(key_rope)} "
-                f"sparse_block_size={kwargs.get('sparse_block_size')} sparse_mode={kwargs.get('sparse_mode')} "
-                f"layout_query={kwargs.get('layout_query')} layout_kv={kwargs.get('layout_kv')}",
-                flush=True,
-            )
-
-        def wrap_indexer(owner, attr, source):
-            if not hasattr(owner, attr):
-                print(f"VLLM_SFA_PROBE missing source={source} attr={attr}", flush=True)
-                return
-            original = getattr(owner, attr)
-
-            def wrapped(*args, **kwargs):
-                if only_decode and not is_decode_like(*args, **kwargs):
-                    return original(*args, **kwargs)
-                if should_print((source, "indexer")):
-                    log_indexer(source, *args, **kwargs)
-                return original(*args, **kwargs)
-
-            setattr(owner, attr, wrapped)
-            print(f"VLLM_SFA_PROBE wrapped source={source} attr={attr}", flush=True)
-
-        def wrap_sfa(owner, attr, source):
-            if not hasattr(owner, attr):
-                print(f"VLLM_SFA_PROBE missing source={source} attr={attr}", flush=True)
-                return
-            original = getattr(owner, attr)
-
-            def wrapped(*args, **kwargs):
-                if only_decode and not is_decode_like(*args, **kwargs):
-                    return original(*args, **kwargs)
-                if should_print((source, "sfa")):
-                    log_sfa(source, *args, **kwargs)
-                return original(*args, **kwargs)
-
-            setattr(owner, attr, wrapped)
-            print(f"VLLM_SFA_PROBE wrapped source={source} attr={attr}", flush=True)
-
-        print(
-            "VLLM_SFA_PROBE installed "
-            f"pid={os.getpid()} rank={rank_info()} "
-            f"torch={getattr(torch, '__version__', 'unknown')} "
-            f"vllm={getattr(vllm, '__version__', 'unknown')} "
-            f"only_decode={only_decode} "
-            f"vllm_file={getattr(vllm, '__file__', 'unknown')} "
-            f"vllm_ascend_file={getattr(vllm_ascend, '__file__', 'unknown')}",
-            flush=True,
-        )
-
-        ascend_ops = getattr(torch.ops, "_C_ascend", None)
-        if ascend_ops is not None:
-            wrap_indexer(ascend_ops, "npu_lightning_indexer", "torch.ops._C_ascend")
-            wrap_sfa(ascend_ops, "npu_sparse_flash_attention", "torch.ops._C_ascend")
-        else:
-            print("VLLM_SFA_PROBE missing source=torch.ops._C_ascend", flush=True)
-
-        wrap_indexer(torch_npu, "npu_lightning_indexer", "torch_npu")
-        wrap_sfa(torch_npu, "npu_sparse_flash_attention", "torch_npu")
-    except Exception as exc:
-        print(f"VLLM_SFA_PROBE install_failed pid={os.getpid()} error={exc!r}", flush=True)
-PY
-
-# 2) Run vllm-ascend 0.15 with the same short prompts. Send me the
-# VLLM_SFA_PROBE lines. They tell us which entry point is actually called and
-# what exact argument shapes/dtypes/layout metadata are used.
-PYTHONPATH=/tmp/nanovllm_vllm_probe:${PYTHONPATH:-} \
-VLLM_ASCEND_SFA_PROBE=1 \
-VLLM_ASCEND_SFA_PROBE_ONLY_DECODE=1 \
-VLLM_ASCEND_SFA_PROBE_MAX_PRINTS=8 \
-VLLM_ASCEND_ENABLE_NZ=0 \
-python - <<'PY' 2>&1 | tee logs/70_vllm_sfa_inputs.log
-import os
-from vllm import LLM, SamplingParams
-
-MODEL_PATH = "/home/models/Deepseek-V3.2-Pruned-95B-BF/"
-TP_SIZE = 4
-MAX_MODEL_LEN = int(os.environ.get("PROBE_MAX_MODEL_LEN", "4096"))
-
-prompts = [
-    "The capital city of China is",
-    "calculate 2 + 3 * 4 = ",
-    "List all prime numbers < 100: 2, 3, ",
-    "1, 3, 7, 15, 31, ",
-    "Large Language Model is a type of AI model that",
-    "If Tom is shorter than Jerry, Spike is taller than Tom, then the shortest person is",
-    "If a train leaves at 2 PM and takes 3 hours to arrive, it will arrive at",
-]
-
-llm = LLM(
-    model=MODEL_PATH,
-    tensor_parallel_size=TP_SIZE,
-    enable_expert_parallel=True,
-    max_model_len=MAX_MODEL_LEN,
-    max_num_batched_tokens=MAX_MODEL_LEN,
-    gpu_memory_utilization=0.95,
-    enforce_eager=True,
-)
-
-sampling_params = SamplingParams(
-    temperature=0.02,
-    max_tokens=32,
-)
-
-outputs = llm.generate(prompts, sampling_params)
-outputs = llm.generate(prompts, sampling_params)
-for prompt, out in zip(prompts, outputs):
-    print("prompt  :", prompt)
-    print("response:", repr(out.outputs[0].text))
-PY
-
-# 3) Run nano on the same short prompts. This should print "NPU SFA input
-# summary" before the current binary-bin failure.
-cat >/tmp/nanovllm_sfa_probe_71.py <<'PY'
-import os
-from time import perf_counter
-
-from nanovllm import LLM, SamplingParams
+echo "REPO=$REPO"
+echo "MODEL=$MODEL"
+echo "TP_SIZE=$TP_SIZE"
+echo "DEVICES=$DEVICES"
+echo "LOG_DIR=$LOG_DIR"
 
 
-MODEL_PATH = "/home/models/Deepseek-V3.2-Pruned-95B-BF/"
-TP_SIZE = 4
+# 0. Basic syntax check. This catches bad sync/copy before spending NPU time.
+python -m py_compile \
+  nanovllm/models/deepseek_v32.py \
+  scripts/probe_deepseek_v32_sfa_attention.py \
+  2>&1 | tee "$LOG_DIR/00_py_compile.log"
 
 
-def main():
-    max_model_len = int(os.environ.get("PROBE_MAX_MODEL_LEN", "4096"))
-    prompts = [
-        "The capital city of China is",
-        "calculate 2 + 3 * 4 = ",
-        "List all prime numbers < 100: 2, 3, ",
-        "1, 3, 7, 15, 31, ",
-        "Large Language Model is a type of AI model that",
-        "If Tom is shorter than Jerry, Spike is taller than Tom, then the shortest person is",
-        "If a train leaves at 2 PM and takes 3 hours to arrive, it will arrive at",
-    ]
-
-    llm = LLM(
-        model=MODEL_PATH,
-        enforce_eager=True,
-        tensor_parallel_size=TP_SIZE,
-        enable_expert_parallel=True,
-        max_model_len=max_model_len,
-        max_num_batched_tokens=max_model_len,
-        max_num_seqs=128,
-        kvcache_block_size=128,
-        skip_warmup=1,
-        trust_remote_code=True,
-        gpu_memory_utilization=0.95,
-    )
-
-    start = perf_counter()
-    outputs = llm.generate(
-        prompts,
-        SamplingParams(temperature=0.02, max_tokens=32),
-        use_tqdm=False,
-    )
-    elapsed = max(perf_counter() - start, 1e-9)
-    total_output_tokens = sum(len(output["token_ids"]) for output in outputs)
-    print(
-        "summary :",
-        f"run 1/1, elapsed={elapsed:.2f}s, output={total_output_tokens / elapsed:.2f} toks/s",
-    )
-    for prompt, output in zip(prompts, outputs):
-        print("prompt  :", prompt)
-        print("response:", repr(output["text"]))
+# 1. Standalone SFA prefill probe with random tensors.
+# This does not load the full model. It only checks torch_npu/vllm-ascend/vllm_ascend_C
+# and the SFA input layout that DeepSeekV32DSAAttention will use.
+ASCEND_RT_VISIBLE_DEVICES=$DEVICES \
+python scripts/probe_deepseek_v32_sfa_attention.py \
+  --phase prefill \
+  --seq-len 2048 \
+  --batch-size 1 \
+  --device npu:0 \
+  2>&1 | tee "$LOG_DIR/01_probe_prefill_2k.log"
 
 
-if __name__ == "__main__":
-    main()
-PY
+# 2. Standalone SFA decode probe with random tensors.
+ASCEND_RT_VISIBLE_DEVICES=$DEVICES \
+python scripts/probe_deepseek_v32_sfa_attention.py \
+  --phase decode \
+  --seq-len 2048 \
+  --batch-size 4 \
+  --device npu:0 \
+  2>&1 | tee "$LOG_DIR/02_probe_decode_2k_bs4.log"
 
-NANOVLLM_ENABLE_NPU_SFA=1 \
-NANOVLLM_USE_TQDM=0 \
-NANOVLLM_PERF_SUMMARY=1 \
-NANOVLLM_PROFILE_DECODE=1 \
-NANOVLLM_PROFILE_DECODE_EVERY=1 \
-python /tmp/nanovllm_sfa_probe_71.py 2>&1 | tee logs/71_nano_sfa_inputs.log
 
-# 4) Extract only the lines I need for the next patch.
-grep -E "VLLM_SFA_PROBE|NPU SFA input summary|NPU SFA decode fast path|failed once|binary bin|AclNN_|Decode profile avg|Perf summary|summary :|Processed prompts" \
-    logs/70_vllm_sfa_inputs.log logs/71_nano_sfa_inputs.log
+# 3. Full-model short prefill correctness check.
+# Keep this short because NANOVLLM_COMPARE_NPU_SFA_PREFILL=1 also runs the PyTorch MLA reference.
+# Expected: no exception, and log lines containing "NPU SFA compare prefill".
+ASCEND_RT_VISIBLE_DEVICES=$DEVICES \
+NANOVLLM_MODEL="$MODEL" \
+NANOVLLM_TP_SIZE=$TP_SIZE \
+NANOVLLM_ENABLE_NPU_SFA_PREFILL=1 \
+NANOVLLM_COMPARE_NPU_SFA_PREFILL=1 \
+NANOVLLM_NPU_SFA_SPARSE_COUNT=256 \
+NANOVLLM_LOG_NPU_SFA_INPUTS=1 \
+NANOVLLM_NPU_SFA_STRICT=1 \
+NANOVLLM_MAX_MODEL_LEN=256 \
+NANOVLLM_MAX_BATCHED_TOKENS=512 \
+NANOVLLM_MAX_NUM_SEQS=2 \
+NANOVLLM_MAX_GEN_TOKENS=1 \
+NANOVLLM_SKIP_WARMUP=1 \
+python example/example.py \
+  2>&1 | tee "$LOG_DIR/03_short_prefill_compare.log"
+
+
+# 4. Long prefill main path: SFA prefill + SFA decode, generate only 1 token.
+# This is the run we need before debugging decode indexer/SFA behavior.
+# Do not enable compare here; the dense PyTorch reference is exactly what makes long prefill painful.
+ASCEND_RT_VISIBLE_DEVICES=$DEVICES \
+NANOVLLM_MODEL="$MODEL" \
+NANOVLLM_TP_SIZE=$TP_SIZE \
+NANOVLLM_ENABLE_NPU_SFA_PREFILL=1 \
+NANOVLLM_ENABLE_NPU_SFA_DECODE=1 \
+NANOVLLM_NPU_SFA_SPARSE_COUNT=2048 \
+NANOVLLM_LOG_NPU_SFA_INPUTS=1 \
+NANOVLLM_DUMP_NPU_SFA_INPUTS="$LOG_DIR/dumps" \
+NANOVLLM_DUMP_NPU_SFA_MAX_CALLS=1 \
+NANOVLLM_NPU_SFA_STRICT=1 \
+NANOVLLM_PROFILE_LAYER_IDS=0 \
+NANOVLLM_MAX_MODEL_LEN=2048 \
+NANOVLLM_MAX_BATCHED_TOKENS=2048 \
+NANOVLLM_MAX_NUM_SEQS=1 \
+NANOVLLM_MAX_GEN_TOKENS=1 \
+NANOVLLM_SKIP_WARMUP=1 \
+python example/example.py \
+  2>&1 | tee "$LOG_DIR/04_long_prefill_sfa_decode1.log"
+
+
+# 5. Optional: replay one dumped SFA call directly through the standalone probe.
+# This is useful if the full-model run fails inside SFA and we need a small reproducer.
+DUMP_FILE=$(find "$LOG_DIR/dumps" -name 'sfa_rank*_layer*_seq*.pt' | head -n 1 || true)
+if [ -n "$DUMP_FILE" ]; then
+  echo "Replaying dump: $DUMP_FILE"
+  ASCEND_RT_VISIBLE_DEVICES=$DEVICES \
+  python scripts/probe_deepseek_v32_sfa_attention.py \
+    --replay-dump "$DUMP_FILE" \
+    --device npu:0 \
+    2>&1 | tee "$LOG_DIR/05_replay_dump.log"
+else
+  echo "No SFA dump file found under $LOG_DIR/dumps" | tee "$LOG_DIR/05_replay_dump.log"
+fi
+
+
+# 6. Collect high-signal lines to paste back.
+grep -E \
+  "PROBE |NPU SFA input summary|NPU SFA compare|NPU SFA .*failed|Dumped NPU SFA|Traceback|RuntimeError|ERROR|Prompt:|text:" \
+  "$LOG_DIR"/*.log \
+  2>&1 | tee "$LOG_DIR/99_key_lines.log"
+
+echo "Done. Please paste back:"
+echo "  $LOG_DIR/01_probe_prefill_2k.log"
+echo "  $LOG_DIR/02_probe_decode_2k_bs4.log"
+echo "  $LOG_DIR/03_short_prefill_compare.log"
+echo "  $LOG_DIR/04_long_prefill_sfa_decode1.log"
+echo "  $LOG_DIR/05_replay_dump.log"
+echo "  $LOG_DIR/99_key_lines.log"
