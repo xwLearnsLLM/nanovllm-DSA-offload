@@ -321,6 +321,8 @@ class DeepseekScalingRotaryEmbedding(nn.Module):
         query: torch.Tensor,
         key: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        query_dtype = query.dtype
+        key_dtype = key.dtype
         positions = positions.to(torch.long)
         cos = self.cos_cache.index_select(0, positions)
         sin = self.sin_cache.index_select(0, positions)
@@ -334,7 +336,7 @@ class DeepseekScalingRotaryEmbedding(nn.Module):
             rotate_fn = _rotate_half_interleaved
         query = query * cos + rotate_fn(query.float()).to(query.dtype) * sin
         key = key * cos + rotate_fn(key.float()).to(key.dtype) * sin
-        return query, key
+        return query.to(query_dtype), key.to(key_dtype)
 
 
 def _resolve_export_mode(config) -> tuple[bool, bool]:
@@ -857,7 +859,7 @@ class DeepseekV32Indexer(nn.Module):
 
         weights = self.weights_proj(hidden_states.float())
         weights = weights * self.softmax_scale * (self.n_head ** -0.5)
-        return q, k, weights
+        return q, k, weights.to(hidden_states.dtype)
 
 
 class DeepseekV32DSAAttention(nn.Module):
