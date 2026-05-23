@@ -1,7 +1,6 @@
 import argparse
 import glob
 import os
-from pathlib import Path
 from time import perf_counter
 
 import torch
@@ -149,7 +148,7 @@ def run_sfa(payload: dict, tensors: dict[str, torch.Tensor]) -> torch.Tensor:
     return out
 
 
-def run_dense_mla(
+def run_dense_mla_materialized(
     payload: dict,
     tensors: dict[str, torch.Tensor],
     mask_size: int,
@@ -181,7 +180,7 @@ def run_dense_mla(
 
     attn_mask = make_causal_mask(mask_size, device)
     print(
-        "COMPARE dense_inputs "
+        "COMPARE dense_materialized_inputs "
         f"{desc('query', query)} {desc('key', key)} {desc('value', value)} "
         f"{desc('query_rope', query_rope)} {desc('key_rope', key_rope)} "
         f"{desc('attn_mask', attn_mask)} q_lens={q_lens} kv_lens={kv_lens}"
@@ -210,7 +209,68 @@ def run_dense_mla(
     )
     torch.npu.synchronize()
     print(
-        f"COMPARE after_dense_mla elapsed={perf_counter() - start:.6f}s "
+        f"COMPARE after_dense_mla_materialized elapsed={perf_counter() - start:.6f}s "
+        f"{desc('mla_out', out)} {desc('mla_lse', lse)}"
+    )
+    return out
+
+
+def run_dense_mla_paged(
+    payload: dict,
+    tensors: dict[str, torch.Tensor],
+    mask_size: int,
+    kv_lens_mode: str,
+) -> torch.Tensor:
+    query = tensors["query"]
+    query_rope = tensors["query_rope"]
+    key_cache = tensors["key"]
+    value_cache = tensors["value"]
+    key_rope_cache = tensors["key_rope"]
+    block_table = tensors["block_table"]
+    device = query.device
+
+    q_ends = [int(x) for x in tensors["actual_seq_lengths_query"].detach().cpu().tolist()]
+    q_lens = cumulative_to_lens(q_ends)
+    kv_lens = [int(x) for x in tensors["actual_seq_lengths_kv"].detach().cpu().tolist()]
+    kv_arg = cumulative(kv_lens) if kv_lens_mode == "cumulative" else kv_lens
+    attn_mask = make_causal_mask(mask_size, device)
+    block_size = int(key_cache.shape[1])
+    num_heads = int(query.shape[1])
+    num_kv_heads = int(key_cache.shape[2])
+
+    print(
+        "COMPARE dense_paged_inputs "
+        f"{desc('query', query)} {desc('key_cache', key_cache)} "
+        f"{desc('value_cache', value_cache)} {desc('query_rope', query_rope)} "
+        f"{desc('key_rope_cache', key_rope_cache)} {desc('block_table', block_table)} "
+        f"{desc('attn_mask', attn_mask)} block_size={block_size} "
+        f"q_lens={q_lens} kv_lens={kv_lens} kv_lens_mode={kv_lens_mode} kv_arg={kv_arg}"
+    )
+
+    start = perf_counter()
+    out, lse = torch_npu.npu_fused_infer_attention_score(
+        query,
+        key_cache,
+        value_cache,
+        query_rope=query_rope,
+        key_rope=key_rope_cache,
+        num_heads=num_heads,
+        num_key_value_heads=num_kv_heads,
+        input_layout="TND",
+        atten_mask=attn_mask,
+        sparse_mode=3,
+        scale=float(payload["scale_value"]),
+        antiquant_mode=0,
+        antiquant_scale=None,
+        block_table=block_table,
+        block_size=block_size,
+        softmax_lse_flag=True,
+        actual_seq_lengths=q_ends,
+        actual_seq_lengths_kv=kv_arg,
+    )
+    torch.npu.synchronize()
+    print(
+        f"COMPARE after_dense_mla_paged elapsed={perf_counter() - start:.6f}s "
         f"{desc('mla_out', out)} {desc('mla_lse', lse)}"
     )
     return out
@@ -243,7 +303,17 @@ def main() -> None:
     parser.add_argument("--dump-glob")
     parser.add_argument("--device", default="npu:0")
     parser.add_argument("--mask-size", type=int, default=2048)
-    parser.add_argument("--no-expand-kv-to-heads", action="store_true")
+    parser.add_argument(
+        "--mla-mode",
+        choices=("paged", "materialized"),
+        default="paged",
+    )
+    parser.add_argument(
+        "--kv-lens-mode",
+        choices=("seq", "cumulative"),
+        default="seq",
+    )
+    parser.add_argument("--expand-materialized-kv-to-heads", action="store_true")
     args = parser.parse_args()
 
     device_index = int(str(args.device).split(":")[-1])
@@ -273,18 +343,27 @@ def main() -> None:
         "COMPARE metadata "
         f"path={dump_path} rank={payload.get('rank')} layer={payload.get('layer_id')} "
         f"phase={payload.get('phase')} scale={payload.get('scale_value')} "
-        f"sparse_count={payload.get('sparse_count')} mask_size={args.mask_size}"
+        f"sparse_count={payload.get('sparse_count')} mask_size={args.mask_size} "
+        f"mla_mode={args.mla_mode}"
     )
     for name, tensor in tensors.items():
         print(f"COMPARE tensor {desc(name, tensor)}")
 
     sfa_out = run_sfa(payload, tensors)
-    mla_out = run_dense_mla(
-        payload,
-        tensors,
-        mask_size=args.mask_size,
-        expand_kv_to_heads=not args.no_expand_kv_to_heads,
-    )
+    if args.mla_mode == "paged":
+        mla_out = run_dense_mla_paged(
+            payload,
+            tensors,
+            mask_size=args.mask_size,
+            kv_lens_mode=args.kv_lens_mode,
+        )
+    else:
+        mla_out = run_dense_mla_materialized(
+            payload,
+            tensors,
+            mask_size=args.mask_size,
+            expand_kv_to_heads=args.expand_materialized_kv_to_heads,
+        )
     compare_outputs(sfa_out, mla_out)
 
 
