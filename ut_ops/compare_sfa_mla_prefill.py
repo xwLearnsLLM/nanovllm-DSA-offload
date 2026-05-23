@@ -11,6 +11,10 @@ import torch_npu
 os.environ.setdefault("VLLM_ASCEND_ENABLE_NZ", "0")
 
 
+def log(message: str) -> None:
+    print(message, flush=True)
+
+
 def _prepend_env_path(name: str, path: str) -> None:
     current = os.environ.get(name, "")
     parts = [part for part in current.split(os.pathsep) if part]
@@ -19,7 +23,10 @@ def _prepend_env_path(name: str, path: str) -> None:
 
 
 def register_ascend_ops() -> None:
+    log("COMPARE stage=register_import_vllm")
     import vllm  # type: ignore  # noqa: F401
+
+    log("COMPARE stage=register_import_vllm_ascend")
     import vllm_ascend  # type: ignore
 
     package_dir = os.path.dirname(os.path.realpath(vllm_ascend.__file__))
@@ -31,13 +38,21 @@ def register_ascend_ops() -> None:
     )
     if os.path.exists(custom_opp_path):
         _prepend_env_path("ASCEND_CUSTOM_OPP_PATH", custom_opp_path)
+    log(
+        "COMPARE stage=register_import_custom_op "
+        f"custom_opp_path={custom_opp_path} "
+        f"ASCEND_CUSTOM_OPP_PATH={os.environ.get('ASCEND_CUSTOM_OPP_PATH', '')}"
+    )
     from vllm_ascend import vllm_ascend_C  # type: ignore  # noqa: F401
+
+    log("COMPARE stage=register_import_layer_shard_linear")
     from vllm_ascend.ops.layer_shard_linear import (  # type: ignore  # noqa: F401
         is_hidden_layer,
         post_process_after_loading_for_shard_weight_series,
         reach_layer_for_shard_weight_series,
         register_all_layers_to_shard_weight_series,
     )
+    log("COMPARE stage=register_done")
 
 
 def desc(name: str, tensor: torch.Tensor) -> str:
@@ -144,7 +159,7 @@ def run_sfa(payload: dict, tensors: dict[str, torch.Tensor]) -> torch.Tensor:
     if isinstance(out, tuple):
         out = out[0]
     torch.npu.synchronize()
-    print(f"COMPARE after_sfa elapsed={perf_counter() - start:.6f}s {desc('sfa_out', out)}")
+    log(f"COMPARE after_sfa elapsed={perf_counter() - start:.6f}s {desc('sfa_out', out)}")
     return out
 
 
@@ -179,7 +194,7 @@ def run_dense_mla_materialized(
         num_kv_heads = num_heads
 
     attn_mask = make_causal_mask(mask_size, device)
-    print(
+    log(
         "COMPARE dense_materialized_inputs "
         f"{desc('query', query)} {desc('key', key)} {desc('value', value)} "
         f"{desc('query_rope', query_rope)} {desc('key_rope', key_rope)} "
@@ -208,7 +223,7 @@ def run_dense_mla_materialized(
         actual_seq_lengths_kv=kv_ends,
     )
     torch.npu.synchronize()
-    print(
+    log(
         f"COMPARE after_dense_mla_materialized elapsed={perf_counter() - start:.6f}s "
         f"{desc('mla_out', out)} {desc('mla_lse', lse)}"
     )
@@ -238,7 +253,7 @@ def run_dense_mla_paged(
     num_heads = int(query.shape[1])
     num_kv_heads = int(key_cache.shape[1])
 
-    print(
+    log(
         "COMPARE dense_paged_inputs "
         f"{desc('query', query)} {desc('key_cache', key_cache)} "
         f"{desc('value_cache', value_cache)} {desc('query_rope', query_rope)} "
@@ -270,7 +285,7 @@ def run_dense_mla_paged(
         actual_seq_lengths_kv=kv_arg,
     )
     torch.npu.synchronize()
-    print(
+    log(
         f"COMPARE after_dense_mla_paged elapsed={perf_counter() - start:.6f}s "
         f"{desc('mla_out', out)} {desc('mla_lse', lse)}"
     )
@@ -286,7 +301,7 @@ def compare_outputs(sfa_out: torch.Tensor, mla_out: torch.Tensor) -> None:
     mla_flat = mla.flatten()
     rel_l2 = torch.linalg.vector_norm(diff.flatten()) / torch.linalg.vector_norm(mla_flat).clamp_min(1e-6)
     cosine = F.cosine_similarity(sfa_flat, mla_flat, dim=0)
-    print(
+    log(
         "COMPARE diff "
         f"max_abs={abs_diff.max().item():.6g} "
         f"mean_abs={abs_diff.mean().item():.6g} "
@@ -294,8 +309,8 @@ def compare_outputs(sfa_out: torch.Tensor, mla_out: torch.Tensor) -> None:
         f"rel_l2={rel_l2.item():.6g} "
         f"cosine={cosine.item():.8f}"
     )
-    print(f"COMPARE {stats('sfa_out', sfa_out)}")
-    print(f"COMPARE {stats('mla_out', mla_out)}")
+    log(f"COMPARE {stats('sfa_out', sfa_out)}")
+    log(f"COMPARE {stats('mla_out', mla_out)}")
 
 
 def main() -> None:
@@ -315,19 +330,28 @@ def main() -> None:
         default="seq",
     )
     parser.add_argument("--expand-materialized-kv-to-heads", action="store_true")
+    parser.add_argument("--metadata-only", action="store_true")
     args = parser.parse_args()
 
+    log("COMPARE stage=start")
     device_index = int(str(args.device).split(":")[-1])
     torch.npu.set_device(device_index)
     torch.npu.config.allow_internal_format = True
+    log(f"COMPARE stage=set_device device={args.device}")
     register_ascend_ops()
 
     dump_path = pick_dump(args.dump, args.dump_glob)
+    log(f"COMPARE stage=load_dump path={dump_path}")
     payload = torch.load(dump_path, map_location="cpu")
+    log(
+        "COMPARE stage=loaded_dump "
+        f"keys={sorted(str(key) for key in payload.keys())}"
+    )
     if payload.get("phase") != "prefill":
         raise ValueError(f"only prefill dumps are supported, got phase={payload.get('phase')!r}")
 
     device = torch.device(args.device)
+    log("COMPARE stage=move_tensors_to_device")
     tensors = {
         "query": to_device(payload, "query", device),
         "key": to_device(payload, "key", device),
@@ -339,8 +363,9 @@ def main() -> None:
         "query_rope": to_device(payload, "query_rope", device),
         "key_rope": to_device(payload, "key_rope", device),
     }
+    log("COMPARE stage=tensors_ready")
 
-    print(
+    log(
         "COMPARE metadata "
         f"path={dump_path} rank={payload.get('rank')} layer={payload.get('layer_id')} "
         f"phase={payload.get('phase')} scale={payload.get('scale_value')} "
@@ -348,10 +373,15 @@ def main() -> None:
         f"mla_mode={args.mla_mode}"
     )
     for name, tensor in tensors.items():
-        print(f"COMPARE tensor {desc(name, tensor)}")
+        log(f"COMPARE tensor {desc(name, tensor)}")
+    if args.metadata_only:
+        log("COMPARE stage=metadata_only_done")
+        return
 
+    log("COMPARE stage=run_sfa")
     sfa_out = run_sfa(payload, tensors)
     if args.mla_mode == "paged":
+        log("COMPARE stage=run_dense_mla_paged")
         mla_out = run_dense_mla_paged(
             payload,
             tensors,
@@ -359,13 +389,16 @@ def main() -> None:
             kv_lens_mode=args.kv_lens_mode,
         )
     else:
+        log("COMPARE stage=run_dense_mla_materialized")
         mla_out = run_dense_mla_materialized(
             payload,
             tensors,
             mask_size=args.mask_size,
             expand_kv_to_heads=args.expand_materialized_kv_to_heads,
         )
+    log("COMPARE stage=compare_outputs")
     compare_outputs(sfa_out, mla_out)
+    log("COMPARE stage=done")
 
 
 if __name__ == "__main__":

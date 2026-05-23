@@ -104,18 +104,27 @@ mkdir -p logs/mla_compare/dump_1024
 PYTORCH_NPU_ALLOC_CONF=expandable_segments:True ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=4 NANOVLLM_ENABLE_NPU_SFA_PREFILL=1 NANOVLLM_NPU_SFA_SPARSE_COUNT=2048 NANOVLLM_LOG_NPU_SFA_INPUTS=1 NANOVLLM_LOG_NPU_SFA_TIMING=1 NANOVLLM_DUMP_NPU_SFA_INPUTS=logs/mla_compare/dump_1024 NANOVLLM_DUMP_NPU_SFA_MAX_CALLS=1 NANOVLLM_NPU_SFA_STRICT=1 NANOVLLM_PROFILE_LAYER_IDS=0 NANOVLLM_LONG_PROMPT_TOKENS=1024 NANOVLLM_MAX_MODEL_LEN=1152 NANOVLLM_MAX_BATCHED_TOKENS=1152 NANOVLLM_MAX_NUM_SEQS=1 NANOVLLM_MAX_GEN_TOKENS=1 NANOVLLM_SKIP_WARMUP=1 python example/example.py 2>&1 | tee logs/sfa_manual/17_make_dump_prefill_1024.log
 
 
-# 18. Compare SFA replay vs dense paged absorb-MLA replay for the <2048 dump.
-ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ../ut_ops/compare_sfa_mla_prefill.py --device npu:0 --dump logs/mla_compare/dump_1024/sfa_rank0_layer000_seq000_prefill.pt --mask-size 2048 2>&1 | tee logs/sfa_manual/18_compare_sfa_mla_prefill_1024.log
+# 18. Inspect the <2048 dump first.
+# This should print COMPARE stage lines through metadata_only_done.
+PYTHONUNBUFFERED=1 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ../ut_ops/compare_sfa_mla_prefill.py --device npu:0 --dump logs/mla_compare/dump_1024/sfa_rank0_layer000_seq000_prefill.pt --mask-size 2048 --metadata-only 2>&1 | tee logs/sfa_manual/18_inspect_dump_1024.log; echo "18_python_exit=${PIPESTATUS[0]}"
 
 
-# 19. Create one Nano prefill SFA dump above 2048 tokens.
+# 19. Compare SFA replay vs dense paged absorb-MLA replay for the <2048 dump.
+PYTHONUNBUFFERED=1 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ../ut_ops/compare_sfa_mla_prefill.py --device npu:0 --dump logs/mla_compare/dump_1024/sfa_rank0_layer000_seq000_prefill.pt --mask-size 2048 2>&1 | tee logs/sfa_manual/19_compare_sfa_mla_prefill_1024.log; echo "19_python_exit=${PIPESTATUS[0]}"
+
+
+# 20. Create one Nano prefill SFA dump above 2048 tokens.
 # This is the lossy case: SFA uses top 2048 out of 3072, dense MLA uses all 3072.
 mkdir -p logs/mla_compare/dump_3072
-PYTORCH_NPU_ALLOC_CONF=expandable_segments:True ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=4 NANOVLLM_ENABLE_NPU_SFA_PREFILL=1 NANOVLLM_NPU_SFA_SPARSE_COUNT=2048 NANOVLLM_LOG_NPU_SFA_INPUTS=1 NANOVLLM_LOG_NPU_SFA_TIMING=1 NANOVLLM_DUMP_NPU_SFA_INPUTS=logs/mla_compare/dump_3072 NANOVLLM_DUMP_NPU_SFA_MAX_CALLS=1 NANOVLLM_NPU_SFA_STRICT=1 NANOVLLM_PROFILE_LAYER_IDS=0 NANOVLLM_LONG_PROMPT_TOKENS=3072 NANOVLLM_MAX_MODEL_LEN=3200 NANOVLLM_MAX_BATCHED_TOKENS=3200 NANOVLLM_MAX_NUM_SEQS=1 NANOVLLM_MAX_GEN_TOKENS=1 NANOVLLM_SKIP_WARMUP=1 python example/example.py 2>&1 | tee logs/sfa_manual/19_make_dump_prefill_3072.log
+PYTORCH_NPU_ALLOC_CONF=expandable_segments:True ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=4 NANOVLLM_ENABLE_NPU_SFA_PREFILL=1 NANOVLLM_NPU_SFA_SPARSE_COUNT=2048 NANOVLLM_LOG_NPU_SFA_INPUTS=1 NANOVLLM_LOG_NPU_SFA_TIMING=1 NANOVLLM_DUMP_NPU_SFA_INPUTS=logs/mla_compare/dump_3072 NANOVLLM_DUMP_NPU_SFA_MAX_CALLS=1 NANOVLLM_NPU_SFA_STRICT=1 NANOVLLM_PROFILE_LAYER_IDS=0 NANOVLLM_LONG_PROMPT_TOKENS=3072 NANOVLLM_MAX_MODEL_LEN=3200 NANOVLLM_MAX_BATCHED_TOKENS=3200 NANOVLLM_MAX_NUM_SEQS=1 NANOVLLM_MAX_GEN_TOKENS=1 NANOVLLM_SKIP_WARMUP=1 python example/example.py 2>&1 | tee logs/sfa_manual/20_make_dump_prefill_3072.log
 
 
-# 20. Compare SFA replay vs dense paged absorb-MLA replay for the >2048 dump.
-ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ../ut_ops/compare_sfa_mla_prefill.py --device npu:0 --dump logs/mla_compare/dump_3072/sfa_rank0_layer000_seq000_prefill.pt --mask-size 2048 2>&1 | tee logs/sfa_manual/20_compare_sfa_mla_prefill_3072.log
+# 21. Inspect the >2048 dump first.
+PYTHONUNBUFFERED=1 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ../ut_ops/compare_sfa_mla_prefill.py --device npu:0 --dump logs/mla_compare/dump_3072/sfa_rank0_layer000_seq000_prefill.pt --mask-size 2048 --metadata-only 2>&1 | tee logs/sfa_manual/21_inspect_dump_3072.log; echo "21_python_exit=${PIPESTATUS[0]}"
+
+
+# 22. Compare SFA replay vs dense paged absorb-MLA replay for the >2048 dump.
+PYTHONUNBUFFERED=1 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ../ut_ops/compare_sfa_mla_prefill.py --device npu:0 --dump logs/mla_compare/dump_3072/sfa_rank0_layer000_seq000_prefill.pt --mask-size 2048 2>&1 | tee logs/sfa_manual/22_compare_sfa_mla_prefill_3072.log; echo "22_python_exit=${PIPESTATUS[0]}"
 
 
 # 99. Extract key lines.
@@ -140,7 +149,9 @@ cat logs/sfa_manual/14_dense_mla_prefill_2176.log
 cat logs/sfa_manual/15_paged_absorb_mla_prefill_2176_mask2048.log
 cat logs/sfa_manual/16_paged_absorb_mla_prefill_3072_mask2048.log
 cat logs/sfa_manual/17_make_dump_prefill_1024.log
-cat logs/sfa_manual/18_compare_sfa_mla_prefill_1024.log
-cat logs/sfa_manual/19_make_dump_prefill_3072.log
-cat logs/sfa_manual/20_compare_sfa_mla_prefill_3072.log
+cat logs/sfa_manual/18_inspect_dump_1024.log
+cat logs/sfa_manual/19_compare_sfa_mla_prefill_1024.log
+cat logs/sfa_manual/20_make_dump_prefill_3072.log
+cat logs/sfa_manual/21_inspect_dump_3072.log
+cat logs/sfa_manual/22_compare_sfa_mla_prefill_3072.log
 cat logs/sfa_manual/99_key_lines.log
