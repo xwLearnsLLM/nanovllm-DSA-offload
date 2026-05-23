@@ -28,6 +28,7 @@ from nanovllm.utils.logger import init_logger
 logger = init_logger(__name__)
 BMM_TRANS_MAX_SUPPORTED_TOKENS = 1024
 PREFILL_MLA_CHUNK_SIZE = 256
+_NPU_MLA_ATTENTION_MASK_CACHE: dict[tuple[str, int], torch.Tensor] = {}
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -90,6 +91,18 @@ def _profile_layer_selected(layer_idx: int, num_layers: int) -> bool:
         if selected == layer_idx:
             return True
     return False
+
+
+def _get_npu_mla_attention_mask(device: torch.device, mask_size: int) -> torch.Tensor:
+    key = (str(device), int(mask_size))
+    mask = _NPU_MLA_ATTENTION_MASK_CACHE.get(key)
+    if mask is None or mask.device != device:
+        mask = torch.triu(
+            torch.ones(mask_size, mask_size, dtype=torch.int8, device=device),
+            diagonal=1,
+        ).contiguous()
+        _NPU_MLA_ATTENTION_MASK_CACHE[key] = mask
+    return mask
 
 
 def yarn_get_mscale(scale: float = 1.0, mscale: float = 1.0) -> float:
@@ -1435,11 +1448,9 @@ class DeepseekV32DSAAttention(nn.Module):
         weights: torch.Tensor,
     ) -> torch.Tensor:
         if self.use_npu_sfa_prefill:
-            sfa_output = self._prefill_forward_sfa(
+            mla_output = self._prefill_forward_npu_mla(
                 ql_nope,
                 q_pe,
-                q_index,
-                weights,
             )
             if self.compare_npu_sfa_prefill:
                 reference = self._prefill_forward_mla(
@@ -1448,31 +1459,75 @@ class DeepseekV32DSAAttention(nn.Module):
                     q_index,
                     weights,
                 )
-                self._log_npu_sfa_compare("prefill", sfa_output, reference)
-            return sfa_output
+                self._log_npu_sfa_compare("prefill", mla_output, reference)
+            return mla_output
         return self._prefill_forward_mla(ql_nope, q_pe, q_index, weights)
 
-    def _prefill_forward_sfa(
+    def _prefill_forward_npu_mla(
         self,
         ql_nope: torch.Tensor,
         q_pe: torch.Tensor,
-        q_index: torch.Tensor,
-        weights: torch.Tensor,
     ) -> torch.Tensor:
+        import torch_npu  # type: ignore
+
         context = get_context()
         cu_seqlens = context.cu_seqlens_q
         actual_seq_lengths_query = cu_seqlens[1:]
         actual_seq_lengths_key = cu_seqlens[1:] - cu_seqlens[:-1]
-        return self._npu_sfa_forward(
+        log_timing = self.log_npu_sfa_timing
+        if log_timing:
+            _profile_sync(ql_nope.device)
+            start = perf_counter()
+        ckv_cache = self.ckv_cache.transpose(1, 2).contiguous()
+        kpe_cache = self.kpe_cache.transpose(1, 2).contiguous()
+        latent, lse = torch_npu.npu_fused_infer_attention_score(
             ql_nope,
-            q_pe,
-            q_index,
-            weights,
-            actual_seq_lengths_query,
-            actual_seq_lengths_key,
-            context.block_tables,
-            "prefill",
+            ckv_cache,
+            ckv_cache,
+            query_rope=q_pe,
+            key_rope=kpe_cache,
+            num_heads=self.num_local_heads,
+            num_key_value_heads=1,
+            input_layout="TND",
+            atten_mask=_get_npu_mla_attention_mask(ql_nope.device, 2048),
+            sparse_mode=3,
+            scale=float(self.scale),
+            antiquant_mode=0,
+            antiquant_scale=None,
+            block_table=context.block_tables,
+            block_size=self.block_size,
+            softmax_lse_flag=True,
+            actual_seq_lengths=actual_seq_lengths_query.detach().cpu().tolist(),
+            actual_seq_lengths_kv=actual_seq_lengths_key.detach().cpu().tolist(),
         )
+        del lse
+        if log_timing:
+            _profile_sync(ql_nope.device)
+            logger.info(
+                "NPU MLA timing: rank=%d phase=prefill layer=%d op=mla "
+                "elapsed=%.6fs %s actual_seq_lengths_query=%s "
+                "actual_seq_lengths_key=%s block_table_shape=%s",
+                _rank_id(),
+                self.layer_id,
+                perf_counter() - start,
+                self._tensor_range_desc("latent", latent),
+                actual_seq_lengths_query.detach().cpu().tolist(),
+                actual_seq_lengths_key.detach().cpu().tolist(),
+                tuple(context.block_tables.shape),
+            )
+            start = perf_counter()
+        output = self._v_up_proj(latent)
+        if log_timing:
+            _profile_sync(output.device)
+            logger.info(
+                "NPU MLA timing: rank=%d phase=prefill layer=%d op=v_up "
+                "elapsed=%.6fs %s",
+                _rank_id(),
+                self.layer_id,
+                perf_counter() - start,
+                self._tensor_range_desc("output", output),
+            )
+        return output
 
     def _prefill_forward_mla(
         self,
