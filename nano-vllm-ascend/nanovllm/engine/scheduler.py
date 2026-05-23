@@ -1,16 +1,8 @@
 from collections import deque
-import os
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence, SequenceStatus, FinishReason
 from nanovllm.engine.block_manager import BlockManager
-
-
-def _env_flag(name: str, default: bool = False) -> bool:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return value.lower() in ("1", "true", "yes", "on")
 
 
 class Scheduler:
@@ -19,18 +11,15 @@ class Scheduler:
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
-        # Keep the last physical block for padded dummy slots. When NPU
-        # indexer/SFA is enabled, also keep block 0 as the null block to match
-        # vLLM's paged-cache convention used by the Ascend kernels.
+        # DeepSeek-V3.2 Ascend kernels use vLLM's paged-cache convention where
+        # block 0 is a null block; the last block is still reserved for padding.
         non_cache_token_ids: list[int] = []
         self.block_manager = BlockManager(
             config.num_kvcache_blocks - 1,
             config.kvcache_block_size,
             non_cache_token_ids=non_cache_token_ids,
             reserve_null_block=(
-                _env_flag("NANOVLLM_ENABLE_NPU_INDEXER", False)
-                or _env_flag("NANOVLLM_ENABLE_NPU_SFA_PREFILL", False)
-                or _env_flag("NANOVLLM_ENABLE_NPU_SFA_DECODE", False)
+                getattr(config.hf_config, "model_type", None) == "deepseek_v32"
             ),
         )
         self.waiting: deque[Sequence] = deque()

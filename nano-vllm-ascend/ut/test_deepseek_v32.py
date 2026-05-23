@@ -67,15 +67,10 @@ class TestDeepseekV32Helpers(unittest.TestCase):
             SELECTION_MANIFEST_SOURCE,
         )
 
-    def test_npu_moe_gating_is_opt_in(self):
-        self.assertIn(
-            'NANOVLLM_ENABLE_NPU_MOE_GATING", "0"',
-            SOURCE,
-        )
-        self.assertIn(
-            "if not self.use_npu_gating:",
-            SOURCE,
-        )
+    def test_npu_moe_gating_is_default_path(self):
+        removed_switch = "NANOVLLM_ENABLE_NPU_" + "MOE_GATING"
+        self.assertNotIn(removed_switch, SOURCE)
+        self.assertIn("torch.ops._C_ascend.moe_gating_top_k", SOURCE)
 
 
 if __name__ == "__main__":

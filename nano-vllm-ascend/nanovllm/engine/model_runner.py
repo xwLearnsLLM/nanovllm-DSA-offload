@@ -29,14 +29,6 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return value.lower() in ("1", "true", "yes", "on")
 
 
-def _use_npu_sfa_or_indexer() -> bool:
-    return (
-        _env_flag("NANOVLLM_ENABLE_NPU_INDEXER", False)
-        or _env_flag("NANOVLLM_ENABLE_NPU_SFA_PREFILL", False)
-        or _env_flag("NANOVLLM_ENABLE_NPU_SFA_DECODE", False)
-    )
-
-
 def _import_torchair():
     try:
         import torchair  # type: ignore
@@ -83,7 +75,7 @@ class ModelRunner:
         self.model_type = self.hf_config.model_type
 
         torch.npu.set_device(rank)
-        if _use_npu_sfa_or_indexer():
+        if self.model_type == "deepseek_v32":
             _register_vllm_ascend_custom_ops()
         dist.init_process_group("hccl", f"tcp://localhost:{config.hccl_port}", world_size=self.world_size, rank=rank)
         default_dtype = torch.get_default_dtype()
@@ -370,49 +362,27 @@ class ModelRunner:
             "Failed to allocate any DeepSeek DSA cache blocks due to "
             "insufficient memory."
         )
-        use_indexer_cache_layout = _use_npu_sfa_or_indexer()
-
-        if use_indexer_cache_layout:
-            ckv_shape = (
-                num_layers,
-                config.num_kvcache_blocks,
-                self.block_size,
-                1,
-                kv_lora_rank,
-            )
-            kpe_shape = (
-                num_layers,
-                config.num_kvcache_blocks,
-                self.block_size,
-                1,
-                rope_dim,
-            )
-            index_shape = (
-                num_layers,
-                config.num_kvcache_blocks,
-                self.block_size,
-                1,
-                index_dim,
-            )
-        else:
-            ckv_shape = (
-                num_layers,
-                config.num_kvcache_blocks,
-                self.block_size,
-                kv_lora_rank,
-            )
-            kpe_shape = (
-                num_layers,
-                config.num_kvcache_blocks,
-                self.block_size,
-                rope_dim,
-            )
-            index_shape = (
-                num_layers,
-                config.num_kvcache_blocks,
-                self.block_size,
-                index_dim,
-            )
+        ckv_shape = (
+            num_layers,
+            config.num_kvcache_blocks,
+            self.block_size,
+            1,
+            kv_lora_rank,
+        )
+        kpe_shape = (
+            num_layers,
+            config.num_kvcache_blocks,
+            self.block_size,
+            1,
+            rope_dim,
+        )
+        index_shape = (
+            num_layers,
+            config.num_kvcache_blocks,
+            self.block_size,
+            1,
+            index_dim,
+        )
         self._log_cache_allocation(
             total=total,
             used=used,
@@ -424,37 +394,22 @@ class ModelRunner:
                 ("DeepSeek index cache", index_shape),
             ],
         )
-        if use_indexer_cache_layout:
-            layer_shapes = (ckv_shape[1:], kpe_shape[1:], index_shape[1:])
-            for module in self.model.modules():
-                if hasattr(module, "assign_dsa_cache") and hasattr(module, "layer_id"):
-                    ckv_cache = torch.empty(
-                        layer_shapes[0], dtype=cache_dtype, device=self.device
-                    )
-                    kpe_cache = torch.empty(
-                        layer_shapes[1], dtype=cache_dtype, device=self.device
-                    )
-                    index_cache = torch.empty(
-                        layer_shapes[2], dtype=cache_dtype, device=self.device
-                    )
-                    ckv_cache.zero_()
-                    kpe_cache.zero_()
-                    index_cache.zero_()
-                    module.assign_dsa_cache(ckv_cache, kpe_cache, index_cache)
-        else:
-            ckv_cache = torch.empty(ckv_shape, dtype=cache_dtype, device=self.device)
-            kpe_cache = torch.empty(kpe_shape, dtype=cache_dtype, device=self.device)
-            index_cache = torch.empty(index_shape, dtype=cache_dtype, device=self.device)
-            ckv_cache.zero_()
-            kpe_cache.zero_()
-            index_cache.zero_()
-            for module in self.model.modules():
-                if hasattr(module, "assign_dsa_cache") and hasattr(module, "layer_id"):
-                    module.assign_dsa_cache(
-                        ckv_cache[module.layer_id],
-                        kpe_cache[module.layer_id],
-                        index_cache[module.layer_id],
-                    )
+        layer_shapes = (ckv_shape[1:], kpe_shape[1:], index_shape[1:])
+        for module in self.model.modules():
+            if hasattr(module, "assign_dsa_cache") and hasattr(module, "layer_id"):
+                ckv_cache = torch.empty(
+                    layer_shapes[0], dtype=cache_dtype, device=self.device
+                )
+                kpe_cache = torch.empty(
+                    layer_shapes[1], dtype=cache_dtype, device=self.device
+                )
+                index_cache = torch.empty(
+                    layer_shapes[2], dtype=cache_dtype, device=self.device
+                )
+                ckv_cache.zero_()
+                kpe_cache.zero_()
+                index_cache.zero_()
+                module.assign_dsa_cache(ckv_cache, kpe_cache, index_cache)
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
@@ -517,7 +472,7 @@ class ModelRunner:
                     slot_mapping.extend(list(range(start, end)))
 
         block_tables = self.prepare_block_tables(seqs)
-        if _use_npu_sfa_or_indexer():
+        if self.model_type == "deepseek_v32":
             block_tables = self._pad_block_tables_to_static_max(block_tables)
 
         input_ids = torch.tensor(input_ids, dtype=torch.int64).to(self.device)
@@ -595,42 +550,17 @@ class ModelRunner:
         positions = []
         slot_mapping = []
         context_lens = []
-        decode_slot_rows = []
-        decode_mask_rows = []
-        max_context_len = max(len(seq) for seq in seqs)
         for seq in seqs:
             input_ids.append(seq.last_token)
             positions.append(len(seq) - 1)
             context_lens.append(len(seq))
             slot_mapping.append([seq.block_table[-1], seq.last_block_num_tokens - 1])
-            seq_slots: list[int] = []
-            remaining = len(seq)
-            for block in seq.block_table[:seq.num_blocks]:
-                take = min(self.block_size, remaining)
-                start = block * self.block_size
-                seq_slots.extend(range(start, start + take))
-                remaining -= take
-                if remaining <= 0:
-                    break
-            padding = max_context_len - len(seq_slots)
-            decode_slot_rows.append(seq_slots + [0] * padding)
-            decode_mask_rows.append([True] * len(seq_slots) + [False] * padding)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).to(self.device, non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).to(self.device, non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
-        decode_slots = torch.tensor(
-            decode_slot_rows,
-            dtype=torch.int64,
-            pin_memory=True,
-        ).to(self.device, non_blocking=True)
-        decode_mask = torch.tensor(
-            decode_mask_rows,
-            dtype=torch.bool,
-            pin_memory=True,
-        ).to(self.device, non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        if _use_npu_sfa_or_indexer():
+        if self.model_type == "deepseek_v32":
             block_tables = self._pad_block_tables_to_static_max(block_tables)
         set_context(False,
                     slot_mapping=slot_mapping,
@@ -638,9 +568,7 @@ class ModelRunner:
                     block_tables=block_tables,
                     is_enforce_eager=self.enforce_eager,
                     real_bs=len(seqs),
-                    block_size=self.config.kvcache_block_size,
-                    decode_slots=decode_slots,
-                    decode_mask=decode_mask)
+                    block_size=self.config.kvcache_block_size)
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):

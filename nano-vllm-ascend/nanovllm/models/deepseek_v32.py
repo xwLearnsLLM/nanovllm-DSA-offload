@@ -7,8 +7,8 @@ from pathlib import Path
 from time import perf_counter
 
 import torch
+import torch_npu  # type: ignore
 import torch.distributed as dist
-import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -27,7 +27,7 @@ from nanovllm.utils.logger import init_logger
 
 logger = init_logger(__name__)
 BMM_TRANS_MAX_SUPPORTED_TOKENS = 1024
-PREFILL_MLA_CHUNK_SIZE = 256
+SFA_SPARSE_COUNT = 2048
 _NPU_MLA_ATTENTION_MASK_CACHE: dict[tuple[str, int], torch.Tensor] = {}
 
 
@@ -448,61 +448,6 @@ class DeepseekV32SparseMoeBlock(nn.Module):
             range(self.local_expert_start, self.local_expert_end)
         )
         self.local_expert_id_set = set(self.local_expert_ids)
-        static_loop_enabled = (
-            _env_flag("NANOVLLM_MOE_STATIC_LOCAL_EXPERTS", False)
-        )
-        static_loop_threshold = int(
-            os.environ.get("NANOVLLM_MOE_STATIC_LOCAL_EXPERT_THRESHOLD", "16")
-        )
-        self.use_static_local_expert_loop = (
-            static_loop_enabled
-            and self.num_local_experts <= static_loop_threshold
-        )
-        trace_dir = os.environ.get("NANOVLLM_MOE_TRACE_DIR")
-        self.trace_dir = Path(trace_dir) if trace_dir else None
-        if self.trace_dir is not None:
-            self.trace_dir.mkdir(parents=True, exist_ok=True)
-        self.trace_prefill_only = (
-            os.environ.get("NANOVLLM_MOE_TRACE_PREFILL_ONLY", "1").lower()
-            in ("1", "true", "yes", "on")
-        )
-        self.trace_max_tokens_per_call = int(
-            os.environ.get("NANOVLLM_MOE_TRACE_MAX_TOKENS_PER_CALL", "0")
-        )
-        self.trace_counter = 0
-        # Prefer the eager PyTorch router path by default on NPU. The fused
-        # gating kernel is opt-in until we have parity coverage for the
-        # DeepSeek-V3.2 grouped-topk routing path.
-        self.use_npu_gating = (
-            os.environ.get("NANOVLLM_ENABLE_NPU_MOE_GATING", "0").lower()
-            in ("1", "true", "yes", "on")
-        )
-        self.profile_moe_detail = (
-            _env_flag("NANOVLLM_PROFILE_MOE_DETAIL", False)
-            and _profile_layer_selected(
-                self.layer_idx,
-                int(config.num_hidden_layers),
-            )
-        )
-        self.profile_moe_every = max(
-            1,
-            int(os.environ.get("NANOVLLM_PROFILE_MOE_DETAIL_EVERY", "31")),
-        )
-        moe_profile_template = {
-            "shared": 0.0,
-            "gate": 0.0,
-            "topk": 0.0,
-            "route_setup": 0.0,
-            "experts": 0.0,
-            "all_reduce": 0.0,
-            "total": 0.0,
-        }
-        self.profile_moe_steps = {"prefill": 0, "decode": 0}
-        self.profile_moe_times = {
-            "prefill": moe_profile_template.copy(),
-            "decode": moe_profile_template.copy(),
-        }
-        self.profile_moe_experts = {"prefill": 0, "decode": 0}
 
         self.gate = ReplicatedLinear(self.hidden_size, self.num_experts, bias=False)
         if getattr(config, "topk_method", None) == "noaux_tc":
@@ -530,127 +475,17 @@ class DeepseekV32SparseMoeBlock(nn.Module):
             }
         )
 
-    def _maybe_trace_inputs(self, hidden_states: torch.Tensor) -> None:
-        if self.trace_dir is None:
-            return
-        if dist.is_initialized() and dist.get_rank() != 0:
-            return
-        context = get_context()
-        if self.trace_prefill_only and not context.is_prefill:
-            return
-        traced_states = hidden_states.detach()
-        if self.trace_max_tokens_per_call > 0:
-            traced_states = traced_states[: self.trace_max_tokens_per_call]
-        payload = {
-            "hidden_states": traced_states.to(torch.bfloat16).cpu(),
-            "is_prefill": bool(context.is_prefill),
-            "layer_idx": self.layer_idx,
-        }
-        file_path = (
-            self.trace_dir
-            / f"layer_{self.layer_idx:03d}_call_{self.trace_counter:06d}.pt"
-        )
-        torch.save(payload, file_path)
-        self.trace_counter += 1
-
     def _grouped_topk(
         self,
-        hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        del hidden_states
-        grouped_topk = self._grouped_topk_npu(router_logits)
-        if grouped_topk is not None:
-            return grouped_topk
-
-        router_logits = router_logits.float()
-        if self.scoring_func == "softmax":
-            scores = torch.softmax(router_logits, dim=-1)
-        elif self.scoring_func == "sigmoid":
-            scores = router_logits.sigmoid()
-        else:
-            raise ValueError(f"Unsupported scoring function: {self.scoring_func}")
-
-        bias = getattr(self.gate, "e_score_correction_bias", None)
-        if self.num_expert_group > 1:
-            num_tokens = scores.shape[0]
-            experts_per_group = scores.shape[-1] // self.num_expert_group
-            if experts_per_group * self.num_expert_group != scores.shape[-1]:
-                raise ValueError(
-                    "n_group must divide the number of routed experts."
-                )
-            if bias is not None:
-                original_scores = scores
-                scores = scores + bias.unsqueeze(0)
-                group_take = min(2, experts_per_group)
-                group_scores = (
-                    scores.view(num_tokens, self.num_expert_group, experts_per_group)
-                    .topk(group_take, dim=-1)[0]
-                    .sum(dim=-1)
-                )
-            else:
-                group_scores = scores.view(
-                    num_tokens, self.num_expert_group, experts_per_group
-                ).max(dim=-1).values
-            topk_group = min(self.topk_group, self.num_expert_group)
-            top_k = min(self.top_k, topk_group * experts_per_group)
-            group_idx = torch.topk(
-                group_scores, k=topk_group, dim=-1, sorted=False
-            ).indices
-            group_mask = torch.zeros_like(group_scores)
-            group_mask.scatter_(1, group_idx, 1)
-            score_mask = (
-                group_mask.unsqueeze(-1)
-                .expand(num_tokens, self.num_expert_group, experts_per_group)
-                .reshape(num_tokens, -1)
-            )
-            tmp_scores = scores.masked_fill(~score_mask.bool(), float("-inf"))
-            if bias is not None:
-                topk_ids = torch.topk(
-                    tmp_scores, k=top_k, dim=-1, sorted=False
-                ).indices
-                topk_weights = original_scores.gather(1, topk_ids)
-            else:
-                topk_weights, topk_ids = torch.topk(
-                    tmp_scores, k=top_k, dim=-1, sorted=False
-                )
-        else:
-            if bias is not None:
-                original_scores = scores
-                topk_ids = torch.topk(
-                    scores + bias.unsqueeze(0),
-                    k=self.top_k,
-                    dim=-1,
-                    sorted=False,
-                ).indices
-                topk_weights = original_scores.gather(1, topk_ids)
-            else:
-                topk_weights, topk_ids = torch.topk(
-                    scores, k=self.top_k, dim=-1, sorted=False
-                )
-
-        if self.renormalize:
-            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-        if self.routed_scaling_factor != 1.0:
-            topk_weights = topk_weights * self.routed_scaling_factor
-        return topk_weights, topk_ids
-
-    def _grouped_topk_npu(
-        self,
-        router_logits: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        if not self.use_npu_gating:
-            return None
-        if router_logits.device.type != "npu":
-            return None
-
         router_logits = router_logits.float()
         bias = getattr(self.gate, "e_score_correction_bias", None)
         if bias is not None and bias.dtype != router_logits.dtype:
             bias = bias.to(router_logits.dtype)
         norm_type = 1 if self.scoring_func == "sigmoid" else 0
         if self.scoring_func not in ("softmax", "sigmoid"):
-            return None
+            raise ValueError(f"Unsupported scoring function: {self.scoring_func}")
 
         topk_weights, topk_ids, _ = torch.ops._C_ascend.moe_gating_top_k(
             router_logits,
@@ -675,114 +510,11 @@ class DeepseekV32SparseMoeBlock(nn.Module):
             topk_weights = topk_weights * self.routed_scaling_factor
         return topk_weights.float(), topk_ids.long()
 
-    def _forward_profiled(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        device = hidden_states.device
-        phase = "prefill" if get_context().is_prefill else "decode"
-        phase_times = self.profile_moe_times[phase]
-
-        def _record(name: str, fn):
-            _profile_sync(device)
-            start = perf_counter()
-            output = fn()
-            _profile_sync(device)
-            phase_times[name] += perf_counter() - start
-            return output
-
-        _profile_sync(device)
-        total_start = perf_counter()
-        sequence_length, hidden_dim = hidden_states.shape
-        self._maybe_trace_inputs(hidden_states)
-        shared_output = _record("shared", lambda: self.shared_experts(hidden_states))
-        router_logits = _record("gate", lambda: self.gate(hidden_states))
-        routing_weights, selected_experts = _record(
-            "topk",
-            lambda: self._grouped_topk(hidden_states, router_logits),
-        )
-        routing_weights = routing_weights.to(hidden_states.dtype)
-
-        routed_hidden_states = torch.zeros(
-            hidden_states.shape,
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
-
-        def _route_setup():
-            expert_mask = torch.nn.functional.one_hot(
-                selected_experts, num_classes=self.num_experts
-            ).permute(2, 1, 0)
-            if self.use_static_local_expert_loop:
-                expert_indices = self.local_expert_ids
-            else:
-                expert_hitted = torch.greater(
-                    expert_mask.sum(dim=(-1, -2)), 0
-                ).nonzero(as_tuple=False).flatten()
-                expert_indices = tuple(
-                    expert_idx
-                    for expert_idx in expert_hitted.tolist()
-                    if expert_idx in self.local_expert_id_set
-                )
-            return expert_mask, expert_indices
-
-        expert_mask, expert_indices = _record("route_setup", _route_setup)
-
-        def _run_experts():
-            for expert_idx in expert_indices:
-                expert_layer = self.experts[str(expert_idx)]
-                idx, top_x = torch.where(expert_mask[expert_idx])
-                current_state = hidden_states[top_x].reshape(-1, hidden_dim)
-                current_hidden_states = (
-                    expert_layer(current_state)
-                    * routing_weights[top_x, idx, None]
-                )
-                routed_hidden_states.index_add_(
-                    0,
-                    top_x,
-                    current_hidden_states.to(hidden_states.dtype),
-                )
-
-        _record("experts", _run_experts)
-        final_hidden_states = routed_hidden_states + shared_output
-        if self.enable_expert_parallel and self.ep_size > 1:
-            _record("all_reduce", lambda: dist.all_reduce(final_hidden_states))
-
-        _profile_sync(device)
-        phase_times["total"] += perf_counter() - total_start
-        self.profile_moe_steps[phase] += 1
-        self.profile_moe_experts[phase] += len(expert_indices)
-        steps = self.profile_moe_steps[phase]
-        if (
-            _is_rank0()
-            and (phase == "prefill" or steps % self.profile_moe_every == 0)
-        ):
-            logger.info(
-                "MoE detail avg: phase=%s layer=%d steps=%d experts=%.2f "
-                "shared=%.4fs gate=%.4fs topk=%.4fs route_setup=%.4fs "
-                "experts=%.4fs all_reduce=%.4fs total=%.4fs",
-                phase,
-                self.layer_idx,
-                steps,
-                self.profile_moe_experts[phase] / steps,
-                phase_times["shared"] / steps,
-                phase_times["gate"] / steps,
-                phase_times["topk"] / steps,
-                phase_times["route_setup"] / steps,
-                phase_times["experts"] / steps,
-                phase_times["all_reduce"] / steps,
-                phase_times["total"] / steps,
-            )
-        return final_hidden_states.view(sequence_length, hidden_dim)
-
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.profile_moe_detail:
-            return self._forward_profiled(hidden_states)
         sequence_length, hidden_dim = hidden_states.shape
-        self._maybe_trace_inputs(hidden_states)
         shared_output = self.shared_experts(hidden_states)
         router_logits = self.gate(hidden_states)
-        routing_weights, selected_experts = self._grouped_topk(
-            hidden_states,
-            router_logits,
-        )
+        routing_weights, selected_experts = self._grouped_topk(router_logits)
         routing_weights = routing_weights.to(hidden_states.dtype)
 
         routed_hidden_states = torch.zeros(
@@ -794,17 +526,14 @@ class DeepseekV32SparseMoeBlock(nn.Module):
             selected_experts, num_classes=self.num_experts
         ).permute(2, 1, 0)
 
-        if self.use_static_local_expert_loop:
-            expert_indices = self.local_expert_ids
-        else:
-            expert_hitted = torch.greater(
-                expert_mask.sum(dim=(-1, -2)), 0
-            ).nonzero(as_tuple=False).flatten()
-            expert_indices = tuple(
-                expert_idx
-                for expert_idx in expert_hitted.tolist()
-                if expert_idx in self.local_expert_id_set
-            )
+        expert_hitted = torch.greater(
+            expert_mask.sum(dim=(-1, -2)), 0
+        ).nonzero(as_tuple=False).flatten()
+        expert_indices = tuple(
+            expert_idx
+            for expert_idx in expert_hitted.tolist()
+            if expert_idx in self.local_expert_id_set
+        )
 
         for expert_idx in expert_indices:
             expert_layer = self.experts[str(expert_idx)]
@@ -901,7 +630,6 @@ class DeepseekV32DSAAttention(nn.Module):
         self.qk_rope_head_dim = int(config.qk_rope_head_dim)
         self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         self.v_head_dim = int(config.v_head_dim)
-        self.index_topk = int(config.index_topk)
         self.layer_id = layer_idx
         self.num_layers = int(config.num_hidden_layers)
         self.scale = self.qk_head_dim ** -0.5
@@ -966,26 +694,13 @@ class DeepseekV32DSAAttention(nn.Module):
         self.index_cache = torch.tensor([])
         self.w_uk_t = None
         self.w_uv = None
-        self.use_npu_indexer = _env_flag("NANOVLLM_ENABLE_NPU_INDEXER", False)
-        self.use_npu_sfa_prefill = _env_flag(
-            "NANOVLLM_ENABLE_NPU_SFA_PREFILL",
-            False,
-        )
         self.use_npu_sfa_decode = _env_flag(
             "NANOVLLM_ENABLE_NPU_SFA_DECODE",
-            False,
-        )
-        self.compare_npu_sfa_prefill = _env_flag(
-            "NANOVLLM_COMPARE_NPU_SFA_PREFILL",
             False,
         )
         self.compare_npu_sfa_decode = _env_flag(
             "NANOVLLM_COMPARE_NPU_SFA_DECODE",
             False,
-        )
-        self.sfa_sparse_count = _env_int(
-            "NANOVLLM_NPU_SFA_SPARSE_COUNT",
-            self.index_topk,
         )
         self.sfa_dump_dir = os.environ.get("NANOVLLM_DUMP_NPU_SFA_INPUTS")
         self.sfa_dump_max_calls = _env_int("NANOVLLM_DUMP_NPU_SFA_MAX_CALLS", 1)
@@ -996,34 +711,6 @@ class DeepseekV32DSAAttention(nn.Module):
             False,
         ) and _profile_layer_selected(self.layer_id, self.num_layers)
         self._npu_sfa_logged = {"prefill": False, "decode": False}
-        self.profile_attention_detail = (
-            _env_flag("NANOVLLM_PROFILE_ATTENTION_DETAIL", False)
-            and _profile_layer_selected(
-                self.layer_id,
-                int(config.num_hidden_layers),
-            )
-        )
-        self.profile_attention_every = max(
-            1,
-            int(os.environ.get("NANOVLLM_PROFILE_ATTENTION_DETAIL_EVERY", "31")),
-        )
-        attention_profile_template = {
-            "q_a": 0.0,
-            "q_b": 0.0,
-            "kv_a": 0.0,
-            "kv_norm_rope": 0.0,
-            "indexer": 0.0,
-            "store_cache": 0.0,
-            "q_up": 0.0,
-            "dsa": 0.0,
-            "o_proj": 0.0,
-            "total": 0.0,
-        }
-        self.profile_attention_steps = {"prefill": 0, "decode": 0}
-        self.profile_attention_times = {
-            "prefill": attention_profile_template.copy(),
-            "decode": attention_profile_template.copy(),
-        }
 
     def assign_dsa_cache(
         self,
@@ -1100,23 +787,6 @@ class DeepseekV32DSAAttention(nn.Module):
             dtype=torch.long,
         )
 
-    def _compute_topk_indices(
-        self,
-        q_index: torch.Tensor,
-        weights: torch.Tensor,
-        key_cache: torch.Tensor,
-        valid_len: int,
-    ) -> torch.Tensor:
-        key_cache = key_cache[:valid_len].float()
-        q_index = q_index.float()
-        weights = weights.float()
-        # Upstream DeepSeek-V3.2 indexer applies ReLU to the per-head
-        # retrieval logits before weighting heads together.
-        scores = torch.einsum("hd,sd->hs", q_index, key_cache)
-        scores = (scores.relu() * weights.unsqueeze(-1)).sum(dim=0)
-        topk = min(self.index_topk, valid_len)
-        return torch.topk(scores, k=topk, dim=-1).indices
-
     @staticmethod
     def _tensor_desc(name: str, tensor: torch.Tensor) -> str:
         return (
@@ -1167,7 +837,7 @@ class DeepseekV32DSAAttention(nn.Module):
             self._tensor_desc("actual_seq_lengths_key", actual_seq_lengths_key),
             self._tensor_desc("query_rope", query_rope),
             self._tensor_desc("key_rope", key_rope),
-            self.sfa_sparse_count,
+            SFA_SPARSE_COUNT,
             self.scale,
         )
 
@@ -1208,7 +878,7 @@ class DeepseekV32DSAAttention(nn.Module):
             "scale_value": float(self.scale),
             "sparse_block_size": 1,
             "sparse_mode": 3,
-            "sparse_count": int(self.sfa_sparse_count),
+            "sparse_count": SFA_SPARSE_COUNT,
             "layout_query": "TND",
             "layout_kv": "PA_BSND",
             "query": query.detach().cpu(),
@@ -1273,7 +943,7 @@ class DeepseekV32DSAAttention(nn.Module):
             block_table=block_table,
             layout_query="TND",
             layout_key="PA_BSND",
-            sparse_count=self.sfa_sparse_count,
+            sparse_count=SFA_SPARSE_COUNT,
             sparse_mode=3,
         )
         if log_timing:
@@ -1376,30 +1046,11 @@ class DeepseekV32DSAAttention(nn.Module):
             block_table=block_table_row.unsqueeze(0),
             layout_query="TND",
             layout_key="PA_BSND",
-            sparse_count=self.index_topk,
+            sparse_count=SFA_SPARSE_COUNT,
             sparse_mode=3,
         )
-        topk = min(self.index_topk, valid_len)
+        topk = min(SFA_SPARSE_COUNT, valid_len)
         return topk_indices.flatten()[:topk].to(torch.long)
-
-    def _select_topk_indices(
-        self,
-        q_index: torch.Tensor,
-        weights: torch.Tensor,
-        key_cache: torch.Tensor,
-        valid_len: int,
-        block_table_row: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        if self.use_npu_indexer:
-            if block_table_row is None:
-                raise RuntimeError("NPU indexer requires a decode block table.")
-            return self._compute_npu_indexer_indices(
-                q_index,
-                weights,
-                block_table_row,
-                valid_len,
-            )
-        return self._compute_topk_indices(q_index, weights, key_cache, valid_len)
 
     def _sparse_attention_single(
         self,
@@ -1454,32 +1105,14 @@ class DeepseekV32DSAAttention(nn.Module):
         self,
         ql_nope: torch.Tensor,
         q_pe: torch.Tensor,
-        q_index: torch.Tensor,
-        weights: torch.Tensor,
     ) -> torch.Tensor:
-        if self.use_npu_sfa_prefill:
-            mla_output = self._prefill_forward_npu_mla(
-                ql_nope,
-                q_pe,
-            )
-            if self.compare_npu_sfa_prefill:
-                reference = self._prefill_forward_mla(
-                    ql_nope,
-                    q_pe,
-                    q_index,
-                    weights,
-                )
-                self._log_npu_sfa_compare("prefill", mla_output, reference)
-            return mla_output
-        return self._prefill_forward_mla(ql_nope, q_pe, q_index, weights)
+        return self._prefill_forward_npu_mla(ql_nope, q_pe)
 
     def _prefill_forward_npu_mla(
         self,
         ql_nope: torch.Tensor,
         q_pe: torch.Tensor,
     ) -> torch.Tensor:
-        import torch_npu  # type: ignore
-
         context = get_context()
         cu_seqlens = context.cu_seqlens_q
         actual_seq_lengths_query = cu_seqlens[1:]
@@ -1539,110 +1172,6 @@ class DeepseekV32DSAAttention(nn.Module):
             )
         return output
 
-    def _prefill_forward_mla(
-        self,
-        ql_nope: torch.Tensor,
-        q_pe: torch.Tensor,
-        q_index: torch.Tensor,
-        weights: torch.Tensor,
-    ) -> torch.Tensor:
-        del q_index, weights
-        context = get_context()
-        cu_seqlens = context.cu_seqlens_q.to(torch.long).tolist()
-        slot_mapping = context.slot_mapping.to(torch.long)
-        if slot_mapping.dim() == 2:
-            slot_mapping = (
-                slot_mapping[:, 0] * self.block_size
-                + slot_mapping[:, 1]
-            )
-        outputs = torch.empty(
-            (
-                ql_nope.shape[0],
-                self.num_local_heads * self.v_head_dim,
-            ),
-            dtype=ql_nope.dtype,
-            device=ql_nope.device,
-        )
-        for seq_idx in range(len(cu_seqlens) - 1):
-            seq_start = cu_seqlens[seq_idx]
-            seq_end = cu_seqlens[seq_idx + 1]
-            seq_len = seq_end - seq_start
-            if seq_len <= 0:
-                continue
-            seq_slots = slot_mapping[seq_start:seq_end]
-            seq_ckv = self.ckv_cache.view(-1, self.kv_lora_rank).index_select(
-                0, seq_slots
-            )
-            seq_kpe = self.kpe_cache.view(-1, self.qk_rope_head_dim).index_select(
-                0, seq_slots
-            )
-            seq_output = self._prefill_mla_full_attention_sequence(
-                ql_nope[seq_start:seq_end],
-                q_pe[seq_start:seq_end],
-                seq_ckv,
-                seq_kpe,
-            )
-            outputs[seq_start:seq_end] = seq_output
-        return outputs
-
-    def _prefill_mla_full_attention_sequence(
-        self,
-        ql_nope: torch.Tensor,
-        q_pe: torch.Tensor,
-        seq_ckv: torch.Tensor,
-        seq_kpe: torch.Tensor,
-    ) -> torch.Tensor:
-        seq_len = int(ql_nope.shape[0])
-        latent = torch.empty(
-            (
-                seq_len,
-                self.num_local_heads,
-                self.kv_lora_rank,
-            ),
-            dtype=seq_ckv.dtype,
-            device=seq_ckv.device,
-        )
-        key_nope_t = seq_ckv.float().transpose(0, 1).contiguous()
-        key_rope_t = seq_kpe.float().transpose(0, 1).contiguous()
-        value = seq_ckv.unsqueeze(0).expand(self.num_local_heads, -1, -1)
-        key_positions = torch.arange(seq_len, device=ql_nope.device)
-        for chunk_start in range(0, seq_len, PREFILL_MLA_CHUNK_SIZE):
-            chunk_end = min(chunk_start + PREFILL_MLA_CHUNK_SIZE, seq_len)
-            query_nope = (
-                ql_nope[chunk_start:chunk_end]
-                .transpose(0, 1)
-                .contiguous()
-                .float()
-            )
-            query_rope = (
-                q_pe[chunk_start:chunk_end]
-                .transpose(0, 1)
-                .contiguous()
-                .float()
-            )
-            scores = torch.bmm(
-                query_nope,
-                key_nope_t.unsqueeze(0).expand(self.num_local_heads, -1, -1),
-            )
-            scores.add_(
-                torch.bmm(
-                    query_rope,
-                    key_rope_t.unsqueeze(0).expand(self.num_local_heads, -1, -1),
-                )
-            )
-            scores.mul_(self.scale)
-            query_positions = torch.arange(
-                chunk_start,
-                chunk_end,
-                device=ql_nope.device,
-            )
-            causal_mask = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
-            scores = scores.masked_fill(~causal_mask.unsqueeze(0), float("-inf"))
-            probs = torch.softmax(scores, dim=-1).to(seq_ckv.dtype)
-            latent_chunk = torch.bmm(probs, value)
-            latent[chunk_start:chunk_end] = latent_chunk.transpose(0, 1)
-        return self._v_up_proj(latent)
-
     def _decode_forward_loop(
         self,
         ql_nope: torch.Tensor,
@@ -1663,15 +1192,11 @@ class DeepseekV32DSAAttention(nn.Module):
             seq_kpe = self.kpe_cache.view(-1, self.qk_rope_head_dim).index_select(
                 0, seq_slots
             )
-            seq_index = self.index_cache.view(-1, self.indexer.head_dim).index_select(
-                0, seq_slots
-            )
-            selected = self._select_topk_indices(
+            selected = self._compute_npu_indexer_indices(
                 q_index[seq_idx],
                 weights[seq_idx],
-                seq_index,
-                seq_len,
                 context.block_tables[seq_idx],
+                seq_len,
             )
             outputs.append(
                 self._sparse_attention_single(
@@ -1682,75 +1207,6 @@ class DeepseekV32DSAAttention(nn.Module):
                 )
             )
         return torch.stack(outputs, dim=0)
-
-    def _decode_forward_vectorized(
-        self,
-        ql_nope: torch.Tensor,
-        q_pe: torch.Tensor,
-        q_index: torch.Tensor,
-        weights: torch.Tensor,
-        slots: torch.Tensor,
-        mask: torch.Tensor,
-    ) -> torch.Tensor:
-        flat_ckv = self.ckv_cache.view(-1, self.kv_lora_rank)
-        flat_kpe = self.kpe_cache.view(-1, self.qk_rope_head_dim)
-        flat_index = self.index_cache.view(-1, self.indexer.head_dim)
-
-        batch_size, max_seq_len = slots.shape
-        flat_slots = slots.reshape(-1)
-        seq_ckv = flat_ckv.index_select(0, flat_slots).view(
-            batch_size,
-            max_seq_len,
-            self.kv_lora_rank,
-        )
-        seq_kpe = flat_kpe.index_select(0, flat_slots).view(
-            batch_size,
-            max_seq_len,
-            self.qk_rope_head_dim,
-        )
-        seq_index = flat_index.index_select(0, flat_slots).view(
-            batch_size,
-            max_seq_len,
-            self.indexer.head_dim,
-        )
-
-        index_scores = torch.einsum(
-            "bhd,bsd->bhs",
-            q_index.float(),
-            seq_index.float(),
-        )
-        index_scores = (
-            index_scores.relu() * weights.float().unsqueeze(-1)
-        ).sum(dim=1)
-        index_scores = index_scores.masked_fill(~mask, float("-inf"))
-        topk = min(self.index_topk, max_seq_len)
-        selected = torch.topk(index_scores, k=topk, dim=-1).indices
-        selected_mask = mask.gather(1, selected)
-
-        selected_ckv = seq_ckv.gather(
-            1,
-            selected.unsqueeze(-1).expand(-1, -1, self.kv_lora_rank),
-        )
-        selected_kpe = seq_kpe.gather(
-            1,
-            selected.unsqueeze(-1).expand(-1, -1, self.qk_rope_head_dim),
-        )
-
-        scores = torch.einsum(
-            "bhl,bsl->bhs",
-            ql_nope.float(),
-            selected_ckv.float(),
-        )
-        scores = scores + torch.einsum(
-            "bhr,bsr->bhs",
-            q_pe.float(),
-            selected_kpe.float(),
-        )
-        scores = scores * self.scale
-        scores = scores.masked_fill(~selected_mask.unsqueeze(1), float("-inf"))
-        probs = torch.softmax(scores, dim=-1).to(selected_ckv.dtype)
-        latent = torch.einsum("bhs,bsl->bhl", probs, selected_ckv)
-        return self._v_up_proj(latent)
 
     def _decode_forward(
         self,
@@ -1811,119 +1267,7 @@ class DeepseekV32DSAAttention(nn.Module):
         q_index: torch.Tensor,
         weights: torch.Tensor,
     ) -> torch.Tensor:
-        context = get_context()
-        if self.use_npu_indexer:
-            return self._decode_forward_loop(ql_nope, q_pe, q_index, weights)
-        if context.decode_slots is not None and context.decode_mask is not None:
-            return self._decode_forward_vectorized(
-                ql_nope,
-                q_pe,
-                q_index,
-                weights,
-                context.decode_slots,
-                context.decode_mask,
-            )
         return self._decode_forward_loop(ql_nope, q_pe, q_index, weights)
-
-    def _forward_profiled(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
-        device = hidden_states.device
-        context = get_context()
-        phase = "prefill" if context.is_prefill else "decode"
-        phase_times = self.profile_attention_times[phase]
-
-        def _record(name: str, fn):
-            _profile_sync(device)
-            start = perf_counter()
-            output = fn()
-            _profile_sync(device)
-            phase_times[name] += perf_counter() - start
-            return output
-
-        _profile_sync(device)
-        total_start = perf_counter()
-        q_c = _record("q_a", lambda: self.q_a_layernorm(self.q_a_proj(hidden_states)))
-
-        def _q_b():
-            q = self.q_b_proj(q_c).view(
-                -1, self.num_local_heads, self.qk_head_dim
-            )
-            return torch.split(
-                q,
-                [self.qk_nope_head_dim, self.qk_rope_head_dim],
-                dim=-1,
-            )
-
-        q_nope, q_pe = _record("q_b", _q_b)
-        ckv, k_pe = _record(
-            "kv_a",
-            lambda: torch.split(
-                self.kv_a_proj_with_mqa(hidden_states),
-                [self.kv_lora_rank, self.qk_rope_head_dim],
-                dim=-1,
-            ),
-        )
-
-        def _kv_norm_rope():
-            ckv_normed = self.kv_a_layernorm(ckv)
-            q_pe_rot, k_pe_rot = self.rotary_emb(
-                positions,
-                q_pe,
-                k_pe.unsqueeze(1),
-            )
-            return ckv_normed, q_pe_rot, k_pe_rot.squeeze(1)
-
-        ckv, q_pe, k_pe = _record("kv_norm_rope", _kv_norm_rope)
-        q_index, index_k, weights = _record(
-            "indexer",
-            lambda: self.indexer(
-                hidden_states,
-                q_c,
-                positions,
-                self.indexer_rotary_emb,
-            ),
-        )
-        _record("store_cache", lambda: self._store_cache(ckv, k_pe, index_k))
-        ql_nope = _record("q_up", lambda: self._q_nope_up_proj(q_nope))
-        def _attention_forward():
-            if context.is_prefill:
-                return self._prefill_forward(ql_nope, q_pe, q_index, weights)
-            return self._decode_forward(ql_nope, q_pe, q_index, weights)
-
-        attn_output = _record("dsa", _attention_forward)
-        output = _record("o_proj", lambda: self.o_proj(attn_output))
-
-        _profile_sync(device)
-        phase_times["total"] += perf_counter() - total_start
-        self.profile_attention_steps[phase] += 1
-        steps = self.profile_attention_steps[phase]
-        if (
-            _is_rank0()
-            and (phase == "prefill" or steps % self.profile_attention_every == 0)
-        ):
-            logger.info(
-                "Attention detail avg: phase=%s layer=%d steps=%d q_a=%.4fs "
-                "q_b=%.4fs kv_a=%.4fs kv_norm_rope=%.4fs indexer=%.4fs "
-                "store_cache=%.4fs q_up=%.4fs attn=%.4fs o_proj=%.4fs "
-                "total=%.4fs",
-                phase,
-                self.layer_id,
-                steps,
-                phase_times["q_a"] / steps,
-                phase_times["q_b"] / steps,
-                phase_times["kv_a"] / steps,
-                phase_times["kv_norm_rope"] / steps,
-                phase_times["indexer"] / steps,
-                phase_times["store_cache"] / steps,
-                phase_times["q_up"] / steps,
-                phase_times["dsa"] / steps,
-                phase_times["o_proj"] / steps,
-                phase_times["total"] / steps,
-            )
-        return output
 
     def forward(
         self,
@@ -1932,8 +1276,6 @@ class DeepseekV32DSAAttention(nn.Module):
     ) -> torch.Tensor:
         if self.w_uk_t is None or self.w_uv is None:
             self.post_load_prepare()
-        if self.profile_attention_detail:
-            return self._forward_profiled(positions, hidden_states)
 
         q_c = self.q_a_layernorm(self.q_a_proj(hidden_states))
         q = self.q_b_proj(q_c).view(
@@ -1965,9 +1307,7 @@ class DeepseekV32DSAAttention(nn.Module):
 
         ql_nope = self._q_nope_up_proj(q_nope)
         if get_context().is_prefill:
-            attn_output = self._prefill_forward(
-                ql_nope, q_pe, q_index, weights
-            )
+            attn_output = self._prefill_forward(ql_nope, q_pe)
         else:
             attn_output = self._decode_forward(
                 ql_nope, q_pe, q_index, weights
@@ -2015,94 +1355,6 @@ class DeepseekV32DecoderLayer(nn.Module):
             int(config.hidden_size),
             eps=float(config.rms_norm_eps),
         )
-        self.profile_layers = (
-            _env_flag("NANOVLLM_PROFILE_LAYERS", False)
-            and _profile_layer_selected(
-                self.layer_idx,
-                int(config.num_hidden_layers),
-            )
-        )
-        self.profile_layers_every = max(
-            1,
-            int(os.environ.get("NANOVLLM_PROFILE_LAYERS_EVERY", "31")),
-        )
-        self.profile_layer_steps = 0
-        self.profile_layer_times = {
-            "input_norm": 0.0,
-            "attention": 0.0,
-            "post_norm": 0.0,
-            "dense_mlp": 0.0,
-            "moe_mlp": 0.0,
-            "total": 0.0,
-        }
-
-    def _forward_profiled(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        device = hidden_states.device
-
-        def _record(name: str, fn):
-            _profile_sync(device)
-            start = perf_counter()
-            output = fn()
-            _profile_sync(device)
-            self.profile_layer_times[name] += perf_counter() - start
-            return output
-
-        _profile_sync(device)
-        total_start = perf_counter()
-
-        if residual is None:
-            residual = hidden_states
-            hidden_states = _record(
-                "input_norm",
-                lambda: self.input_layernorm(hidden_states),
-            )
-        else:
-            hidden_states, residual = _record(
-                "input_norm",
-                lambda: self.input_layernorm(hidden_states, residual),
-            )
-        hidden_states = _record(
-            "attention",
-            lambda: self.self_attn(positions, hidden_states),
-        )
-        hidden_states, residual = _record(
-            "post_norm",
-            lambda: self.post_attention_layernorm(hidden_states, residual),
-        )
-        mlp_key = (
-            "moe_mlp"
-            if isinstance(self.mlp, DeepseekV32SparseMoeBlock)
-            else "dense_mlp"
-        )
-        hidden_states = _record(mlp_key, lambda: self.mlp(hidden_states))
-
-        _profile_sync(device)
-        self.profile_layer_times["total"] += perf_counter() - total_start
-        self.profile_layer_steps += 1
-        if (
-            _is_rank0()
-            and self.profile_layer_steps % self.profile_layers_every == 0
-        ):
-            steps = self.profile_layer_steps
-            logger.info(
-                "Layer profile avg: layer=%d steps=%d "
-                "input_norm=%.4fs attention=%.4fs post_norm=%.4fs "
-                "dense_mlp=%.4fs moe_mlp=%.4fs total=%.4fs",
-                self.layer_idx,
-                steps,
-                self.profile_layer_times["input_norm"] / steps,
-                self.profile_layer_times["attention"] / steps,
-                self.profile_layer_times["post_norm"] / steps,
-                self.profile_layer_times["dense_mlp"] / steps,
-                self.profile_layer_times["moe_mlp"] / steps,
-                self.profile_layer_times["total"] / steps,
-            )
-        return hidden_states, residual
 
     def forward(
         self,
@@ -2110,8 +1362,6 @@ class DeepseekV32DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.profile_layers and not get_context().is_prefill:
-            return self._forward_profiled(positions, hidden_states, residual)
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)

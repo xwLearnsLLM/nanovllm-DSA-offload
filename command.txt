@@ -1,222 +1,31 @@
-# DeepSeek V3.2 SFA manual validation commands.
-#
-# Run these commands manually, one by one. This file is not meant to be
-# executed as a shell script.
-#
-# Assumptions:
-#   repo:   /home/w00916487/nano-vllm-ascend-KVstar-DSA/nano-vllm-ascend
-#   model:  /home/models/Deepseek-V3.2-Pruned-95B-BF/
-#   cards:  0,1,2,3
-#   tp:     4
+# Run these commands manually from the nano-vllm-ascend directory.
 
 
-# Setup. Enter repo and prepare log dir.
-cd /home/w00916487/nano-vllm-ascend-KVstar-DSA/nano-vllm-ascend
-mkdir -p logs/sfa_manual
+# 33. Cleaned integrated path after switch removal:
+# - prefill always uses paged dense MLA
+# - MoE gating always uses torch.ops._C_ascend.moe_gating_top_k
+# - indexer always uses torch.ops._C_ascend.npu_lightning_indexer
+# - sparse_count is fixed at 2048 in code
+PYTORCH_NPU_ALLOC_CONF=expandable_segments:True ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=4 NANOVLLM_ENABLE_NPU_SFA_DECODE=1 NANOVLLM_LOG_NPU_SFA_TIMING=1 NANOVLLM_PROFILE_LAYER_IDS=0 NANOVLLM_LONG_PROMPT_TOKENS=3072 NANOVLLM_MAX_MODEL_LEN=3200 NANOVLLM_MAX_BATCHED_TOKENS=3200 NANOVLLM_MAX_NUM_SEQS=1 NANOVLLM_MAX_GEN_TOKENS=1 NANOVLLM_SKIP_WARMUP=1 python example/example.py 2>&1 | tee logs/sfa_manual/33_clean_mla_prefill_npu_moe_3072.log
 
 
-# 00. Syntax check.
-python -m py_compile nanovllm/models/deepseek_v32.py nanovllm/engine/model_runner.py nanovllm/engine/llm_engine.py scripts/probe_deepseek_v32_sfa_attention.py example/example.py ../ut_ops/perf_mla_prefill.py ../ut_ops/perf_mla_paged_prefill.py ../ut_ops/compare_sfa_mla_prefill.py 2>&1 | tee logs/sfa_manual/00_py_compile.log
+# 34. Cleaned path with SFA decode disabled.
+# This should generate more than one token using the torch sparse decode path
+# plus the NPU indexer, avoiding the currently unstable SFA decode kernel.
+PYTORCH_NPU_ALLOC_CONF=expandable_segments:True ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=4 NANOVLLM_LOG_NPU_SFA_TIMING=1 NANOVLLM_PROFILE_LAYER_IDS=0 NANOVLLM_LONG_PROMPT_TOKENS=129 NANOVLLM_MAX_MODEL_LEN=256 NANOVLLM_MAX_BATCHED_TOKENS=256 NANOVLLM_MAX_NUM_SEQS=1 NANOVLLM_MAX_GEN_TOKENS=3 NANOVLLM_SKIP_WARMUP=1 python example/example.py 2>&1 | tee logs/sfa_manual/34_clean_decode_torch_sparse_129_gen3.log
 
 
-# 01. Standalone prefill: npu_lightning_indexer + npu_sparse_flash_attention.
-ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python scripts/probe_deepseek_v32_sfa_attention.py --phase prefill --seq-len 2048 --batch-size 1 --device npu:0 2>&1 | tee logs/sfa_manual/01_probe_prefill_2k.log
+# 35. SFA decode stress after cleanup.
+# This is expected to reproduce the decode crash if the kernel issue remains.
+PYTORCH_NPU_ALLOC_CONF=expandable_segments:True ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=4 NANOVLLM_ENABLE_NPU_SFA_DECODE=1 NANOVLLM_LOG_NPU_SFA_TIMING=1 NANOVLLM_PROFILE_LAYER_IDS=0 NANOVLLM_LONG_PROMPT_TOKENS=129 NANOVLLM_MAX_MODEL_LEN=256 NANOVLLM_MAX_BATCHED_TOKENS=256 NANOVLLM_MAX_NUM_SEQS=1 NANOVLLM_MAX_GEN_TOKENS=3 NANOVLLM_SKIP_WARMUP=1 python example/example.py 2>&1 | tee logs/sfa_manual/35_clean_sfa_decode_129_gen3.log
 
 
-# 02. Standalone decode: npu_lightning_indexer + npu_sparse_flash_attention.
-ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python scripts/probe_deepseek_v32_sfa_attention.py --phase decode --seq-len 2048 --batch-size 4 --device npu:0 2>&1 | tee logs/sfa_manual/02_probe_decode_2k_bs4.log
-
-
-# 03. Full-model short prefill correctness check.
-# Keep compare enabled only for short prompts; it also runs the PyTorch MLA reference.
-ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=4 NANOVLLM_ENABLE_NPU_SFA_PREFILL=1 NANOVLLM_COMPARE_NPU_SFA_PREFILL=1 NANOVLLM_NPU_SFA_SPARSE_COUNT=256 NANOVLLM_LOG_NPU_SFA_INPUTS=1 NANOVLLM_LOG_NPU_SFA_TIMING=1 NANOVLLM_PROFILE_LAYER_IDS=0 NANOVLLM_MAX_MODEL_LEN=256 NANOVLLM_MAX_BATCHED_TOKENS=512 NANOVLLM_MAX_NUM_SEQS=2 NANOVLLM_MAX_GEN_TOKENS=1 NANOVLLM_SKIP_WARMUP=1 python example/example.py 2>&1 | tee logs/sfa_manual/03_short_prefill_compare.log
-
-
-# 04. Full-model long path: one exact 2048-token prompt, SFA prefill + SFA decode, generate 1 token.
-# Do not enable compare here, otherwise the dense MLA reference will dominate runtime.
-# Keep NANOVLLM_MAX_BATCHED_TOKENS >= NANOVLLM_MAX_MODEL_LEN, otherwise nanovllm rejects the config.
-ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=4 NANOVLLM_ENABLE_NPU_SFA_PREFILL=1 NANOVLLM_ENABLE_NPU_SFA_DECODE=1 NANOVLLM_NPU_SFA_SPARSE_COUNT=2048 NANOVLLM_LOG_NPU_SFA_INPUTS=1 NANOVLLM_LOG_NPU_SFA_TIMING=1 NANOVLLM_DUMP_NPU_SFA_INPUTS=logs/sfa_manual/dumps NANOVLLM_DUMP_NPU_SFA_MAX_CALLS=1 NANOVLLM_PROFILE_LAYER_IDS=0 NANOVLLM_LONG_PROMPT_TOKENS=2048 NANOVLLM_MAX_MODEL_LEN=2176 NANOVLLM_MAX_BATCHED_TOKENS=3072 NANOVLLM_MAX_NUM_SEQS=1 NANOVLLM_MAX_GEN_TOKENS=1 NANOVLLM_SKIP_WARMUP=1 python example/example.py 2>&1 | tee logs/sfa_manual/04_long_prefill_sfa_decode1.log
-
-
-# 05. If step 04 created dumps, pick one actual path and replay it on one NPU.
-# This checks whether one dumped SFA input, including causal -1 sparse_indices,
-# can run npu_sparse_flash_attention by itself.
-find logs/sfa_manual/dumps -name 'sfa_rank*_layer*_seq*.pt' | head -n 5
-ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python scripts/probe_deepseek_v32_sfa_attention.py --replay-dump logs/sfa_manual/dumps/REPLACE_WITH_ACTUAL_DUMP.pt --device npu:0 2>&1 | tee logs/sfa_manual/05_replay_dump.log
-
-
-# 06. Replay one dumped SFA input per rank concurrently.
-# This checks whether the same dumped SFA inputs only fail when TP ranks call
-# npu_sparse_flash_attention at the same time.
-ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python scripts/probe_npu_sfa_decode.py --dump-dir logs/sfa_manual/dumps --world-size 4 --hccl-port 28089 --repeats 1 2>&1 | tee logs/sfa_manual/06_replay_dump_dir_tp4.log
-
-
-# 07. Trace the working vllm-ascend 0.19 SFA path and print real op inputs.
-ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 SFA_TRACE_MAX_CALLS=8 python scripts/trace_vllm_ascend_sfa_inputs.py --model /home/models/Deepseek-V3.2-Pruned-95B-BF/ --tp-size 4 --prompt-tokens 2048 --max-model-len 2176 --max-num-batched-tokens 3072 --max-tokens 1 2>&1 | tee logs/sfa_manual/07_vllm_ascend_sfa_trace.log
-
-
-# 08. Full Nano SFA path without dumping tensors.
-# This checks whether NANOVLLM_DUMP_NPU_SFA_INPUTS itself changes the crash behavior.
-PYTORCH_NPU_ALLOC_CONF=expandable_segments:True ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=4 NANOVLLM_ENABLE_NPU_SFA_PREFILL=1 NANOVLLM_ENABLE_NPU_SFA_DECODE=1 NANOVLLM_NPU_SFA_SPARSE_COUNT=2048 NANOVLLM_LOG_NPU_SFA_INPUTS=1 NANOVLLM_LOG_NPU_SFA_TIMING=1 NANOVLLM_NPU_SFA_STRICT=1 NANOVLLM_PROFILE_LAYER_IDS=0 NANOVLLM_LONG_PROMPT_TOKENS=2048 NANOVLLM_MAX_MODEL_LEN=2176 NANOVLLM_MAX_BATCHED_TOKENS=3072 NANOVLLM_MAX_NUM_SEQS=1 NANOVLLM_MAX_GEN_TOKENS=1 NANOVLLM_SKIP_WARMUP=1 python example/example.py 2>&1 | tee logs/sfa_manual/08_nano_full_sfa_no_dump_2048.log
-
-
-# 09. Re-run the vllm-ascend 0.19 trace after stride/storage_offset logging is enabled.
-ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 SFA_TRACE_MAX_CALLS=2 python scripts/trace_vllm_ascend_sfa_inputs.py --model /home/models/Deepseek-V3.2-Pruned-95B-BF/ --tp-size 4 --prompt-tokens 2048 --max-model-len 2176 --max-num-batched-tokens 3072 --max-tokens 1 2>&1 | tee logs/sfa_manual/09_vllm_ascend_sfa_trace_stride.log
-
-
-# 10. Re-run the full Nano SFA path after aligning with vllm-ascend's
-# torch.npu.config.allow_internal_format=True setting.
-PYTORCH_NPU_ALLOC_CONF=expandable_segments:True ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=4 NANOVLLM_ENABLE_NPU_SFA_PREFILL=1 NANOVLLM_ENABLE_NPU_SFA_DECODE=1 NANOVLLM_NPU_SFA_SPARSE_COUNT=2048 NANOVLLM_LOG_NPU_SFA_INPUTS=1 NANOVLLM_LOG_NPU_SFA_TIMING=1 NANOVLLM_NPU_SFA_STRICT=1 NANOVLLM_PROFILE_LAYER_IDS=0 NANOVLLM_LONG_PROMPT_TOKENS=2048 NANOVLLM_MAX_MODEL_LEN=2176 NANOVLLM_MAX_BATCHED_TOKENS=3072 NANOVLLM_MAX_NUM_SEQS=1 NANOVLLM_MAX_GEN_TOKENS=1 NANOVLLM_SKIP_WARMUP=1 python example/example.py 2>&1 | tee logs/sfa_manual/10_nano_full_sfa_internal_format_2048.log
-
-
-# 11. Short prompt sanity check with the same internal-format setting.
-PYTORCH_NPU_ALLOC_CONF=expandable_segments:True ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=4 NANOVLLM_ENABLE_NPU_SFA_PREFILL=1 NANOVLLM_ENABLE_NPU_SFA_DECODE=1 NANOVLLM_NPU_SFA_SPARSE_COUNT=2048 NANOVLLM_LOG_NPU_SFA_INPUTS=1 NANOVLLM_LOG_NPU_SFA_TIMING=1 NANOVLLM_NPU_SFA_STRICT=1 NANOVLLM_PROFILE_LAYER_IDS=0 NANOVLLM_LONG_PROMPT_TOKENS=129 NANOVLLM_MAX_MODEL_LEN=256 NANOVLLM_MAX_BATCHED_TOKENS=256 NANOVLLM_MAX_NUM_SEQS=1 NANOVLLM_MAX_GEN_TOKENS=1 NANOVLLM_SKIP_WARMUP=1 python example/example.py 2>&1 | tee logs/sfa_manual/11_nano_full_sfa_internal_format_129.log
-
-
-# 12. Dense MLA prefill op probe, small enough to print a CPU reference diff.
-ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ../ut_ops/perf_mla_prefill.py --device npu:0 --seq-lens 128 --mask-size 2048 --warmup 1 --iters 5 --check-reference 2>&1 | tee logs/sfa_manual/12_dense_mla_prefill_128.log
-
-
-# 13. Dense MLA prefill op probe, DeepSeek V3.2 TP=4 local-head shape and 2048 tokens.
-ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ../ut_ops/perf_mla_prefill.py --device npu:0 --seq-lens 2048 --mask-size 2048 --warmup 3 --iters 10 2>&1 | tee logs/sfa_manual/13_dense_mla_prefill_2048.log
-
-
-# 14. Dense MLA prefill op probe above 2k tokens with a 4096 mask.
-# This is expected to fail on current torch-npu because FIA wants the fixed
-# vllm-ascend splitfuse mask shape [2048, 2048].
-ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ../ut_ops/perf_mla_prefill.py --device npu:0 --seq-lens 2176 --mask-size 4096 --warmup 1 --iters 3 2>&1 | tee logs/sfa_manual/14_dense_mla_prefill_2176.log
-
-
-# 15. Dense MLA prefill above 2k with absorb + paged KV cache.
-# FIA paged MLA expects BnNBsD key/value layout:
-# key/value [blocks, 1, 128, 512], key_rope [blocks, 1, 128, 64].
-# Nano/SFA cache is PA_BSND [blocks, 128, 1, D], so integration will transpose it.
-ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ../ut_ops/perf_mla_paged_prefill.py --device npu:0 --seq-lens 2176 --mask-size 2048 --warmup 1 --iters 3 2>&1 | tee logs/sfa_manual/15_paged_absorb_mla_prefill_2176_mask2048.log
-
-
-# 16. Dense MLA prefill at 3072 tokens with the same absorb + paged KV shape.
-ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ../ut_ops/perf_mla_paged_prefill.py --device npu:0 --seq-lens 3072 --mask-size 2048 --warmup 1 --iters 3 2>&1 | tee logs/sfa_manual/16_paged_absorb_mla_prefill_3072_mask2048.log
-
-
-# 17. Create one Nano prefill SFA dump below 2048 tokens.
-# The full model may still crash inside SFA after the dump is written.
-mkdir -p logs/mla_compare/dump_1024
-PYTORCH_NPU_ALLOC_CONF=expandable_segments:True ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=4 NANOVLLM_ENABLE_NPU_SFA_PREFILL=1 NANOVLLM_NPU_SFA_SPARSE_COUNT=2048 NANOVLLM_LOG_NPU_SFA_INPUTS=1 NANOVLLM_LOG_NPU_SFA_TIMING=1 NANOVLLM_DUMP_NPU_SFA_INPUTS=logs/mla_compare/dump_1024 NANOVLLM_DUMP_NPU_SFA_MAX_CALLS=1 NANOVLLM_NPU_SFA_STRICT=1 NANOVLLM_PROFILE_LAYER_IDS=0 NANOVLLM_LONG_PROMPT_TOKENS=1024 NANOVLLM_MAX_MODEL_LEN=1152 NANOVLLM_MAX_BATCHED_TOKENS=1152 NANOVLLM_MAX_NUM_SEQS=1 NANOVLLM_MAX_GEN_TOKENS=1 NANOVLLM_SKIP_WARMUP=1 python example/example.py 2>&1 | tee logs/sfa_manual/17_make_dump_prefill_1024.log
-
-
-# 18. Inspect the <2048 dump first.
-# This should print COMPARE stage lines through metadata_only_done.
-PYTHONUNBUFFERED=1 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ../ut_ops/compare_sfa_mla_prefill.py --device npu:0 --dump logs/mla_compare/dump_1024/sfa_rank0_layer000_seq000_prefill.pt --mask-size 2048 --metadata-only 2>&1 | tee logs/sfa_manual/18_inspect_dump_1024.log; echo "18_python_exit=${PIPESTATUS[0]}"
-
-
-# 19. Compare SFA replay vs dense paged absorb-MLA replay for the <2048 dump.
-# Re-run this after the compare script registration-order fix.
-PYTHONUNBUFFERED=1 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ../ut_ops/compare_sfa_mla_prefill.py --device npu:0 --dump logs/mla_compare/dump_1024/sfa_rank0_layer000_seq000_prefill.pt --mask-size 2048 2>&1 | tee logs/sfa_manual/19_compare_sfa_mla_prefill_1024.log; echo "19_python_exit=${PIPESTATUS[0]}"
-
-
-# 20. Replay the same <2048 dump through the older standalone SFA replay script.
-# If this passes while step 19 exits 139, the crash is caused by compare script
-# environment/import differences rather than the dump tensors alone.
-PYTHONUNBUFFERED=1 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python scripts/probe_deepseek_v32_sfa_attention.py --replay-dump logs/mla_compare/dump_1024/sfa_rank0_layer000_seq000_prefill.pt --device npu:0 2>&1 | tee logs/sfa_manual/20_probe_replay_dump_1024.log; echo "20_python_exit=${PIPESTATUS[0]}"
-
-
-# 21. Compare dense paged MLA with a torch sparse reference built from
-# sparse_indices, without calling the crashing SFA op.
-# The diff line prints absolute errors, rel_l2/cosine, and range-normalized
-# relative_max_error / relative_mean_abs_error.
-PYTHONUNBUFFERED=1 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ../ut_ops/compare_sfa_mla_prefill.py --device npu:0 --dump logs/mla_compare/dump_1024/sfa_rank0_layer000_seq000_prefill.pt --mask-size 2048 --skip-sfa-op --torch-sparse-reference --reference-chunk-size 64 2>&1 | tee logs/sfa_manual/21_compare_sparse_ref_mla_prefill_1024.log; echo "21_python_exit=${PIPESTATUS[0]}"
-
-
-# 22. Create one Nano prefill SFA dump above 2048 tokens.
-# This is the lossy case: SFA uses top 2048 out of 3072, dense MLA uses all 3072.
-mkdir -p logs/mla_compare/dump_3072
-PYTORCH_NPU_ALLOC_CONF=expandable_segments:True ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=4 NANOVLLM_ENABLE_NPU_SFA_PREFILL=1 NANOVLLM_NPU_SFA_SPARSE_COUNT=2048 NANOVLLM_LOG_NPU_SFA_INPUTS=1 NANOVLLM_LOG_NPU_SFA_TIMING=1 NANOVLLM_DUMP_NPU_SFA_INPUTS=logs/mla_compare/dump_3072 NANOVLLM_DUMP_NPU_SFA_MAX_CALLS=1 NANOVLLM_NPU_SFA_STRICT=1 NANOVLLM_PROFILE_LAYER_IDS=0 NANOVLLM_LONG_PROMPT_TOKENS=3072 NANOVLLM_MAX_MODEL_LEN=3200 NANOVLLM_MAX_BATCHED_TOKENS=3200 NANOVLLM_MAX_NUM_SEQS=1 NANOVLLM_MAX_GEN_TOKENS=1 NANOVLLM_SKIP_WARMUP=1 python example/example.py 2>&1 | tee logs/sfa_manual/22_make_dump_prefill_3072.log
-
-
-# 23. Inspect the >2048 dump first.
-PYTHONUNBUFFERED=1 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ../ut_ops/compare_sfa_mla_prefill.py --device npu:0 --dump logs/mla_compare/dump_3072/sfa_rank0_layer000_seq000_prefill.pt --mask-size 2048 --metadata-only 2>&1 | tee logs/sfa_manual/23_inspect_dump_3072.log; echo "23_python_exit=${PIPESTATUS[0]}"
-
-
-# 24. Compare SFA replay vs dense paged absorb-MLA replay for the >2048 dump.
-PYTHONUNBUFFERED=1 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ../ut_ops/compare_sfa_mla_prefill.py --device npu:0 --dump logs/mla_compare/dump_3072/sfa_rank0_layer000_seq000_prefill.pt --mask-size 2048 2>&1 | tee logs/sfa_manual/24_compare_sfa_mla_prefill_3072.log; echo "24_python_exit=${PIPESTATUS[0]}"
-
-
-# 25. Compare dense paged MLA with a torch sparse reference for the >2048 dump,
-# without calling SFA. This quantifies top-2048 sparse attention vs full dense MLA.
-# The diff line prints absolute errors, rel_l2/cosine, and range-normalized
-# relative_max_error / relative_mean_abs_error.
-PYTHONUNBUFFERED=1 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ../ut_ops/compare_sfa_mla_prefill.py --device npu:0 --dump logs/mla_compare/dump_3072/sfa_rank0_layer000_seq000_prefill.pt --mask-size 2048 --skip-sfa-op --torch-sparse-reference --reference-chunk-size 32 2>&1 | tee logs/sfa_manual/25_compare_sparse_ref_mla_prefill_3072.log; echo "25_python_exit=${PIPESTATUS[0]}"
-
-
-# 26. Current integrated path: short prefill uses paged dense MLA,
-# decode still uses SFA. Compare prefill against the PyTorch MLA reference.
-PYTORCH_NPU_ALLOC_CONF=expandable_segments:True ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=4 NANOVLLM_ENABLE_NPU_SFA_PREFILL=1 NANOVLLM_COMPARE_NPU_SFA_PREFILL=1 NANOVLLM_ENABLE_NPU_SFA_DECODE=1 NANOVLLM_NPU_SFA_SPARSE_COUNT=2048 NANOVLLM_LOG_NPU_SFA_TIMING=1 NANOVLLM_PROFILE_LAYER_IDS=0 NANOVLLM_LONG_PROMPT_TOKENS=129 NANOVLLM_MAX_MODEL_LEN=256 NANOVLLM_MAX_BATCHED_TOKENS=256 NANOVLLM_MAX_NUM_SEQS=1 NANOVLLM_MAX_GEN_TOKENS=1 NANOVLLM_SKIP_WARMUP=1 python example/example.py 2>&1 | tee logs/sfa_manual/26_nano_mla_prefill_sfa_decode_129.log
-
-
-# 27. Current integrated path: long prefill uses paged dense MLA,
-# decode still uses SFA. This is the main smoke test.
-PYTORCH_NPU_ALLOC_CONF=expandable_segments:True ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=4 NANOVLLM_ENABLE_NPU_SFA_PREFILL=1 NANOVLLM_ENABLE_NPU_SFA_DECODE=1 NANOVLLM_NPU_SFA_SPARSE_COUNT=2048 NANOVLLM_LOG_NPU_SFA_TIMING=1 NANOVLLM_PROFILE_LAYER_IDS=0 NANOVLLM_LONG_PROMPT_TOKENS=3072 NANOVLLM_MAX_MODEL_LEN=3200 NANOVLLM_MAX_BATCHED_TOKENS=3200 NANOVLLM_MAX_NUM_SEQS=1 NANOVLLM_MAX_GEN_TOKENS=1 NANOVLLM_SKIP_WARMUP=1 python example/example.py 2>&1 | tee logs/sfa_manual/27_nano_mla_prefill_sfa_decode_3072.log
-
-
-# 28. Official-like MoE routing setting:
-# enable Ascend moe_gating_top_k for router topk, keep dynamic local expert loop.
-# This is closest to vllm-ascend among the current Nano switches.
-PYTORCH_NPU_ALLOC_CONF=expandable_segments:True ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=4 NANOVLLM_ENABLE_NPU_MOE_GATING=1 NANOVLLM_MOE_STATIC_LOCAL_EXPERTS=0 NANOVLLM_ENABLE_NPU_SFA_PREFILL=1 NANOVLLM_ENABLE_NPU_SFA_DECODE=1 NANOVLLM_NPU_SFA_SPARSE_COUNT=2048 NANOVLLM_LOG_NPU_SFA_TIMING=1 NANOVLLM_PROFILE_LAYER_IDS=0 NANOVLLM_LONG_PROMPT_TOKENS=3072 NANOVLLM_MAX_MODEL_LEN=3200 NANOVLLM_MAX_BATCHED_TOKENS=3200 NANOVLLM_MAX_NUM_SEQS=1 NANOVLLM_MAX_GEN_TOKENS=1 NANOVLLM_SKIP_WARMUP=1 python example/example.py 2>&1 | tee logs/sfa_manual/28_nano_mla_prefill_npu_moe_gating_3072.log
-
-
-# 29. Unit-test Ascend moe_gating_top_k against the Nano torch grouped-topk.
-# This also proves that renorm=1 fails on this machine, while renorm=0 +
-# manual renormalize is the expected path.
-PYTHONUNBUFFERED=1 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ../ut_ops/compare_moe_gating_topk.py --device npu:0 --model-config /home/models/Deepseek-V3.2-Pruned-95B-BF/ --tokens 3072 --try-renorm-one 2>&1 | tee logs/sfa_manual/29_compare_moe_gating_topk_3072.log; echo "29_python_exit=${PIPESTATUS[0]}"
-
-
-# 30. Retry the integrated official-like MoE routing path after the renorm fix.
-PYTORCH_NPU_ALLOC_CONF=expandable_segments:True ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=4 NANOVLLM_ENABLE_NPU_MOE_GATING=1 NANOVLLM_MOE_STATIC_LOCAL_EXPERTS=0 NANOVLLM_ENABLE_NPU_SFA_PREFILL=1 NANOVLLM_ENABLE_NPU_SFA_DECODE=1 NANOVLLM_NPU_SFA_SPARSE_COUNT=2048 NANOVLLM_LOG_NPU_SFA_TIMING=1 NANOVLLM_PROFILE_LAYER_IDS=0 NANOVLLM_LONG_PROMPT_TOKENS=3072 NANOVLLM_MAX_MODEL_LEN=3200 NANOVLLM_MAX_BATCHED_TOKENS=3200 NANOVLLM_MAX_NUM_SEQS=1 NANOVLLM_MAX_GEN_TOKENS=1 NANOVLLM_SKIP_WARMUP=1 python example/example.py 2>&1 | tee logs/sfa_manual/30_nano_mla_prefill_npu_moe_gating_3072.log
-
-
-# 31. Unit-test the real-model dtype pattern: bf16 router logits and bf16 bias.
-PYTHONUNBUFFERED=1 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ../ut_ops/compare_moe_gating_topk.py --device npu:0 --model-config /home/models/Deepseek-V3.2-Pruned-95B-BF/ --tokens 3072 --logits-dtype bf16 --bias-dtype bf16 --try-renorm-one 2>&1 | tee logs/sfa_manual/31_compare_moe_gating_topk_bf16_3072.log; echo "31_python_exit=${PIPESTATUS[0]}"
-
-
-# 32. Retry the integrated official-like MoE routing path after the dtype fix.
-PYTORCH_NPU_ALLOC_CONF=expandable_segments:True ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=4 NANOVLLM_ENABLE_NPU_MOE_GATING=1 NANOVLLM_MOE_STATIC_LOCAL_EXPERTS=0 NANOVLLM_ENABLE_NPU_SFA_PREFILL=1 NANOVLLM_ENABLE_NPU_SFA_DECODE=1 NANOVLLM_NPU_SFA_SPARSE_COUNT=2048 NANOVLLM_LOG_NPU_SFA_TIMING=1 NANOVLLM_PROFILE_LAYER_IDS=0 NANOVLLM_LONG_PROMPT_TOKENS=3072 NANOVLLM_MAX_MODEL_LEN=3200 NANOVLLM_MAX_BATCHED_TOKENS=3200 NANOVLLM_MAX_NUM_SEQS=1 NANOVLLM_MAX_GEN_TOKENS=1 NANOVLLM_SKIP_WARMUP=1 python example/example.py 2>&1 | tee logs/sfa_manual/32_nano_mla_prefill_npu_moe_gating_3072.log
-
-
-# 99. Extract key lines.
-grep -E "PROBE |COMPARE |MOE_GATE |MLA_PROBE|MLA_BENCH|PAGED_MLA|PAGED_MLA_BENCH|SFA_TRACE|built long prompt|TP-wide minimum KV cache blocks|NPU SFA input summary|NPU SFA timing|NPU MLA timing|NPU SFA compare|NPU SFA .*failed|Dumped NPU SFA|Traceback|RuntimeError|ERROR|Prompt:|prompt len:|text:" logs/sfa_manual/*.log 2>&1 | tee logs/sfa_manual/99_key_lines.log
+# 99. Extract key lines after 33-35.
+grep -E "built long prompt|TP-wide minimum KV cache blocks|NPU SFA input summary|NPU SFA timing|NPU MLA timing|NPU SFA compare|Traceback|RuntimeError|ERROR|Prompt:|prompt len:|text:" logs/sfa_manual/33_clean_mla_prefill_npu_moe_3072.log logs/sfa_manual/34_clean_decode_torch_sparse_129_gen3.log logs/sfa_manual/35_clean_sfa_decode_129_gen3.log 2>&1 | tee logs/sfa_manual/99_clean_key_lines.log
 
 
 # Paste these logs back.
-cat logs/sfa_manual/01_probe_prefill_2k.log
-cat logs/sfa_manual/02_probe_decode_2k_bs4.log
-cat logs/sfa_manual/03_short_prefill_compare.log
-cat logs/sfa_manual/04_long_prefill_sfa_decode1.log
-cat logs/sfa_manual/05_replay_dump.log
-cat logs/sfa_manual/06_replay_dump_dir_tp4.log
-cat logs/sfa_manual/07_vllm_ascend_sfa_trace.log
-cat logs/sfa_manual/08_nano_full_sfa_no_dump_2048.log
-cat logs/sfa_manual/09_vllm_ascend_sfa_trace_stride.log
-cat logs/sfa_manual/10_nano_full_sfa_internal_format_2048.log
-cat logs/sfa_manual/11_nano_full_sfa_internal_format_129.log
-cat logs/sfa_manual/12_dense_mla_prefill_128.log
-cat logs/sfa_manual/13_dense_mla_prefill_2048.log
-cat logs/sfa_manual/14_dense_mla_prefill_2176.log
-cat logs/sfa_manual/15_paged_absorb_mla_prefill_2176_mask2048.log
-cat logs/sfa_manual/16_paged_absorb_mla_prefill_3072_mask2048.log
-cat logs/sfa_manual/17_make_dump_prefill_1024.log
-cat logs/sfa_manual/18_inspect_dump_1024.log
-cat logs/sfa_manual/19_compare_sfa_mla_prefill_1024.log
-cat logs/sfa_manual/20_probe_replay_dump_1024.log
-cat logs/sfa_manual/21_compare_sparse_ref_mla_prefill_1024.log
-cat logs/sfa_manual/22_make_dump_prefill_3072.log
-cat logs/sfa_manual/23_inspect_dump_3072.log
-cat logs/sfa_manual/24_compare_sfa_mla_prefill_3072.log
-cat logs/sfa_manual/25_compare_sparse_ref_mla_prefill_3072.log
-cat logs/sfa_manual/26_nano_mla_prefill_sfa_decode_129.log
-cat logs/sfa_manual/27_nano_mla_prefill_sfa_decode_3072.log
-cat logs/sfa_manual/28_nano_mla_prefill_npu_moe_gating_3072.log
-cat logs/sfa_manual/29_compare_moe_gating_topk_3072.log
-cat logs/sfa_manual/30_nano_mla_prefill_npu_moe_gating_3072.log
-cat logs/sfa_manual/31_compare_moe_gating_topk_bf16_3072.log
-cat logs/sfa_manual/32_nano_mla_prefill_npu_moe_gating_3072.log
-cat logs/sfa_manual/99_key_lines.log
+cat logs/sfa_manual/33_clean_mla_prefill_npu_moe_3072.log
+cat logs/sfa_manual/34_clean_decode_torch_sparse_129_gen3.log
+cat logs/sfa_manual/35_clean_sfa_decode_129_gen3.log
+cat logs/sfa_manual/99_clean_key_lines.log
