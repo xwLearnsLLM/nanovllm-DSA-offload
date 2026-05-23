@@ -110,6 +110,7 @@ PYTHONUNBUFFERED=1 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ../ut_ops/compare_sf
 
 
 # 19. Compare SFA replay vs dense paged absorb-MLA replay for the <2048 dump.
+# Re-run this after the compare script registration-order fix.
 PYTHONUNBUFFERED=1 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ../ut_ops/compare_sfa_mla_prefill.py --device npu:0 --dump logs/mla_compare/dump_1024/sfa_rank0_layer000_seq000_prefill.pt --mask-size 2048 2>&1 | tee logs/sfa_manual/19_compare_sfa_mla_prefill_1024.log; echo "19_python_exit=${PIPESTATUS[0]}"
 
 
@@ -121,6 +122,8 @@ PYTHONUNBUFFERED=1 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python scripts/probe_deepse
 
 # 21. Compare dense paged MLA with a torch sparse reference built from
 # sparse_indices, without calling the crashing SFA op.
+# The diff line prints absolute errors, rel_l2/cosine, and range-normalized
+# relative_max_error / relative_mean_abs_error.
 PYTHONUNBUFFERED=1 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ../ut_ops/compare_sfa_mla_prefill.py --device npu:0 --dump logs/mla_compare/dump_1024/sfa_rank0_layer000_seq000_prefill.pt --mask-size 2048 --skip-sfa-op --torch-sparse-reference --reference-chunk-size 64 2>&1 | tee logs/sfa_manual/21_compare_sparse_ref_mla_prefill_1024.log; echo "21_python_exit=${PIPESTATUS[0]}"
 
 
@@ -140,6 +143,8 @@ PYTHONUNBUFFERED=1 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ../ut_ops/compare_sf
 
 # 25. Compare dense paged MLA with a torch sparse reference for the >2048 dump,
 # without calling SFA. This quantifies top-2048 sparse attention vs full dense MLA.
+# The diff line prints absolute errors, rel_l2/cosine, and range-normalized
+# relative_max_error / relative_mean_abs_error.
 PYTHONUNBUFFERED=1 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ../ut_ops/compare_sfa_mla_prefill.py --device npu:0 --dump logs/mla_compare/dump_3072/sfa_rank0_layer000_seq000_prefill.pt --mask-size 2048 --skip-sfa-op --torch-sparse-reference --reference-chunk-size 32 2>&1 | tee logs/sfa_manual/25_compare_sparse_ref_mla_prefill_3072.log; echo "25_python_exit=${PIPESTATUS[0]}"
 
 

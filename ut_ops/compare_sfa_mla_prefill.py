@@ -3,12 +3,10 @@ import glob
 import os
 from time import perf_counter
 
+os.environ.setdefault("VLLM_ASCEND_ENABLE_NZ", "0")
+
 import torch
 import torch.nn.functional as F
-import torch_npu
-
-
-os.environ.setdefault("VLLM_ASCEND_ENABLE_NZ", "0")
 
 
 def log(message: str) -> None:
@@ -22,14 +20,21 @@ def _prepend_env_path(name: str, path: str) -> None:
         os.environ[name] = f"{path}{os.pathsep}{current}" if current else path
 
 
-def register_ascend_ops() -> None:
-    log("COMPARE stage=register_import_vllm")
-    import vllm  # type: ignore  # noqa: F401
+def _dedupe_env_path(name: str) -> None:
+    current = os.environ.get(name, "")
+    parts = []
+    seen = set()
+    for part in current.split(os.pathsep):
+        if not part or part in seen:
+            continue
+        seen.add(part)
+        parts.append(part)
+    if parts:
+        os.environ[name] = os.pathsep.join(parts)
 
-    log("COMPARE stage=register_import_vllm_ascend")
-    import vllm_ascend  # type: ignore
 
-    package_dir = os.path.dirname(os.path.realpath(vllm_ascend.__file__))
+def _ensure_vllm_ascend_custom_opp_path(vllm_ascend_module) -> str | None:
+    package_dir = os.path.dirname(os.path.realpath(vllm_ascend_module.__file__))
     custom_opp_path = os.path.join(
         package_dir,
         "_cann_ops_custom",
@@ -38,6 +43,27 @@ def register_ascend_ops() -> None:
     )
     if os.path.exists(custom_opp_path):
         _prepend_env_path("ASCEND_CUSTOM_OPP_PATH", custom_opp_path)
+    try:
+        from vllm_ascend.platform import NPUPlatform  # type: ignore
+
+        NPUPlatform.import_kernels()
+    except Exception as exc:
+        log(f"COMPARE warning import_kernels failed: {exc!r}")
+    _dedupe_env_path("ASCEND_CUSTOM_OPP_PATH")
+    return custom_opp_path if os.path.exists(custom_opp_path) else None
+
+
+def register_ascend_ops() -> None:
+    log("COMPARE stage=register_import_torch_npu")
+    import torch_npu  # type: ignore  # noqa: F401
+
+    log("COMPARE stage=register_import_vllm")
+    import vllm  # type: ignore  # noqa: F401
+
+    log("COMPARE stage=register_import_vllm_ascend")
+    import vllm_ascend  # type: ignore
+
+    custom_opp_path = _ensure_vllm_ascend_custom_opp_path(vllm_ascend)
     log(
         "COMPARE stage=register_import_custom_op "
         f"custom_opp_path={custom_opp_path} "
@@ -169,6 +195,8 @@ def run_dense_mla_materialized(
     mask_size: int,
     expand_kv_to_heads: bool,
 ) -> torch.Tensor:
+    import torch_npu  # type: ignore
+
     query = tensors["query"]
     query_rope = tensors["query_rope"]
     block_table = tensors["block_table"]
@@ -236,6 +264,8 @@ def run_dense_mla_paged(
     mask_size: int,
     kv_lens_mode: str,
 ) -> torch.Tensor:
+    import torch_npu  # type: ignore
+
     query = tensors["query"]
     query_rope = tensors["query_rope"]
     key_cache = tensors["key"].transpose(1, 2).contiguous()
@@ -378,6 +408,13 @@ def compare_outputs(
     right = right_out.float()
     diff = left - right
     abs_diff = diff.abs()
+    left_min = left.min()
+    left_max = left.max()
+    right_min = right.min()
+    right_max = right.max()
+    value_range = (torch.maximum(left_max, right_max) - torch.minimum(left_min, right_min)).clamp_min(1e-6)
+    max_abs = abs_diff.max()
+    mean_abs = abs_diff.mean()
     left_flat = left.flatten()
     right_flat = right.flatten()
     rel_l2 = torch.linalg.vector_norm(diff.flatten()) / torch.linalg.vector_norm(right_flat).clamp_min(1e-6)
@@ -385,11 +422,14 @@ def compare_outputs(
     log(
         "COMPARE diff "
         f"left={left_name} right={right_name} "
-        f"max_abs={abs_diff.max().item():.6g} "
-        f"mean_abs={abs_diff.mean().item():.6g} "
+        f"max_abs={max_abs.item():.6g} "
+        f"mean_abs={mean_abs.item():.6g} "
         f"rms={diff.pow(2).mean().sqrt().item():.6g} "
         f"rel_l2={rel_l2.item():.6g} "
-        f"cosine={cosine.item():.8f}"
+        f"cosine={cosine.item():.8f} "
+        f"value_range={value_range.item():.6g} "
+        f"relative_max_error={(max_abs / value_range).item():.6g} "
+        f"relative_mean_abs_error={(mean_abs / value_range).item():.6g}"
     )
     log(f"COMPARE {stats(left_name, left_out)}")
     log(f"COMPARE {stats(right_name, right_out)}")
@@ -419,11 +459,11 @@ def main() -> None:
     args = parser.parse_args()
 
     log("COMPARE stage=start")
+    register_ascend_ops()
     device_index = int(str(args.device).split(":")[-1])
     torch.npu.set_device(device_index)
     torch.npu.config.allow_internal_format = True
     log(f"COMPARE stage=set_device device={args.device}")
-    register_ascend_ops()
 
     dump_path = pick_dump(args.dump, args.dump_glob)
     log(f"COMPARE stage=load_dump path={dump_path}")
