@@ -154,6 +154,7 @@ class LLMEngine:
             tokenizer = PreTrainedTokenizerFast.from_pretrained(
                 config.model,
                 trust_remote_code=config.trust_remote_code,
+                fix_mistral_regex=True,
             )
             if not getattr(tokenizer, "chat_template", None):
                 tokenizer.chat_template = DEEPSEEK_V32_CHAT_TEMPLATE

@@ -1309,9 +1309,7 @@ class DeepseekV32DSAAttention(nn.Module):
         if get_context().is_prefill:
             attn_output = self._prefill_forward(ql_nope, q_pe)
         else:
-            attn_output = self._decode_forward(
-                ql_nope, q_pe, q_index, weights
-            )
+            attn_output = self._decode_forward(ql_nope, q_pe, q_index, weights)
         return self.o_proj(attn_output)
 
 

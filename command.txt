@@ -1,6 +1,10 @@
 # Run these commands manually from the nano-vllm-ascend directory.
 
 
+# 00. Create the log directory once.
+mkdir -p logs/sfa_manual
+
+
 # 33. Cleaned integrated path after switch removal:
 # - prefill always uses paged dense MLA
 # - MoE gating always uses torch.ops._C_ascend.moe_gating_top_k
@@ -20,12 +24,29 @@ PYTORCH_NPU_ALLOC_CONF=expandable_segments:True ASCEND_RT_VISIBLE_DEVICES=0,1,2,
 PYTORCH_NPU_ALLOC_CONF=expandable_segments:True ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=4 NANOVLLM_ENABLE_NPU_SFA_DECODE=1 NANOVLLM_LOG_NPU_SFA_TIMING=1 NANOVLLM_PROFILE_LAYER_IDS=0 NANOVLLM_LONG_PROMPT_TOKENS=129 NANOVLLM_MAX_MODEL_LEN=256 NANOVLLM_MAX_BATCHED_TOKENS=256 NANOVLLM_MAX_NUM_SEQS=1 NANOVLLM_MAX_GEN_TOKENS=3 NANOVLLM_SKIP_WARMUP=1 python example/example.py 2>&1 | tee logs/sfa_manual/35_clean_sfa_decode_129_gen3.log
 
 
-# 99. Extract key lines after 33-35.
-grep -E "built long prompt|TP-wide minimum KV cache blocks|NPU SFA input summary|NPU SFA timing|NPU MLA timing|NPU SFA compare|Traceback|RuntimeError|ERROR|Prompt:|prompt len:|text:" logs/sfa_manual/33_clean_mla_prefill_npu_moe_3072.log logs/sfa_manual/34_clean_decode_torch_sparse_129_gen3.log logs/sfa_manual/35_clean_sfa_decode_129_gen3.log 2>&1 | tee logs/sfa_manual/99_clean_key_lines.log
+# 36. Short prompts, stable decode path, max 16 completion tokens.
+PYTORCH_NPU_ALLOC_CONF=expandable_segments:True ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=4 NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_SKIP_WARMUP=1 python example/short_prompts.py 2>&1 | tee logs/sfa_manual/36_short_prompts.log
+
+
+# 37. Three hard-coded long English QA prompts, stable decode path.
+PYTORCH_NPU_ALLOC_CONF=expandable_segments:True ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=4 NANOVLLM_MAX_GEN_TOKENS=32 NANOVLLM_SKIP_WARMUP=1 python example/long_prompts.py 2>&1 | tee logs/sfa_manual/37_long_prompts.log
+
+
+# 38. Exact-length behavior test, equivalent to the old example.py role.
+PYTORCH_NPU_ALLOC_CONF=expandable_segments:True ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=4 NANOVLLM_LONG_PROMPT_TOKENS=3072 NANOVLLM_MAX_MODEL_LEN=3200 NANOVLLM_MAX_BATCHED_TOKENS=3200 NANOVLLM_MAX_NUM_SEQS=1 NANOVLLM_MAX_GEN_TOKENS=1 NANOVLLM_SKIP_WARMUP=1 python example/test.py 2>&1 | tee logs/sfa_manual/38_exact_3072.log
+
+
+# 39. Exact short prompt with stable multi-token decode.
+PYTORCH_NPU_ALLOC_CONF=expandable_segments:True ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=4 NANOVLLM_LONG_PROMPT_TOKENS=129 NANOVLLM_MAX_MODEL_LEN=256 NANOVLLM_MAX_BATCHED_TOKENS=256 NANOVLLM_MAX_NUM_SEQS=1 NANOVLLM_MAX_GEN_TOKENS=10 NANOVLLM_SKIP_WARMUP=1 python example/test.py 2>&1 | tee logs/sfa_manual/39_exact_129_gen10.log
+
+
+# 99. Extract key lines after 36-39.
+grep -E "long prompt|prompt [0-9]+ token_len|prompt_len:|prompt    :|response  :|token_ids :|NPU SFA timing|NPU MLA timing|Traceback|RuntimeError|ERROR" logs/sfa_manual/36_short_prompts.log logs/sfa_manual/37_long_prompts.log logs/sfa_manual/38_exact_3072.log logs/sfa_manual/39_exact_129_gen10.log 2>&1 | tee logs/sfa_manual/99_example_key_lines.log
 
 
 # Paste these logs back.
-cat logs/sfa_manual/33_clean_mla_prefill_npu_moe_3072.log
-cat logs/sfa_manual/34_clean_decode_torch_sparse_129_gen3.log
-cat logs/sfa_manual/35_clean_sfa_decode_129_gen3.log
-cat logs/sfa_manual/99_clean_key_lines.log
+cat logs/sfa_manual/36_short_prompts.log
+cat logs/sfa_manual/37_long_prompts.log
+cat logs/sfa_manual/38_exact_3072.log
+cat logs/sfa_manual/39_exact_129_gen10.log
+cat logs/sfa_manual/99_example_key_lines.log
