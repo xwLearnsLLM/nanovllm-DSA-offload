@@ -113,18 +113,13 @@ class LLMEngine:
 
     @classmethod
     def _tokenizer_load_kwargs(cls, config: Config) -> dict:
-        kwargs = {
-            "trust_remote_code": config.trust_remote_code,
-        }
-        if cls._is_deepseek_v32(config):
-            kwargs["fix_mistral_regex"] = True
-        return kwargs
+        return {"trust_remote_code": config.trust_remote_code}
 
     @staticmethod
     def _format_deepseek_prompt(prompt: str, use_chat_template: bool) -> str:
         if not use_chat_template:
             return prompt
-        return f"<｜User｜>{prompt}<｜Assistant｜>"
+        return f"<\uFF5CUser\uFF5C>{prompt}<\uFF5CAssistant\uFF5C>"
 
     def _encode_string_prompt(self, prompt: str) -> list[int]:
         if not self._is_deepseek_v32(self.config):
@@ -154,7 +149,7 @@ class LLMEngine:
             tokenizer = PreTrainedTokenizerFast.from_pretrained(
                 config.model,
                 trust_remote_code=config.trust_remote_code,
-                fix_mistral_regex=True,
+                fix_mistral_regex=False,
             )
             if not getattr(tokenizer, "chat_template", None):
                 tokenizer.chat_template = DEEPSEEK_V32_CHAT_TEMPLATE
@@ -176,7 +171,7 @@ class LLMEngine:
             tokenizer = LlamaTokenizerFast.from_pretrained(
                 config.model,
                 legacy=True,
-                fix_mistral_regex=True,
+                fix_mistral_regex=False,
             )
         if (
             getattr(config.hf_config, "model_type", None) == "deepseek_v32"

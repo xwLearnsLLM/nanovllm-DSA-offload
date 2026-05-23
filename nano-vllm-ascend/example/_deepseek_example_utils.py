@@ -1,7 +1,6 @@
 import os
 
 from nanovllm import LLM, SamplingParams
-from transformers import LlamaTokenizerFast
 
 
 MODEL_PATH = "/home/models/Deepseek-V3.2-Pruned-95B-BF/"
@@ -53,16 +52,7 @@ def make_llm(
 
 
 def prompt_tokenizer(llm: LLM):
-    tokenizer_path = os.environ.get("NANOVLLM_TOKENIZER", model_path())
-    try:
-        return LlamaTokenizerFast.from_pretrained(
-            tokenizer_path,
-            legacy=True,
-            fix_mistral_regex=True,
-        )
-    except Exception as exc:
-        print(f"tokenizer fallback: using llm.tokenizer because {exc!r}")
-        return llm.tokenizer
+    return llm.tokenizer
 
 
 def encode_prompts(tokenizer, prompts: list[str]) -> list[list[int]]:
