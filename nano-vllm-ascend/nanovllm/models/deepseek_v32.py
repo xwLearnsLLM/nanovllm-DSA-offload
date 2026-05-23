@@ -645,7 +645,8 @@ class DeepseekV32SparseMoeBlock(nn.Module):
             return None
 
         bias = getattr(self.gate, "e_score_correction_bias", None)
-        group_select_mode = 1 if bias is not None else 0
+        if bias is not None and bias.dtype != router_logits.dtype:
+            bias = bias.to(router_logits.dtype)
         norm_type = 1 if self.scoring_func == "sigmoid" else 0
         if self.scoring_func not in ("softmax", "sigmoid"):
             return None
@@ -655,14 +656,22 @@ class DeepseekV32SparseMoeBlock(nn.Module):
             k=self.top_k,
             k_group=self.topk_group,
             group_count=self.num_expert_group,
-            group_select_mode=group_select_mode,
-            renorm=1 if self.renormalize else 0,
+            group_select_mode=1,
+            renorm=0,
             norm_type=norm_type,
             out_flag=False,
-            routed_scaling_factor=self.routed_scaling_factor,
+            routed_scaling_factor=1.0,
             eps=1e-20,
             bias_opt=bias,
         )
+        topk_weights = topk_weights.float()
+        if self.renormalize:
+            topk_weights = topk_weights / topk_weights.sum(
+                dim=-1,
+                keepdim=True,
+            ).clamp_min(1e-20)
+        if self.routed_scaling_factor != 1.0:
+            topk_weights = topk_weights * self.routed_scaling_factor
         return topk_weights.float(), topk_ids.long()
 
     def _forward_profiled(self, hidden_states: torch.Tensor) -> torch.Tensor:
