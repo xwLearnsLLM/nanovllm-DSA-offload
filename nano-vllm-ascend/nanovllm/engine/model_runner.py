@@ -30,6 +30,14 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return value.lower() in ("1", "true", "yes", "on")
 
 
+def _use_npu_sfa_or_indexer() -> bool:
+    return (
+        _env_flag("NANOVLLM_ENABLE_NPU_INDEXER", False)
+        or _env_flag("NANOVLLM_ENABLE_NPU_SFA_PREFILL", False)
+        or _env_flag("NANOVLLM_ENABLE_NPU_SFA_DECODE", False)
+    )
+
+
 def _import_torchair():
     try:
         import torchair  # type: ignore
@@ -57,7 +65,7 @@ def _register_vllm_ascend_custom_ops() -> bool:
     except Exception as exc:
         logger.warning("Failed to register vLLM-Ascend custom ops early: %r", exc)
         return False
-    logger.info("Registered vLLM-Ascend custom ops early for Nano NPU indexer.")
+    logger.info("Registered vLLM-Ascend custom ops early for Nano NPU indexer/SFA.")
     return True
 
 
@@ -75,7 +83,7 @@ class ModelRunner:
         self.model_type = self.hf_config.model_type
 
         torch.npu.set_device(rank)
-        if _env_flag("NANOVLLM_ENABLE_NPU_INDEXER", False):
+        if _use_npu_sfa_or_indexer():
             _register_vllm_ascend_custom_ops()
         dist.init_process_group("hccl", f"tcp://localhost:{config.hccl_port}", world_size=self.world_size, rank=rank)
         default_dtype = torch.get_default_dtype()
@@ -297,6 +305,25 @@ class ModelRunner:
         for name, shape in shapes:
             logger.info(f"{name} allocated successfully shape: {shape}")
 
+    def _sync_kvcache_blocks_across_tp(self, local_num_blocks: int) -> int:
+        if self.world_size <= 1 or not dist.is_initialized():
+            return local_num_blocks
+        blocks = torch.tensor(
+            [local_num_blocks],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        dist.all_reduce(blocks, op=dist.ReduceOp.MIN)
+        synced_num_blocks = int(blocks.item())
+        if synced_num_blocks != local_num_blocks:
+            logger.info(
+                "Using TP-wide minimum KV cache blocks: rank=%d local=%d synced=%d",
+                self.rank,
+                local_num_blocks,
+                synced_num_blocks,
+            )
+        return synced_num_blocks
+
     def _allocate_dense_kv_cache(self):
         config = self.config
         hf_config = config.hf_config
@@ -318,7 +345,10 @@ class ModelRunner:
             * head_dim
             * self._dtype_itemsize(cache_dtype)
         )
-        config.num_kvcache_blocks = int(available_mem) // block_bytes
+        local_num_blocks = int(available_mem) // block_bytes
+        config.num_kvcache_blocks = self._sync_kvcache_blocks_across_tp(
+            local_num_blocks,
+        )
         assert config.num_kvcache_blocks > 0, "Failed to allocate any KV cache blocks due to insufficient memory."
         cache_shape = (2, num_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads * head_dim)
         kv_cache = torch.empty(cache_shape, dtype=cache_dtype, device=self.device)
@@ -355,16 +385,15 @@ class ModelRunner:
             * (kv_lora_rank + rope_dim + index_dim)
             * self._dtype_itemsize(cache_dtype)
         )
-        config.num_kvcache_blocks = int(available_mem) // block_bytes
+        local_num_blocks = int(available_mem) // block_bytes
+        config.num_kvcache_blocks = self._sync_kvcache_blocks_across_tp(
+            local_num_blocks,
+        )
         assert config.num_kvcache_blocks > 0, (
             "Failed to allocate any DeepSeek DSA cache blocks due to "
             "insufficient memory."
         )
-        use_indexer_cache_layout = (
-            _env_flag("NANOVLLM_ENABLE_NPU_INDEXER", False)
-            or _env_flag("NANOVLLM_ENABLE_NPU_SFA_PREFILL", False)
-            or _env_flag("NANOVLLM_ENABLE_NPU_SFA_DECODE", False)
-        )
+        use_indexer_cache_layout = _use_npu_sfa_or_indexer()
 
         if use_indexer_cache_layout:
             ckv_shape = (
@@ -457,6 +486,21 @@ class ModelRunner:
                                                                                          non_blocking=True)
         return block_tables
 
+    def _pad_block_tables_to_static_max(self, block_tables: torch.Tensor) -> torch.Tensor:
+        static_max_block_cols = (
+            self.config.max_model_len + self.config.kvcache_block_size - 1
+        ) // self.config.kvcache_block_size
+        if block_tables.shape[1] >= static_max_block_cols:
+            return block_tables
+        padded_block_tables = torch.full(
+            (block_tables.shape[0], static_max_block_cols),
+            fill_value=-1,
+            dtype=block_tables.dtype,
+            device=block_tables.device,
+        )
+        padded_block_tables[:, : block_tables.shape[1]] = block_tables
+        return padded_block_tables
+
     def prepare_prefill(self, seqs: list[Sequence]):
         input_ids = []
         positions = []
@@ -492,6 +536,8 @@ class ModelRunner:
                     slot_mapping.extend(list(range(start, end)))
 
         block_tables = self.prepare_block_tables(seqs)
+        if _use_npu_sfa_or_indexer():
+            block_tables = self._pad_block_tables_to_static_max(block_tables)
 
         input_ids = torch.tensor(input_ids, dtype=torch.int64).to(self.device)
         positions = torch.tensor(positions, dtype=torch.int64).to(self.device)

@@ -28,47 +28,6 @@ from nanovllm.utils.logger import init_logger
 logger = init_logger(__name__)
 BMM_TRANS_MAX_SUPPORTED_TOKENS = 1024
 PREFILL_MLA_CHUNK_SIZE = 256
-_VLLM_ASCEND_OPS_REGISTERED = False
-_VLLM_ASCEND_OPS_IMPORT_ERROR: str | None = None
-
-
-def _prepend_env_path(name: str, path: str) -> None:
-    current = os.environ.get(name, "")
-    parts = [part for part in current.split(os.pathsep) if part]
-    if path not in parts:
-        os.environ[name] = f"{path}{os.pathsep}{current}" if current else path
-
-
-def _dedupe_env_path(name: str) -> None:
-    current = os.environ.get(name, "")
-    parts = []
-    seen = set()
-    for part in current.split(os.pathsep):
-        if not part or part in seen:
-            continue
-        seen.add(part)
-        parts.append(part)
-    if parts:
-        os.environ[name] = os.pathsep.join(parts)
-
-
-def _ensure_vllm_ascend_custom_opp_path(vllm_ascend_module) -> None:
-    package_dir = os.path.dirname(os.path.realpath(vllm_ascend_module.__file__))
-    custom_opp_path = os.path.join(
-        package_dir,
-        "_cann_ops_custom",
-        "vendors",
-        "vllm-ascend",
-    )
-    if os.path.exists(custom_opp_path):
-        _prepend_env_path("ASCEND_CUSTOM_OPP_PATH", custom_opp_path)
-    try:
-        from vllm_ascend.platform import NPUPlatform  # type: ignore
-
-        NPUPlatform.import_kernels()
-    except Exception:
-        pass
-    _dedupe_env_path("ASCEND_CUSTOM_OPP_PATH")
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -131,62 +90,6 @@ def _profile_layer_selected(layer_idx: int, num_layers: int) -> bool:
         if selected == layer_idx:
             return True
     return False
-
-
-def _import_vllm_ascend_custom_ops() -> bool:
-    global _VLLM_ASCEND_OPS_REGISTERED, _VLLM_ASCEND_OPS_IMPORT_ERROR
-    if _VLLM_ASCEND_OPS_REGISTERED:
-        return True
-    if _VLLM_ASCEND_OPS_IMPORT_ERROR is not None:
-        return False
-    try:
-        os.environ.setdefault("VLLM_ASCEND_ENABLE_NZ", "0")
-        import torch_npu  # noqa: F401  # type: ignore
-        import vllm  # noqa: F401  # type: ignore
-        import vllm_ascend  # type: ignore
-
-        _ensure_vllm_ascend_custom_opp_path(vllm_ascend)
-        from vllm_ascend import vllm_ascend_C  # noqa: F401  # type: ignore
-        from vllm_ascend.ops.layer_shard_linear import (  # noqa: F401
-            is_hidden_layer,
-            post_process_after_loading_for_shard_weight_series,
-            reach_layer_for_shard_weight_series,
-            register_all_layers_to_shard_weight_series,
-        )
-    except Exception as exc:
-        _VLLM_ASCEND_OPS_IMPORT_ERROR = repr(exc)
-        if _is_rank0():
-            logger.info(
-                "vllm-ascend custom op registration unavailable: %s",
-                _VLLM_ASCEND_OPS_IMPORT_ERROR,
-            )
-        return False
-    _VLLM_ASCEND_OPS_REGISTERED = True
-    return True
-
-
-def _get_ascend_op(
-    name: str,
-    *,
-    allow_vllm_ascend_import: bool = False,
-):
-    ascend_ops = getattr(torch.ops, "_C_ascend", None)
-    if ascend_ops is not None and hasattr(ascend_ops, name):
-        return getattr(ascend_ops, name), "torch.ops._C_ascend"
-    if allow_vllm_ascend_import and _import_vllm_ascend_custom_ops():
-        ascend_ops = getattr(torch.ops, "_C_ascend", None)
-        if ascend_ops is not None and hasattr(ascend_ops, name):
-            return getattr(ascend_ops, name), "torch.ops._C_ascend(vllm_ascend_C)"
-    return None, None
-
-
-def _get_vllm_ascend_op(name: str):
-    if not _import_vllm_ascend_custom_ops():
-        return None, None
-    ascend_ops = getattr(torch.ops, "_C_ascend", None)
-    if ascend_ops is not None and hasattr(ascend_ops, name):
-        return getattr(ascend_ops, name), "torch.ops._C_ascend(vllm_ascend_C)"
-    return None, None
 
 
 def yarn_get_mscale(scale: float = 1.0, mscale: float = 1.0) -> float:
@@ -1082,7 +985,6 @@ class DeepseekV32DSAAttention(nn.Module):
             "NANOVLLM_ENABLE_NPU_SFA_DECODE",
             False,
         )
-        self.strict_npu_sfa = _env_flag("NANOVLLM_NPU_SFA_STRICT", False)
         self.compare_npu_sfa_prefill = _env_flag(
             "NANOVLLM_COMPARE_NPU_SFA_PREFILL",
             False,
@@ -1388,24 +1290,6 @@ class DeepseekV32DSAAttention(nn.Module):
         if _is_rank0():
             logger.info("Dumped NPU SFA inputs to %s", path)
 
-    def _handle_npu_sfa_failure(
-        self,
-        phase: str,
-        exc: Exception,
-    ) -> None:
-        message = (
-            f"NPU SFA {phase} failed once on layer {self.layer_id}; "
-            f"falling back to the PyTorch path. error={exc!r}"
-        )
-        if self.strict_npu_sfa:
-            raise RuntimeError(message) from exc
-        if phase == "prefill":
-            self.use_npu_sfa_prefill = False
-        else:
-            self.use_npu_sfa_decode = False
-        if _is_rank0():
-            logger.warning(message)
-
     def _log_npu_sfa_compare(
         self,
         phase: str,
@@ -1429,65 +1313,63 @@ class DeepseekV32DSAAttention(nn.Module):
             tuple(expected.shape),
         )
 
-    def _npu_lightning_indexer(
+    def _npu_sfa_forward(
         self,
+        ql_nope: torch.Tensor,
+        q_pe: torch.Tensor,
         q_index: torch.Tensor,
         weights: torch.Tensor,
         actual_seq_lengths_query: torch.Tensor,
         actual_seq_lengths_key: torch.Tensor,
         block_table: torch.Tensor,
+        phase: str,
     ) -> torch.Tensor:
-        query = q_index.to(self.index_cache.dtype).contiguous()
-        key = self._npu_pa_bsnd_cache(
+        block_table = self._npu_sfa_block_table(block_table)
+        actual_seq_lengths_query = actual_seq_lengths_query.to(
+            dtype=torch.int32,
+            device=ql_nope.device,
+        ).contiguous()
+        actual_seq_lengths_key = actual_seq_lengths_key.to(
+            dtype=torch.int32,
+            device=ql_nope.device,
+        ).contiguous()
+        log_timing = self.log_npu_sfa_timing
+        if log_timing:
+            _profile_sync(ql_nope.device)
+            start = perf_counter()
+        index_cache = self._npu_pa_bsnd_cache(
             self.index_cache,
             self.indexer.head_dim,
             "index",
         )
-        weights = weights.to(self.index_cache.dtype).contiguous()
-        actual_seq_lengths_query = actual_seq_lengths_query.contiguous()
-        actual_seq_lengths_key = actual_seq_lengths_key.contiguous()
-        lightning_indexer, _ = _get_ascend_op(
-            "npu_lightning_indexer",
-            allow_vllm_ascend_import=True,
-        )
-        if lightning_indexer is None:
-            raise RuntimeError(
-                "torch.ops._C_ascend.npu_lightning_indexer is unavailable"
-            )
-        topk_indices = lightning_indexer(
-            query=query,
-            key=key,
-            weights=weights,
-            actual_seq_lengths_query=actual_seq_lengths_query,
-            actual_seq_lengths_key=actual_seq_lengths_key,
+        topk_indices = torch.ops._C_ascend.npu_lightning_indexer(
+            query=q_index.to(self.index_cache.dtype).contiguous(),
+            key=index_cache,
+            weights=weights.to(self.index_cache.dtype).contiguous(),
+            actual_seq_lengths_query=actual_seq_lengths_query.contiguous(),
+            actual_seq_lengths_key=actual_seq_lengths_key.contiguous(),
             block_table=block_table,
             layout_query="TND",
             layout_key="PA_BSND",
             sparse_count=self.sfa_sparse_count,
             sparse_mode=3,
         )
-        if isinstance(topk_indices, tuple):
-            topk_indices = topk_indices[0]
-        return topk_indices
-
-    def _npu_sparse_flash_attention(
-        self,
-        ql_nope: torch.Tensor,
-        q_pe: torch.Tensor,
-        topk_indices: torch.Tensor,
-        actual_seq_lengths_query: torch.Tensor,
-        actual_seq_lengths_key: torch.Tensor,
-        block_table: torch.Tensor,
-        phase: str,
-    ) -> torch.Tensor:
-        sparse_flash_attention, _ = _get_ascend_op(
-            "npu_sparse_flash_attention",
-            allow_vllm_ascend_import=True,
-        )
-        if sparse_flash_attention is None:
-            raise RuntimeError(
-                "torch.ops._C_ascend.npu_sparse_flash_attention is unavailable"
+        if log_timing:
+            _profile_sync(ql_nope.device)
+            logger.info(
+                "NPU SFA timing: rank=%d phase=%s layer=%d op=indexer "
+                "elapsed=%.6fs %s actual_seq_lengths_query=%s "
+                "actual_seq_lengths_key=%s block_table_shape=%s",
+                _rank_id(),
+                phase,
+                self.layer_id,
+                perf_counter() - start,
+                self._tensor_range_desc("topk_indices", topk_indices),
+                actual_seq_lengths_query.detach().cpu().tolist(),
+                actual_seq_lengths_key.detach().cpu().tolist(),
+                tuple(block_table.shape),
             )
+            start = perf_counter()
         ckv_cache = self._npu_pa_bsnd_cache(
             self.ckv_cache,
             self.kv_lora_rank,
@@ -1524,7 +1406,7 @@ class DeepseekV32DSAAttention(nn.Module):
             query_rope,
             kpe_cache,
         )
-        latent = sparse_flash_attention(
+        latent = torch.ops._C_ascend.npu_sparse_flash_attention(
             query=query,
             key=ckv_cache,
             value=ckv_cache,
@@ -1539,66 +1421,6 @@ class DeepseekV32DSAAttention(nn.Module):
             layout_query="TND",
             layout_kv="PA_BSND",
             sparse_mode=3,
-        )
-        if isinstance(latent, tuple):
-            latent = latent[0]
-        return latent
-
-    def _npu_sfa_forward(
-        self,
-        ql_nope: torch.Tensor,
-        q_pe: torch.Tensor,
-        q_index: torch.Tensor,
-        weights: torch.Tensor,
-        actual_seq_lengths_query: torch.Tensor,
-        actual_seq_lengths_key: torch.Tensor,
-        block_table: torch.Tensor,
-        phase: str,
-    ) -> torch.Tensor:
-        block_table = self._npu_sfa_block_table(block_table)
-        actual_seq_lengths_query = actual_seq_lengths_query.to(
-            dtype=torch.int32,
-            device=ql_nope.device,
-        ).contiguous()
-        actual_seq_lengths_key = actual_seq_lengths_key.to(
-            dtype=torch.int32,
-            device=ql_nope.device,
-        ).contiguous()
-        log_timing = self.log_npu_sfa_timing
-        if log_timing:
-            _profile_sync(ql_nope.device)
-            start = perf_counter()
-        topk_indices = self._npu_lightning_indexer(
-            q_index,
-            weights,
-            actual_seq_lengths_query,
-            actual_seq_lengths_key,
-            block_table,
-        )
-        if log_timing:
-            _profile_sync(ql_nope.device)
-            logger.info(
-                "NPU SFA timing: rank=%d phase=%s layer=%d op=indexer "
-                "elapsed=%.6fs %s actual_seq_lengths_query=%s "
-                "actual_seq_lengths_key=%s block_table_shape=%s",
-                _rank_id(),
-                phase,
-                self.layer_id,
-                perf_counter() - start,
-                self._tensor_range_desc("topk_indices", topk_indices),
-                actual_seq_lengths_query.detach().cpu().tolist(),
-                actual_seq_lengths_key.detach().cpu().tolist(),
-                tuple(block_table.shape),
-            )
-            start = perf_counter()
-        latent = self._npu_sparse_flash_attention(
-            ql_nope,
-            q_pe,
-            topk_indices,
-            actual_seq_lengths_query,
-            actual_seq_lengths_key,
-            block_table,
-            phase,
         )
         if log_timing:
             _profile_sync(ql_nope.device)
@@ -1633,16 +1455,10 @@ class DeepseekV32DSAAttention(nn.Module):
         block_table_row: torch.Tensor,
         valid_len: int,
     ) -> torch.Tensor:
-        lightning_indexer, _ = _get_vllm_ascend_op("npu_lightning_indexer")
-        if lightning_indexer is None:
-            raise RuntimeError(
-                "NANOVLLM_ENABLE_NPU_INDEXER=1 but "
-                "torch.ops._C_ascend.npu_lightning_indexer is unavailable"
-            )
         device = q_index.device
         seq_lengths_query = torch.ones((1,), dtype=torch.int32, device=device)
         seq_lengths_key = torch.tensor([valid_len], dtype=torch.int32, device=device)
-        topk_indices = lightning_indexer(
+        topk_indices = torch.ops._C_ascend.npu_lightning_indexer(
             query=q_index.unsqueeze(0).to(self.index_cache.dtype).contiguous(),
             key=self._npu_indexer_cache(),
             weights=weights.unsqueeze(0).to(self.index_cache.dtype).contiguous(),
@@ -1654,8 +1470,6 @@ class DeepseekV32DSAAttention(nn.Module):
             sparse_count=self.index_topk,
             sparse_mode=3,
         )
-        if isinstance(topk_indices, tuple):
-            topk_indices = topk_indices[0]
         topk = min(self.index_topk, valid_len)
         return topk_indices.flatten()[:topk].to(torch.long)
 
@@ -1742,24 +1556,21 @@ class DeepseekV32DSAAttention(nn.Module):
         weights: torch.Tensor,
     ) -> torch.Tensor:
         if self.use_npu_sfa_prefill:
-            try:
-                sfa_output = self._prefill_forward_sfa(
+            sfa_output = self._prefill_forward_sfa(
+                ql_nope,
+                q_pe,
+                q_index,
+                weights,
+            )
+            if self.compare_npu_sfa_prefill:
+                reference = self._prefill_forward_mla(
                     ql_nope,
                     q_pe,
                     q_index,
                     weights,
                 )
-                if self.compare_npu_sfa_prefill:
-                    reference = self._prefill_forward_mla(
-                        ql_nope,
-                        q_pe,
-                        q_index,
-                        weights,
-                    )
-                    self._log_npu_sfa_compare("prefill", sfa_output, reference)
-                return sfa_output
-            except Exception as exc:
-                self._handle_npu_sfa_failure("prefill", exc)
+                self._log_npu_sfa_compare("prefill", sfa_output, reference)
+            return sfa_output
         return self._prefill_forward_mla(ql_nope, q_pe, q_index, weights)
 
     def _prefill_forward_sfa(
@@ -2004,26 +1815,22 @@ class DeepseekV32DSAAttention(nn.Module):
         q_index: torch.Tensor,
         weights: torch.Tensor,
     ) -> torch.Tensor:
-        context = get_context()
         if self.use_npu_sfa_decode:
-            try:
-                sfa_output = self._decode_forward_sfa(
+            sfa_output = self._decode_forward_sfa(
+                ql_nope,
+                q_pe,
+                q_index,
+                weights,
+            )
+            if self.compare_npu_sfa_decode:
+                reference = self._decode_forward_torch(
                     ql_nope,
                     q_pe,
                     q_index,
                     weights,
                 )
-                if self.compare_npu_sfa_decode:
-                    reference = self._decode_forward_torch(
-                        ql_nope,
-                        q_pe,
-                        q_index,
-                        weights,
-                    )
-                    self._log_npu_sfa_compare("decode", sfa_output, reference)
-                return sfa_output
-            except Exception as exc:
-                self._handle_npu_sfa_failure("decode", exc)
+                self._log_npu_sfa_compare("decode", sfa_output, reference)
+            return sfa_output
         return self._decode_forward_torch(ql_nope, q_pe, q_index, weights)
 
     def _decode_forward_sfa(
