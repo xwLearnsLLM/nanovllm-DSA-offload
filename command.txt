@@ -42,13 +42,19 @@ find logs/sfa_manual/dumps -name 'sfa_rank*_layer*_seq*.pt' | head -n 5
 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python scripts/probe_deepseek_v32_sfa_attention.py --replay-dump logs/sfa_manual/dumps/REPLACE_WITH_ACTUAL_DUMP.pt --device npu:0 2>&1 | tee logs/sfa_manual/05_replay_dump.log
 
 
-# 7. Extract key lines.
-grep -E "PROBE |built long prompt|NPU SFA input summary|NPU SFA timing|NPU SFA compare|NPU SFA .*failed|Dumped NPU SFA|Traceback|RuntimeError|ERROR|Prompt:|prompt len:|text:" logs/sfa_manual/*.log 2>&1 | tee logs/sfa_manual/99_key_lines.log
+# 7. Trace the working vllm-ascend 0.19 SFA path and print real op inputs.
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 SFA_TRACE_MAX_CALLS=8 python scripts/trace_vllm_ascend_sfa_inputs.py --model /home/models/Deepseek-V3.2-Pruned-95B-BF/ --tp-size 4 --prompt-tokens 2048 --max-model-len 2176 --max-num-batched-tokens 3072 --max-tokens 1 2>&1 | tee logs/sfa_manual/06_vllm_ascend_sfa_trace.log
 
 
-# 8. Paste these logs back.
+# 8. Extract key lines.
+grep -E "PROBE |SFA_TRACE|built long prompt|NPU SFA input summary|NPU SFA timing|NPU SFA compare|NPU SFA .*failed|Dumped NPU SFA|Traceback|RuntimeError|ERROR|Prompt:|prompt len:|text:" logs/sfa_manual/*.log 2>&1 | tee logs/sfa_manual/99_key_lines.log
+
+
+# 9. Paste these logs back.
 cat logs/sfa_manual/01_probe_prefill_2k.log
 cat logs/sfa_manual/02_probe_decode_2k_bs4.log
 cat logs/sfa_manual/03_short_prefill_compare.log
 cat logs/sfa_manual/04_long_prefill_sfa_decode1.log
+cat logs/sfa_manual/05_replay_dump.log
+cat logs/sfa_manual/06_vllm_ascend_sfa_trace.log
 cat logs/sfa_manual/99_key_lines.log
