@@ -644,6 +644,7 @@ class DeepseekV32SparseMoeBlock(nn.Module):
         if router_logits.device.type != "npu":
             return None
 
+        router_logits = router_logits.float()
         bias = getattr(self.gate, "e_score_correction_bias", None)
         if bias is not None and bias.dtype != router_logits.dtype:
             bias = bias.to(router_logits.dtype)
@@ -652,7 +653,7 @@ class DeepseekV32SparseMoeBlock(nn.Module):
             return None
 
         topk_weights, topk_ids, _ = torch.ops._C_ascend.moe_gating_top_k(
-            router_logits.float(),
+            router_logits,
             k=self.top_k,
             k_group=self.topk_group,
             group_count=self.num_expert_group,

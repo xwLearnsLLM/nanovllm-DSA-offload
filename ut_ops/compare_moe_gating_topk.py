@@ -98,6 +98,8 @@ def torch_grouped_topk(
         scores = router_logits.sigmoid()
     else:
         raise ValueError(f"Unsupported scoring function: {scoring_func}")
+    if bias is not None and bias.dtype != scores.dtype:
+        bias = bias.to(scores.dtype)
 
     if num_expert_group > 1:
         num_tokens = scores.shape[0]
@@ -176,8 +178,11 @@ def npu_grouped_topk(
     bias: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     norm_type = 1 if scoring_func == "sigmoid" else 0
+    router_logits = router_logits.float()
+    if bias is not None and bias.dtype != router_logits.dtype:
+        bias = bias.to(router_logits.dtype)
     topk_weights, topk_ids, _ = torch.ops._C_ascend.moe_gating_top_k(
-        router_logits.float(),
+        router_logits,
         k=top_k,
         k_group=topk_group,
         group_count=num_expert_group,
@@ -216,6 +221,17 @@ def tensor_desc(name: str, tensor: torch.Tensor) -> str:
     )
 
 
+def parse_dtype(name: str) -> torch.dtype:
+    normalized = name.lower()
+    if normalized in ("float32", "fp32"):
+        return torch.float32
+    if normalized in ("bfloat16", "bf16"):
+        return torch.bfloat16
+    if normalized in ("float16", "fp16"):
+        return torch.float16
+    raise ValueError(f"Unsupported dtype: {name}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", default="npu:0")
@@ -229,6 +245,8 @@ def main() -> None:
     parser.add_argument("--routed-scaling-factor", type=float, default=None)
     parser.add_argument("--renormalize", type=int, default=None)
     parser.add_argument("--bias-mode", choices=("auto", "none", "random"), default="auto")
+    parser.add_argument("--logits-dtype", default="float32")
+    parser.add_argument("--bias-dtype", default="float32")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--iters", type=int, default=5)
@@ -263,13 +281,15 @@ def main() -> None:
     )
 
     torch.manual_seed(args.seed)
+    logits_dtype = parse_dtype(args.logits_dtype)
+    bias_dtype = parse_dtype(args.bias_dtype)
     router_logits = torch.randn(
         (tokens, experts),
-        dtype=torch.float32,
+        dtype=logits_dtype,
         device=device,
     )
     bias = (
-        torch.randn((experts,), dtype=torch.float32, device=device) * 0.01
+        torch.randn((experts,), dtype=bias_dtype, device=device) * 0.01
         if use_bias
         else None
     )
@@ -301,8 +321,14 @@ def main() -> None:
 
     if args.try_renorm_one:
         try:
+            renorm_one_logits = router_logits.float()
+            renorm_one_bias = (
+                bias.to(renorm_one_logits.dtype)
+                if bias is not None and bias.dtype != renorm_one_logits.dtype
+                else bias
+            )
             torch.ops._C_ascend.moe_gating_top_k(
-                router_logits.float(),
+                renorm_one_logits,
                 k=top_k,
                 k_group=topk_group,
                 group_count=n_group,
@@ -312,7 +338,7 @@ def main() -> None:
                 out_flag=False,
                 routed_scaling_factor=1.0,
                 eps=1e-20,
-                bias_opt=bias,
+                bias_opt=renorm_one_bias,
             )
             torch.npu.synchronize()
             log("MOE_GATE renorm_one=ok")
