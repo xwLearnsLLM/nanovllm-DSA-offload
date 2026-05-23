@@ -292,25 +292,107 @@ def run_dense_mla_paged(
     return out
 
 
-def compare_outputs(sfa_out: torch.Tensor, mla_out: torch.Tensor) -> None:
-    sfa = sfa_out.float()
-    mla = mla_out.float()
-    diff = sfa - mla
+def run_torch_sparse_reference(
+    payload: dict,
+    tensors: dict[str, torch.Tensor],
+    chunk_size: int,
+) -> torch.Tensor:
+    query = tensors["query"]
+    query_rope = tensors["query_rope"]
+    sparse_indices = tensors["sparse_indices"]
+    block_table = tensors["block_table"]
+    key = materialize_paged_cache(
+        tensors["key"],
+        block_table,
+        [int(x) for x in tensors["actual_seq_lengths_kv"].detach().cpu().tolist()],
+    )
+    value = materialize_paged_cache(
+        tensors["value"],
+        block_table,
+        [int(x) for x in tensors["actual_seq_lengths_kv"].detach().cpu().tolist()],
+    )
+    key_rope = materialize_paged_cache(
+        tensors["key_rope"],
+        block_table,
+        [int(x) for x in tensors["actual_seq_lengths_kv"].detach().cpu().tolist()],
+    )
+    if int(key.shape[1]) != 1:
+        raise ValueError(f"sparse reference only supports absorb kv_heads=1, got {key.shape}")
+
+    q_ends = [int(x) for x in tensors["actual_seq_lengths_query"].detach().cpu().tolist()]
+    q_starts = [0] + q_ends[:-1]
+    kv_lens = [int(x) for x in tensors["actual_seq_lengths_kv"].detach().cpu().tolist()]
+    kv_starts = [0] + cumulative(kv_lens)[:-1]
+    scale = float(payload["scale_value"])
+    out = torch.empty_like(query)
+
+    log(
+        "COMPARE torch_sparse_reference_inputs "
+        f"{desc('query', query)} {desc('key', key)} {desc('value', value)} "
+        f"{desc('query_rope', query_rope)} {desc('key_rope', key_rope)} "
+        f"{desc('sparse_indices', sparse_indices)} chunk_size={chunk_size}"
+    )
+    start = perf_counter()
+    for seq_idx, (q_start, q_end, kv_start) in enumerate(
+        zip(q_starts, q_ends, kv_starts)
+    ):
+        for chunk_start in range(q_start, q_end, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, q_end)
+            selected_local = sparse_indices[chunk_start:chunk_end, 0, :]
+            valid = selected_local >= 0
+            selected = selected_local.clamp_min(0) + kv_start
+
+            q = query[chunk_start:chunk_end].float()
+            q_pe = query_rope[chunk_start:chunk_end].float()
+            k = key[selected].squeeze(2).float()
+            v = value[selected].squeeze(2).float()
+            k_pe = key_rope[selected].squeeze(2).float()
+
+            scores = torch.einsum("chd,ckd->chk", q, k)
+            scores = scores + torch.einsum("chr,ckr->chk", q_pe, k_pe)
+            scores = scores * scale
+            scores = scores.masked_fill(~valid[:, None, :], -float("inf"))
+            probs = torch.softmax(scores, dim=-1)
+            probs = probs.masked_fill(~valid[:, None, :], 0)
+            latent = torch.einsum("chk,ckd->chd", probs, v)
+            out[chunk_start:chunk_end] = latent.to(out.dtype)
+        log(
+            "COMPARE torch_sparse_reference_progress "
+            f"seq={seq_idx} q_range=[{q_start},{q_end}) kv_start={kv_start}"
+        )
+    torch.npu.synchronize()
+    log(
+        f"COMPARE after_torch_sparse_reference elapsed={perf_counter() - start:.6f}s "
+        f"{desc('sparse_ref', out)}"
+    )
+    return out
+
+
+def compare_outputs(
+    left_name: str,
+    left_out: torch.Tensor,
+    right_name: str,
+    right_out: torch.Tensor,
+) -> None:
+    left = left_out.float()
+    right = right_out.float()
+    diff = left - right
     abs_diff = diff.abs()
-    sfa_flat = sfa.flatten()
-    mla_flat = mla.flatten()
-    rel_l2 = torch.linalg.vector_norm(diff.flatten()) / torch.linalg.vector_norm(mla_flat).clamp_min(1e-6)
-    cosine = F.cosine_similarity(sfa_flat, mla_flat, dim=0)
+    left_flat = left.flatten()
+    right_flat = right.flatten()
+    rel_l2 = torch.linalg.vector_norm(diff.flatten()) / torch.linalg.vector_norm(right_flat).clamp_min(1e-6)
+    cosine = F.cosine_similarity(left_flat, right_flat, dim=0)
     log(
         "COMPARE diff "
+        f"left={left_name} right={right_name} "
         f"max_abs={abs_diff.max().item():.6g} "
         f"mean_abs={abs_diff.mean().item():.6g} "
         f"rms={diff.pow(2).mean().sqrt().item():.6g} "
         f"rel_l2={rel_l2.item():.6g} "
         f"cosine={cosine.item():.8f}"
     )
-    log(f"COMPARE {stats('sfa_out', sfa_out)}")
-    log(f"COMPARE {stats('mla_out', mla_out)}")
+    log(f"COMPARE {stats(left_name, left_out)}")
+    log(f"COMPARE {stats(right_name, right_out)}")
 
 
 def main() -> None:
@@ -331,6 +413,9 @@ def main() -> None:
     )
     parser.add_argument("--expand-materialized-kv-to-heads", action="store_true")
     parser.add_argument("--metadata-only", action="store_true")
+    parser.add_argument("--skip-sfa-op", action="store_true")
+    parser.add_argument("--torch-sparse-reference", action="store_true")
+    parser.add_argument("--reference-chunk-size", type=int, default=64)
     args = parser.parse_args()
 
     log("COMPARE stage=start")
@@ -378,8 +463,12 @@ def main() -> None:
         log("COMPARE stage=metadata_only_done")
         return
 
-    log("COMPARE stage=run_sfa")
-    sfa_out = run_sfa(payload, tensors)
+    sfa_out = None
+    if args.skip_sfa_op:
+        log("COMPARE stage=skip_sfa_op")
+    else:
+        log("COMPARE stage=run_sfa")
+        sfa_out = run_sfa(payload, tensors)
     if args.mla_mode == "paged":
         log("COMPARE stage=run_dense_mla_paged")
         mla_out = run_dense_mla_paged(
@@ -396,8 +485,19 @@ def main() -> None:
             mask_size=args.mask_size,
             expand_kv_to_heads=args.expand_materialized_kv_to_heads,
         )
-    log("COMPARE stage=compare_outputs")
-    compare_outputs(sfa_out, mla_out)
+
+    if args.torch_sparse_reference:
+        log("COMPARE stage=run_torch_sparse_reference")
+        sparse_ref = run_torch_sparse_reference(
+            payload,
+            tensors,
+            chunk_size=args.reference_chunk_size,
+        )
+        log("COMPARE stage=compare_sparse_reference_to_mla")
+        compare_outputs("sparse_ref", sparse_ref, "mla_out", mla_out)
+    if sfa_out is not None:
+        log("COMPARE stage=compare_sfa_to_mla")
+        compare_outputs("sfa_out", sfa_out, "mla_out", mla_out)
     log("COMPARE stage=done")
 
 
