@@ -15,7 +15,6 @@ from nanovllm.config import Config, GraphMode
 from nanovllm.engine.sequence import Sequence
 from nanovllm.layers.sampler import Sampler
 from nanovllm.models.models_map import model_dict
-from nanovllm.models.qwen3_vl import load_qwen3_vl_model
 from nanovllm.utils.context import set_context, reset_context, get_context
 from nanovllm.utils.loader import load_model
 from nanovllm.utils.logger import init_logger
@@ -92,18 +91,7 @@ class ModelRunner:
         torch.set_default_dtype(torch_dtype)
         torch.set_default_device(self.device)
 
-        self.is_multimodal = False
-        self._load_strategies = {
-            "qwen3_vl": self._load_qwen3_vl_strategy,
-        }
-        loader = self._load_strategies.get(self.model_type, self._load_default_strategy)
-        self.model = loader()
-        self.config.is_multimodal = self.is_multimodal
-
-        embed_module = self._get_embed_module()
-        # Keep a reference dtype so that cached vision embeddings can be copied
-        # back to the GPU without hitting dtype mismatches.
-        self.model_dtype = embed_module.embed_tokens.weight.dtype
+        self.model = self._load_default_strategy()
 
         self.sampler = Sampler()
         self.profile_decode = _env_flag("NANOVLLM_PROFILE_DECODE", False)
@@ -131,18 +119,6 @@ class ModelRunner:
         torch.set_default_dtype(default_dtype)
         logger.info(f"config: {config}")
         self._share_memory(rank)
-
-    def _get_embed_module(self):
-        # Multimodal support is optional; fall back to text-only runner when
-        # the extended Qwen3-VL stack is not available.
-        embed_module = getattr(self.model, "language_model", self.model)
-        if hasattr(embed_module, "model"):
-            embed_module = embed_module.model
-        return embed_module
-
-    def _load_qwen3_vl_strategy(self):
-        self.is_multimodal = True
-        return load_qwen3_vl_model(self.config.model, self.config)
 
     def _load_default_strategy(self):
         arch = self.hf_config.architectures[0]
@@ -487,14 +463,18 @@ class ModelRunner:
         return block_tables
 
     def _pad_block_tables_to_static_max(self, block_tables: torch.Tensor) -> torch.Tensor:
+        block_tables = torch.where(
+            block_tables >= 0,
+            block_tables,
+            torch.zeros_like(block_tables),
+        )
         static_max_block_cols = (
             self.config.max_model_len + self.config.kvcache_block_size - 1
         ) // self.config.kvcache_block_size
         if block_tables.shape[1] >= static_max_block_cols:
             return block_tables
-        padded_block_tables = torch.full(
+        padded_block_tables = torch.zeros(
             (block_tables.shape[0], static_max_block_cols),
-            fill_value=-1,
             dtype=block_tables.dtype,
             device=block_tables.device,
         )
@@ -649,19 +629,8 @@ class ModelRunner:
             pin_memory=True,
         ).to(self.device, non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        if _env_flag("NANOVLLM_ENABLE_NPU_INDEXER", False):
-            static_max_block_cols = (
-                self.config.max_model_len + self.config.kvcache_block_size - 1
-            ) // self.config.kvcache_block_size
-            if block_tables.shape[1] < static_max_block_cols:
-                padded_block_tables = torch.full(
-                    (len(seqs), static_max_block_cols),
-                    fill_value=-1,
-                    dtype=torch.int32,
-                    device=self.device,
-                )
-                padded_block_tables[:, : block_tables.shape[1]] = block_tables
-                block_tables = padded_block_tables
+        if _use_npu_sfa_or_indexer():
+            block_tables = self._pad_block_tables_to_static_max(block_tables)
         set_context(False,
                     slot_mapping=slot_mapping,
                     context_lens=context_lens,
@@ -686,16 +655,7 @@ class ModelRunner:
                   input_ids: torch.Tensor,
                   positions: torch.Tensor,
                   is_prefill: bool,
-                  sequence_lengths: list[int] | None = None,
-                  vision_slices_per_seq: list[list[dict]] | None = None,
                   ):
-        model_kwargs = {}
-        if self.is_multimodal:
-            # Prefill can stream only part of the visual tokens. Pass
-            # slice metadata so the forward pass knows which cached chunks
-            # to use.
-            model_kwargs["sequence_lengths"] = sequence_lengths
-            model_kwargs["vision_slices_per_seq"] = vision_slices_per_seq
         execute_tokens = len(input_ids) if is_prefill else get_context().real_bs
         if _env_flag("NANOVLLM_LOG_EXECUTE_TOKENS", False):
             logger.info(
@@ -707,7 +667,7 @@ class ModelRunner:
             torch.npu.synchronize()
             forward_start = perf_counter()
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
-            hidden_states = self.model(input_ids, positions, **model_kwargs)
+            hidden_states = self.model(input_ids, positions)
         else:
             hidden_states = self.compile_decode(input_ids, positions)
         if should_profile:
@@ -732,57 +692,12 @@ class ModelRunner:
         _sync_if_profile()
         prepare_time = perf_counter() - prepare_start
 
-        # Track how many freshly decoded tokens each sequence contributes; the
-        # model uses these lengths to align partial vision slices with text.
-        sequence_lengths = ([len(seq) - seq.num_cached_tokens for seq in seqs] if is_prefill else None)
-        vision_slices_per_seq = None
-
-        vision_slices_per_seq = self._get_vision_slices_per_seq(is_prefill, seqs, vision_slices_per_seq)
-
-        def _advance_vision_offsets():
-            if not is_prefill or not self.is_multimodal:
-                return
-            if vision_slices_per_seq is None:
-                return
-            for seq, slices in zip(seqs, vision_slices_per_seq):
-                for slice_info in slices:
-                    length = slice_info["length"]
-                    placeholder_idx = slice_info["placeholder_idx"]
-                    if placeholder_idx < len(seq.vision_consumed):
-                        span = seq.vision_placeholders[placeholder_idx][1]
-                        seq.vision_consumed[placeholder_idx] += length
-                        seq.vision_consumed[placeholder_idx] = min(
-                            seq.vision_consumed[placeholder_idx],
-                            span,
-                        )
-                if seq.vision_placeholders:
-                    # Once every placeholder has been consumed we can drop the
-                    # cached tensors to release CPU memory.
-                    all_consumed = all(
-                        seq.vision_consumed[idx] >= span
-                        for idx, (_, span) in enumerate(
-                            seq.vision_placeholders
-                        )
-                    )
-                else:
-                    all_consumed = True
-                if all_consumed:
-                    seq.cached_vision_tokens = None
-                    seq.cached_deepstack_tokens = None
-
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         _sync_if_profile()
         model_start = perf_counter()
-        logits = self.run_model(
-            input_ids,
-            positions,
-            is_prefill,
-            sequence_lengths=sequence_lengths,
-            vision_slices_per_seq=vision_slices_per_seq,
-        )
+        logits = self.run_model(input_ids, positions, is_prefill)
         _sync_if_profile()
         model_time = perf_counter() - model_start
-        _advance_vision_offsets()
 
         sample_start = perf_counter()
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
@@ -821,110 +736,3 @@ class ModelRunner:
                 )
         reset_context()
         return token_ids
-
-    def _get_vision_slices_per_seq(self, is_prefill, seqs, vision_slices_per_seq):
-        if is_prefill and self.is_multimodal:
-            vision_slices_per_seq = []
-            has_slices = False
-            for seq in seqs:
-                # Cache the full vision tower output once; subsequent prefill
-                # steps only read the portions still needed for this sequence.
-                self._ensure_vision_cache(seq)
-                slices_for_seq: list[dict] = []
-                window_start = seq.num_cached_tokens
-                window_end = len(seq)
-
-                for placeholder_idx, (offset, length) in enumerate(seq.vision_placeholders):
-                    if placeholder_idx >= len(seq.vision_counts):
-                        continue
-                    consumed = seq.vision_consumed[placeholder_idx]
-                    total_len = length
-                    if consumed >= total_len:
-                        continue
-                    range_start = offset
-                    range_end = offset + total_len
-
-                    overlap_start = max(range_start, window_start)
-                    overlap_end = min(range_end, window_end)
-                    if overlap_end <= overlap_start:
-                        continue
-                    slice_offset = max(consumed, overlap_start - range_start)
-                    remaining = total_len - slice_offset
-                    overlap_available = overlap_end - overlap_start
-                    take = min(remaining, overlap_available)
-                    if take <= 0:
-                        continue
-                    target_offset = overlap_start - window_start
-                    token_slice = self._get_token_slice(placeholder_idx, seq, slice_offset, take)
-                    deepstack_slice = self._get_deepstack_slice(placeholder_idx, seq, slice_offset, take)
-                    self._get_slices_for_seq(deepstack_slice, placeholder_idx, slices_for_seq, take, target_offset,
-                                             token_slice)
-                    has_slices = True
-                vision_slices_per_seq.append(slices_for_seq)
-            if not has_slices:
-                vision_slices_per_seq = None
-        return vision_slices_per_seq
-
-    @staticmethod
-    def _get_slices_for_seq(deepstack_slice, placeholder_idx, slices_for_seq, take, target_offset, token_slice):
-        slices_for_seq.append(
-            {
-                "tokens": token_slice,
-                "deepstack": deepstack_slice,
-                "length": take,
-                "target_offset": target_offset,
-                "placeholder_idx": placeholder_idx,
-            }
-        )
-
-    def _get_deepstack_slice(self, placeholder_idx, seq, slice_offset, take):
-        deepstack_slice: list[torch.Tensor] | None = None
-        if seq.cached_deepstack_tokens:
-            deepstack_slice = []
-            for layer_tokens in seq.cached_deepstack_tokens:
-                if placeholder_idx >= len(layer_tokens):
-                    deepstack_slice.append(None)
-                    continue
-                layer_slice = layer_tokens[placeholder_idx][slice_offset:slice_offset + take].to(
-                    device=self.device,
-                    dtype=self.model_dtype,
-                    non_blocking=True,
-                ).contiguous()
-                deepstack_slice.append(layer_slice)
-        return deepstack_slice
-
-    def _get_token_slice(self, placeholder_idx, seq, slice_offset, take):
-        chunk_tokens = seq.cached_vision_tokens[placeholder_idx]
-        token_slice = chunk_tokens[slice_offset:slice_offset + take].to(
-            device=self.device,
-            dtype=self.model_dtype,
-            non_blocking=True,
-        ).contiguous()
-        return token_slice
-
-    def _ensure_vision_cache(self, seq: Sequence):
-        if seq.cached_vision_tokens is not None:
-            return
-        if seq.pixel_values is None or seq.image_grid_thw is None:
-            seq.cached_vision_tokens = []
-            seq.cached_deepstack_tokens = []
-            return
-
-        # Run the vision encoder once on the GPU and stash the outputs on CPU.
-        # Later prefill iterations reuse these tensors without recomputing the
-        # expensive 3D convolutions.
-        pixel = seq.pixel_values.to(device=self.device, dtype=self.model_dtype, non_blocking=True).contiguous()
-        grid = seq.image_grid_thw.to(device=self.device, dtype=torch.int32, non_blocking=True).contiguous()
-
-        image_embeds, deepstack_features = self.model.visual(pixel, grid)
-        seq.cached_vision_tokens = [emb.detach().cpu() for emb in image_embeds]
-        if deepstack_features:
-            cached_deepstack = []
-            for layer_tokens in deepstack_features:
-                cached_layer = [feat.detach().cpu() for feat in layer_tokens]
-                cached_deepstack.append(cached_layer)
-            seq.cached_deepstack_tokens = cached_deepstack
-        else:
-            seq.cached_deepstack_tokens = []
-        seq.pixel_values = None
-        seq.image_grid_thw = None

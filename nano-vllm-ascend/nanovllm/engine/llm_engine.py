@@ -10,7 +10,6 @@ from time import perf_counter
 
 import torch
 import torch_npu
-from torch import Tensor
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, LlamaTokenizerFast, PreTrainedTokenizerFast
 import torch.multiprocessing as mp
@@ -261,11 +260,6 @@ class LLMEngine:
                     prompt: str | list[int],
                     sampling_params: SamplingParams,
                     request_id: str = None,
-                    images=None,
-                    pixel_values=None,
-                    image_grid_thw=None,
-                    vision_counts=None,
-                    vision_placeholders=None,
                     ):
         if isinstance(prompt, str):
             prompt = self._encode_string_prompt(prompt)
@@ -273,11 +267,6 @@ class LLMEngine:
             prompt,
             sampling_params,
             request_id=request_id,
-            images=images,
-            pixel_values=pixel_values,
-            image_grid_thw=image_grid_thw,
-            vision_counts=vision_counts,
-            vision_placeholders=vision_placeholders,
             block_size=self.block_size
         )
         self.scheduler.add(seq)
@@ -391,200 +380,3 @@ class LLMEngine:
         if use_tqdm:
             pbar.close()
         return outputs
-
-    def generate_multimodal(
-            self,
-            requests: list[dict],
-            sampling_params: SamplingParams | list[SamplingParams],
-            processor,
-            use_tqdm: bool = True,
-    ) -> list[str]:
-        if use_tqdm:
-            pbar = tqdm(
-                total=len(requests),
-                desc="Processed prompts",
-                dynamic_ncols=True,
-                postfix=(
-                    f"est. speed input: {0:.2f} toks/s, output: {0:.2f} toks/s"
-                ),
-            )
-
-        self._mm_add_request(processor, requests, sampling_params)
-
-        outputs = {}
-        total_input_tokens = 0
-        total_output_tokens = 0
-        total_start = perf_counter()
-        while not self.is_finished():
-            output, num_tokens = self.step()
-            for seq_id, token_ids, _, _ in output:
-                outputs[seq_id] = token_ids
-                if use_tqdm:
-                    total_output_tokens += len(token_ids)
-                    elapsed = pbar.format_dict.get("elapsed")
-                    if not elapsed:
-                        elapsed = perf_counter() - total_start
-                    elapsed = max(elapsed, 1e-9)
-                    pbar.set_postfix_str(
-                        f"est. speed input: {total_input_tokens / elapsed:.2f} "
-                        f"toks/s, output: {total_output_tokens / elapsed:.2f} toks/s"
-                    )
-                    pbar.update(1)
-            if use_tqdm and pbar.n == len(requests):
-                pbar.refresh()
-
-        outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
-        results = self.get_mm_results(outputs)
-        if use_tqdm:
-            pbar.close()
-        return results
-
-    def _expand_vision_placeholders(
-            self,
-            input_ids: list[int],
-            image_grid_thw: torch.Tensor,
-    ) -> tuple[list[int], list[int], list[tuple[int, int]]]:
-        """Expand vision placeholders according to the vision grid metadata."""
-        hf_config = self.model_runner.config.hf_config
-        vision_config = hf_config.vision_config
-        merge_size = vision_config.spatial_merge_size
-
-        image_token_id = getattr(hf_config, "image_token_id", None)
-        vision_start_token_id = getattr(hf_config, "vision_start_token_id", None)
-        vision_end_token_id = getattr(hf_config, "vision_end_token_id", None)
-
-        if None in (image_token_id, vision_start_token_id, vision_end_token_id):
-            raise ValueError("Missing vision placeholder token ids in the config")
-
-        if image_grid_thw.dim() != 2 or image_grid_thw.size(-1) != 3:
-            raise ValueError("image_grid_thw must have shape [num_images, 3]")
-
-        grids = image_grid_thw.tolist()
-        expected_counts = [int(t * h * w // (merge_size ** 2)) for t, h, w in grids]
-
-        new_input_ids: list[int] = []
-        i = 0
-        image_idx = 0
-        total_images = len(expected_counts)
-        length = len(input_ids)
-
-        placeholder_ranges: list[tuple[int, int]] = []
-
-        while i < length:
-            token = input_ids[i]
-            if token == vision_start_token_id and image_idx < total_images:
-                new_input_ids.append(token)
-                i += 1
-                # Skip original contents until matching vision_end_token_id
-                while i < length and input_ids[i] != vision_end_token_id:
-                    i += 1
-                if i == length:
-                    raise ValueError("vision_start_token does not have a matching vision_end_token")
-
-                required = expected_counts[image_idx]
-                start_offset = len(new_input_ids)
-                new_input_ids.extend([image_token_id] * required)
-                new_input_ids.append(vision_end_token_id)
-                placeholder_ranges.append((start_offset, required))
-                i += 1  # Skip the original vision_end token
-                image_idx += 1
-            else:
-                new_input_ids.append(token)
-                i += 1
-
-        if image_idx != total_images:
-            raise ValueError(f"{total_images - image_idx} images do not have matching placeholders")
-
-        return new_input_ids, expected_counts, placeholder_ranges
-
-    def get_mm_results(self, outputs):
-        results = [
-            {
-                # Decode without special tokens so the response is clean.
-                "text": self.tokenizer.decode(
-                    token_ids,
-                    skip_special_tokens=True,
-                    clean_up_tokenization_spaces=False,
-                ),
-                "token_ids": token_ids,
-            }
-            for token_ids in outputs
-        ]
-        return results
-
-    def _mm_add_request(self, processor, requests, sampling_params):
-        if not isinstance(sampling_params, list):
-            sampling_params = [sampling_params] * len(requests)
-        for request, sp in zip(requests, sampling_params):
-            messages = request.get("messages")
-            text = request.get("text")
-            images = request.get("images")
-
-            images, text = self._text_is_none(images, messages, processor, text)
-
-            if images is not None and not isinstance(images, (list, tuple)):
-                images = [images]
-
-            processor_kwargs = {
-                "text": [text],
-                "return_tensors": "pt",
-                "padding": True,
-            }
-            if images:
-                # Let the processor handle image normalization + batching.
-                processor_kwargs["images"] = images
-
-            processor_outputs = processor(**processor_kwargs)
-
-            input_ids = processor_outputs["input_ids"][0].tolist()
-            pixel_values = processor_outputs.get("pixel_values")
-            image_grid_thw = processor_outputs.get("image_grid_thw")
-
-            vision_counts = []
-            vision_placeholders = []
-            if image_grid_thw is not None:
-                image_grid_thw: Tensor = image_grid_thw.squeeze(0) if image_grid_thw.dim() == 3 else image_grid_thw
-                (expanded_input_ids, vision_counts, vision_placeholders) \
-                    = self._expand_vision_placeholders(input_ids, image_grid_thw)
-                input_ids = expanded_input_ids
-
-            if pixel_values is not None:
-                # Move vision features to CPU; ModelRunner will re-upload.
-                pixel_values = pixel_values.contiguous().cpu()
-
-            if image_grid_thw is not None:
-                image_grid_thw = image_grid_thw.contiguous().cpu()
-
-            self.add_request(
-                input_ids,
-                sp,
-                pixel_values=pixel_values,
-                image_grid_thw=image_grid_thw,
-                vision_counts=vision_counts,
-                vision_placeholders=vision_placeholders,
-            )
-
-    @staticmethod
-    def _text_is_none(images, messages, processor, text):
-        if text is None:
-            if messages is None:
-                raise ValueError(
-                    "multimodal request requires 'text' or 'messages'"
-                )
-
-            text = processor.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-
-            if images is None:
-                extracted_images = []
-                for message in messages:
-                    for content in message.get("content", []):
-                        is_image = content.get("type") == "image"
-                        has_payload = "image" in content
-                        if is_image and has_payload:
-                            extracted_images.append(content["image"])
-                images = extracted_images if extracted_images else None
-        return images, text

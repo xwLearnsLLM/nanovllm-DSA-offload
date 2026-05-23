@@ -629,60 +629,25 @@ class DeepseekV32SparseMoeBlock(nn.Module):
         if router_logits.device.type != "npu":
             return None
 
-        try:
-            import torch_npu  # type: ignore
-        except Exception:
-            return None
-
-        gating_op = getattr(torch_npu, "npu_moe_gating_top_k", None)
-
         bias = getattr(self.gate, "e_score_correction_bias", None)
         group_select_mode = 1 if bias is not None else 0
         norm_type = 1 if self.scoring_func == "sigmoid" else 0
         if self.scoring_func not in ("softmax", "sigmoid"):
             return None
 
-        if hasattr(torch.ops, "_C_ascend") and hasattr(
-            torch.ops._C_ascend,
-            "moe_gating_top_k",
-        ):
-            try:
-                topk_weights, topk_ids, _ = torch.ops._C_ascend.moe_gating_top_k(
-                    router_logits.float(),
-                    k=self.top_k,
-                    k_group=self.topk_group,
-                    group_count=self.num_expert_group,
-                    group_select_mode=group_select_mode,
-                    renorm=1 if self.renormalize else 0,
-                    norm_type=norm_type,
-                    out_flag=False,
-                    routed_scaling_factor=self.routed_scaling_factor,
-                    eps=1e-20,
-                    bias_opt=bias,
-                )
-                return topk_weights.float(), topk_ids.long()
-            except Exception:
-                pass
-
-        if gating_op is None:
-            return None
-
-        try:
-            topk_weights, topk_ids, _ = gating_op(
-                router_logits.float(),
-                self.top_k,
-                bias=bias,
-                k_group=self.topk_group,
-                group_count=self.num_expert_group,
-                group_select_mode=group_select_mode,
-                renorm=1 if self.renormalize else 0,
-                norm_type=norm_type,
-                out_flag=False,
-                routed_scaling_factor=self.routed_scaling_factor,
-            )
-        except Exception:
-            return None
-
+        topk_weights, topk_ids, _ = torch.ops._C_ascend.moe_gating_top_k(
+            router_logits.float(),
+            k=self.top_k,
+            k_group=self.topk_group,
+            group_count=self.num_expert_group,
+            group_select_mode=group_select_mode,
+            renorm=1 if self.renormalize else 0,
+            norm_type=norm_type,
+            out_flag=False,
+            routed_scaling_factor=self.routed_scaling_factor,
+            eps=1e-20,
+            bias_opt=bias,
+        )
         return topk_weights.float(), topk_ids.long()
 
     def _forward_profiled(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1006,10 +971,6 @@ class DeepseekV32DSAAttention(nn.Module):
             False,
         ) and _profile_layer_selected(self.layer_id, self.num_layers)
         self._npu_sfa_logged = {"prefill": False, "decode": False}
-        self.use_batch_matmul_transpose = not _env_flag(
-            "NANOVLLM_DISABLE_BATCH_MATMUL_TRANSPOSE",
-            False,
-        )
         self.profile_attention_detail = (
             _env_flag("NANOVLLM_PROFILE_ATTENTION_DETAIL", False)
             and _profile_layer_selected(
@@ -1081,17 +1042,17 @@ class DeepseekV32DSAAttention(nn.Module):
         self.ckv_cache.view(-1, self.kv_lora_rank).index_copy_(
             0,
             flat_slots,
-            ckv.to(self.ckv_cache.dtype),
+            ckv,
         )
         self.kpe_cache.view(-1, self.qk_rope_head_dim).index_copy_(
             0,
             flat_slots,
-            kpe.to(self.kpe_cache.dtype),
+            kpe,
         )
         self.index_cache.view(-1, self.indexer.head_dim).index_copy_(
             0,
             flat_slots,
-            index_k.to(self.index_cache.dtype),
+            index_k,
         )
 
     def _get_sequence_slots_from_block_table(
@@ -1130,57 +1091,6 @@ class DeepseekV32DSAAttention(nn.Module):
         scores = (scores.relu() * weights.unsqueeze(-1)).sum(dim=0)
         topk = min(self.index_topk, valid_len)
         return torch.topk(scores, k=topk, dim=-1).indices
-
-    def _npu_indexer_cache(self) -> torch.Tensor:
-        if self.index_cache.dim() == 4:
-            return self.index_cache
-        if self.index_cache.dim() == 3:
-            return self.index_cache.unsqueeze(2)
-        raise RuntimeError(
-            "DeepSeek index cache must be 3D or PA_BSND 4D, "
-            f"got shape={tuple(self.index_cache.shape)}"
-        )
-
-    def _npu_indexer_block_table(self, block_table_row: torch.Tensor) -> torch.Tensor:
-        block_table = block_table_row.to(dtype=torch.int32)
-        block_table = torch.where(
-            block_table >= 0,
-            block_table,
-            torch.zeros_like(block_table),
-        )
-        return block_table.unsqueeze(0).contiguous()
-
-    def _npu_pa_bsnd_cache(
-        self,
-        cache: torch.Tensor,
-        expected_dim: int,
-        name: str,
-    ) -> torch.Tensor:
-        if cache.dim() == 4:
-            pa_cache = cache
-        elif cache.dim() == 3:
-            pa_cache = cache.unsqueeze(2)
-        else:
-            raise RuntimeError(
-                f"DeepSeek {name} cache must be 3D or PA_BSND 4D, "
-                f"got shape={tuple(cache.shape)}"
-            )
-        if pa_cache.shape[-1] != expected_dim:
-            raise RuntimeError(
-                f"DeepSeek {name} cache last dim mismatch: expected "
-                f"{expected_dim}, got shape={tuple(pa_cache.shape)}"
-            )
-        return pa_cache.contiguous()
-
-    @staticmethod
-    def _npu_sfa_block_table(block_table: torch.Tensor) -> torch.Tensor:
-        block_table = block_table.to(dtype=torch.int32)
-        block_table = torch.where(
-            block_table >= 0,
-            block_table,
-            torch.zeros_like(block_table),
-        )
-        return block_table.contiguous()
 
     @staticmethod
     def _tensor_desc(name: str, tensor: torch.Tensor) -> str:
@@ -1324,30 +1234,16 @@ class DeepseekV32DSAAttention(nn.Module):
         block_table: torch.Tensor,
         phase: str,
     ) -> torch.Tensor:
-        block_table = self._npu_sfa_block_table(block_table)
-        actual_seq_lengths_query = actual_seq_lengths_query.to(
-            dtype=torch.int32,
-            device=ql_nope.device,
-        ).contiguous()
-        actual_seq_lengths_key = actual_seq_lengths_key.to(
-            dtype=torch.int32,
-            device=ql_nope.device,
-        ).contiguous()
         log_timing = self.log_npu_sfa_timing
         if log_timing:
             _profile_sync(ql_nope.device)
             start = perf_counter()
-        index_cache = self._npu_pa_bsnd_cache(
-            self.index_cache,
-            self.indexer.head_dim,
-            "index",
-        )
         topk_indices = torch.ops._C_ascend.npu_lightning_indexer(
-            query=q_index.to(self.index_cache.dtype).contiguous(),
-            key=index_cache,
-            weights=weights.to(self.index_cache.dtype).contiguous(),
-            actual_seq_lengths_query=actual_seq_lengths_query.contiguous(),
-            actual_seq_lengths_key=actual_seq_lengths_key.contiguous(),
+            query=q_index,
+            key=self.index_cache,
+            weights=weights,
+            actual_seq_lengths_query=actual_seq_lengths_query,
+            actual_seq_lengths_key=actual_seq_lengths_key,
             block_table=block_table,
             layout_query="TND",
             layout_key="PA_BSND",
@@ -1370,54 +1266,41 @@ class DeepseekV32DSAAttention(nn.Module):
                 tuple(block_table.shape),
             )
             start = perf_counter()
-        ckv_cache = self._npu_pa_bsnd_cache(
-            self.ckv_cache,
-            self.kv_lora_rank,
-            "CKV",
-        )
-        kpe_cache = self._npu_pa_bsnd_cache(
-            self.kpe_cache,
-            self.qk_rope_head_dim,
-            "KPE",
-        )
-        query = ql_nope.to(ckv_cache.dtype).contiguous()
-        query_rope = q_pe.to(kpe_cache.dtype).contiguous()
-        sparse_indices = topk_indices.to(torch.int32).contiguous()
         self._maybe_log_npu_sfa_inputs(
             phase,
-            query,
-            ckv_cache,
-            sparse_indices,
+            ql_nope,
+            self.ckv_cache,
+            topk_indices,
             block_table,
             actual_seq_lengths_query,
             actual_seq_lengths_key,
-            query_rope,
-            kpe_cache,
+            q_pe,
+            self.kpe_cache,
         )
         self._maybe_dump_npu_sfa_inputs(
             phase,
-            query,
-            ckv_cache,
-            ckv_cache,
-            sparse_indices,
+            ql_nope,
+            self.ckv_cache,
+            self.ckv_cache,
+            topk_indices,
             block_table,
             actual_seq_lengths_query,
             actual_seq_lengths_key,
-            query_rope,
-            kpe_cache,
+            q_pe,
+            self.kpe_cache,
         )
         latent = torch.ops._C_ascend.npu_sparse_flash_attention(
-            query=query,
-            key=ckv_cache,
-            value=ckv_cache,
-            sparse_indices=sparse_indices,
+            query=ql_nope,
+            key=self.ckv_cache,
+            value=self.ckv_cache,
+            sparse_indices=topk_indices,
             scale_value=float(self.scale),
             sparse_block_size=1,
             block_table=block_table,
-            actual_seq_lengths_query=actual_seq_lengths_query.contiguous(),
-            actual_seq_lengths_kv=actual_seq_lengths_key.contiguous(),
-            query_rope=query_rope,
-            key_rope=kpe_cache,
+            actual_seq_lengths_query=actual_seq_lengths_query,
+            actual_seq_lengths_kv=actual_seq_lengths_key,
+            query_rope=q_pe,
+            key_rope=self.kpe_cache,
             layout_query="TND",
             layout_kv="PA_BSND",
             sparse_mode=3,
@@ -1459,12 +1342,12 @@ class DeepseekV32DSAAttention(nn.Module):
         seq_lengths_query = torch.ones((1,), dtype=torch.int32, device=device)
         seq_lengths_key = torch.tensor([valid_len], dtype=torch.int32, device=device)
         topk_indices = torch.ops._C_ascend.npu_lightning_indexer(
-            query=q_index.unsqueeze(0).to(self.index_cache.dtype).contiguous(),
-            key=self._npu_indexer_cache(),
-            weights=weights.unsqueeze(0).to(self.index_cache.dtype).contiguous(),
+            query=q_index.unsqueeze(0),
+            key=self.index_cache,
+            weights=weights.unsqueeze(0),
             actual_seq_lengths_query=seq_lengths_query,
             actual_seq_lengths_key=seq_lengths_key,
-            block_table=self._npu_indexer_block_table(block_table_row),
+            block_table=block_table_row.unsqueeze(0),
             layout_query="TND",
             layout_key="PA_BSND",
             sparse_count=self.index_topk,
@@ -1518,31 +1401,24 @@ class DeepseekV32DSAAttention(nn.Module):
     def _v_up_proj(self, latent: torch.Tensor) -> torch.Tensor:
         num_tokens = latent.shape[0]
         if (
-            self.use_batch_matmul_transpose
-            and latent.dtype in (torch.float16, torch.bfloat16)
-            and hasattr(torch.ops, "_C_ascend")
-            and hasattr(torch.ops._C_ascend, "batch_matmul_transpose")
+            latent.dtype in (torch.float16, torch.bfloat16)
             and num_tokens <= BMM_TRANS_MAX_SUPPORTED_TOKENS
         ):
-            try:
-                latent = latent.contiguous()
-                output = torch.empty(
-                    (
-                        num_tokens,
-                        self.num_local_heads,
-                        self.v_head_dim,
-                    ),
-                    dtype=latent.dtype,
-                    device=latent.device,
-                )
-                torch.ops._C_ascend.batch_matmul_transpose(
-                    latent,
-                    self.w_uv,
-                    output,
-                )
-                return output.reshape(num_tokens, -1)
-            except Exception:
-                self.use_batch_matmul_transpose = False
+            output = torch.empty(
+                (
+                    num_tokens,
+                    self.num_local_heads,
+                    self.v_head_dim,
+                ),
+                dtype=latent.dtype,
+                device=latent.device,
+            )
+            torch.ops._C_ascend.batch_matmul_transpose(
+                latent,
+                self.w_uv,
+                output,
+            )
+            return output.reshape(num_tokens, -1)
 
         latent_by_head = latent.transpose(0, 1).contiguous()
         output = torch.bmm(latent_by_head, self.w_uv)
@@ -1581,7 +1457,7 @@ class DeepseekV32DSAAttention(nn.Module):
         weights: torch.Tensor,
     ) -> torch.Tensor:
         context = get_context()
-        cu_seqlens = context.cu_seqlens_q.to(torch.int32)
+        cu_seqlens = context.cu_seqlens_q
         actual_seq_lengths_query = cu_seqlens[1:]
         actual_seq_lengths_key = cu_seqlens[1:] - cu_seqlens[:-1]
         return self._npu_sfa_forward(
@@ -1848,7 +1724,7 @@ class DeepseekV32DSAAttention(nn.Module):
             dtype=torch.int32,
             device=ql_nope.device,
         )
-        actual_seq_lengths_key = context.context_lens[:batch_size].to(torch.int32)
+        actual_seq_lengths_key = context.context_lens[:batch_size]
         return self._npu_sfa_forward(
             ql_nope[:batch_size],
             q_pe[:batch_size],

@@ -23,15 +23,6 @@ class Scheduler:
         # indexer/SFA is enabled, also keep block 0 as the null block to match
         # vLLM's paged-cache convention used by the Ascend kernels.
         non_cache_token_ids: list[int] = []
-        if config.is_multimodal and config.hf_config is not None:
-            for attr in (
-                    "image_token_id",
-                    "vision_start_token_id",
-                    "vision_end_token_id",
-            ):
-                token_id = getattr(config.hf_config, attr, None)
-                if token_id is not None:
-                    non_cache_token_ids.append(token_id)
         self.block_manager = BlockManager(
             config.num_kvcache_blocks - 1,
             config.kvcache_block_size,

@@ -31,7 +31,6 @@ class Config:
     use_graph_cache: bool = False
     hccl_port: int = 28000
     graph_mode: str = GraphMode.MAX_AUTOTUNE.value
-    is_multimodal: bool = False
     skip_warmup: bool = False
     device = "npu"
     trust_remote_code: bool = False
@@ -50,8 +49,6 @@ class Config:
         if getattr(self.hf_config, "model_type", None) == "deepseek_v32":
             self.enforce_eager = True
         #self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
-        # Multimodal models (e.g. Qwen3-VL) store the text settings in
-        # hf_config.text_config.
         text_config = getattr(self.hf_config, "text_config", self.hf_config)
 
         max_position_embeddings = getattr(
