@@ -38,13 +38,21 @@ ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Prun
 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=4 NANOVLLM_ENABLE_NPU_SFA_PREFILL=1 NANOVLLM_ENABLE_NPU_SFA_DECODE=1 NANOVLLM_NPU_SFA_SPARSE_COUNT=2048 NANOVLLM_LOG_NPU_SFA_INPUTS=1 NANOVLLM_LOG_NPU_SFA_TIMING=1 NANOVLLM_DUMP_NPU_SFA_INPUTS=logs/sfa_manual/dumps NANOVLLM_DUMP_NPU_SFA_MAX_CALLS=1 NANOVLLM_PROFILE_LAYER_IDS=0 NANOVLLM_LONG_PROMPT_TOKENS=2048 NANOVLLM_MAX_MODEL_LEN=2176 NANOVLLM_MAX_BATCHED_TOKENS=3072 NANOVLLM_MAX_NUM_SEQS=1 NANOVLLM_MAX_GEN_TOKENS=1 NANOVLLM_SKIP_WARMUP=1 python example/example.py 2>&1 | tee logs/sfa_manual/04_long_prefill_sfa_decode1.log
 
 
-# 05. If step 04 created dumps, pick one actual path and replay it.
+# 05. If step 04 created dumps, pick one actual path and replay it on one NPU.
+# This checks whether one dumped SFA input, including causal -1 sparse_indices,
+# can run npu_sparse_flash_attention by itself.
 find logs/sfa_manual/dumps -name 'sfa_rank*_layer*_seq*.pt' | head -n 5
 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python scripts/probe_deepseek_v32_sfa_attention.py --replay-dump logs/sfa_manual/dumps/REPLACE_WITH_ACTUAL_DUMP.pt --device npu:0 2>&1 | tee logs/sfa_manual/05_replay_dump.log
 
 
-# 06. Trace the working vllm-ascend 0.19 SFA path and print real op inputs.
-ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 SFA_TRACE_MAX_CALLS=8 python scripts/trace_vllm_ascend_sfa_inputs.py --model /home/models/Deepseek-V3.2-Pruned-95B-BF/ --tp-size 4 --prompt-tokens 2048 --max-model-len 2176 --max-num-batched-tokens 3072 --max-tokens 1 2>&1 | tee logs/sfa_manual/06_vllm_ascend_sfa_trace.log
+# 06. Replay one dumped SFA input per rank concurrently.
+# This checks whether the same dumped SFA inputs only fail when TP ranks call
+# npu_sparse_flash_attention at the same time.
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python scripts/probe_npu_sfa_decode.py --dump-dir logs/sfa_manual/dumps --world-size 4 --hccl-port 28089 --repeats 1 2>&1 | tee logs/sfa_manual/06_replay_dump_dir_tp4.log
+
+
+# 07. Trace the working vllm-ascend 0.19 SFA path and print real op inputs.
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 SFA_TRACE_MAX_CALLS=8 python scripts/trace_vllm_ascend_sfa_inputs.py --model /home/models/Deepseek-V3.2-Pruned-95B-BF/ --tp-size 4 --prompt-tokens 2048 --max-model-len 2176 --max-num-batched-tokens 3072 --max-tokens 1 2>&1 | tee logs/sfa_manual/07_vllm_ascend_sfa_trace.log
 
 
 # 99. Extract key lines.
@@ -57,5 +65,6 @@ cat logs/sfa_manual/02_probe_decode_2k_bs4.log
 cat logs/sfa_manual/03_short_prefill_compare.log
 cat logs/sfa_manual/04_long_prefill_sfa_decode1.log
 cat logs/sfa_manual/05_replay_dump.log
-cat logs/sfa_manual/06_vllm_ascend_sfa_trace.log
+cat logs/sfa_manual/06_replay_dump_dir_tp4.log
+cat logs/sfa_manual/07_vllm_ascend_sfa_trace.log
 cat logs/sfa_manual/99_key_lines.log
