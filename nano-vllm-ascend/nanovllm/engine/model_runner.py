@@ -52,6 +52,7 @@ def _register_vllm_ascend_custom_ops() -> bool:
     os.environ.setdefault("VLLM_ASCEND_ENABLE_NZ", "0")
     try:
         import torch_npu  # noqa: F401  # type: ignore
+        torch.npu.config.allow_internal_format = True
         import vllm  # noqa: F401  # type: ignore
         import vllm_ascend  # noqa: F401  # type: ignore
         from vllm_ascend import vllm_ascend_C  # noqa: F401  # type: ignore

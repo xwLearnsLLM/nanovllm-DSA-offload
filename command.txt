@@ -64,6 +64,15 @@ PYTORCH_NPU_ALLOC_CONF=expandable_segments:True ASCEND_RT_VISIBLE_DEVICES=0,1,2,
 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 SFA_TRACE_MAX_CALLS=2 python scripts/trace_vllm_ascend_sfa_inputs.py --model /home/models/Deepseek-V3.2-Pruned-95B-BF/ --tp-size 4 --prompt-tokens 2048 --max-model-len 2176 --max-num-batched-tokens 3072 --max-tokens 1 2>&1 | tee logs/sfa_manual/09_vllm_ascend_sfa_trace_stride.log
 
 
+# 10. Re-run the full Nano SFA path after aligning with vllm-ascend's
+# torch.npu.config.allow_internal_format=True setting.
+PYTORCH_NPU_ALLOC_CONF=expandable_segments:True ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=4 NANOVLLM_ENABLE_NPU_SFA_PREFILL=1 NANOVLLM_ENABLE_NPU_SFA_DECODE=1 NANOVLLM_NPU_SFA_SPARSE_COUNT=2048 NANOVLLM_LOG_NPU_SFA_INPUTS=1 NANOVLLM_LOG_NPU_SFA_TIMING=1 NANOVLLM_NPU_SFA_STRICT=1 NANOVLLM_PROFILE_LAYER_IDS=0 NANOVLLM_LONG_PROMPT_TOKENS=2048 NANOVLLM_MAX_MODEL_LEN=2176 NANOVLLM_MAX_BATCHED_TOKENS=3072 NANOVLLM_MAX_NUM_SEQS=1 NANOVLLM_MAX_GEN_TOKENS=1 NANOVLLM_SKIP_WARMUP=1 python example/example.py 2>&1 | tee logs/sfa_manual/10_nano_full_sfa_internal_format_2048.log
+
+
+# 11. Short prompt sanity check with the same internal-format setting.
+PYTORCH_NPU_ALLOC_CONF=expandable_segments:True ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=4 NANOVLLM_ENABLE_NPU_SFA_PREFILL=1 NANOVLLM_ENABLE_NPU_SFA_DECODE=1 NANOVLLM_NPU_SFA_SPARSE_COUNT=2048 NANOVLLM_LOG_NPU_SFA_INPUTS=1 NANOVLLM_LOG_NPU_SFA_TIMING=1 NANOVLLM_NPU_SFA_STRICT=1 NANOVLLM_PROFILE_LAYER_IDS=0 NANOVLLM_LONG_PROMPT_TOKENS=129 NANOVLLM_MAX_MODEL_LEN=256 NANOVLLM_MAX_BATCHED_TOKENS=256 NANOVLLM_MAX_NUM_SEQS=1 NANOVLLM_MAX_GEN_TOKENS=1 NANOVLLM_SKIP_WARMUP=1 python example/example.py 2>&1 | tee logs/sfa_manual/11_nano_full_sfa_internal_format_129.log
+
+
 # 99. Extract key lines.
 grep -E "PROBE |SFA_TRACE|built long prompt|TP-wide minimum KV cache blocks|NPU SFA input summary|NPU SFA timing|NPU SFA compare|NPU SFA .*failed|Dumped NPU SFA|Traceback|RuntimeError|ERROR|Prompt:|prompt len:|text:" logs/sfa_manual/*.log 2>&1 | tee logs/sfa_manual/99_key_lines.log
 
@@ -78,4 +87,6 @@ cat logs/sfa_manual/06_replay_dump_dir_tp4.log
 cat logs/sfa_manual/07_vllm_ascend_sfa_trace.log
 cat logs/sfa_manual/08_nano_full_sfa_no_dump_2048.log
 cat logs/sfa_manual/09_vllm_ascend_sfa_trace_stride.log
+cat logs/sfa_manual/10_nano_full_sfa_internal_format_2048.log
+cat logs/sfa_manual/11_nano_full_sfa_internal_format_129.log
 cat logs/sfa_manual/99_key_lines.log
