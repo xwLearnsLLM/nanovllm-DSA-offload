@@ -121,6 +121,75 @@ def _stats(name: str, tensor: torch.Tensor) -> str:
     )
 
 
+def _sparse_indices_report(
+    name: str,
+    sparse_indices: torch.Tensor,
+    actual_seq_lengths_query: torch.Tensor | None = None,
+    actual_seq_lengths_key: torch.Tensor | None = None,
+    row_limit: int = 8,
+) -> str:
+    indices = sparse_indices.detach().cpu()
+    if indices.numel() == 0:
+        return f"{name}_report empty=True"
+    if indices.ndim != 3:
+        return (
+            f"{name}_report ndim={indices.ndim} "
+            f"negative_count={int((indices < 0).sum().item())}"
+        )
+
+    valid = indices >= 0
+    negative_count = int((~valid).sum().item())
+    valid_counts = valid.sum(dim=-1)
+    seen_negative = (~valid).to(torch.int32).cumsum(dim=-1) > 0
+    valid_after_negative = bool((valid & seen_negative).any().item())
+    valid_values = indices[valid]
+    if valid_values.numel():
+        valid_min = int(valid_values.min().item())
+        valid_max = int(valid_values.max().item())
+    else:
+        valid_min = None
+        valid_max = None
+
+    parts = [
+        f"{name}_report shape={tuple(indices.shape)}",
+        f"negative_count={negative_count}",
+        f"valid_min={valid_min}",
+        f"valid_max={valid_max}",
+        f"valid_after_negative={valid_after_negative}",
+        f"valid_count_head={valid_counts[:row_limit, 0].tolist()}",
+    ]
+
+    if actual_seq_lengths_query is not None and actual_seq_lengths_key is not None:
+        q_ends = actual_seq_lengths_query.detach().cpu().tolist()
+        kv_lens = actual_seq_lengths_key.detach().cpu().tolist()
+        q_starts = [0] + [int(x) for x in q_ends[:-1]]
+        q_ends = [int(x) for x in q_ends]
+        if q_ends and q_ends[-1] == indices.shape[0] and len(q_ends) == len(kv_lens):
+            q_lens = [end - start for start, end in zip(q_starts, q_ends)]
+            parts.append(f"query_lens={q_lens[:row_limit]}")
+            parts.append(f"kv_lens={kv_lens[:row_limit]}")
+            if all(int(q_len) == int(kv_len) for q_len, kv_len in zip(q_lens, kv_lens)):
+                mismatch_rows = 0
+                checked_rows = 0
+                for seq_idx, (start, end) in enumerate(zip(q_starts, q_ends)):
+                    kv_len = int(kv_lens[seq_idx])
+                    for row in range(start, end):
+                        local_pos = row - start
+                        expected = min(local_pos + 1, kv_len, indices.shape[-1])
+                        row_counts = valid_counts[row]
+                        checked_rows += 1
+                        if bool((row_counts != expected).any().item()):
+                            mismatch_rows += 1
+                parts.append(f"prefill_causal_checked_rows={checked_rows}")
+                parts.append(f"prefill_causal_mismatch_rows={mismatch_rows}")
+
+    row_samples = []
+    for row in range(min(row_limit, indices.shape[0])):
+        row_samples.append(indices[row, 0, : min(16, indices.shape[-1])].tolist())
+    parts.append(f"row_head_samples={row_samples}")
+    return " ".join(parts)
+
+
 def _to_device(payload: dict, name: str, device: torch.device) -> torch.Tensor:
     value = payload[name]
     if not isinstance(value, torch.Tensor):
@@ -198,6 +267,16 @@ def _run_ops(
         f"{_stats('topk', topk.detach().cpu())}",
         flush=True,
     )
+    print(
+        "PROBE after_indexer "
+        + _sparse_indices_report(
+            "topk",
+            topk,
+            actual_seq_lengths_query,
+            actual_seq_lengths_key,
+        ),
+        flush=True,
+    )
 
     print(
         "PROBE before_sfa "
@@ -261,6 +340,16 @@ def replay_dump(path: str, device: torch.device) -> None:
     )
     for name, tensor in tensors.items():
         print(f"PROBE replay_tensor {_desc(name, tensor)}", flush=True)
+    print(
+        "PROBE replay_sparse_indices "
+        + _sparse_indices_report(
+            "sparse_indices",
+            tensors["sparse_indices"],
+            tensors["actual_seq_lengths_query"],
+            tensors["actual_seq_lengths_key"],
+        ),
+        flush=True,
+    )
 
     start = perf_counter()
     out = torch.ops._C_ascend.npu_sparse_flash_attention(
