@@ -45,7 +45,8 @@ def _desc(name, value) -> str:
     if torch is not None and isinstance(value, torch.Tensor):
         text = (
             f"{name}=shape={tuple(value.shape)} dtype={value.dtype} "
-            f"device={value.device} contiguous={value.is_contiguous()}"
+            f"device={value.device} contiguous={value.is_contiguous()} "
+            f"stride={tuple(value.stride())} storage_offset={value.storage_offset()}"
         )
         if value.numel() and name in {
             "actual_seq_lengths_query",

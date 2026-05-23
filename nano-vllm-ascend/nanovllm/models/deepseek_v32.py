@@ -1098,7 +1098,8 @@ class DeepseekV32DSAAttention(nn.Module):
     def _tensor_desc(name: str, tensor: torch.Tensor) -> str:
         return (
             f"{name}=shape={tuple(tensor.shape)} dtype={tensor.dtype} "
-            f"device={tensor.device} contiguous={tensor.is_contiguous()}"
+            f"device={tensor.device} contiguous={tensor.is_contiguous()} "
+            f"stride={tuple(tensor.stride())} storage_offset={tensor.storage_offset()}"
         )
 
     @staticmethod
