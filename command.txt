@@ -88,8 +88,9 @@ ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ../ut_ops/perf_mla_prefill.py --device 
 
 
 # 15. Dense MLA prefill above 2k with absorb + paged KV cache.
-# This matches Nano/SFA input shape: key/value [blocks, 128, 1, 512],
-# key_rope [blocks, 128, 1, 64], query [T, 32, 512], query_rope [T, 32, 64].
+# FIA paged MLA expects BnNBsD key/value layout:
+# key/value [blocks, 1, 128, 512], key_rope [blocks, 1, 128, 64].
+# Nano/SFA cache is PA_BSND [blocks, 128, 1, D], so integration will transpose it.
 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ../ut_ops/perf_mla_paged_prefill.py --device npu:0 --seq-lens 2176 --mask-size 2048 --warmup 1 --iters 3 2>&1 | tee logs/sfa_manual/15_paged_absorb_mla_prefill_2176_mask2048.log
 
 

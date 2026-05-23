@@ -223,9 +223,9 @@ def run_dense_mla_paged(
 ) -> torch.Tensor:
     query = tensors["query"]
     query_rope = tensors["query_rope"]
-    key_cache = tensors["key"]
-    value_cache = tensors["value"]
-    key_rope_cache = tensors["key_rope"]
+    key_cache = tensors["key"].transpose(1, 2).contiguous()
+    value_cache = tensors["value"].transpose(1, 2).contiguous()
+    key_rope_cache = tensors["key_rope"].transpose(1, 2).contiguous()
     block_table = tensors["block_table"]
     device = query.device
 
@@ -234,9 +234,9 @@ def run_dense_mla_paged(
     kv_lens = [int(x) for x in tensors["actual_seq_lengths_kv"].detach().cpu().tolist()]
     kv_arg = cumulative(kv_lens) if kv_lens_mode == "cumulative" else kv_lens
     attn_mask = make_causal_mask(mask_size, device)
-    block_size = int(key_cache.shape[1])
+    block_size = int(key_cache.shape[2])
     num_heads = int(query.shape[1])
-    num_kv_heads = int(key_cache.shape[2])
+    num_kv_heads = int(key_cache.shape[1])
 
     print(
         "COMPARE dense_paged_inputs "
@@ -244,7 +244,8 @@ def run_dense_mla_paged(
         f"{desc('value_cache', value_cache)} {desc('query_rope', query_rope)} "
         f"{desc('key_rope_cache', key_rope_cache)} {desc('block_table', block_table)} "
         f"{desc('attn_mask', attn_mask)} block_size={block_size} "
-        f"q_lens={q_lens} kv_lens={kv_lens} kv_lens_mode={kv_lens_mode} kv_arg={kv_arg}"
+        f"layout=BnNBsD q_lens={q_lens} kv_lens={kv_lens} "
+        f"kv_lens_mode={kv_lens_mode} kv_arg={kv_arg}"
     )
 
     start = perf_counter()

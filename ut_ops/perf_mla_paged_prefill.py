@@ -85,16 +85,16 @@ def make_inputs(args: argparse.Namespace):
     )
     key_cache = torch.randn(
         num_blocks,
-        args.block_size,
         args.kv_heads,
+        args.block_size,
         args.latent_dim,
         dtype=torch.bfloat16,
         device=args.device,
     )
     value_cache = key_cache if args.share_kv else torch.randn(
         num_blocks,
-        args.block_size,
         args.kv_heads,
+        args.block_size,
         args.latent_dim,
         dtype=torch.bfloat16,
         device=args.device,
@@ -108,8 +108,8 @@ def make_inputs(args: argparse.Namespace):
     )
     key_rope_cache = torch.randn(
         num_blocks,
-        args.block_size,
         args.kv_heads,
+        args.block_size,
         args.rope_dim,
         dtype=torch.bfloat16,
         device=args.device,
@@ -216,6 +216,7 @@ def main() -> None:
         f"latent_dim={args.latent_dim} rope_dim={args.rope_dim} "
         f"block_size={args.block_size} mask_size={args.mask_size} scale={args.scale}"
     )
+    print("PAGED_MLA layout key/value/key_rope=BnNBsD")
     if args.mask_size < max(args.seq_lens):
         print(
             "PAGED_MLA mask_note "
