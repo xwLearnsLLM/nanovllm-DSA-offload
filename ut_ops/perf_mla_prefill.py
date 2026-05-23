@@ -185,8 +185,6 @@ def main() -> None:
     args = parser.parse_args()
 
     total_tokens = sum(args.seq_lens)
-    if args.mask_size < max(args.seq_lens):
-        raise ValueError("--mask-size must be >= max(seq_lens)")
 
     device_index = int(str(args.device).split(":")[-1])
     torch.npu.set_device(device_index)
@@ -202,6 +200,13 @@ def main() -> None:
         f"rope_dim={args.rope_dim} value_dim={args.value_dim} "
         f"scale={args.scale} mask_size={args.mask_size}"
     )
+    if args.mask_size < max(args.seq_lens):
+        print(
+            "MLA_PROBE mask_note "
+            f"mask_size={args.mask_size} is smaller than max_seq_len={max(args.seq_lens)}; "
+            "this matches vllm-ascend's fixed 2048x2048 splitfuse MLA mask.",
+            flush=True,
+        )
     for name, tensor in (
         ("q_nope", q_nope),
         ("k_nope", k_nope),
