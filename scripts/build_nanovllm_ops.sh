@@ -14,6 +14,11 @@ echo "[nanovllm ops] python: $(${PYTHON_BIN} -c 'import sys; print(sys.executabl
 echo "[nanovllm ops] soc: ${SOC_VERSION}"
 echo "[nanovllm ops] ascend: ${ASCEND_HOME_PATH}"
 
+echo "[nanovllm ops] normalize build script line endings"
+find "${ROOT_DIR}/csrc/nanovllm_ascend_ops" -type f \
+  \( -name "*.sh" -o -name "*.cmake" -o -name "CMakeLists.txt" \) \
+  -exec sed -i 's/\r$//' {} +
+
 pushd "${ROOT_DIR}/csrc/nanovllm_ascend_ops/cann_ops" >/dev/null
 rm -rf build output
 bash build.sh -n "${CUSTOM_OPS}" -c "${SOC_VERSION}"
