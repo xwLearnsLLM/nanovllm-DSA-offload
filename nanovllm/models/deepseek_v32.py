@@ -1260,6 +1260,7 @@ class DeepseekV32DSAAttention(nn.Module):
         num_tokens = q_nope.shape[0]
         if (
             q_nope.dtype in (torch.float16, torch.bfloat16)
+            and num_tokens == 1
             and num_tokens <= BMM_TRANS_MAX_SUPPORTED_TOKENS
         ):
             ql_nope = torch.empty(
