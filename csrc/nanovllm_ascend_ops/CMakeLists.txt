@@ -63,6 +63,8 @@ if(NOT DEFINED SOC_VERSION)
   set(SOC_VERSION "ascend910_93")
 endif()
 
+set(ASCEND_CANN_PACKAGE_PATH ${ASCEND_HOME_PATH})
+
 if(EXISTS ${ASCEND_HOME_PATH}/tools/tikcpp/ascendc_kernel_cmake)
   set(ASCENDC_CMAKE_DIR ${ASCEND_HOME_PATH}/tools/tikcpp/ascendc_kernel_cmake)
 elseif(EXISTS ${ASCEND_HOME_PATH}/compiler/tikcpp/ascendc_kernel_cmake)
