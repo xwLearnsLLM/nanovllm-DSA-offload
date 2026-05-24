@@ -108,3 +108,18 @@ Runs three hard-coded English long QA prompts with dense MLA decode.
 ```bash
 PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=4 NANOVLLM_DECODE_ATTENTION_BACKEND=mla NANOVLLM_MAX_GEN_TOKENS=32 NANOVLLM_SKIP_WARMUP=1 python example/long_prompts.py
 ```
+
+## 38. MoE Grouped Matmul Probe
+
+Checks whether the Ascend grouped MoE route matches the current local-expert
+reference path. This does not load the model.
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ut_ops/probe_moe_grouped.py --device npu:0 --tokens 128 --hidden-size 512 --intermediate-size 256 --num-experts 32 --num-local-experts 8 --local-start 0 --topk 8
+```
+
+For a decode-shaped micro-batch:
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ut_ops/probe_moe_grouped.py --device npu:0 --tokens 3 --hidden-size 512 --intermediate-size 256 --num-experts 32 --num-local-experts 8 --local-start 0 --topk 8 --warmup 5 --iters 20
+```
