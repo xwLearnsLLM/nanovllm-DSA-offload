@@ -169,7 +169,7 @@ else
 fi
 
 if [ "${PARENT_JOB}" == "false" ];then
-    CPU_NUM=$(($(cat /proc/cpuinfo | grep "^processor" | wc -l)*2))
+    CPU_NUM=${NANOVLLM_CANN_BUILD_JOBS:-1}
     JOB_NUM="-j${CPU_NUM}"
 fi
 

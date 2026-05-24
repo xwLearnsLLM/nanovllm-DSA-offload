@@ -18,6 +18,9 @@ PYTHONPATH=$PWD:$PYTHONPATH bash scripts/build_nanovllm_ops.sh
 ```
 
 Set `SOC_VERSION=...` before the command if the worker is not `ascend910_93`.
+Values like `ascend910_9391` are normalized to `ascend910_93`. The CANN custom
+OPP build is serial by default for readable logs; set
+`NANOVLLM_CANN_BUILD_JOBS=8` if you want a faster local rebuild.
 
 ## Common Setup
 

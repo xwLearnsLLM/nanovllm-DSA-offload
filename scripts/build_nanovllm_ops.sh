@@ -3,15 +3,30 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON_BIN="${PYTHON:-python}"
-SOC_VERSION="${SOC_VERSION:-ascend910_93}"
+RAW_SOC_VERSION="${SOC_VERSION:-ascend910_93}"
 ASCEND_HOME_PATH="${ASCEND_HOME_PATH:-/usr/local/Ascend/ascend-toolkit/latest}"
 CUSTOM_OPS="lightning_indexer_vllm;sparse_flash_attention;moe_gating_top_k"
+
+case "${RAW_SOC_VERSION}" in
+  ascend910_93*)
+    SOC_VERSION="ascend910_93"
+    ;;
+  ascend910b*)
+    SOC_VERSION="ascend910b"
+    ;;
+  ascend310*)
+    SOC_VERSION="ascend310p"
+    ;;
+  *)
+    SOC_VERSION="${RAW_SOC_VERSION}"
+    ;;
+esac
 
 export ASCEND_HOME_PATH
 
 echo "[nanovllm ops] root: ${ROOT_DIR}"
 echo "[nanovllm ops] python: $(${PYTHON_BIN} -c 'import sys; print(sys.executable)')"
-echo "[nanovllm ops] soc: ${SOC_VERSION}"
+echo "[nanovllm ops] soc: ${RAW_SOC_VERSION} -> ${SOC_VERSION}"
 echo "[nanovllm ops] ascend: ${ASCEND_HOME_PATH}"
 
 echo "[nanovllm ops] normalize build script line endings"
