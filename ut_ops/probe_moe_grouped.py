@@ -90,8 +90,23 @@ def _grouped_moe(
     num_experts: int,
     local_start: int,
     num_local_experts: int,
+    *,
+    mask_nonlocal_probs: bool,
+    swap_w13_halves: bool,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     import torch_npu
+
+    if mask_nonlocal_probs:
+        local_end = local_start + num_local_experts
+        local_mask = (topk_ids >= local_start) & (topk_ids < local_end)
+        combine_weights = topk_weights * local_mask.to(topk_weights.dtype)
+    else:
+        combine_weights = topk_weights
+
+    grouped_w13 = w13
+    if swap_w13_halves:
+        gate, up = w13.chunk(2, dim=1)
+        grouped_w13 = torch.cat((up, gate), dim=1).contiguous()
 
     sorted_hidden, expanded_row_idx, expert_tokens, pertoken_scale = (
         torch_npu.npu_moe_init_routing_v2(
@@ -110,7 +125,7 @@ def _grouped_moe(
 
     gate_up = torch_npu.npu_grouped_matmul(
         x=[sorted_hidden],
-        weight=[w13.transpose(1, 2).contiguous()],
+        weight=[grouped_w13.transpose(1, 2).contiguous()],
         split_item=2,
         group_list_type=1,
         group_type=0,
@@ -128,7 +143,7 @@ def _grouped_moe(
     out = torch_npu.npu_moe_token_unpermute(
         permuted_tokens=routed,
         sorted_indices=torch.abs(expanded_row_idx),
-        probs=topk_weights,
+        probs=combine_weights,
     )
     metadata = {
         "sorted_hidden": sorted_hidden,
@@ -241,27 +256,43 @@ def main() -> None:
     _sync(device)
     print(f"MOE_PROBE after_reference elapsed={perf_counter() - ref_start:.6f}s")
 
-    _sync(device)
-    grouped_start = perf_counter()
-    grouped, metadata = _grouped_moe(
-        hidden_states,
-        topk_ids,
-        topk_weights,
-        w13,
-        w2,
-        args.num_experts,
-        args.local_start,
-        args.num_local_experts,
-    )
-    _sync(device)
-    print(f"MOE_PROBE after_grouped elapsed={perf_counter() - grouped_start:.6f}s")
-    print("MOE_PROBE " + _describe("grouped_out", grouped))
+    grouped = None
+    metadata = None
+    for label, mask_nonlocal_probs, swap_w13_halves in (
+        ("raw_probs_normal_w13", False, False),
+        ("local_probs_normal_w13", True, False),
+        ("local_probs_swapped_w13", True, True),
+    ):
+        _sync(device)
+        grouped_start = perf_counter()
+        candidate, candidate_metadata = _grouped_moe(
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            w13,
+            w2,
+            args.num_experts,
+            args.local_start,
+            args.num_local_experts,
+            mask_nonlocal_probs=mask_nonlocal_probs,
+            swap_w13_halves=swap_w13_halves,
+        )
+        _sync(device)
+        print(
+            f"MOE_PROBE after_grouped label={label} "
+            f"elapsed={perf_counter() - grouped_start:.6f}s"
+        )
+        print("MOE_PROBE " + _describe(f"grouped_out_{label}", candidate))
+        print(f"MOE_PROBE diff reference_vs_{label} " + _diff(ref, candidate))
+        if label == "local_probs_swapped_w13":
+            grouped = candidate
+            metadata = candidate_metadata
+
+    assert grouped is not None and metadata is not None
     for name, tensor in metadata.items():
         print("MOE_PROBE " + _describe(name, tensor))
         if name == "expert_tokens":
             print(f"MOE_PROBE expert_tokens_values={tensor.detach().cpu().tolist()}")
-
-    print("MOE_PROBE diff reference_vs_grouped " + _diff(ref, grouped))
 
     grouped_times = []
     for _ in range(args.warmup):
@@ -274,6 +305,8 @@ def main() -> None:
             args.num_experts,
             args.local_start,
             args.num_local_experts,
+            mask_nonlocal_probs=True,
+            swap_w13_halves=True,
         )
     _sync(device)
     for _ in range(args.iters):
@@ -287,6 +320,8 @@ def main() -> None:
             args.num_experts,
             args.local_start,
             args.num_local_experts,
+            mask_nonlocal_probs=True,
+            swap_w13_halves=True,
         )
         _sync(device)
         grouped_times.append((perf_counter() - start) * 1000.0)
