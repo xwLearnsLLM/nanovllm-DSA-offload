@@ -175,12 +175,19 @@ class ModelRunner:
         total: int,
         used: int,
         block_bytes: int,
+        available_blocks: int,
+        max_needed_blocks: int,
         num_blocks: int,
         shapes: list[tuple[str, tuple[int, ...]]],
     ) -> None:
         logger.info(f"Total NPU Mem: {total / 1024 ** 2:.2f} MB")
         logger.info(f"Used NPU Mem (Weights): {used / 1024 ** 2:.2f} MB")
         logger.info(f"Single Block Size: {block_bytes / 1024 ** 2:.2f} MB")
+        if available_blocks > max_needed_blocks:
+            logger.info(
+                "Capping KV cache blocks by request limit: "
+                f"available={available_blocks}, max_needed={max_needed_blocks}."
+            )
         logger.info(f"Allocating {num_blocks} blocks.")
         for name, shape in shapes:
             logger.info(f"{name} allocated successfully shape: {shape}")
@@ -220,11 +227,16 @@ class ModelRunner:
             * (kv_lora_rank + rope_dim + index_dim)
             * self._dtype_itemsize(cache_dtype)
         )
-        local_num_blocks = int(available_mem) // block_bytes
+        available_blocks = int(available_mem) // block_bytes
+        blocks_per_seq = (config.max_model_len + self.block_size - 1) // self.block_size
+        # Scheduler reserves block 0 as the paged-attention null block and
+        # keeps one final block out of the allocatable pool for padding.
+        max_needed_blocks = max(3, blocks_per_seq * config.max_num_seqs + 2)
+        local_num_blocks = min(available_blocks, max_needed_blocks)
         config.num_kvcache_blocks = self._sync_kvcache_blocks_across_tp(
             local_num_blocks,
         )
-        assert config.num_kvcache_blocks > 0, (
+        assert config.num_kvcache_blocks > 2, (
             "Failed to allocate any DeepSeek DSA cache blocks due to "
             "insufficient memory."
         )
@@ -253,6 +265,8 @@ class ModelRunner:
             total=total,
             used=used,
             block_bytes=block_bytes,
+            available_blocks=available_blocks,
+            max_needed_blocks=max_needed_blocks,
             num_blocks=config.num_kvcache_blocks,
             shapes=[
                 ("DeepSeek CKV cache", ckv_shape),
