@@ -14,6 +14,35 @@ mkdir -p logs/sfa_manual
 PYTHONPATH=$PWD:$PYTHONPATH python -m pip show nano-vllm-ascend
 ```
 
+## NANOVLLM Environment Variables
+
+| Variable | Default | Used by | Meaning |
+|---|---:|---|---|
+| `NANOVLLM_MODEL` | `/home/models/Deepseek-V3.2-Pruned-95B-BF/` | examples | Model directory. Set this to the local BF16 DeepSeek V3.2 export path. |
+| `NANOVLLM_TP_SIZE` | `4` | examples | Tensor parallel world size. The current 95B pruned model normally uses `4` cards. |
+| `NANOVLLM_ENABLE_EXPERT_PARALLEL` | `true` | examples | Enables expert parallel execution for routed MoE layers. Keep enabled for DeepSeek V3.2. |
+| `NANOVLLM_GPU_MEMORY_UTILIZATION` | `0.95` | examples | Fraction of visible NPU memory used to size KV cache blocks. Lower it if allocation fails. |
+| `NANOVLLM_KVCACHE_BLOCK_SIZE` | `128` | examples | Paged KV cache block size. The current SFA/MLA paths expect `128`. |
+| `NANOVLLM_SKIP_WARMUP` | `true` | examples | `true` skips warmup for faster startup; `false` runs warmup before generation. |
+| `NANOVLLM_MAX_MODEL_LEN` | `256` in `example/test.py` | `example/test.py` | Max sequence length used to initialize the engine. Must be no larger than `NANOVLLM_MAX_BATCHED_TOKENS`. |
+| `NANOVLLM_MAX_BATCHED_TOKENS` | `NANOVLLM_MAX_MODEL_LEN` in `example/test.py` | `example/test.py` | Max tokens scheduled in one batch. Keep this >= `NANOVLLM_MAX_MODEL_LEN` for the current Nano scheduler. |
+| `NANOVLLM_MAX_NUM_SEQS` | `1` in `example/test.py` | `example/test.py` | Max concurrent sequences. |
+| `NANOVLLM_LONG_PROMPT_TOKENS` | `0` | `example/test.py` | `0` uses short built-in prompts; `>0` builds one exact-length token prompt for prefill/decode tests. |
+| `NANOVLLM_USE_DEEPSEEK_CHAT` | `false` normally, `true` for exact-token test prompt | examples, `LLM.generate` string prompts | `true` wraps string prompts as `<｜User｜>...<｜Assistant｜>`; `false` uses raw prompt text. |
+| `NANOVLLM_ADD_BOS` | same as `NANOVLLM_USE_DEEPSEEK_CHAT` | examples, `LLM.generate` string prompts | `true` prepends tokenizer BOS when available; `false` does not. |
+| `NANOVLLM_TEMPERATURE` | `0.02` in prompt examples, `0.0` in `example/test.py` | examples | Sampling temperature. |
+| `NANOVLLM_MAX_GEN_TOKENS` | script-specific | examples | Max decode tokens per request. Overrides the script default. |
+| `NANOVLLM_IGNORE_EOS` | `false` | examples | `true` keeps decoding until `max_tokens`; `false` stops on EOS. |
+| `NANOVLLM_DECODE_ATTENTION_BACKEND` | `mla` | `deepseek_v32.py` | Decode attention backend. `mla` uses dense paged MLA; `torch` uses the slow PyTorch sparse reference; `sfa` uses `npu_sparse_flash_attention`. |
+| `NANOVLLM_ENABLE_NPU_SFA_DECODE` | `false` | `deepseek_v32.py` | Legacy override. `true` forces decode backend to SFA even if `NANOVLLM_DECODE_ATTENTION_BACKEND` is set. This currently reproduces the SFA decode crash. |
+| `NANOVLLM_COMPARE_NPU_SFA_DECODE` | `false` | `deepseek_v32.py` | When SFA decode is enabled, also computes the PyTorch sparse reference and logs the max difference. |
+| `NANOVLLM_PROFILE_LAYER_IDS` | `0,mid,last` | `deepseek_v32.py` | Selects layers for timing/logging/dumps. Accepts comma-separated ids plus `mid`, `last`, `all`, or `*`. |
+| `NANOVLLM_LOG_NPU_SFA_TIMING` | `false` | `deepseek_v32.py` | Logs prefill MLA timing and SFA timing for selected layers. Useful for low-level attention profiling. |
+| `NANOVLLM_LOG_NPU_SFA_INPUTS` | `false` | `deepseek_v32.py` | Logs tensor shape/dtype/stride summaries for SFA input tensors on selected phases. |
+| `NANOVLLM_DUMP_NPU_SFA_INPUTS` | unset | `deepseek_v32.py` | Directory used to dump SFA-style attention inputs as `.pt` files for replay/debug. |
+| `NANOVLLM_DUMP_NPU_SFA_MAX_CALLS` | `1` | `deepseek_v32.py` | Max number of SFA input dumps per attention module. |
+| `NANOVLLM_LOG_DECODE_LAYER_TIMING` | `false` | `deepseek_v32.py` | `true` logs per selected decode layer: broad attention time, narrow decode attention op time, and MoE/MLP time. Combine with `NANOVLLM_PROFILE_LAYER_IDS=all` for all layers. |
+
 ## 33. Long Prefill, Dense MLA Path
 
 This path uses paged dense MLA for prefill and dense MLA decode. It does not
