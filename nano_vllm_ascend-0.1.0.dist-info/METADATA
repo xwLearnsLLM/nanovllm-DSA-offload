@@ -1,0 +1,15 @@
+Metadata-Version: 2.1
+Name: nano-vllm-ascend
+Version: 0.1.0
+Summary: a lightweight vLLM implementation built from scratch
+Author: linziming
+License: MIT
+Requires-Python: >=3.10,<3.13
+Requires-Dist: transformers==5.5.3
+Requires-Dist: torch==2.9.0+cpu
+Requires-Dist: torch-npu==2.9.0
+Requires-Dist: xxhash==3.7.0
+Requires-Dist: mistral-common==1.11.1
+Requires-Dist: vllm==0.19.1
+Requires-Dist: vllm-ascend==0.19.1rc1
+Project-URL: Homepage, https://github.com/linzm1007/nano-vllm-ascend
