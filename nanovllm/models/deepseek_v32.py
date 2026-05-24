@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import gc
 from pathlib import Path
 from time import perf_counter
 
@@ -490,14 +491,35 @@ class DeepseekV32SparseMoeBlock(nn.Module):
         first_weight = self.local_expert_layers[0].gate_up_proj.weight
         if first_weight.device.type != "npu":
             return
+        dtype = first_weight.dtype
+        device = first_weight.device
+        del first_weight
+
+        cpu_w13_parts: list[torch.Tensor] = []
+        cpu_w2_parts: list[torch.Tensor] = []
+        for expert_layer in self.local_expert_layers:
+            cpu_w13_parts.append(
+                expert_layer.gate_up_proj.weight.detach().cpu()
+            )
+            cpu_w2_parts.append(
+                expert_layer.down_proj.weight.detach().cpu()
+            )
+            expert_layer.gate_up_proj._parameters.pop("weight", None)
+            expert_layer.down_proj._parameters.pop("weight", None)
+
+        self.experts = nn.ModuleDict()
+        self.local_expert_layers = ()
+        gc.collect()
+        torch.npu.empty_cache()
+
         w13 = torch.empty(
             (
                 self.num_local_experts,
                 self.hidden_size,
                 2 * self.moe_intermediate_size,
             ),
-            dtype=first_weight.dtype,
-            device=first_weight.device,
+            dtype=dtype,
+            device=device,
         )
         w2 = torch.empty(
             (
@@ -505,17 +527,19 @@ class DeepseekV32SparseMoeBlock(nn.Module):
                 self.moe_intermediate_size,
                 self.hidden_size,
             ),
-            dtype=first_weight.dtype,
-            device=first_weight.device,
+            dtype=dtype,
+            device=device,
         )
-        for local_idx, expert_layer in enumerate(self.local_expert_layers):
-            w13[local_idx].copy_(expert_layer.gate_up_proj.weight.transpose(0, 1))
-            w2[local_idx].copy_(expert_layer.down_proj.weight.transpose(0, 1))
+        for local_idx, (w13_part, w2_part) in enumerate(
+            zip(cpu_w13_parts, cpu_w2_parts)
+        ):
+            w13[local_idx].copy_(w13_part.transpose(0, 1))
+            w2[local_idx].copy_(w2_part.transpose(0, 1))
 
         self.grouped_w13_weight = nn.Parameter(w13, requires_grad=False)
         self.grouped_w2_weight = nn.Parameter(w2, requires_grad=False)
-        self.experts = nn.ModuleDict()
-        self.local_expert_layers = ()
+        del cpu_w13_parts, cpu_w2_parts
+        gc.collect()
 
     def _grouped_topk(
         self,
