@@ -70,7 +70,7 @@ def main() -> None:
         SamplingParams(
             temperature=env_float("NANOVLLM_TEMPERATURE", 0.0),
             max_tokens=env_int("NANOVLLM_MAX_GEN_TOKENS", 1),
-            ignore_eos=env_bool("NANOVLLM_IGNORE_EOS", False),
+            ignore_eos=env_bool("NANOVLLM_IGNORE_EOS", True),
         ),
     )
     print_outputs(prompts, prompt_token_ids, outputs)
