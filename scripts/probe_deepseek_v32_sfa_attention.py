@@ -18,71 +18,15 @@ import os
 from time import perf_counter
 
 import torch
-
-
-os.environ.setdefault("VLLM_ASCEND_ENABLE_NZ", "0")
-
-
-def _prepend_env_path(name: str, path: str) -> None:
-    current = os.environ.get(name, "")
-    parts = [part for part in current.split(os.pathsep) if part]
-    if path not in parts:
-        os.environ[name] = f"{path}{os.pathsep}{current}" if current else path
-
-
-def _dedupe_env_path(name: str) -> None:
-    current = os.environ.get(name, "")
-    parts = []
-    seen = set()
-    for part in current.split(os.pathsep):
-        if not part or part in seen:
-            continue
-        seen.add(part)
-        parts.append(part)
-    if parts:
-        os.environ[name] = os.pathsep.join(parts)
-
-
-def _ensure_vllm_ascend_custom_opp_path(vllm_ascend_module) -> str | None:
-    package_dir = os.path.dirname(os.path.realpath(vllm_ascend_module.__file__))
-    custom_opp_path = os.path.join(
-        package_dir,
-        "_cann_ops_custom",
-        "vendors",
-        "vllm-ascend",
-    )
-    if os.path.exists(custom_opp_path):
-        _prepend_env_path("ASCEND_CUSTOM_OPP_PATH", custom_opp_path)
-    try:
-        from vllm_ascend.platform import NPUPlatform  # type: ignore
-
-        NPUPlatform.import_kernels()
-    except Exception as exc:
-        print(f"PROBE warning import_kernels failed: {exc!r}", flush=True)
-    _dedupe_env_path("ASCEND_CUSTOM_OPP_PATH")
-    return custom_opp_path if os.path.exists(custom_opp_path) else None
+import torch_npu  # type: ignore  # noqa: F401
+import nanovllm.ops as ascend_ops
 
 
 def _register_ascend_ops() -> None:
-    import torch_npu  # type: ignore  # noqa: F401
-    import vllm  # type: ignore  # noqa: F401
-    import vllm_ascend  # type: ignore  # noqa: F401
-
-    custom_opp_path = _ensure_vllm_ascend_custom_opp_path(vllm_ascend)
-    from vllm_ascend import vllm_ascend_C  # type: ignore  # noqa: F401
-    from vllm_ascend.ops.layer_shard_linear import (  # type: ignore  # noqa: F401
-        is_hidden_layer,
-        post_process_after_loading_for_shard_weight_series,
-        reach_layer_for_shard_weight_series,
-        register_all_layers_to_shard_weight_series,
-    )
-
     print(
         "PROBE env "
         f"torch_npu={getattr(torch_npu, '__file__', None)} "
-        f"vllm={getattr(vllm, '__file__', None)} "
-        f"vllm_ascend={getattr(vllm_ascend, '__file__', None)} "
-        f"custom_opp_path={custom_opp_path} "
+        f"nanovllm_ops={getattr(ascend_ops, '__file__', None)} "
         f"ASCEND_CUSTOM_OPP_PATH={os.environ.get('ASCEND_CUSTOM_OPP_PATH', '')}",
         flush=True,
     )
@@ -207,7 +151,7 @@ def _call_ascend_indexer(
     block_table: torch.Tensor,
     sparse_count: int,
 ) -> torch.Tensor:
-    return torch.ops._C_ascend.npu_lightning_indexer(
+    return ascend_ops.npu_lightning_indexer(
         query=q_index,
         key=index_cache,
         weights=weights,
@@ -288,7 +232,7 @@ def _run_ops(
         flush=True,
     )
     start = perf_counter()
-    out = torch.ops._C_ascend.npu_sparse_flash_attention(
+    out = ascend_ops.npu_sparse_flash_attention(
         query=ql_nope,
         key=ckv_cache,
         value=ckv_cache,
@@ -352,7 +296,7 @@ def replay_dump(path: str, device: torch.device) -> None:
     )
 
     start = perf_counter()
-    out = torch.ops._C_ascend.npu_sparse_flash_attention(
+    out = ascend_ops.npu_sparse_flash_attention(
         query=tensors["query"],
         key=tensors["key"],
         value=tensors["value"],

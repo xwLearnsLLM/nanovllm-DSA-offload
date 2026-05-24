@@ -7,6 +7,18 @@ No editable install is required. Use `PYTHONPATH=$PWD:$PYTHONPATH` so Python can
 import `nanovllm` and `pip show nano-vllm-ascend` can see the local metadata in
 `nano_vllm_ascend-0.1.0.dist-info/`.
 
+## Build Local Ascend Ops
+
+Run this once on the Ascend machine after cloning or after changing `csrc/`.
+It builds `nanovllm._C` and installs the local CANN custom OPP package under
+`nanovllm/_cann_ops_custom/`.
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH bash scripts/build_nanovllm_ops.sh
+```
+
+Set `SOC_VERSION=...` before the command if the worker is not `ascend910_93`.
+
 ## Common Setup
 
 ```bash
@@ -33,7 +45,7 @@ PYTHONPATH=$PWD:$PYTHONPATH python -m pip show nano-vllm-ascend
 | `NANOVLLM_TEMPERATURE` | `0.02` in prompt examples, `0.0` in `example/test.py` | examples | Sampling temperature. |
 | `NANOVLLM_MAX_GEN_TOKENS` | script-specific | examples | Max decode tokens per request. Overrides the script default. |
 | `NANOVLLM_IGNORE_EOS` | `false` | examples | `true` keeps decoding until `max_tokens`; `false` stops on EOS. |
-| `NANOVLLM_DECODE_ATTENTION_BACKEND` | `mla` | `deepseek_v32.py` | Decode attention backend. `mla` uses dense paged MLA; `torch` uses the slow PyTorch sparse reference; `sfa` uses `npu_sparse_flash_attention`. |
+| `NANOVLLM_DECODE_ATTENTION_BACKEND` | `mla` | `deepseek_v32.py` | Decode attention backend. `mla` uses dense paged MLA; `torch` uses the slow PyTorch sparse reference; `sfa` uses `nanovllm.ops.npu_sparse_flash_attention`. |
 | `NANOVLLM_ENABLE_NPU_SFA_DECODE` | `false` | `deepseek_v32.py` | Legacy override. `true` forces decode backend to SFA even if `NANOVLLM_DECODE_ATTENTION_BACKEND` is set. This currently reproduces the SFA decode crash. |
 | `NANOVLLM_COMPARE_NPU_SFA_DECODE` | `false` | `deepseek_v32.py` | When SFA decode is enabled, also computes the PyTorch sparse reference and logs the max difference. |
 | `NANOVLLM_PROFILE_LAYER_IDS` | `0,mid,last` | `deepseek_v32.py` | Selects layers for timing/logging/dumps. Accepts comma-separated ids plus `mid`, `last`, `all`, or `*`. |
@@ -85,13 +97,4 @@ Runs three hard-coded English long QA prompts with dense MLA decode.
 
 ```bash
 PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=4 NANOVLLM_DECODE_ATTENTION_BACKEND=mla NANOVLLM_MAX_GEN_TOKENS=32 NANOVLLM_SKIP_WARMUP=1 python example/long_prompts.py
-```
-
-## 38. Long Prompts With Decode Layer Timing
-
-Runs the long prompt set and prints per-layer decode timing for broad attention,
-the narrow decode attention op, and MoE/MLP.
-
-```bash
-PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=4 NANOVLLM_DECODE_ATTENTION_BACKEND=mla NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_PROFILE_LAYER_IDS=all NANOVLLM_MAX_GEN_TOKENS=32 NANOVLLM_SKIP_WARMUP=1 python example/long_prompts.py
 ```

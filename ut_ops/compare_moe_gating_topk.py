@@ -3,68 +3,19 @@ import json
 import os
 from time import perf_counter
 
-os.environ.setdefault("VLLM_ASCEND_ENABLE_NZ", "0")
-
 import torch
+import torch_npu  # type: ignore  # noqa: F401
+import nanovllm.ops as ascend_ops
 
 
 def log(message: str) -> None:
     print(message, flush=True)
 
 
-def _prepend_env_path(name: str, path: str) -> None:
-    current = os.environ.get(name, "")
-    parts = [part for part in current.split(os.pathsep) if part]
-    if path not in parts:
-        os.environ[name] = f"{path}{os.pathsep}{current}" if current else path
-
-
-def _dedupe_env_path(name: str) -> None:
-    current = os.environ.get(name, "")
-    parts = []
-    seen = set()
-    for part in current.split(os.pathsep):
-        if not part or part in seen:
-            continue
-        seen.add(part)
-        parts.append(part)
-    if parts:
-        os.environ[name] = os.pathsep.join(parts)
-
-
 def register_ascend_ops() -> None:
     log("MOE_GATE stage=register_import_torch_npu")
-    import torch_npu  # type: ignore  # noqa: F401
-
-    log("MOE_GATE stage=register_import_vllm")
-    import vllm  # type: ignore  # noqa: F401
-
-    log("MOE_GATE stage=register_import_vllm_ascend")
-    import vllm_ascend  # type: ignore
-
-    package_dir = os.path.dirname(os.path.realpath(vllm_ascend.__file__))
-    custom_opp_path = os.path.join(
-        package_dir,
-        "_cann_ops_custom",
-        "vendors",
-        "vllm-ascend",
-    )
-    if os.path.exists(custom_opp_path):
-        _prepend_env_path("ASCEND_CUSTOM_OPP_PATH", custom_opp_path)
-    try:
-        from vllm_ascend.platform import NPUPlatform  # type: ignore
-
-        NPUPlatform.import_kernels()
-    except Exception as exc:
-        log(f"MOE_GATE warning import_kernels failed: {exc!r}")
-    _dedupe_env_path("ASCEND_CUSTOM_OPP_PATH")
-    log(
-        "MOE_GATE stage=register_custom_op "
-        f"custom_opp_path={custom_opp_path if os.path.exists(custom_opp_path) else None} "
-        f"ASCEND_CUSTOM_OPP_PATH={os.environ.get('ASCEND_CUSTOM_OPP_PATH', '')}"
-    )
-    from vllm_ascend import vllm_ascend_C  # type: ignore  # noqa: F401
-
+    log("MOE_GATE stage=register_import_nanovllm_ops")
+    log(f"MOE_GATE ASCEND_CUSTOM_OPP_PATH={os.environ.get('ASCEND_CUSTOM_OPP_PATH', '')}")
     log("MOE_GATE stage=register_done")
 
 
@@ -181,7 +132,7 @@ def npu_grouped_topk(
     router_logits = router_logits.float()
     if bias is not None and bias.dtype != router_logits.dtype:
         bias = bias.to(router_logits.dtype)
-    topk_weights, topk_ids, _ = torch.ops._C_ascend.moe_gating_top_k(
+    topk_weights, topk_ids, _ = ascend_ops.moe_gating_top_k(
         router_logits,
         k=top_k,
         k_group=topk_group,
@@ -327,7 +278,7 @@ def main() -> None:
                 if bias is not None and bias.dtype != renorm_one_logits.dtype
                 else bias
             )
-            torch.ops._C_ascend.moe_gating_top_k(
+            ascend_ops.moe_gating_top_k(
                 renorm_one_logits,
                 k=top_k,
                 k_group=topk_group,

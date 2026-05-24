@@ -3,15 +3,7 @@ import time
 import numpy as np
 import torch
 import torch_npu
-import vllm
-import vllm_ascend
-from vllm_ascend import vllm_ascend_C
-from vllm_ascend.ops.layer_shard_linear import (
-    is_hidden_layer,
-    post_process_after_loading_for_shard_weight_series,
-    reach_layer_for_shard_weight_series,
-    register_all_layers_to_shard_weight_series,
-)
+import nanovllm.ops as ascend_ops
 
 
 # 性能测试配置 --------------------------------------------
@@ -83,7 +75,7 @@ def generate_test_data(batch_size, seq_len):
 
 
 def run_sfa(q_nope, kv, q_pe, k_pe, topk_indices, seq_len_q, seq_len_k, block_tables, seq_len, verify=False):
-    attn_output = torch.ops._C_ascend.npu_sparse_flash_attention(
+    attn_output = ascend_ops.npu_sparse_flash_attention(
         query = q_nope,
         key = kv,
         value = kv,
@@ -165,7 +157,7 @@ def print_results(results):
 
 if __name__ == '__main__':
     print("验证算子是否加载成功...")
-    print(torch.ops._C_ascend.npu_sparse_flash_attention)
+    print(ascend_ops.npu_sparse_flash_attention)
     print(f"\n设备: {device}")
     print(f"预热次数: {NUM_WARMUP}")
     print(f"测试迭代: {NUM_ITERATIONS}")

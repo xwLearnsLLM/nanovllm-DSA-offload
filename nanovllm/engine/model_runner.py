@@ -1,29 +1,15 @@
 ﻿# SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the Nano-vLLM project
 
-
-import os
 import pickle
 from multiprocessing.shared_memory import SharedMemory
 from multiprocessing.synchronize import Event
-
-os.environ.setdefault("VLLM_ASCEND_ENABLE_NZ", "0")
 
 import torch
 import torch.distributed as dist
 import torch_npu  # noqa: F401
 
 torch.npu.config.allow_internal_format = True
-
-import vllm  # noqa: F401
-import vllm_ascend  # noqa: F401
-from vllm_ascend import vllm_ascend_C  # noqa: F401
-from vllm_ascend.ops.layer_shard_linear import (  # noqa: F401
-    is_hidden_layer,
-    post_process_after_loading_for_shard_weight_series,
-    reach_layer_for_shard_weight_series,
-    register_all_layers_to_shard_weight_series,
-)
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence

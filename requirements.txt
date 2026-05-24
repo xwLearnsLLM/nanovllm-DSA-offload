@@ -1,11 +1,11 @@
 # Ascend worker environment used for DeepSeek V3.2 testing.
-# torch/torch-npu/vllm-ascend wheels are platform-specific; install them from
-# the Ascend/vLLM-Ascend environment or wheel source that matches your machine.
+# torch/torch-npu wheels are platform-specific; install them from the Ascend
+# wheel source that matches your machine.
 
+cmake
+pybind11
 transformers==5.5.3
 torch==2.9.0+cpu
 torch-npu==2.9.0
-xxhash
+xxhash==3.7.0
 mistral-common==1.11.1
-vllm==0.19.1
-vllm-ascend==0.19.1rc1

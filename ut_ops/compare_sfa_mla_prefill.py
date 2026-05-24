@@ -3,81 +3,20 @@ import glob
 import os
 from time import perf_counter
 
-os.environ.setdefault("VLLM_ASCEND_ENABLE_NZ", "0")
-
 import torch
 import torch.nn.functional as F
+import torch_npu  # type: ignore  # noqa: F401
+import nanovllm.ops as ascend_ops
 
 
 def log(message: str) -> None:
     print(message, flush=True)
 
 
-def _prepend_env_path(name: str, path: str) -> None:
-    current = os.environ.get(name, "")
-    parts = [part for part in current.split(os.pathsep) if part]
-    if path not in parts:
-        os.environ[name] = f"{path}{os.pathsep}{current}" if current else path
-
-
-def _dedupe_env_path(name: str) -> None:
-    current = os.environ.get(name, "")
-    parts = []
-    seen = set()
-    for part in current.split(os.pathsep):
-        if not part or part in seen:
-            continue
-        seen.add(part)
-        parts.append(part)
-    if parts:
-        os.environ[name] = os.pathsep.join(parts)
-
-
-def _ensure_vllm_ascend_custom_opp_path(vllm_ascend_module) -> str | None:
-    package_dir = os.path.dirname(os.path.realpath(vllm_ascend_module.__file__))
-    custom_opp_path = os.path.join(
-        package_dir,
-        "_cann_ops_custom",
-        "vendors",
-        "vllm-ascend",
-    )
-    if os.path.exists(custom_opp_path):
-        _prepend_env_path("ASCEND_CUSTOM_OPP_PATH", custom_opp_path)
-    try:
-        from vllm_ascend.platform import NPUPlatform  # type: ignore
-
-        NPUPlatform.import_kernels()
-    except Exception as exc:
-        log(f"COMPARE warning import_kernels failed: {exc!r}")
-    _dedupe_env_path("ASCEND_CUSTOM_OPP_PATH")
-    return custom_opp_path if os.path.exists(custom_opp_path) else None
-
-
 def register_ascend_ops() -> None:
     log("COMPARE stage=register_import_torch_npu")
-    import torch_npu  # type: ignore  # noqa: F401
-
-    log("COMPARE stage=register_import_vllm")
-    import vllm  # type: ignore  # noqa: F401
-
-    log("COMPARE stage=register_import_vllm_ascend")
-    import vllm_ascend  # type: ignore
-
-    custom_opp_path = _ensure_vllm_ascend_custom_opp_path(vllm_ascend)
-    log(
-        "COMPARE stage=register_import_custom_op "
-        f"custom_opp_path={custom_opp_path} "
-        f"ASCEND_CUSTOM_OPP_PATH={os.environ.get('ASCEND_CUSTOM_OPP_PATH', '')}"
-    )
-    from vllm_ascend import vllm_ascend_C  # type: ignore  # noqa: F401
-
-    log("COMPARE stage=register_import_layer_shard_linear")
-    from vllm_ascend.ops.layer_shard_linear import (  # type: ignore  # noqa: F401
-        is_hidden_layer,
-        post_process_after_loading_for_shard_weight_series,
-        reach_layer_for_shard_weight_series,
-        register_all_layers_to_shard_weight_series,
-    )
+    log("COMPARE stage=register_import_nanovllm_ops")
+    log(f"COMPARE ASCEND_CUSTOM_OPP_PATH={os.environ.get('ASCEND_CUSTOM_OPP_PATH', '')}")
     log("COMPARE stage=register_done")
 
 
@@ -166,7 +105,7 @@ def make_causal_mask(mask_size: int, device: torch.device) -> torch.Tensor:
 
 def run_sfa(payload: dict, tensors: dict[str, torch.Tensor]) -> torch.Tensor:
     start = perf_counter()
-    out = torch.ops._C_ascend.npu_sparse_flash_attention(
+    out = ascend_ops.npu_sparse_flash_attention(
         query=tensors["query"],
         key=tensors["key"],
         value=tensors["value"],

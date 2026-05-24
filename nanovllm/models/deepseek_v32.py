@@ -12,6 +12,7 @@ import torch.distributed as dist
 from torch import nn
 from transformers import PretrainedConfig
 
+import nanovllm.ops as ascend_ops
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
 from nanovllm.layers.layernorm import RMSNorm
@@ -487,7 +488,7 @@ class DeepseekV32SparseMoeBlock(nn.Module):
         if self.scoring_func not in ("softmax", "sigmoid"):
             raise ValueError(f"Unsupported scoring function: {self.scoring_func}")
 
-        topk_weights, topk_ids, _ = torch.ops._C_ascend.moe_gating_top_k(
+        topk_weights, topk_ids, _ = ascend_ops.moe_gating_top_k(
             router_logits,
             k=self.top_k,
             k_group=self.topk_group,
@@ -952,7 +953,7 @@ class DeepseekV32DSAAttention(nn.Module):
         if log_timing:
             _profile_sync(ql_nope.device)
             start = perf_counter()
-        topk_indices = torch.ops._C_ascend.npu_lightning_indexer(
+        topk_indices = ascend_ops.npu_lightning_indexer(
             query=q_index,
             key=self.index_cache,
             weights=weights,
@@ -1006,7 +1007,7 @@ class DeepseekV32DSAAttention(nn.Module):
         if phase == "decode" and self.log_decode_layer_timing:
             _profile_sync(ql_nope.device)
             attention_op_start = perf_counter()
-        latent = torch.ops._C_ascend.npu_sparse_flash_attention(
+        latent = ascend_ops.npu_sparse_flash_attention(
             query=ql_nope,
             key=self.ckv_cache,
             value=self.ckv_cache,
@@ -1063,7 +1064,7 @@ class DeepseekV32DSAAttention(nn.Module):
         device = q_index.device
         seq_lengths_query = torch.ones((1,), dtype=torch.int32, device=device)
         seq_lengths_key = torch.tensor([valid_len], dtype=torch.int32, device=device)
-        topk_indices = torch.ops._C_ascend.npu_lightning_indexer(
+        topk_indices = ascend_ops.npu_lightning_indexer(
             query=q_index.unsqueeze(0),
             key=self.index_cache,
             weights=weights.unsqueeze(0),
@@ -1116,7 +1117,7 @@ class DeepseekV32DSAAttention(nn.Module):
                 dtype=latent.dtype,
                 device=latent.device,
             )
-            torch.ops._C_ascend.batch_matmul_transpose(
+            ascend_ops.batch_matmul_transpose(
                 latent,
                 self.w_uv,
                 output,

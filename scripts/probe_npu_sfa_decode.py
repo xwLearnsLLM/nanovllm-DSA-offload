@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Probe vLLM-Ascend SFA decode ops without running a full model prefill.
+"""Probe local Nano SFA decode ops without running a full model prefill.
 
 This mirrors the Nano DeepSeek-V3.2 decode SFA shapes:
   indexer query: [1, 64, 128]
@@ -17,21 +17,11 @@ import argparse
 import glob
 import os
 
-os.environ.setdefault("VLLM_ASCEND_ENABLE_NZ", "0")
-
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch_npu  # type: ignore  # noqa: F401
-import vllm  # type: ignore  # noqa: F401
-import vllm_ascend  # type: ignore  # noqa: F401
-from vllm_ascend import vllm_ascend_C  # type: ignore  # noqa: F401
-from vllm_ascend.ops.layer_shard_linear import (  # type: ignore  # noqa: F401
-    is_hidden_layer,
-    post_process_after_loading_for_shard_weight_series,
-    reach_layer_for_shard_weight_series,
-    register_all_layers_to_shard_weight_series,
-)
+import nanovllm.ops as ascend_ops
 
 
 def _head(tensor: torch.Tensor, limit: int = 16) -> list[int | float]:
@@ -238,7 +228,7 @@ def _run_sfa_dump(
         ),
         flush=True,
     )
-    out = torch.ops._C_ascend.npu_sparse_flash_attention(
+    out = ascend_ops.npu_sparse_flash_attention(
         query=query,
         key=key,
         value=value,
@@ -434,7 +424,7 @@ def main() -> None:
         f"block_head={_head(block_table)}",
         flush=True,
     )
-    topk = torch.ops._C_ascend.npu_lightning_indexer(
+    topk = ascend_ops.npu_lightning_indexer(
         query=q_index,
         key=index_cache,
         weights=weights,
@@ -466,7 +456,7 @@ def main() -> None:
         f"{_desc('key_rope', k_pe)}",
         flush=True,
     )
-    out = torch.ops._C_ascend.npu_sparse_flash_attention(
+    out = ascend_ops.npu_sparse_flash_attention(
         query=ql_nope,
         key=kv,
         value=kv,
