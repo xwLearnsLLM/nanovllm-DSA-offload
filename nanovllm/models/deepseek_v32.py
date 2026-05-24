@@ -11,6 +11,7 @@ import torch
 import torch_npu  # type: ignore
 import torch.distributed as dist
 from torch import nn
+import torch.nn.functional as F
 from transformers import PretrainedConfig
 
 import nanovllm.ops as ascend_ops
@@ -559,21 +560,14 @@ class DeepseekV32SparseMoeBlock(nn.Module):
             k_group=self.topk_group,
             group_count=self.num_expert_group,
             group_select_mode=1,
-            renorm=0,
+            renorm=1 if self.renormalize else 0,
             norm_type=norm_type,
             out_flag=False,
-            routed_scaling_factor=1.0,
+            routed_scaling_factor=self.routed_scaling_factor,
             eps=1e-20,
             bias_opt=bias,
         )
         topk_weights = topk_weights.float()
-        if self.renormalize:
-            topk_weights = topk_weights / topk_weights.sum(
-                dim=-1,
-                keepdim=True,
-            ).clamp_min(1e-20)
-        if self.routed_scaling_factor != 1.0:
-            topk_weights = topk_weights * self.routed_scaling_factor
         return topk_weights, topk_ids
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -828,6 +822,7 @@ class DeepseekV32DSAAttention(nn.Module):
         self.ckv_cache = torch.tensor([])
         self.kpe_cache = torch.tensor([])
         self.index_cache = torch.tensor([])
+        self.register_parameter("wd_qkv", None)
         self.w_uk_t = None
         self.w_uv = None
         self.use_npu_sfa_decode = _env_flag(
@@ -875,6 +870,31 @@ class DeepseekV32DSAAttention(nn.Module):
         self.index_cache = index_cache
 
     def post_load_prepare(self) -> None:
+        if self.wd_qkv is None:
+            q_weight = self.q_a_proj.weight.detach().cpu()
+            kv_weight = self.kv_a_proj_with_mqa.weight.detach().cpu()
+            dtype = self.q_a_proj.weight.dtype
+            device = self.q_a_proj.weight.device
+            self.q_a_proj._parameters.pop("weight", None)
+            self.kv_a_proj_with_mqa._parameters.pop("weight", None)
+            gc.collect()
+            if device.type == "npu":
+                torch.npu.empty_cache()
+
+            wd_qkv = torch.empty(
+                (
+                    self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim,
+                    self.hidden_size,
+                ),
+                dtype=dtype,
+                device=device,
+            )
+            wd_qkv[: self.q_lora_rank].copy_(q_weight)
+            wd_qkv[self.q_lora_rank :].copy_(kv_weight)
+            self.wd_qkv = nn.Parameter(wd_qkv, requires_grad=False)
+            del q_weight, kv_weight
+            gc.collect()
+
         weight = self.kv_b_proj.weight.data.view(
             self.num_local_heads,
             self.qk_nope_head_dim + self.v_head_dim,
@@ -1237,6 +1257,27 @@ class DeepseekV32DSAAttention(nn.Module):
         return self._v_up_proj(latent.unsqueeze(0)).reshape(-1)
 
     def _q_nope_up_proj(self, q_nope: torch.Tensor) -> torch.Tensor:
+        num_tokens = q_nope.shape[0]
+        if (
+            q_nope.dtype in (torch.float16, torch.bfloat16)
+            and num_tokens <= BMM_TRANS_MAX_SUPPORTED_TOKENS
+        ):
+            ql_nope = torch.empty(
+                (
+                    num_tokens,
+                    self.num_local_heads,
+                    self.kv_lora_rank,
+                ),
+                dtype=q_nope.dtype,
+                device=q_nope.device,
+            )
+            ascend_ops.batch_matmul_transpose(
+                q_nope,
+                self.w_uk_t,
+                ql_nope,
+            )
+            return ql_nope
+
         q_nope_by_head = q_nope.transpose(0, 1).contiguous()
         ql_nope = torch.bmm(q_nope_by_head, self.w_uk_t)
         return ql_nope.transpose(0, 1).contiguous()
@@ -1496,7 +1537,16 @@ class DeepseekV32DSAAttention(nn.Module):
         if self.w_uk_t is None or self.w_uv is None:
             self.post_load_prepare()
 
-        q_c = self.q_a_layernorm(self.q_a_proj(hidden_states))
+        if self.wd_qkv is None:
+            self.post_load_prepare()
+
+        qkv_a = F.linear(hidden_states, self.wd_qkv)
+        q_c, kv = torch.split(
+            qkv_a,
+            [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+            dim=-1,
+        )
+        q_c = self.q_a_layernorm(q_c)
         q = self.q_b_proj(q_c).view(
             -1, self.num_local_heads, self.qk_head_dim
         )
@@ -1506,7 +1556,6 @@ class DeepseekV32DSAAttention(nn.Module):
             dim=-1,
         )
 
-        kv = self.kv_a_proj_with_mqa(hidden_states)
         ckv, k_pe = torch.split(
             kv,
             [self.kv_lora_rank, self.qk_rope_head_dim],
