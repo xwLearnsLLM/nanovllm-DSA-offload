@@ -26,9 +26,10 @@ def _make_balanced_topk(
     num_experts: int,
     local_start: int,
     num_local_experts: int,
+    dtype: torch.dtype,
     device: torch.device,
 ) -> torch.Tensor:
-    ids = torch.empty((num_tokens, topk), dtype=torch.int64, device=device)
+    ids = torch.empty((num_tokens, topk), dtype=torch.int64, device="cpu")
     local_end = local_start + num_local_experts
     for t in range(num_tokens):
         ids[t, 0] = local_start + (t % num_local_experts)
@@ -37,8 +38,10 @@ def _make_balanced_topk(
             if ids[t, k] == ids[t, 0]:
                 ids[t, k] = (ids[t, k] + 1) % num_experts
     if topk > 1 and local_end < num_experts:
-        ids[0::2, -1] = local_end + (torch.arange((num_tokens + 1) // 2, device=device) % (num_experts - local_end))
-    return ids.contiguous()
+        ids[0::2, -1] = local_end + (
+            torch.arange((num_tokens + 1) // 2) % (num_experts - local_end)
+        )
+    return ids.to(device=device, dtype=dtype).contiguous()
 
 
 def _random_topk_weights(
@@ -167,6 +170,7 @@ def main() -> None:
     parser.add_argument("--num-local-experts", type=int, default=8)
     parser.add_argument("--local-start", type=int, default=0)
     parser.add_argument("--topk", type=int, default=8)
+    parser.add_argument("--topk-dtype", choices=("int32", "int64"), default="int32")
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument("--seed", type=int, default=0)
@@ -206,6 +210,7 @@ def main() -> None:
         args.num_experts,
         args.local_start,
         args.num_local_experts,
+        torch.int32 if args.topk_dtype == "int32" else torch.int64,
         device,
     )
     topk_weights = _random_topk_weights(args.tokens, args.topk, device)
