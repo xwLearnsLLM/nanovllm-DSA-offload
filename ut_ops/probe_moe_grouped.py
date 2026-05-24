@@ -284,7 +284,7 @@ def main() -> None:
         )
         print("MOE_PROBE " + _describe(f"grouped_out_{label}", candidate))
         print(f"MOE_PROBE diff reference_vs_{label} " + _diff(ref, candidate))
-        if label == "local_probs_swapped_w13":
+        if label == "local_probs_normal_w13":
             grouped = candidate
             metadata = candidate_metadata
 
@@ -306,7 +306,7 @@ def main() -> None:
             args.local_start,
             args.num_local_experts,
             mask_nonlocal_probs=True,
-            swap_w13_halves=True,
+            swap_w13_halves=False,
         )
     _sync(device)
     for _ in range(args.iters):
@@ -321,7 +321,7 @@ def main() -> None:
             args.local_start,
             args.num_local_experts,
             mask_nonlocal_probs=True,
-            swap_w13_halves=True,
+            swap_w13_halves=False,
         )
         _sync(device)
         grouped_times.append((perf_counter() - start) * 1000.0)

@@ -478,6 +478,44 @@ class DeepseekV32SparseMoeBlock(nn.Module):
         self.local_expert_layers = tuple(
             self.experts[str(expert_idx)] for expert_idx in self.local_expert_ids
         )
+        self.register_parameter("grouped_w13_weight", None)
+        self.register_parameter("grouped_w2_weight", None)
+
+    def post_load_prepare(self) -> None:
+        if self.grouped_w13_weight is not None:
+            return
+        if not self.local_expert_layers:
+            return
+
+        first_weight = self.local_expert_layers[0].gate_up_proj.weight
+        if first_weight.device.type != "npu":
+            return
+        w13 = torch.empty(
+            (
+                self.num_local_experts,
+                self.hidden_size,
+                2 * self.moe_intermediate_size,
+            ),
+            dtype=first_weight.dtype,
+            device=first_weight.device,
+        )
+        w2 = torch.empty(
+            (
+                self.num_local_experts,
+                self.moe_intermediate_size,
+                self.hidden_size,
+            ),
+            dtype=first_weight.dtype,
+            device=first_weight.device,
+        )
+        for local_idx, expert_layer in enumerate(self.local_expert_layers):
+            w13[local_idx].copy_(expert_layer.gate_up_proj.weight.transpose(0, 1))
+            w2[local_idx].copy_(expert_layer.down_proj.weight.transpose(0, 1))
+
+        self.grouped_w13_weight = nn.Parameter(w13, requires_grad=False)
+        self.grouped_w2_weight = nn.Parameter(w2, requires_grad=False)
+        self.experts = nn.ModuleDict()
+        self.local_expert_layers = ()
 
     def _grouped_topk(
         self,
@@ -519,8 +557,32 @@ class DeepseekV32SparseMoeBlock(nn.Module):
         shared_output = self.shared_experts(hidden_states)
         router_logits = self.gate(hidden_states)
         routing_weights, selected_experts = self._grouped_topk(router_logits)
-        routing_weights = routing_weights.to(hidden_states.dtype)
+        if self.grouped_w13_weight is not None and hidden_states.device.type == "npu":
+            routed_hidden_states = self._grouped_experts_forward(
+                hidden_states,
+                selected_experts,
+                routing_weights,
+            )
+        else:
+            routed_hidden_states = self._loop_experts_forward(
+                hidden_states,
+                selected_experts,
+                routing_weights,
+            )
 
+        final_hidden_states = routed_hidden_states + shared_output
+        if self.enable_expert_parallel and self.ep_size > 1:
+            dist.all_reduce(final_hidden_states)
+        return final_hidden_states.view(sequence_length, hidden_dim)
+
+    def _loop_experts_forward(
+        self,
+        hidden_states: torch.Tensor,
+        selected_experts: torch.Tensor,
+        routing_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        hidden_dim = hidden_states.shape[-1]
+        routing_weights = routing_weights.to(hidden_states.dtype)
         routed_hidden_states = torch.zeros(
             hidden_states.shape,
             dtype=hidden_states.dtype,
@@ -544,11 +606,65 @@ class DeepseekV32SparseMoeBlock(nn.Module):
                 top_x,
                 current_hidden_states.to(hidden_states.dtype),
             )
+        return routed_hidden_states
 
-        final_hidden_states = routed_hidden_states + shared_output
-        if self.enable_expert_parallel and self.ep_size > 1:
-            dist.all_reduce(final_hidden_states)
-        return final_hidden_states.view(sequence_length, hidden_dim)
+    def _grouped_experts_forward(
+        self,
+        hidden_states: torch.Tensor,
+        selected_experts: torch.Tensor,
+        routing_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        if selected_experts.dtype != torch.int32:
+            selected_experts = selected_experts.to(torch.int32)
+        selected_experts = selected_experts.contiguous()
+        local_mask = (
+            (selected_experts >= self.local_expert_start)
+            & (selected_experts < self.local_expert_end)
+        )
+        routing_weights = (
+            routing_weights * local_mask.to(routing_weights.dtype)
+        ).contiguous()
+
+        sorted_hidden, expanded_row_idx, expert_tokens, _ = (
+            torch_npu.npu_moe_init_routing_v2(
+                hidden_states,
+                selected_experts,
+                scale=None,
+                active_num=hidden_states.shape[0] * self.top_k,
+                expert_num=self.num_experts,
+                expert_tokens_num_type=1,
+                expert_tokens_num_flag=True,
+                active_expert_range=[
+                    self.local_expert_start,
+                    self.local_expert_end,
+                ],
+                quant_mode=-1,
+            )
+        )
+        expert_tokens = expert_tokens.to(torch.int64)
+
+        gate_up = torch_npu.npu_grouped_matmul(
+            x=[sorted_hidden],
+            weight=[self.grouped_w13_weight],
+            split_item=2,
+            group_list_type=1,
+            group_type=0,
+            group_list=expert_tokens,
+        )[0]
+        hidden_states = torch_npu.npu_swiglu(gate_up)
+        hidden_states = torch_npu.npu_grouped_matmul(
+            x=[hidden_states],
+            weight=[self.grouped_w2_weight],
+            split_item=2,
+            group_list_type=1,
+            group_type=0,
+            group_list=expert_tokens,
+        )[0]
+        return torch_npu.npu_moe_token_unpermute(
+            permuted_tokens=hidden_states,
+            sorted_indices=torch.abs(expanded_row_idx),
+            probs=routing_weights,
+        )
 
 
 class DeepseekV32Indexer(nn.Module):
@@ -1526,6 +1642,8 @@ class DeepseekV32Model(nn.Module):
     def post_load_prepare(self) -> None:
         for layer in self.layers:
             layer.self_attn.post_load_prepare()
+            if isinstance(layer.mlp, DeepseekV32SparseMoeBlock):
+                layer.mlp.post_load_prepare()
 
 
 class DeepseekV32ForCausalLM(nn.Module):

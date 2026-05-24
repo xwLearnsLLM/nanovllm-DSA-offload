@@ -123,3 +123,12 @@ For a decode-shaped micro-batch:
 ```bash
 PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ut_ops/probe_moe_grouped.py --device npu:0 --tokens 3 --hidden-size 512 --intermediate-size 256 --num-experts 32 --num-local-experts 8 --local-start 0 --topk 8 --topk-dtype int32 --warmup 5 --iters 20
 ```
+
+## 39. Short Decode With Layer Timing
+
+Runs the model with grouped MoE enabled by default and prints per-layer decode
+timing for selected layers.
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=4 NANOVLLM_DECODE_ATTENTION_BACKEND=mla NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_PROFILE_LAYER_IDS=0,mid,last NANOVLLM_LONG_PROMPT_TOKENS=129 NANOVLLM_MAX_MODEL_LEN=256 NANOVLLM_MAX_BATCHED_TOKENS=256 NANOVLLM_MAX_NUM_SEQS=1 NANOVLLM_MAX_GEN_TOKENS=8 NANOVLLM_SKIP_WARMUP=1 python example/test.py
+```
