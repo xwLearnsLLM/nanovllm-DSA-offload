@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
+﻿# SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the Nano-vLLM project
 
 
@@ -6,59 +6,34 @@ import os
 import pickle
 from multiprocessing.shared_memory import SharedMemory
 from multiprocessing.synchronize import Event
-from time import perf_counter
+
+os.environ.setdefault("VLLM_ASCEND_ENABLE_NZ", "0")
 
 import torch
 import torch.distributed as dist
+import torch_npu  # noqa: F401
 
-from nanovllm.config import Config, GraphMode
+torch.npu.config.allow_internal_format = True
+
+import vllm  # noqa: F401
+import vllm_ascend  # noqa: F401
+from vllm_ascend import vllm_ascend_C  # noqa: F401
+from vllm_ascend.ops.layer_shard_linear import (  # noqa: F401
+    is_hidden_layer,
+    post_process_after_loading_for_shard_weight_series,
+    reach_layer_for_shard_weight_series,
+    register_all_layers_to_shard_weight_series,
+)
+
+from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.layers.sampler import Sampler
-from nanovllm.models.models_map import model_dict
-from nanovllm.utils.context import set_context, reset_context, get_context
+from nanovllm.models.deepseek_v32 import DeepseekV32ForCausalLM
+from nanovllm.utils.context import set_context, reset_context
 from nanovllm.utils.loader import load_model
 from nanovllm.utils.logger import init_logger
 
 logger = init_logger(__name__)
-
-
-def _env_flag(name: str, default: bool = False) -> bool:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return value.lower() in ("1", "true", "yes", "on")
-
-
-def _import_torchair():
-    try:
-        import torchair  # type: ignore
-    except Exception as exc:
-        raise RuntimeError(
-            "torchair is only required for the non-eager graph/compile path. "
-            "Install torchair, or run with `enforce_eager=True`."
-        ) from exc
-    return torchair
-
-
-def _register_vllm_ascend_custom_ops() -> bool:
-    os.environ.setdefault("VLLM_ASCEND_ENABLE_NZ", "0")
-    try:
-        import torch_npu  # noqa: F401  # type: ignore
-        torch.npu.config.allow_internal_format = True
-        import vllm  # noqa: F401  # type: ignore
-        import vllm_ascend  # noqa: F401  # type: ignore
-        from vllm_ascend import vllm_ascend_C  # noqa: F401  # type: ignore
-        from vllm_ascend.ops.layer_shard_linear import (  # noqa: F401
-            is_hidden_layer,
-            post_process_after_loading_for_shard_weight_series,
-            reach_layer_for_shard_weight_series,
-            register_all_layers_to_shard_weight_series,
-        )
-    except Exception as exc:
-        logger.warning("Failed to register vLLM-Ascend custom ops early: %r", exc)
-        return False
-    logger.info("Registered vLLM-Ascend custom ops early for Nano NPU indexer/SFA.")
-    return True
 
 
 class ModelRunner:
@@ -67,16 +42,12 @@ class ModelRunner:
         self.config = config
         self.hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
-        self.enforce_eager = config.enforce_eager
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
         self.device = config.device
-        self.model_type = self.hf_config.model_type
 
         torch.npu.set_device(rank)
-        if self.model_type == "deepseek_v32":
-            _register_vllm_ascend_custom_ops()
         dist.init_process_group("hccl", f"tcp://localhost:{config.hccl_port}", world_size=self.world_size, rank=rank)
         default_dtype = torch.get_default_dtype()
 
@@ -87,26 +58,8 @@ class ModelRunner:
         self.model = self._load_default_strategy()
 
         self.sampler = Sampler()
-        self.profile_decode = _env_flag("NANOVLLM_PROFILE_DECODE", False)
-        self.profile_decode_every = max(
-            1,
-            int(os.environ.get("NANOVLLM_PROFILE_DECODE_EVERY", "31")),
-        )
-        self.profile_decode_steps = 0
-        self.profile_decode_tokens = 0
-        self.profile_prepare_time = 0.0
-        self.profile_model_time = 0.0
-        self.profile_forward_time = 0.0
-        self.profile_logits_time = 0.0
-        self.profile_sample_time = 0.0
-        self._last_forward_time = 0.0
-        self._last_logits_time = 0.0
         torch.npu.empty_cache()
         self.allocate_kv_cache()
-        if not self.enforce_eager:
-            self.compiler_config = None
-            self.compile_decode = None
-            self.decode_compile(config)
 
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
@@ -114,8 +67,13 @@ class ModelRunner:
         self._share_memory(rank)
 
     def _load_default_strategy(self):
-        arch = self.hf_config.architectures[0]
-        model = model_dict[arch](self.hf_config)
+        arch = (getattr(self.hf_config, "architectures", None) or [""])[0]
+        if arch not in ("DeepseekV32ForCausalLM", "DeepseekV3ForCausalLM", ""):
+            raise ValueError(
+                f"Unsupported architecture {arch!r}; nano-vllm-ascend now "
+                "only loads DeepSeek-V3.2 style models."
+            )
+        model = DeepseekV32ForCausalLM(self.hf_config)
         load_model(
             model,
             self.config.model,
@@ -170,36 +128,6 @@ class ModelRunner:
             torch_dtype = torch.float16
         return torch_dtype
 
-    def decode_compile(self, config):
-        torchair = _import_torchair()
-        """
-        max-autotune模式（Ascend IR）：将PyTorch的FX计算图转换为昇腾中间表示（IR，Intermediate Representation），
-        即Ascend IR计算图，并通过GE（Graph Engine，图引擎）实现计算图的编译和执行。
-        """
-        logger.info(f"graph mode: {config.graph_mode}")
-        if config.graph_mode == GraphMode.MAX_AUTOTUNE.value:
-            if config.use_graph_cache:
-                self.compile_decode = torchair.inference.cache_compile(self.model.forward,
-                                                                       config=self.compiler_config,
-                                                                       dynamic=False,
-                                                                       fullgraph=True,
-                                                                       ge_cache=True)
-            else:
-                npu_backend = torchair.get_npu_backend(compiler_config=self.compiler_config)
-                self.compile_decode = torch.compile(self.model.forward, dynamic=False, fullgraph=True,
-                                                    backend=npu_backend)
-        """
-        reduce-overhead模式（aclgraph）：采用Capture&Replay方式实现任务一次捕获多次执行，Capture阶段捕获Stream任务到Device侧，暂不执行；
-        Replay阶段从Host侧发出执行指令，Device侧再执行已捕获的任务，从而减少Host调度开销，提升性能。
-        """
-        if config.graph_mode == GraphMode.REDUCE_OVERHEAD.value:
-            from torchair.configs.compiler_config import CompilerConfig
-
-            compiler_config = CompilerConfig()
-            compiler_config.mode = GraphMode.REDUCE_OVERHEAD.value
-            npu_backend = torchair.get_npu_backend(compiler_config=compiler_config)
-            self.compile_decode = torch.compile(self.model.forward, backend=npu_backend)
-
     def exit(self):
         if self.world_size > 1:
             self.shm.close()
@@ -240,10 +168,7 @@ class ModelRunner:
         return method(*args)
 
     def allocate_kv_cache(self):
-        if self.model_type == "deepseek_v32":
-            self._allocate_deepseek_dsa_cache()
-            return
-        self._allocate_dense_kv_cache()
+        self._allocate_deepseek_dsa_cache()
 
     def _get_available_cache_mem(self):
         config = self.config
@@ -292,51 +217,6 @@ class ModelRunner:
                 synced_num_blocks,
             )
         return synced_num_blocks
-
-    def _allocate_dense_kv_cache(self):
-        config = self.config
-        hf_config = config.hf_config
-        text_config = getattr(hf_config, "text_config", hf_config)
-        available_mem, used, total = self._get_available_cache_mem()
-        cache_dtype = self._set_torch_dtype(text_config)
-        num_kv_heads = text_config.num_key_value_heads // self.world_size
-        head_dim = (
-            text_config.head_dim
-            if hasattr(text_config, "head_dim")
-            else text_config.hidden_size // text_config.num_attention_heads
-        )
-        num_layers = text_config.num_hidden_layers
-        block_bytes = (
-            2
-            * num_layers
-            * self.block_size
-            * num_kv_heads
-            * head_dim
-            * self._dtype_itemsize(cache_dtype)
-        )
-        local_num_blocks = int(available_mem) // block_bytes
-        config.num_kvcache_blocks = self._sync_kvcache_blocks_across_tp(
-            local_num_blocks,
-        )
-        assert config.num_kvcache_blocks > 0, "Failed to allocate any KV cache blocks due to insufficient memory."
-        cache_shape = (2, num_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads * head_dim)
-        kv_cache = torch.empty(cache_shape, dtype=cache_dtype, device=self.device)
-        kv_cache.zero_()
-        self._log_cache_allocation(
-            total=total,
-            used=used,
-            block_bytes=block_bytes,
-            num_blocks=config.num_kvcache_blocks,
-            shapes=[("KV Cache", cache_shape)],
-        )
-        layer_id = 0
-        for module in self.model.modules():
-            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                module.k_cache = kv_cache[0, layer_id]
-                module.v_cache = kv_cache[1, layer_id]
-                if hasattr(module, "layer_id"):
-                    module.layer_id = layer_id
-                layer_id += 1
 
     def _allocate_deepseek_dsa_cache(self):
         config = self.config
@@ -472,8 +352,7 @@ class ModelRunner:
                     slot_mapping.extend(list(range(start, end)))
 
         block_tables = self.prepare_block_tables(seqs)
-        if self.model_type == "deepseek_v32":
-            block_tables = self._pad_block_tables_to_static_max(block_tables)
+        block_tables = self._pad_block_tables_to_static_max(block_tables)
 
         input_ids = torch.tensor(input_ids, dtype=torch.int64).to(self.device)
         positions = torch.tensor(positions, dtype=torch.int64).to(self.device)
@@ -493,58 +372,6 @@ class ModelRunner:
 
         return input_ids, positions
 
-    def prepare_decode_padding(self, seqs: list[Sequence]):
-        input_ids, positions, slot_mapping, context_lens = [], [], [], []
-        max_compile_bs = self.config.max_num_seqs
-        real_bs = len(seqs)
-
-        for seq in seqs:
-            input_ids.append(seq.last_token)
-            positions.append(len(seq) - 1)
-            context_lens.append(len(seq))
-            slot_mapping.append([seq.block_table[-1], seq.last_block_num_tokens - 1])
-
-        # padding
-        padding_size = max_compile_bs - real_bs
-        if padding_size > 0:
-            input_ids.extend([0] * padding_size)
-            positions.extend([0] * padding_size)
-            context_lens.extend([0] * padding_size)
-            # dummy_slot block_num=1891 max_num_seq=4 seq=3 [[0,10],[1,11],[2,19],[1890,0]]
-            dummy_slot = [self.config.num_kvcache_blocks - 1, 0]
-            slot_mapping.extend([dummy_slot] * padding_size)
-
-        input_ids = torch.tensor(input_ids, dtype=torch.int64).to(self.device).contiguous()
-        positions = torch.tensor(positions, dtype=torch.int64).to(self.device).contiguous()
-        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32).to(self.device).contiguous()
-        context_lens = torch.tensor(context_lens, dtype=torch.int32).to(self.device).contiguous()
-
-        # 构造静态形状的 block_tables (max_compile_bs, static_max_block_cols) 避免图编译报错
-        static_max_block_cols = self.config.max_model_len // self.config.kvcache_block_size
-        raw_block_tables = self.prepare_block_tables(seqs)
-
-        block_tables = torch.full(
-            (max_compile_bs, static_max_block_cols),
-            fill_value=-1,
-            dtype=torch.int32,
-            device=self.device
-        )
-
-        curr_real_bs, curr_cols = raw_block_tables.shape
-        actual_cols = min(curr_cols, static_max_block_cols)
-        block_tables[:curr_real_bs, :actual_cols] = raw_block_tables[:, :actual_cols]
-
-        set_context(False,
-                    slot_mapping=slot_mapping,
-                    context_lens=context_lens,
-                    block_tables=block_tables,
-                    is_enforce_eager=self.enforce_eager,
-                    real_bs=curr_real_bs,
-                    block_size=self.config.kvcache_block_size
-                    )
-
-        return input_ids, positions
-
     def prepare_decode(self, seqs: list[Sequence]):
         input_ids = []
         positions = []
@@ -560,13 +387,12 @@ class ModelRunner:
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        if self.model_type == "deepseek_v32":
-            block_tables = self._pad_block_tables_to_static_max(block_tables)
+        block_tables = self._pad_block_tables_to_static_max(block_tables)
         set_context(False,
                     slot_mapping=slot_mapping,
                     context_lens=context_lens,
                     block_tables=block_tables,
-                    is_enforce_eager=self.enforce_eager,
+                    is_enforce_eager=True,
                     real_bs=len(seqs),
                     block_size=self.config.kvcache_block_size)
         return input_ids, positions
@@ -585,83 +411,18 @@ class ModelRunner:
                   positions: torch.Tensor,
                   is_prefill: bool,
                   ):
-        execute_tokens = len(input_ids) if is_prefill else get_context().real_bs
-        if _env_flag("NANOVLLM_LOG_EXECUTE_TOKENS", False):
-            logger.info(
-                f"{'prefill' if is_prefill else 'decode'} execute tokens: "
-                f"{execute_tokens}"
-            )
-        should_profile = self.profile_decode and not is_prefill
-        if should_profile:
-            torch.npu.synchronize()
-            forward_start = perf_counter()
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
-            hidden_states = self.model(input_ids, positions)
-        else:
-            hidden_states = self.compile_decode(input_ids, positions)
-        if should_profile:
-            torch.npu.synchronize()
-            self._last_forward_time = perf_counter() - forward_start
-            logits_start = perf_counter()
+        hidden_states = self.model(input_ids, positions)
         logits = self.model.compute_logits(hidden_states)
-        if should_profile:
-            torch.npu.synchronize()
-            self._last_logits_time = perf_counter() - logits_start
         return logits
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        def _sync_if_profile():
-            if self.profile_decode and not is_prefill:
-                torch.npu.synchronize()
-
-        _sync_if_profile()
-        prepare_start = perf_counter()
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else (
-            self.prepare_decode(seqs) if self.enforce_eager else self.prepare_decode_padding(seqs))
-        _sync_if_profile()
-        prepare_time = perf_counter() - prepare_start
-
+        input_ids, positions = (
+            self.prepare_prefill(seqs)
+            if is_prefill
+            else self.prepare_decode(seqs)
+        )
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        _sync_if_profile()
-        model_start = perf_counter()
         logits = self.run_model(input_ids, positions, is_prefill)
-        _sync_if_profile()
-        model_time = perf_counter() - model_start
-
-        sample_start = perf_counter()
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
-        sample_time = perf_counter() - sample_start
-        if self.profile_decode and not is_prefill and self.rank == 0:
-            real_bs = get_context().real_bs
-            self.profile_decode_steps += 1
-            self.profile_decode_tokens += int(real_bs)
-            self.profile_prepare_time += prepare_time
-            self.profile_model_time += model_time
-            self.profile_forward_time += self._last_forward_time
-            self.profile_logits_time += self._last_logits_time
-            self.profile_sample_time += sample_time
-            if self.profile_decode_steps % self.profile_decode_every == 0:
-                steps = self.profile_decode_steps
-                tokens = max(self.profile_decode_tokens, 1)
-                total_time = (
-                    self.profile_prepare_time
-                    + self.profile_model_time
-                    + self.profile_sample_time
-                )
-                logger.info(
-                    "Decode profile avg: steps=%d tokens=%d "
-                    "prepare=%.4fs/step model_forward=%.4fs/step "
-                    "lm_head=%.4fs/step model_lm=%.4fs/step "
-                    "sample=%.4fs/step total=%.4fs/step %.2f toks/s",
-                    steps,
-                    tokens,
-                    self.profile_prepare_time / steps,
-                    self.profile_forward_time / steps,
-                    self.profile_logits_time / steps,
-                    self.profile_model_time / steps,
-                    self.profile_sample_time / steps,
-                    total_time / steps,
-                    tokens / max(total_time, 1e-9),
-                )
         reset_context()
         return token_ids

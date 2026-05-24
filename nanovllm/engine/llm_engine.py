@@ -10,7 +10,7 @@ from time import perf_counter
 
 import torch
 import torch_npu
-from transformers import AutoTokenizer, LlamaTokenizerFast, PreTrainedTokenizerFast
+from transformers import LlamaTokenizerFast, PreTrainedTokenizerFast
 import torch.multiprocessing as mp
 
 from nanovllm.config import Config
@@ -21,30 +21,6 @@ from nanovllm.engine.model_runner import ModelRunner
 from nanovllm.utils.logger import init_logger
 
 logger = init_logger(__name__)
-
-
-DEEPSEEK_V32_CHAT_TEMPLATE = """{% if not add_generation_prompt is defined %}{% set add_generation_prompt = false %}{% endif %}
-{% set ns = namespace(system_prompt='') %}
-{%- for message in messages %}
-    {%- if message['role'] == 'system' %}
-        {%- if ns.system_prompt %}
-            {% set ns.system_prompt = ns.system_prompt + '\\n\\n' + message['content'] %}
-        {%- else %}
-            {% set ns.system_prompt = message['content'] %}
-        {%- endif %}
-    {%- endif %}
-{%- endfor %}
-{{ bos_token }}{{ ns.system_prompt }}
-{%- for message in messages %}
-    {%- if message['role'] == 'user' %}
-        {{ '<｜User｜>' + message['content'] }}
-    {%- elif message['role'] == 'assistant' %}
-        {{ '<｜Assistant｜>' + message['content'] + eos_token }}
-    {%- endif %}
-{%- endfor %}
-{%- if add_generation_prompt %}
-    {{ '<｜Assistant｜>' }}
-{%- endif %}"""
 
 
 DEEPSEEK_V32_CHAT_TEMPLATE = """{% if not add_generation_prompt is defined %}{% set add_generation_prompt = false %}{% endif %}
@@ -107,23 +83,12 @@ class LLMEngine:
         return value.lower() in ("1", "true", "yes", "on")
 
     @staticmethod
-    def _is_deepseek_v32(config: Config) -> bool:
-        return getattr(config.hf_config, "model_type", None) == "deepseek_v32"
-
-    @classmethod
-    def _tokenizer_load_kwargs(cls, config: Config) -> dict:
-        return {"trust_remote_code": config.trust_remote_code}
-
-    @staticmethod
     def _format_deepseek_prompt(prompt: str, use_chat_template: bool) -> str:
         if not use_chat_template:
             return prompt
         return f"<\uFF5CUser\uFF5C>{prompt}<\uFF5CAssistant\uFF5C>"
 
     def _encode_string_prompt(self, prompt: str) -> list[int]:
-        if not self._is_deepseek_v32(self.config):
-            return self.tokenizer.encode(prompt)
-
         use_chat_template = self._is_true_env(
             "NANOVLLM_USE_DEEPSEEK_CHAT",
             False,
@@ -142,28 +107,15 @@ class LLMEngine:
             token_ids = [bos_token_id] + token_ids
         return token_ids
 
-    @classmethod
-    def _load_tokenizer(cls, config: Config):
-        if getattr(config.hf_config, "model_type", None) == "deepseek_v32":
+    @staticmethod
+    def _load_tokenizer(config: Config):
+        try:
             tokenizer = PreTrainedTokenizerFast.from_pretrained(
                 config.model,
                 trust_remote_code=config.trust_remote_code,
                 fix_mistral_regex=False,
             )
-            if not getattr(tokenizer, "chat_template", None):
-                tokenizer.chat_template = DEEPSEEK_V32_CHAT_TEMPLATE
-            return tokenizer
-
-        try:
-            tokenizer = AutoTokenizer.from_pretrained(
-                config.model,
-                use_fast=True,
-                config=config.hf_config,
-                **cls._tokenizer_load_kwargs(config),
-            )
         except Exception:
-            if getattr(config.hf_config, "model_type", None) != "deepseek_v32":
-                raise
             logger.warning(
                 "Falling back to LlamaTokenizerFast for deepseek_v32 export."
             )
@@ -172,10 +124,7 @@ class LLMEngine:
                 legacy=True,
                 fix_mistral_regex=False,
             )
-        if (
-            getattr(config.hf_config, "model_type", None) == "deepseek_v32"
-            and not getattr(tokenizer, "chat_template", None)
-        ):
+        if not getattr(tokenizer, "chat_template", None):
             tokenizer.chat_template = DEEPSEEK_V32_CHAT_TEMPLATE
         return tokenizer
 
@@ -232,14 +181,7 @@ class LLMEngine:
         logger.info(f"warmup start !!!!!!")
         start_time = perf_counter()
         self.prefill_warmup()
-        if self.config.enforce_eager:
-            self.decode_warmup()
-        else:
-            cache_dir = os.path.join(os.getcwd(), ".torchair_cache")
-            has_cache = os.path.exists(cache_dir) and os.listdir(cache_dir)
-            if has_cache:
-                logger.info(f"Graph cache found at {cache_dir}.")
-            self.decode_warmup()
+        self.decode_warmup()
         end_time = perf_counter()
         duration = end_time - start_time
         logger.info(f"warmup end !!!!!!")
@@ -304,8 +246,8 @@ class LLMEngine:
         total_input_tokens = 0
         total_output_tokens = 0
         total_start = perf_counter()
-        total_ttft = 0.0
-        total_tpot = 0.0
+        total_prefill_time = 0.0
+        total_decode_time = 0.0
         total_prefill_tokens = 0
         total_decode_tokens = 0
         prefill_steps = 0
@@ -323,11 +265,11 @@ class LLMEngine:
             if is_prefill:
                 prefill_steps += 1
                 total_prefill_tokens += step_tokens
-                total_ttft += step_elapsed
+                total_prefill_time += step_elapsed
             else:
                 decode_steps += 1
                 total_decode_tokens += step_tokens
-                total_tpot += step_elapsed
+                total_decode_time += step_elapsed
 
             if (
                 is_prefill
@@ -335,10 +277,11 @@ class LLMEngine:
                 or i_step % 64 == 0
                 or self.is_finished()
             ):
+                latency_name = "TTFT" if is_prefill else "TPOT"
                 print(
                     f"[step{i_step:4d} {'Prefill' if is_prefill else ' Decode'}] "
                     f"bsz={batch_size}, num_tokens={step_tokens}, "
-                    f"latency={step_elapsed * 1000:.2f} ms, "
+                    f"{latency_name}={step_elapsed:.4f} sec, "
                     f"TPS={step_tps:.2f} tok/s"
                 )
             last_is_prefill = is_prefill
@@ -353,17 +296,14 @@ class LLMEngine:
                     "cache_tokens": cache_tokens} for
                    token_ids, prompt_len, cache_tokens in outputs]
         elapsed = perf_counter() - total_start
-        mean_ttft = total_ttft / prefill_steps if prefill_steps else 0.0
-        mean_tpot = total_tpot / decode_steps if decode_steps else 0.0
-        token_tpot = total_tpot / total_decode_tokens if total_decode_tokens else 0.0
         prefill_tps = (
-            total_prefill_tokens / total_ttft
-            if total_ttft > 0
+            total_prefill_tokens / total_prefill_time
+            if total_prefill_time > 0
             else 0.0
         )
         decode_tps = (
-            total_decode_tokens / total_tpot
-            if total_tpot > 0
+            total_decode_tokens / total_decode_time
+            if total_decode_time > 0
             else 0.0
         )
         e2e_input_tps = total_input_tokens / elapsed if elapsed > 0 else 0.0
@@ -373,16 +313,14 @@ class LLMEngine:
             f"e2e latency = {elapsed:.2f} sec\n"
             f"    prefill steps = {prefill_steps}, "
             f"prefill tokens = {total_prefill_tokens}, "
-            f"total TTFT = {total_ttft:.4f} sec, "
-            f"mean TTFT = {mean_ttft:.4f} sec, "
+            f"total prefill time = {total_prefill_time:.4f} sec, "
             f"prefill TPS = {prefill_tps:.2f} tok/s\n"
             f"    decode steps = {decode_steps}, "
             f"decode tokens = {total_decode_tokens}, "
-            f"total TPOT = {total_tpot:.4f} sec, "
-            f"mean TPOT = {mean_tpot:.4f} sec/step, "
-            f"token TPOT = {token_tpot:.6f} sec/token, "
+            f"total decode time = {total_decode_time:.4f} sec, "
             f"decode TPS = {decode_tps:.2f} tok/s\n"
             f"    e2e input TPS = {e2e_input_tps:.2f} tok/s, "
-            f"e2e output TPS = {e2e_output_tps:.2f} tok/s"
+            f"e2e output TPS = {e2e_output_tps:.2f} tok/s\n"
+            f"    TTFT/TPOT are per-step request latencies printed above."
         )
         return outputs

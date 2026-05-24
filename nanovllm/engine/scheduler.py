@@ -13,14 +13,10 @@ class Scheduler:
         self.eos = config.eos
         # DeepSeek-V3.2 Ascend kernels use vLLM's paged-cache convention where
         # block 0 is a null block; the last block is still reserved for padding.
-        non_cache_token_ids: list[int] = []
         self.block_manager = BlockManager(
             config.num_kvcache_blocks - 1,
             config.kvcache_block_size,
-            non_cache_token_ids=non_cache_token_ids,
-            reserve_null_block=(
-                getattr(config.hf_config, "model_type", None) == "deepseek_v32"
-            ),
+            reserve_null_block=True,
         )
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()

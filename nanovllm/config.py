@@ -1,17 +1,8 @@
 import json
 import os
 from dataclasses import dataclass
-from enum import Enum
-
-from transformers import AutoConfig
 
 from nanovllm.models.deepseek_v32 import DeepseekV32Config
-
-
-class GraphMode(Enum):
-    EAGER = "eager"
-    MAX_AUTOTUNE = "max-autotune"  # Ascend IR 图模式
-    REDUCE_OVERHEAD = "reduce-overhead"  # aclgraph 模式
 
 
 @dataclass
@@ -24,13 +15,11 @@ class Config:
     tensor_parallel_size: int = 1
     enable_expert_parallel: bool = False
     enforce_eager: bool = False
-    hf_config: AutoConfig | None = None
+    hf_config: DeepseekV32Config | None = None
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
-    use_graph_cache: bool = False
     hccl_port: int = 28000
-    graph_mode: str = GraphMode.MAX_AUTOTUNE.value
     skip_warmup: bool = False
     device = "npu"
     trust_remote_code: bool = False
@@ -46,11 +35,9 @@ class Config:
             bool(self.enable_expert_parallel),
         )
         self._validate_model_format()
-        if getattr(self.hf_config, "model_type", None) == "deepseek_v32":
-            self.enforce_eager = True
-        #self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
-        text_config = getattr(self.hf_config, "text_config", self.hf_config)
+        self.enforce_eager = True
 
+        text_config = getattr(self.hf_config, "text_config", self.hf_config)
         max_position_embeddings = getattr(
             text_config,
             "max_position_embeddings",
@@ -62,7 +49,6 @@ class Config:
                 max_position_embeddings,
             )
 
-        # eos may be defined within the text config
         eos_token_id = getattr(text_config, "eos_token_id", None)
         if eos_token_id is not None:
             self.eos = eos_token_id
@@ -70,8 +56,6 @@ class Config:
         assert self.max_num_batched_tokens >= self.max_model_len
 
     def _validate_model_format(self):
-        if getattr(self.hf_config, "model_type", None) != "deepseek_v32":
-            return
         quantization_config = getattr(
             self.hf_config,
             "quantization_config",
@@ -115,19 +99,15 @@ class Config:
         if deepseek_v32_like:
             return DeepseekV32Config.from_pretrained(self.model)
 
-        try:
-            return AutoConfig.from_pretrained(
-                self.model,
-                trust_remote_code=self.trust_remote_code,
-            )
-        except ValueError:
-            config = DeepseekV32Config.from_pretrained(self.model)
-            if getattr(config, "model_type", None) != "deepseek_v32":
-                raise
-            return config
+        raise ValueError(
+            "nano-vllm-ascend only supports DeepSeek-V3.2 style model "
+            "directories. Expected config.json model_type='deepseek_v32', "
+            "DeepseekV32ForCausalLM architecture, or DeepSeek V3.2 fields "
+            "such as first_k_dense_replace/q_lora_rank/kv_lora_rank/index_topk."
+        )
 
     def __repr__(self):
-        attrs = {k: v for k, v in self.__dict__.items() if k != 'hf_config'}
-        attrs['hf_config'] = f"{self.hf_config.__class__.__name__}(...)"
+        attrs = {k: v for k, v in self.__dict__.items() if k != "hf_config"}
+        attrs["hf_config"] = f"{self.hf_config.__class__.__name__}(...)"
         items = [f"{k}={v}" for k, v in attrs.items()]
         return f"Config({', '.join(items)})"
