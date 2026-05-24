@@ -3,22 +3,26 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON_BIN="${PYTHON:-python}"
-RAW_SOC_VERSION="${SOC_VERSION:-ascend910_93}"
+RAW_SOC_VERSION="${SOC_VERSION:-ascend910_9391}"
 ASCEND_HOME_PATH="${ASCEND_HOME_PATH:-/usr/local/Ascend/ascend-toolkit/latest}"
 CUSTOM_OPS="lightning_indexer_vllm;sparse_flash_attention;moe_gating_top_k"
 
 case "${RAW_SOC_VERSION}" in
   ascend910_93*)
-    SOC_VERSION="ascend910_93"
+    CANN_OPP_SOC_VERSION="ascend910_93"
+    ASCENDC_SOC_VERSION="${RAW_SOC_VERSION}"
     ;;
   ascend910b*)
-    SOC_VERSION="ascend910b"
+    CANN_OPP_SOC_VERSION="ascend910b"
+    ASCENDC_SOC_VERSION="ascend910b"
     ;;
   ascend310*)
-    SOC_VERSION="ascend310p"
+    CANN_OPP_SOC_VERSION="ascend310p"
+    ASCENDC_SOC_VERSION="ascend310p1"
     ;;
   *)
-    SOC_VERSION="${RAW_SOC_VERSION}"
+    CANN_OPP_SOC_VERSION="${RAW_SOC_VERSION}"
+    ASCENDC_SOC_VERSION="${RAW_SOC_VERSION}"
     ;;
 esac
 
@@ -26,7 +30,7 @@ export ASCEND_HOME_PATH
 
 echo "[nanovllm ops] root: ${ROOT_DIR}"
 echo "[nanovllm ops] python: $(${PYTHON_BIN} -c 'import sys; print(sys.executable)')"
-echo "[nanovllm ops] soc: ${RAW_SOC_VERSION} -> ${SOC_VERSION}"
+echo "[nanovllm ops] soc: raw=${RAW_SOC_VERSION}, cann_opp=${CANN_OPP_SOC_VERSION}, ascendc=${ASCENDC_SOC_VERSION}"
 echo "[nanovllm ops] ascend: ${ASCEND_HOME_PATH}"
 
 echo "[nanovllm ops] normalize build script line endings"
@@ -36,7 +40,7 @@ find "${ROOT_DIR}/csrc/nanovllm_ascend_ops" -type f \
 
 pushd "${ROOT_DIR}/csrc/nanovllm_ascend_ops/cann_ops" >/dev/null
 rm -rf build output
-bash build.sh -n "${CUSTOM_OPS}" -c "${SOC_VERSION}"
+bash build.sh -n "${CUSTOM_OPS}" -c "${CANN_OPP_SOC_VERSION}"
 rm -rf "${ROOT_DIR}/nanovllm/_cann_ops_custom"
 ./output/CANN-custom_ops*.run --install-path="${ROOT_DIR}/nanovllm/_cann_ops_custom"
 popd >/dev/null
@@ -55,7 +59,7 @@ cmake -S "${ROOT_DIR}/csrc/nanovllm_ascend_ops" \
   -DPYTHON_EXECUTABLE="$(${PYTHON_BIN} -c 'import sys; print(sys.executable)')" \
   -DTORCH_NPU_PATH="${TORCH_NPU_PATH}" \
   -DASCEND_HOME_PATH="${ASCEND_HOME_PATH}" \
-  -DSOC_VERSION="${SOC_VERSION}"
+  -DSOC_VERSION="${ASCENDC_SOC_VERSION}"
 
 cmake --build "${ROOT_DIR}/build/nanovllm_ascend_ops" --target install -j"$(nproc)"
 

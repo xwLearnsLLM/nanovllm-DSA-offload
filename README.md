@@ -17,10 +17,11 @@ It builds `nanovllm._C` and installs the local CANN custom OPP package under
 PYTHONPATH=$PWD:$PYTHONPATH bash scripts/build_nanovllm_ops.sh
 ```
 
-Set `SOC_VERSION=...` before the command if the worker is not `ascend910_93`.
-Values like `ascend910_9391` are normalized to `ascend910_93`. The CANN custom
-OPP build is serial by default for readable logs; set
-`NANOVLLM_CANN_BUILD_JOBS=8` if you want a faster local rebuild.
+Set `SOC_VERSION=...` before the command if the worker is not `ascend910_9391`.
+The script uses two SoC names internally: `ascend910_93` for the CANN custom OPP
+package and the detailed value, such as `ascend910_9391`, for the AscendC
+extension build. The CANN custom OPP build is serial by default for readable
+logs; set `NANOVLLM_CANN_BUILD_JOBS=8` if you want a faster local rebuild.
 
 ## Common Setup
 
