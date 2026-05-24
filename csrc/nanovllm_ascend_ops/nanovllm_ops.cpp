@@ -147,7 +147,7 @@ void batch_matmul_transpose_py(
 
 }  // namespace
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+PYBIND11_MODULE(_C, m) {
   m.def(
       "npu_lightning_indexer",
       &npu_lightning_indexer_py,

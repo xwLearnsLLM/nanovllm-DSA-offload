@@ -15,7 +15,13 @@ It builds `nanovllm._C` and installs the local CANN custom OPP package under
 
 ```bash
 PYTHONPATH=$PWD:$PYTHONPATH bash scripts/build_nanovllm_ops.sh
+ls -lh nanovllm/_C*.so nanovllm/libnanovllm_ascend_kernels.so
 ```
+
+`nanovllm/ops/` is only the Python wrapper package. The compiled extension is
+loaded from `nanovllm/_C*.so`.
+If the CANN custom OPP package was already built and only the pybind extension
+changed, use `NANOVLLM_SKIP_CANN_OPP_BUILD=1` to skip the slow OPP rebuild.
 
 Set `SOC_VERSION=...` before the command if the worker is not `ascend910_9391`.
 The script uses two SoC names internally: `ascend910_93` for the CANN custom OPP

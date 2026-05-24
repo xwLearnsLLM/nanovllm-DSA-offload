@@ -38,12 +38,16 @@ find "${ROOT_DIR}/csrc/nanovllm_ascend_ops" -type f \
   \( -name "*.sh" -o -name "*.cmake" -o -name "CMakeLists.txt" \) \
   -exec sed -i 's/\r$//' {} +
 
-pushd "${ROOT_DIR}/csrc/nanovllm_ascend_ops/cann_ops" >/dev/null
-rm -rf build output
-bash build.sh -n "${CUSTOM_OPS}" -c "${CANN_OPP_SOC_VERSION}"
-rm -rf "${ROOT_DIR}/nanovllm/_cann_ops_custom"
-./output/CANN-custom_ops*.run --install-path="${ROOT_DIR}/nanovllm/_cann_ops_custom"
-popd >/dev/null
+if [[ "${NANOVLLM_SKIP_CANN_OPP_BUILD:-0}" == "1" ]]; then
+  echo "[nanovllm ops] skip CANN custom OPP build"
+else
+  pushd "${ROOT_DIR}/csrc/nanovllm_ascend_ops/cann_ops" >/dev/null
+  rm -rf build output
+  bash build.sh -n "${CUSTOM_OPS}" -c "${CANN_OPP_SOC_VERSION}"
+  rm -rf "${ROOT_DIR}/nanovllm/_cann_ops_custom"
+  ./output/CANN-custom_ops*.run --install-path="${ROOT_DIR}/nanovllm/_cann_ops_custom"
+  popd >/dev/null
+fi
 
 TORCH_NPU_PATH="$(${PYTHON_BIN} - <<'PY'
 import os
@@ -62,5 +66,25 @@ cmake -S "${ROOT_DIR}/csrc/nanovllm_ascend_ops" \
   -DSOC_VERSION="${ASCENDC_SOC_VERSION}"
 
 cmake --build "${ROOT_DIR}/build/nanovllm_ascend_ops" --target install -j"$(nproc)"
+
+NANOVLLM_EXT="$(
+  find "${ROOT_DIR}/build/nanovllm_ascend_ops" -maxdepth 1 -name "_C*.so" -print -quit
+)"
+if [[ -z "${NANOVLLM_EXT}" ]]; then
+  echo "[nanovllm ops] ERROR: built extension _C*.so was not found." >&2
+  exit 1
+fi
+cp -f "${NANOVLLM_EXT}" "${ROOT_DIR}/nanovllm/"
+
+NANOVLLM_KERNEL_LIB="$(
+  find "${ROOT_DIR}/build/nanovllm_ascend_ops" -name "libnanovllm_ascend_kernels.so" -print -quit
+)"
+if [[ -z "${NANOVLLM_KERNEL_LIB}" ]]; then
+  echo "[nanovllm ops] ERROR: built kernel libnanovllm_ascend_kernels.so was not found." >&2
+  exit 1
+fi
+cp -f "${NANOVLLM_KERNEL_LIB}" "${ROOT_DIR}/nanovllm/"
+
+ls -lh "${ROOT_DIR}/nanovllm"/_C*.so "${ROOT_DIR}/nanovllm/libnanovllm_ascend_kernels.so"
 
 echo "[nanovllm ops] built nanovllm/_C*.so and nanovllm/_cann_ops_custom/"

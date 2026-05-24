@@ -34,7 +34,8 @@ try:
 except ImportError as exc:
     raise ImportError(
         "nanovllm Ascend ops are not built. Run "
-        "`bash scripts/build_nanovllm_ops.sh` on the Ascend machine first."
+        "`bash scripts/build_nanovllm_ops.sh` on the Ascend machine first. "
+        f"Original import error: {exc}"
     ) from exc
 
 

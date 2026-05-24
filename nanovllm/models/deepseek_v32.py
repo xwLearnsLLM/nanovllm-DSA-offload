@@ -475,6 +475,9 @@ class DeepseekV32SparseMoeBlock(nn.Module):
                 for expert_idx in self.local_expert_ids
             }
         )
+        self.local_expert_layers = tuple(
+            self.experts[str(expert_idx)] for expert_idx in self.local_expert_ids
+        )
 
     def _grouped_topk(
         self,
@@ -509,7 +512,7 @@ class DeepseekV32SparseMoeBlock(nn.Module):
             ).clamp_min(1e-20)
         if self.routed_scaling_factor != 1.0:
             topk_weights = topk_weights * self.routed_scaling_factor
-        return topk_weights.float(), topk_ids.long()
+        return topk_weights, topk_ids
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         sequence_length, hidden_dim = hidden_states.shape
@@ -523,22 +526,14 @@ class DeepseekV32SparseMoeBlock(nn.Module):
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
-        expert_mask = torch.nn.functional.one_hot(
-            selected_experts, num_classes=self.num_experts
-        ).permute(2, 1, 0)
 
-        expert_hitted = torch.greater(
-            expert_mask.sum(dim=(-1, -2)), 0
-        ).nonzero(as_tuple=False).flatten()
-        expert_indices = tuple(
-            expert_idx
-            for expert_idx in expert_hitted.tolist()
-            if expert_idx in self.local_expert_id_set
-        )
-
-        for expert_idx in expert_indices:
-            expert_layer = self.experts[str(expert_idx)]
-            idx, top_x = torch.where(expert_mask[expert_idx])
+        for expert_idx, expert_layer in zip(
+            self.local_expert_ids,
+            self.local_expert_layers,
+        ):
+            top_x, idx = torch.where(selected_experts == expert_idx)
+            if top_x.numel() == 0:
+                continue
             current_state = hidden_states[top_x].reshape(-1, hidden_dim)
             current_hidden_states = (
                 expert_layer(current_state)

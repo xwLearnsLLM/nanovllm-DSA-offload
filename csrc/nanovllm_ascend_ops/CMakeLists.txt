@@ -123,4 +123,7 @@ target_link_libraries(_C PUBLIC
 target_link_options(_C PRIVATE
   "-Wl,-rpath,$ORIGIN:$ORIGIN/lib:$ORIGIN/_cann_ops_custom/vendors/nanovllm-ascend/op_api/lib")
 
-install(TARGETS _C nanovllm_ascend_kernels DESTINATION ${CMAKE_INSTALL_PREFIX})
+install(TARGETS _C nanovllm_ascend_kernels
+  LIBRARY DESTINATION .
+  RUNTIME DESTINATION .
+  ARCHIVE DESTINATION .)
