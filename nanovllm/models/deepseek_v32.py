@@ -885,6 +885,8 @@ class DeepseekV32DSAAttention(nn.Module):
 
     @property
     def block_size(self) -> int:
+        if self.ckv_cache.dim() >= 4 and int(self.ckv_cache.shape[1]) == 1:
+            return int(self.ckv_cache.shape[2])
         return int(self.ckv_cache.shape[1])
 
     def _flat_slots(self) -> torch.Tensor:
@@ -1088,6 +1090,8 @@ class DeepseekV32DSAAttention(nn.Module):
         if log_timing:
             _profile_sync(ql_nope.device)
             start = perf_counter()
+        ckv_cache = self.ckv_cache.transpose(1, 2).contiguous()
+        kpe_cache = self.kpe_cache.transpose(1, 2).contiguous()
         topk_indices = ascend_ops.npu_lightning_indexer(
             query=q_index,
             key=self.index_cache,
@@ -1119,33 +1123,33 @@ class DeepseekV32DSAAttention(nn.Module):
         self._maybe_log_npu_sfa_inputs(
             phase,
             ql_nope,
-            self.ckv_cache,
+            ckv_cache,
             topk_indices,
             block_table,
             actual_seq_lengths_query,
             actual_seq_lengths_key,
             q_pe,
-            self.kpe_cache,
+            kpe_cache,
         )
         self._maybe_dump_npu_sfa_inputs(
             phase,
             ql_nope,
-            self.ckv_cache,
-            self.ckv_cache,
+            ckv_cache,
+            ckv_cache,
             topk_indices,
             block_table,
             actual_seq_lengths_query,
             actual_seq_lengths_key,
             q_pe,
-            self.kpe_cache,
+            kpe_cache,
         )
         if phase == "decode" and self.log_decode_layer_timing:
             _profile_sync(ql_nope.device)
             attention_op_start = perf_counter()
         latent = ascend_ops.npu_sparse_flash_attention(
             query=ql_nope,
-            key=self.ckv_cache,
-            value=self.ckv_cache,
+            key=ckv_cache,
+            value=ckv_cache,
             sparse_indices=topk_indices,
             scale_value=float(self.scale),
             sparse_block_size=1,
@@ -1153,7 +1157,7 @@ class DeepseekV32DSAAttention(nn.Module):
             actual_seq_lengths_query=actual_seq_lengths_query,
             actual_seq_lengths_kv=actual_seq_lengths_key,
             query_rope=q_pe,
-            key_rope=self.kpe_cache,
+            key_rope=kpe_cache,
             layout_query="TND",
             layout_kv="PA_BSND",
             sparse_mode=3,
@@ -1283,14 +1287,12 @@ class DeepseekV32DSAAttention(nn.Module):
         if log_timing:
             _profile_sync(ql_nope.device)
             start = perf_counter()
-        ckv_cache = self.ckv_cache.transpose(1, 2).contiguous()
-        kpe_cache = self.kpe_cache.transpose(1, 2).contiguous()
         latent, lse = torch_npu.npu_fused_infer_attention_score(
             ql_nope,
-            ckv_cache,
-            ckv_cache,
+            self.ckv_cache,
+            self.ckv_cache,
             query_rope=q_pe,
-            key_rope=kpe_cache,
+            key_rope=self.kpe_cache,
             num_heads=self.num_local_heads,
             num_key_value_heads=1,
             input_layout="TND",
@@ -1410,21 +1412,19 @@ class DeepseekV32DSAAttention(nn.Module):
     ) -> torch.Tensor:
         context = get_context()
         batch_size = int(ql_nope.shape[0])
-        ckv_cache = self.ckv_cache.transpose(1, 2).contiguous()
-        kpe_cache = self.kpe_cache.transpose(1, 2).contiguous()
-        actual_seq_lengths_query = list(range(1, batch_size + 1))
-        actual_seq_lengths_key = (
-            context.context_lens[:batch_size].detach().cpu().tolist()
-        )
+        actual_seq_lengths_query = context.actual_seq_lengths_query
+        actual_seq_lengths_key = context.actual_seq_lengths_kv
+        assert actual_seq_lengths_query is not None
+        assert actual_seq_lengths_key is not None
         if self.log_decode_layer_timing:
             _profile_sync(ql_nope.device)
             start = perf_counter()
         latent, lse = torch_npu.npu_fused_infer_attention_score(
             ql_nope,
-            ckv_cache,
-            ckv_cache,
+            self.ckv_cache,
+            self.ckv_cache,
             query_rope=q_pe,
-            key_rope=kpe_cache,
+            key_rope=self.kpe_cache,
             num_heads=self.num_local_heads,
             num_key_value_heads=1,
             input_layout="TND",

@@ -231,15 +231,15 @@ class ModelRunner:
         ckv_shape = (
             num_layers,
             config.num_kvcache_blocks,
-            self.block_size,
             1,
+            self.block_size,
             kv_lora_rank,
         )
         kpe_shape = (
             num_layers,
             config.num_kvcache_blocks,
-            self.block_size,
             1,
+            self.block_size,
             rope_dim,
         )
         index_shape = (
@@ -377,6 +377,8 @@ class ModelRunner:
         set_context(False,
                     slot_mapping=slot_mapping,
                     context_lens=context_lens,
+                    actual_seq_lengths_query=list(range(1, len(seqs) + 1)),
+                    actual_seq_lengths_kv=[len(seq) for seq in seqs],
                     block_tables=block_tables,
                     is_enforce_eager=True,
                     real_bs=len(seqs),
