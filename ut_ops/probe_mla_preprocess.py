@@ -9,6 +9,14 @@ import torch.nn.functional as F
 
 import nanovllm.ops as ascend_ops
 
+try:
+    import torch_npu
+except ImportError:
+    torch_npu = None
+
+
+ACL_FORMAT_FRACTAL_NZ = 29
+
 
 def desc(name: str, tensor: torch.Tensor) -> str:
     return (
@@ -43,6 +51,42 @@ def apply_rope_neox(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> to
         sin = sin.unsqueeze(1)
     y = x * cos + rotate_half_neox(x.float()).to(x.dtype) * sin
     return y.contiguous()
+
+
+def round_up(value: int, align: int) -> int:
+    return ((value + align - 1) // align) * align
+
+
+def trans_rope_weight(weight: torch.Tensor, rope_dim: int) -> torch.Tensor:
+    if rope_dim == 0:
+        return weight.contiguous()
+    nope_part = weight[..., :-rope_dim, :]
+    rope_part = weight[..., -rope_dim:, :]
+    rope_part = torch.cat((rope_part[..., ::2, :], rope_part[..., 1::2, :]), dim=-2)
+    return torch.cat((nope_part, rope_part), dim=-2).contiguous()
+
+
+def transdata(nd_mat: torch.Tensor, block_size: tuple[int, int] = (16, 16)) -> torch.Tensor:
+    rows = round_up(nd_mat.shape[0], block_size[0])
+    cols = round_up(nd_mat.shape[1], block_size[1])
+    row_pad = rows - nd_mat.shape[0]
+    col_pad = cols - nd_mat.shape[1]
+    nd_mat = F.pad(nd_mat, (0, row_pad, 0, col_pad))
+    nz_mat = nd_mat.reshape(
+        rows // block_size[0],
+        block_size[0],
+        cols // block_size[1],
+        block_size[1],
+    )
+    nz_mat = nz_mat.permute(2, 0, 1, 3)
+    return nz_mat.reshape(nz_mat.shape[0], nz_mat.shape[1] * nz_mat.shape[2], nz_mat.shape[3])
+
+
+def to_mlapo_nz_weight(nd_weight: torch.Tensor, block_size: tuple[int, int] = (16, 32)) -> torch.Tensor:
+    nz_weight = transdata(nd_weight, block_size=block_size).unsqueeze(0).contiguous()
+    if torch_npu is not None and nz_weight.device.type == "npu":
+        return torch_npu.npu_format_cast(nz_weight, ACL_FORMAT_FRACTAL_NZ)
+    return nz_weight
 
 
 def make_cos_sin(
@@ -86,13 +130,20 @@ def build_inputs(args: argparse.Namespace, device: torch.device, dtype: torch.dt
         dtype=dtype,
     ) * args.init_scale
     q_weight = torch.randn(args.q_lora_rank, args.hidden_size, device=device, dtype=dtype) * args.init_scale
-    wdqkv = torch.cat((kv_weight, q_weight), dim=0).contiguous()
-    wuq = torch.randn(
+    kv_weight = trans_rope_weight(kv_weight, args.rope_dim)
+    wdqkv_ref = torch.cat((kv_weight, q_weight), dim=0).contiguous()
+    wuq_ref = torch.randn(
         args.heads * (args.nope_dim + args.rope_dim),
         args.q_lora_rank,
         device=device,
         dtype=dtype,
     ) * args.init_scale
+    wuq_ref = trans_rope_weight(
+        wuq_ref.view(args.heads, args.nope_dim + args.rope_dim, args.q_lora_rank),
+        args.rope_dim,
+    ).reshape(args.heads * (args.nope_dim + args.rope_dim), args.q_lora_rank).contiguous()
+    wdqkv = to_mlapo_nz_weight(wdqkv_ref, block_size=(16, 32))
+    wuq = to_mlapo_nz_weight(wuq_ref, block_size=(16, 32))
     wuk = torch.randn(
         args.heads,
         args.nope_dim,
@@ -125,7 +176,9 @@ def build_inputs(args: argparse.Namespace, device: torch.device, dtype: torch.dt
     return {
         "hidden": hidden.contiguous(),
         "wdqkv": wdqkv,
-        "wuq": wuq.contiguous(),
+        "wdqkv_ref": wdqkv_ref,
+        "wuq": wuq,
+        "wuq_ref": wuq_ref,
         "wuk": wuk.contiguous(),
         "gamma1": gamma1,
         "beta1": beta1,
@@ -142,7 +195,7 @@ def reference(
     tensors: dict[str, torch.Tensor],
     args: argparse.Namespace,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    qkv = F.linear(tensors["hidden"], tensors["wdqkv"])
+    qkv = F.linear(tensors["hidden"], tensors["wdqkv_ref"])
     kv, q_c = torch.split(
         qkv,
         [args.kv_lora_rank + args.rope_dim, args.q_lora_rank],
@@ -152,7 +205,7 @@ def reference(
     ckv = rms_norm(ckv, tensors["gamma2"], args.rms_eps)
     q_c = rms_norm(q_c, tensors["gamma1"], args.rms_eps)
 
-    q = F.linear(q_c, tensors["wuq"]).view(
+    q = F.linear(q_c, tensors["wuq_ref"]).view(
         args.tokens,
         args.heads,
         args.nope_dim + args.rope_dim,
@@ -254,7 +307,21 @@ def main() -> None:
         f"q_lora={args.q_lora_rank} kv_lora={args.kv_lora_rank} "
         f"nope={args.nope_dim} rope={args.rope_dim} cache_mode={args.cache_mode}"
     )
-    for name in ("hidden", "wdqkv", "wuq", "wuk", "gamma1", "beta1", "gamma2", "cos", "sin", "ckv_cache", "kpe_cache"):
+    for name in (
+        "hidden",
+        "wdqkv_ref",
+        "wdqkv",
+        "wuq_ref",
+        "wuq",
+        "wuk",
+        "gamma1",
+        "beta1",
+        "gamma2",
+        "cos",
+        "sin",
+        "ckv_cache",
+        "kpe_cache",
+    ):
         print("MLAPO_PROBE " + desc(name, tensors[name]))
 
     expected = reference(tensors, args)

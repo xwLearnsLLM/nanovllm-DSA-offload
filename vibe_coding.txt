@@ -518,3 +518,30 @@ PYTHONPATH=$PWD:$PYTHONPATH bash scripts/build_nanovllm_ops.sh
 PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ut_ops/probe_mla_preprocess.py --device npu:0 --tokens 7 --heads 32 --warmup 2 --iters 10
 PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ut_ops/probe_mla_preprocess.py --device npu:0 --tokens 128 --heads 32 --warmup 2 --iters 10
 ```
+
+## 2026-05-25：MLAPO probe 首轮结果与修正
+
+用户在昇腾机器上成功运行 `ut_ops/probe_mla_preprocess.py`，说明 `nanovllm.ops.mla_preprocess` 的 Python 绑定和 C++/AscendC 编译产物已经能正常调用。
+
+首轮结果：
+
+- `tokens=7`：算子平均约 `0.37 ms`，但 `ql_nope/q_pe/ckv_cache/kpe_cache` 相对误差都很大。
+- `tokens=128`：算子平均约 `0.25 ms`，误差同样很大。
+
+这不是 BF16 舍入误差。继续对照 vllm-ascend 0.19 后发现关键原因：
+
+- BF16 no-quant 的 `mla_preprocess` kernel 对 `wdqkv` 和 `wuq` 使用的是 `DataFormat::NZ`。
+- vllm-ascend 在 `mla_v1.py/sfa_v1.py` 中会先做：
+  - `trans_rope_weight(...)`
+  - `transdata(weight, block_size=(16, 32)).unsqueeze(0).contiguous()`
+  - `torch_npu.npu_format_cast(..., 29)`
+- 之前 probe 直接把普通 ND contiguous `[out, in]` 权重传给 MLAPO，所以 kernel 按 NZ 格式读错了权重，连不涉及 RoPE 的 `ckv_cache` 也会大幅偏离。
+
+已修正 `ut_ops/probe_mla_preprocess.py`：
+
+- 增加 `trans_rope_weight`。
+- 增加 vllm-ascend 同款 `transdata`。
+- 增加 `to_mlapo_nz_weight`，在 NPU 上用 `torch_npu.npu_format_cast(..., 29)` 转成 MLAPO 期望的 NZ 权重。
+- reference 继续用普通 ND 权重，算子输入用 NZ 权重。
+
+这次只改 Python probe，不需要重新编译 C++。下一步让用户直接重新跑第 41 条两个 probe 命令即可。
