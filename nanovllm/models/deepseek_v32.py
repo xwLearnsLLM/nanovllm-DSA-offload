@@ -148,6 +148,11 @@ def _to_mlapo_bf16_nz_weight(weight: torch.Tensor) -> torch.Tensor:
     return torch_npu.npu_format_cast(nz_weight, ACL_FORMAT_FRACTAL_NZ)
 
 
+def _rope_neox_to_interleaved(x: torch.Tensor) -> torch.Tensor:
+    half = x.shape[-1] // 2
+    return torch.stack((x[..., :half], x[..., half:]), dim=-1).flatten(-2).contiguous()
+
+
 def yarn_get_mscale(scale: float = 1.0, mscale: float = 1.0) -> float:
     if scale <= 1:
         return 1.0
@@ -1159,6 +1164,11 @@ class DeepseekV32DSAAttention(nn.Module):
             quant_mode="no_quant",
             enable_inner_out=False,
         )
+        q_pe = _rope_neox_to_interleaved(q_pe)
+        kpe_flat = self.kpe_cache.view(-1, self.qk_rope_head_dim)
+        slots = slotmapping.to(torch.long)
+        k_pe = kpe_flat.index_select(0, slots)
+        kpe_flat.index_copy_(0, slots, _rope_neox_to_interleaved(k_pe))
         self._decode_timer_end(profile_decode, "mlapo", start, ql_nope.device)
         return ql_nope, q_pe
 

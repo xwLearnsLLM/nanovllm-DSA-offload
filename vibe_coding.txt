@@ -655,3 +655,28 @@ PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ut_ops/prob
 - 普通 prefill 路径保持不变，SFA/torch sparse decode 路径保持不变。
 - decode layer timing 中新增 `mlapo` 字段，用来观察融合前处理本身的耗时。
 - README 新增第 43 条 `Decode MLAPO Path`，建议先用 TP8 跑，因为当前还会额外保存 NZ 格式 `wdqkv/wuq` 权重。
+
+## 2026-05-25：runlog14，MLAPO 速度变快但输出异常，定位为 RoPE basis 混用
+
+用户用 `example/long_prompts.py` 对比：
+- 关闭 `NANOVLLM_ENABLE_DECODE_MLAPO`
+  - 输出仍然像人话。
+  - decode TPOT 大约 `0.149~0.166s`，总 decode TPS 约 `19.39 tok/s`。
+- 开启 `NANOVLLM_ENABLE_DECODE_MLAPO=1`
+  - decode TPOT 降到大约 `0.117~0.124s`，总 decode TPS 约 `24.79 tok/s`。
+  - 但输出明显异常，第一个样本反复输出 BOS token id 0。
+
+判断：
+- MLAPO probe 只证明 MLAPO 与“neox 排列 reference”对齐。
+- 当前模型的普通 prefill 路径仍然用 `DeepseekScalingRotaryEmbedding(is_neox_style=False)`，写入 `kpe_cache` 的历史 KPE 是 interleaved basis。
+- MLAPO decode 路径为了适配算子，`wdqkv/wuq` 做了 `trans_rope_weight`，输出的 `q_pe` 以及写入的新 token `kpe_cache` 是 neox basis。
+- 因此 long prompt 的 decode 第一步会用 neox `q_pe` 去和 prefill 已有的 interleaved `kpe_cache` 做 dense MLA，RoPE basis 不一致，语义会明显破坏。
+
+已修复尝试：
+- 增加 `_rope_neox_to_interleaved`。
+- 在 `_decode_mlapo_preprocess` 调用 `nanovllm.ops.mla_preprocess` 后：
+  - 将 `q_pe` 从 neox 排列转回 interleaved 排列。
+  - 将刚由 MLAPO 写入当前 token slots 的 `kpe_cache` 从 neox 排列转回 interleaved 排列。
+- 这样可以继续保持 prefill cache 与 decode cache 的 RoPE basis 一致。
+
+下一步让用户继续跑 README 第 43 条，观察输出是否恢复，同时看 TPOT 是否仍然明显优于非 MLAPO 路径。
