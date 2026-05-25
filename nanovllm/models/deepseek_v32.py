@@ -29,7 +29,6 @@ from nanovllm.utils.logger import init_logger
 
 
 logger = init_logger(__name__)
-BMM_TRANS_MAX_SUPPORTED_TOKENS = 1024
 SFA_SPARSE_COUNT = 2048
 _NPU_MLA_ATTENTION_MASK_CACHE: dict[tuple[str, int], torch.Tensor] = {}
 
@@ -491,10 +490,6 @@ class DeepseekV32SparseMoeBlock(nn.Module):
         self.moe_backend = os.environ.get("NANOVLLM_MOE_BACKEND", "grouped").strip().lower()
         if self.moe_backend not in ("grouped", "loop"):
             raise ValueError("NANOVLLM_MOE_BACKEND must be 'grouped' or 'loop'.")
-        self.moe_expert_tokens_int64 = _env_flag(
-            "NANOVLLM_MOE_EXPERT_TOKENS_INT64",
-            True,
-        )
 
     def post_load_prepare(self) -> None:
         if self.grouped_w13_weight is not None:
@@ -678,9 +673,6 @@ class DeepseekV32SparseMoeBlock(nn.Module):
                 quant_mode=-1,
             )
         )
-        if self.moe_expert_tokens_int64:
-            expert_tokens = expert_tokens.to(torch.int64)
-
         gate_up = torch_npu.npu_grouped_matmul(
             x=[sorted_hidden],
             weight=[self.grouped_w13_weight],
@@ -847,14 +839,9 @@ class DeepseekV32DSAAttention(nn.Module):
         self.w_uv = None
         self.fuse_qkv_a = _env_flag("NANOVLLM_FUSE_QKV_A", True)
         self.free_kv_b_proj = _env_flag("NANOVLLM_FREE_KV_B_PROJ", True)
-        self.mla_softmax_lse = _env_flag("NANOVLLM_MLA_SOFTMAX_LSE", True)
         self.q_up_bmm_trans_max_tokens = _env_int(
             "NANOVLLM_Q_UP_BMM_TRANS_MAX_TOKENS",
             1,
-        )
-        self.v_up_bmm_trans_max_tokens = _env_int(
-            "NANOVLLM_V_UP_BMM_TRANS_MAX_TOKENS",
-            BMM_TRANS_MAX_SUPPORTED_TOKENS,
         )
         self.decode_timing_sync = _env_flag(
             "NANOVLLM_DECODE_LAYER_TIMING_SYNC",
@@ -1309,6 +1296,7 @@ class DeepseekV32DSAAttention(nn.Module):
         if (
             q_nope.dtype in (torch.float16, torch.bfloat16)
             and self.q_up_bmm_trans_max_tokens > 0
+            and num_tokens == 1
             and num_tokens <= self.q_up_bmm_trans_max_tokens
         ):
             ql_nope = torch.empty(
@@ -1333,27 +1321,6 @@ class DeepseekV32DSAAttention(nn.Module):
 
     def _v_up_proj(self, latent: torch.Tensor) -> torch.Tensor:
         num_tokens = latent.shape[0]
-        if (
-            latent.dtype in (torch.float16, torch.bfloat16)
-            and self.v_up_bmm_trans_max_tokens > 0
-            and num_tokens <= self.v_up_bmm_trans_max_tokens
-        ):
-            output = torch.empty(
-                (
-                    num_tokens,
-                    self.num_local_heads,
-                    self.v_head_dim,
-                ),
-                dtype=latent.dtype,
-                device=latent.device,
-            )
-            ascend_ops.batch_matmul_transpose(
-                latent,
-                self.w_uv,
-                output,
-            )
-            return output.reshape(num_tokens, -1)
-
         latent_by_head = latent.transpose(0, 1).contiguous()
         output = torch.bmm(latent_by_head, self.w_uv)
         return output.transpose(0, 1).reshape(num_tokens, -1)
@@ -1394,7 +1361,7 @@ class DeepseekV32DSAAttention(nn.Module):
             antiquant_scale=None,
             block_table=context.block_tables,
             block_size=self.block_size,
-            softmax_lse_flag=self.mla_softmax_lse,
+            softmax_lse_flag=False,
             actual_seq_lengths=actual_seq_lengths_query.detach().cpu().tolist(),
             actual_seq_lengths_kv=actual_seq_lengths_key.detach().cpu().tolist(),
         )
@@ -1528,7 +1495,7 @@ class DeepseekV32DSAAttention(nn.Module):
             antiquant_scale=None,
             block_table=context.block_tables[:batch_size],
             block_size=self.block_size,
-            softmax_lse_flag=self.mla_softmax_lse,
+            softmax_lse_flag=False,
             actual_seq_lengths=actual_seq_lengths_query,
             actual_seq_lengths_kv=actual_seq_lengths_key,
         )

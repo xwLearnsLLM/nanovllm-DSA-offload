@@ -67,11 +67,8 @@ PYTHONPATH=$PWD:$PYTHONPATH python -m pip show nano-vllm-ascend
 | `NANOVLLM_DECODE_LAYER_TIMING_SYNC` | `true` | `deepseek_v32.py` | `true` synchronizes before/after profiled regions for accurate layer timing; `false` prints lower-overhead approximate timing. |
 | `NANOVLLM_FUSE_QKV_A` | `true` | `deepseek_v32.py` | `true` fuses `q_a_proj` and `kv_a_proj_with_mqa` into one projection after loading; `false` keeps the original two projections. |
 | `NANOVLLM_FREE_KV_B_PROJ` | `true` | `deepseek_v32.py` | `true` frees `kv_b_proj.weight` after preparing `w_uk_t/w_uv`; `false` keeps the original weight for debugging. |
-| `NANOVLLM_MLA_SOFTMAX_LSE` | `true` | `deepseek_v32.py` | `true` asks `npu_fused_infer_attention_score` to also return LSE; `false` requests only attention output and may reduce decode overhead if supported. |
-| `NANOVLLM_Q_UP_BMM_TRANS_MAX_TOKENS` | `1` | `deepseek_v32.py` | Max token count using local `batch_matmul_transpose` for q-up projection. `1` is the current safe decode path; try `7`, `16`, or `1024` to test batched q-up. `0` disables it. |
-| `NANOVLLM_V_UP_BMM_TRANS_MAX_TOKENS` | `1024` | `deepseek_v32.py` | Max token count using local `batch_matmul_transpose` for v-up projection. `0` forces the PyTorch `bmm` path. |
+| `NANOVLLM_Q_UP_BMM_TRANS_MAX_TOKENS` | `1` | `deepseek_v32.py` | Max token count using local `batch_matmul_transpose` for q-up projection. The local op is only used when `num_tokens == 1`; batched q-up is ignored because it can trigger an AICore MTE fault. `0` disables it fully. |
 | `NANOVLLM_MOE_BACKEND` | `grouped` | `deepseek_v32.py` | `grouped` packs local experts and uses `npu_grouped_matmul`; `loop` keeps the original per-expert Python loop for comparison. |
-| `NANOVLLM_MOE_EXPERT_TOKENS_INT64` | `true` | `deepseek_v32.py` | `true` converts grouped MoE token counts to `int64`; `false` passes the operator's original dtype, useful for testing whether the cast is avoidable. |
 
 ## 33. Long Prefill, Dense MLA Path
 
@@ -143,34 +140,18 @@ PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True ASCE
 
 ## 40. Decode Optimization Sweep
 
-Baseline TP8 short-prompt decode without per-layer timing:
+Recommended TP8 short-prompt decode without per-layer timing:
 
 ```bash
 PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANOVLLM_GPU_MEMORY_UTILIZATION=0.8 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=8 NANOVLLM_DECODE_ATTENTION_BACKEND=mla NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_SKIP_WARMUP=1 python example/short_prompts.py
 ```
 
-Try skipping MLA LSE output:
+Batched q-up through the local `batch_matmul_transpose` op is currently disabled
+for `num_tokens > 1` because it reproduced an AICore MTE fault. To compare with
+the local q-up op fully disabled, run:
 
 ```bash
-PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANOVLLM_GPU_MEMORY_UTILIZATION=0.8 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=8 NANOVLLM_DECODE_ATTENTION_BACKEND=mla NANOVLLM_MLA_SOFTMAX_LSE=0 NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_SKIP_WARMUP=1 python example/short_prompts.py
-```
-
-Try batched q-up through the local transpose-matmul op:
-
-```bash
-PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANOVLLM_GPU_MEMORY_UTILIZATION=0.8 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=8 NANOVLLM_DECODE_ATTENTION_BACKEND=mla NANOVLLM_Q_UP_BMM_TRANS_MAX_TOKENS=1024 NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_SKIP_WARMUP=1 python example/short_prompts.py
-```
-
-Try disabling the v-up transpose-matmul op:
-
-```bash
-PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANOVLLM_GPU_MEMORY_UTILIZATION=0.8 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=8 NANOVLLM_DECODE_ATTENTION_BACKEND=mla NANOVLLM_V_UP_BMM_TRANS_MAX_TOKENS=0 NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_SKIP_WARMUP=1 python example/short_prompts.py
-```
-
-Try grouped MoE without the `expert_tokens` int64 cast:
-
-```bash
-PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANOVLLM_GPU_MEMORY_UTILIZATION=0.8 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=8 NANOVLLM_DECODE_ATTENTION_BACKEND=mla NANOVLLM_MOE_EXPERT_TOKENS_INT64=0 NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_SKIP_WARMUP=1 python example/short_prompts.py
+PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANOVLLM_GPU_MEMORY_UTILIZATION=0.8 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=8 NANOVLLM_DECODE_ATTENTION_BACKEND=mla NANOVLLM_Q_UP_BMM_TRANS_MAX_TOKENS=0 NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_SKIP_WARMUP=1 python example/short_prompts.py
 ```
 
 Timing with less synchronization overhead:
