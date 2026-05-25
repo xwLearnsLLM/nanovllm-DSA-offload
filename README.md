@@ -214,3 +214,22 @@ path keeps extra NZ-format attention weights for now.
 ```bash
 PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANOVLLM_GPU_MEMORY_UTILIZATION=0.8 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=8 NANOVLLM_DECODE_ATTENTION_BACKEND=mla NANOVLLM_ENABLE_DECODE_MLAPO=1 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=0 NANOVLLM_PROFILE_LAYER_IDS=0,mid,last NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_SKIP_WARMUP=1 python example/short_prompts.py
 ```
+
+## 44. Decode V-Up Transpose BatchMatmul Check
+
+No rebuild is needed for this change. The decode v-up projection now uses
+`torch_npu.npu_transpose_batchmatmul`, matching the vllm-ascend MLA path more
+closely. Run this and compare TPOT plus the per-layer `v_up` timing against the
+previous MLAPO run.
+
+First, check the v-up micro-kernel against the previous `torch.bmm` reference:
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ut_ops/probe_v_up_proj.py --device npu:0 --tokens 7 --heads 32 --warmup 5 --iters 20
+```
+
+Then run the model path:
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANOVLLM_GPU_MEMORY_UTILIZATION=0.8 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=8 NANOVLLM_DECODE_ATTENTION_BACKEND=mla NANOVLLM_ENABLE_DECODE_MLAPO=1 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=0 NANOVLLM_PROFILE_LAYER_IDS=0,mid,last NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_SKIP_WARMUP=1 python example/short_prompts.py
+```

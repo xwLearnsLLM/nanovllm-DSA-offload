@@ -1573,8 +1573,12 @@ class DeepseekV32DSAAttention(nn.Module):
     def _v_up_proj(self, latent: torch.Tensor) -> torch.Tensor:
         num_tokens = latent.shape[0]
         latent_by_head = latent.transpose(0, 1).contiguous()
-        output = torch.bmm(latent_by_head, self.w_uv)
-        return output.transpose(0, 1).reshape(num_tokens, -1)
+        output = torch_npu.npu_transpose_batchmatmul(
+            latent_by_head,
+            self.w_uv,
+            perm_y=(1, 0, 2),
+        )
+        return output.reshape(num_tokens, -1)
 
     def _prefill_forward(
         self,

@@ -699,3 +699,20 @@ PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ut_ops/prob
 3. 给 MoE 继续细拆 timing，尤其分开 routing、grouped matmul、unpermute、all_reduce，确认 decode TPOT 中通信占比。
 4. 中长期再考虑对齐 vllm-ascend 的 fused MoE comm / MC2 / graph decode；这是收益可能最大但改动也最大的方向。
 5. SFA decode 仍然是最终更接近 DeepSeek V3.2 DSA 的方向，但当前 `npu_sparse_flash_attention` core dump 未解决，短期先以 dense MLA decode 路线提速。
+
+## 2026-05-25：完成 decode v-up 对齐 vllm-ascend 的第一步
+
+按用户要求先做 decode 优化优先级第 1 项：把本仓 `DeepseekV32DSAAttention._v_up_proj` 从
+`latent.transpose(0, 1).contiguous() -> torch.bmm -> transpose/reshape`
+替换为 vllm-ascend MLA 路径同款的 `torch_npu.npu_transpose_batchmatmul(..., perm_y=(1, 0, 2))`。
+
+当前实现仍然保持输入 `latent` 形状为 `[tokens, local_heads, kv_lora_rank]`，内部先转成
+`[local_heads, tokens, kv_lora_rank]`，`self.w_uv` 是 `[local_heads, kv_lora_rank, v_head_dim]`。
+`npu_transpose_batchmatmul` 输出直接是 `[tokens, local_heads, v_head_dim]`，最后 reshape 成
+`[tokens, local_heads * v_head_dim]`，数学含义与原先 bmm 路径一致。
+
+README 新增第 44 条命令：
+- 先跑 `ut_ops/probe_v_up_proj.py`，用同一批随机 BF16 输入对比旧 `torch.bmm` reference 和新 `npu_transpose_batchmatmul` 的误差/耗时。
+- 再跑 TP8 + MLAPO + layer timing，对比修改前后的 TPOT 和每层 `v_up` timing。
+
+此改动不涉及 C++/AscendC，自身不需要重新 build local ops。
