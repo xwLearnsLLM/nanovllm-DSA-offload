@@ -545,3 +545,34 @@ PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ut_ops/prob
 - reference 继续用普通 ND 权重，算子输入用 NZ 权重。
 
 这次只改 Python probe，不需要重新编译 C++。下一步让用户直接重新跑第 41 条两个 probe 命令即可。
+
+## 2026-05-25：runlog11，NZ 权重后 MLAPO 仍未对齐
+
+用户重新运行第 41 条 probe，结果在 `runlog/runlog11.txt`。
+
+结果：
+
+- `tokens=7`
+  - `MLAPO_BENCH avg_ms=0.170848`
+  - `ql_nope/q_pe/ckv_cache/kpe_cache` 仍然是大误差。
+- `tokens=128`
+  - `MLAPO_BENCH avg_ms=0.204061`
+  - 误差仍然大，`ckv_cache mean_abs=1.13019`。
+
+结论：
+
+- NZ 权重之后速度更像一个可用的小融合算子，但精度没有对齐。
+- 这说明问题不只是普通 ND 权重被 MLAPO 当 NZ 读。
+- vllm-ascend 0.19 中 MLAPO 实际只在 W8A8/MXFP8 量化路径启用；未量化 BF16 模型会关闭 MLAPO。因此本仓库现在使用的 BF16 `quant_mode=no_quant` kernel 可能不是 vllm-ascend 主路径，不能假设它一定正确。
+
+已继续增强 `ut_ops/probe_mla_preprocess.py`：
+
+- 增加 `--quant-mode`，可测试 `no_quant` 与 `per_tensor_quant_asymm`。
+- 增加 `--no-format-cast`，可跳过 `torch_npu.npu_format_cast(..., 29)`，只使用显式 `transdata` 后的存储。
+- 增加 `ckv_cache_valid` 和 `kpe_cache_valid`，只比较 slotmapping 实际写入的 cache 行，避免 padding 行稀释误差。
+
+已在 `README.md` 增加第 42 条诊断命令：
+
+1. `--init-scale 0`：全零输入，验证基础写出是否干净。
+2. `--no-format-cast`：隔离 internal format cast 是否影响。
+3. `--quant-mode per_tensor_quant_asymm`：尝试 vllm-ascend 量化路径使用的 tiling key。

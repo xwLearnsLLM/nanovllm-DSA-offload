@@ -177,3 +177,27 @@ For a larger decode-shaped micro-batch:
 ```bash
 PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ut_ops/probe_mla_preprocess.py --device npu:0 --tokens 128 --heads 32 --warmup 2 --iters 10
 ```
+
+## 42. MLAPO Preprocess Diagnostics
+
+Use these when section 41 still shows large `MLAPO_DIFF` values. They isolate
+whether the issue is basic output writing, `npu_format_cast`, or the no-quant
+tiling key.
+
+All-zero inputs should produce all-zero outputs:
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ut_ops/probe_mla_preprocess.py --device npu:0 --tokens 7 --heads 32 --init-scale 0 --warmup 0 --iters 1
+```
+
+Use explicit `transdata` storage without `torch_npu.npu_format_cast(..., 29)`:
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ut_ops/probe_mla_preprocess.py --device npu:0 --tokens 7 --heads 32 --no-format-cast --warmup 2 --iters 10
+```
+
+Try the vllm-ascend MLAPO tiling key used by its quantized path:
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ut_ops/probe_mla_preprocess.py --device npu:0 --tokens 7 --heads 32 --quant-mode per_tensor_quant_asymm --warmup 2 --iters 10
+```

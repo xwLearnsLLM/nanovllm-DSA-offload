@@ -82,9 +82,13 @@ def transdata(nd_mat: torch.Tensor, block_size: tuple[int, int] = (16, 16)) -> t
     return nz_mat.reshape(nz_mat.shape[0], nz_mat.shape[1] * nz_mat.shape[2], nz_mat.shape[3])
 
 
-def to_mlapo_nz_weight(nd_weight: torch.Tensor, block_size: tuple[int, int] = (16, 32)) -> torch.Tensor:
+def to_mlapo_nz_weight(
+    nd_weight: torch.Tensor,
+    block_size: tuple[int, int] = (16, 32),
+    use_format_cast: bool = True,
+) -> torch.Tensor:
     nz_weight = transdata(nd_weight, block_size=block_size).unsqueeze(0).contiguous()
-    if torch_npu is not None and nz_weight.device.type == "npu":
+    if use_format_cast and torch_npu is not None and nz_weight.device.type == "npu":
         return torch_npu.npu_format_cast(nz_weight, ACL_FORMAT_FRACTAL_NZ)
     return nz_weight
 
@@ -142,8 +146,8 @@ def build_inputs(args: argparse.Namespace, device: torch.device, dtype: torch.dt
         wuq_ref.view(args.heads, args.nope_dim + args.rope_dim, args.q_lora_rank),
         args.rope_dim,
     ).reshape(args.heads * (args.nope_dim + args.rope_dim), args.q_lora_rank).contiguous()
-    wdqkv = to_mlapo_nz_weight(wdqkv_ref, block_size=(16, 32))
-    wuq = to_mlapo_nz_weight(wuq_ref, block_size=(16, 32))
+    wdqkv = to_mlapo_nz_weight(wdqkv_ref, block_size=(16, 32), use_format_cast=not args.no_format_cast)
+    wuq = to_mlapo_nz_weight(wuq_ref, block_size=(16, 32), use_format_cast=not args.no_format_cast)
     wuk = torch.randn(
         args.heads,
         args.nope_dim,
@@ -267,7 +271,7 @@ def run_mlapo(
         kv_cache_out1=kpe_cache,
         inner_out=inner_out,
         cache_mode=args.cache_mode,
-        quant_mode="no_quant",
+        quant_mode=args.quant_mode,
         enable_inner_out=False,
     )
     return ql_nope, q_pe, ckv_cache, kpe_cache
@@ -290,6 +294,16 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--dtype", choices=["bf16", "fp16"], default="bf16")
     parser.add_argument("--cache-mode", choices=["krope_ctkv"], default="krope_ctkv")
+    parser.add_argument(
+        "--quant-mode",
+        choices=["no_quant", "per_tensor_quant_asymm"],
+        default="no_quant",
+    )
+    parser.add_argument(
+        "--no-format-cast",
+        action="store_true",
+        help="Use the explicit transdata tensor without torch_npu.npu_format_cast(..., 29).",
+    )
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iters", type=int, default=10)
     args = parser.parse_args()
@@ -305,7 +319,8 @@ def main() -> None:
         "MLAPO_PROBE config "
         f"tokens={args.tokens} heads={args.heads} hidden={args.hidden_size} "
         f"q_lora={args.q_lora_rank} kv_lora={args.kv_lora_rank} "
-        f"nope={args.nope_dim} rope={args.rope_dim} cache_mode={args.cache_mode}"
+        f"nope={args.nope_dim} rope={args.rope_dim} cache_mode={args.cache_mode} "
+        f"quant_mode={args.quant_mode} format_cast={not args.no_format_cast}"
     )
     for name in (
         "hidden",
@@ -332,6 +347,17 @@ def main() -> None:
         print("MLAPO_PROBE after_mlapo " + desc(name, out))
     for name, got, exp in zip(("ql_nope", "q_pe", "ckv_cache", "kpe_cache"), actual, expected):
         diff(name, got, exp)
+    slots = tensors["slotmapping"].to(torch.long)
+    diff(
+        "ckv_cache_valid",
+        actual[2].view(-1, args.kv_lora_rank).index_select(0, slots),
+        expected[2].view(-1, args.kv_lora_rank).index_select(0, slots),
+    )
+    diff(
+        "kpe_cache_valid",
+        actual[3].view(-1, args.rope_dim).index_select(0, slots),
+        expected[3].view(-1, args.rope_dim).index_select(0, slots),
+    )
 
     for _ in range(args.warmup):
         run_mlapo(tensors, args)
