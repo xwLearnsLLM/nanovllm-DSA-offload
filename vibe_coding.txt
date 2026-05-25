@@ -1,0 +1,314 @@
+# nano-vllm-ascend DeepSeek V3.2 接手记录
+
+更新时间：2026-05-25
+
+编码约定：本文件使用 UTF-8 中文记录。后续重要实验结论、代码决策、已知问题和下一步计划都继续追加到这里，方便其它 AI 或人类接手。
+
+## 目标
+
+当前目标是让 nano-vllm-ascend 在昇腾 NPU 上高性能运行 DeepSeek V3.2 类模型。
+
+目标模型：
+
+- ModelScope：`xwLearnsLLM/Deepseek-V3.2-Pruned-95B`
+- 昇腾机器上的常用本地路径：`/home/models/Deepseek-V3.2-Pruned-95B-BF/`
+- BF16
+- 用户机器上 TP=4 可以跑，TP=8 也用于性能测试
+- 当前只关心 DeepSeek V3.2，不再追求 Qwen、多模态、graph mode 或通用模型支持
+- 当前只要求 eager 模式可用
+- 关键并行方式：Attention TP、MoE EP
+- 关键算子尽量对齐 vllm-ascend 0.19.1，但项目方向是逐步内化到 `nanovllm.ops`，摆脱对 vllm-ascend Python 包和其 OPP 注册路径的依赖
+
+## 仓库结构和运行方式
+
+仓库已经扁平化，直接从仓库根目录运行：
+
+- `nanovllm/`
+- `example/`
+- `scripts/`
+- `ut_ops/`
+- `requirements.txt`
+- `README.md`
+
+不需要 `pip install -e .`。运行命令里使用：
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH
+```
+
+本地 Ascend 自定义算子需要在昇腾机器上先编译：
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH bash scripts/build_nanovllm_ops.sh
+```
+
+预期编译产物包括：
+
+- `nanovllm/_C*.so`
+- `nanovllm/libnanovllm_ascend_kernels.so`
+- `nanovllm/_cann_ops_custom/`
+
+如果只改了 pybind extension，可以尝试跳过慢速 OPP 重编译：
+
+```bash
+NANOVLLM_SKIP_CANN_OPP_BUILD=1
+```
+
+注意：之前 skip build 时遇到过 CANN kernel 中间产物状态不完整的问题；完整重编译已经在用户昇腾机器上验证通过。
+
+## 环境
+
+用户昇腾机器上观察到的关键包版本：
+
+- `transformers==5.5.3`
+- `torch==2.9.0+cpu`
+- `torch_npu==2.9.0`
+- `vllm_ascend==0.19.1rc1`
+- `xxhash==3.7.0`
+- `mistral_common==1.11.1`
+
+当前环境里仍然有 `vllm_ascend`，但项目方向是把 nano-vllm-ascend 需要的算子内化。
+
+## 关键算子
+
+当前使用或封装的关键算子：
+
+- `nanovllm.ops.npu_lightning_indexer`
+- `nanovllm.ops.npu_sparse_flash_attention`
+- `nanovllm.ops.moe_gating_top_k`
+- `nanovllm.ops.batch_matmul_transpose`
+- `torch_npu.npu_fused_infer_attention_score`
+- `torch_npu.npu_grouped_matmul`
+- `torch_npu.npu_moe_init_routing_v2`
+- `torch_npu.npu_moe_token_unpermute`
+- `torch_npu.npu_swiglu`
+
+`npu_lightning_indexer` 和 `npu_sparse_flash_attention` 必须保留，因为长期目标仍然是 decode 使用 SFA。当前 SFA decode core dump 是已知问题，后续再修。
+
+## Attention 路线
+
+### Prefill
+
+DeepSeek V3.2 的 DSA 原始设计是 sparse attention：序列长度大于 2048 时，从历史 token 中选择最多 2048 个重要 token 参与 attention。
+
+由于 `npu_sparse_flash_attention` 在 Nano 集成路径中出现过 core dump，当前 prefill 改为 dense paged MLA：
+
+```python
+torch_npu.npu_fused_infer_attention_score(...)
+```
+
+当前是 absorb + paged KV cache 形态，典型形状：
+
+- query：`(tokens, local_q_heads, 512)`
+- ckv cache：`(num_blocks, block_size=128, 1, 512)`
+- query_rope：`(tokens, local_q_heads, 64)`
+- kpe cache：`(num_blocks, block_size=128, 1, 64)`
+
+用户做过 SFA vs dense MLA 对比：
+
+- 序列长度 1024：dense MLA 和 sparse reference 几乎一致，`relative_max_error` 约 `0.0016`
+- 序列长度 3072：SFA 是 3072 选 2048，dense MLA 是全量计算，`relative_max_error` 约 `0.0403`，mean error 很小
+
+结论：prefill 暂时用 dense MLA 可以接受，性能也不错。
+
+### Decode
+
+当前 decode attention backend：
+
+- 默认：`NANOVLLM_DECODE_ATTENTION_BACKEND=mla`
+- `mla`：dense paged MLA，当前工作路径
+- `torch`：慢速 PyTorch sparse reference，仍依赖 `npu_lightning_indexer` 的 top-k 结果
+- `sfa`：`nanovllm.ops.npu_sparse_flash_attention`，当前会复现 core dump
+- 旧开关：`NANOVLLM_ENABLE_NPU_SFA_DECODE=1` 会强制走 SFA decode，只用于复现/调试 crash
+
+当前 decode 性能仍不够好。TP8 short prompts 大致结果：
+
+- decode TPS 约 40 tok/s
+- TPOT 约 0.16-0.22 秒
+- 目标是 TPOT 降到 0.1 秒以下
+
+观察：`decode_attention_op` 很小，但 `attention_total` 明显更大。因此瓶颈大概率不在 MLA kernel 本身，而在投影、cache 写入、q-up/v-up、o-proj、TP all-reduce 或剩余调度开销。
+
+已经新增细粒度 decode attention timing，打开：
+
+```bash
+NANOVLLM_LOG_DECODE_LAYER_TIMING=1
+```
+
+日志字段包括：
+
+- `attention_total`
+- `qkv_a`
+- `q_norm`
+- `q_b`
+- `kv_rope`
+- `indexer`
+- `cache`
+- `q_up`
+- `decode_attention_op`
+- `v_up`
+- `o_proj`
+- `attention_gap`
+- `moe_total`
+
+下一步重点看：
+
+- `q_b`
+- `q_up`
+- `v_up`
+- `o_proj`
+- `attention_gap`
+
+其中 `o_proj` 包含 `RowParallelLinear` 里的 TP `all_reduce`，可以判断是不是 TP 通信拖慢 decode。
+
+## 当前代码状态
+
+当前有未提交修改：
+
+- `nanovllm/models/deepseek_v32.py`
+- `README.md`
+- `vibe_coding.txt`
+
+最近完成的代码决策：
+
+1. 删除以下 3 个优化开关，只保留更快路径：
+   - `NANOVLLM_MLA_SOFTMAX_LSE`
+   - `NANOVLLM_V_UP_BMM_TRANS_MAX_TOKENS`
+   - `NANOVLLM_MOE_EXPERT_TOKENS_INT64`
+2. MLA 固定 `softmax_lse_flag=False`
+3. v-up 固定走 torch `bmm`
+4. MoE 固定不做 `expert_tokens.to(torch.int64)`
+5. q-up 的本地 `batch_matmul_transpose` 只允许 `num_tokens == 1`
+6. 新增更细粒度 decode attention timing
+
+本地语法检查已通过：
+
+```bash
+python -m py_compile nanovllm/models/deepseek_v32.py
+```
+
+注意：细粒度 timing 是刚加的，还需要用户在昇腾机器上跑日志验证。
+
+## 已知问题和坑
+
+### 1. SFA decode core dump
+
+`NANOVLLM_ENABLE_NPU_SFA_DECODE=1` 当前会复现 core dump。正常运行不要打开。
+
+### 2. batched q-up 本地算子 crash
+
+之前 sweep 中设置：
+
+```bash
+NANOVLLM_Q_UP_BMM_TRANS_MAX_TOKENS=1024
+```
+
+batch=7 时让 q-up 走本地 `batch_matmul_transpose`，触发 AICore MTE write address out of range。代码已保护为只有 `num_tokens == 1` 时才走本地 op。
+
+### 3. Tokenizer 问题
+
+Transformers 5.5.3 加载该模型 tokenizer 时曾遇到：
+
+```text
+AttributeError: 'tokenizers.Tokenizer' object has no attribute 'backend_tokenizer'
+```
+
+当前 tokenizer 加载路径已经有兜底，example 能跑。
+
+### 4. EOS 影响测试
+
+`example/test.py` 默认 `NANOVLLM_IGNORE_EOS=true`，避免固定 decode 长度测试被 `\n + EOS` 提前截断。
+
+### 5. Scheduler 约束
+
+当前 Nano scheduler 要求：
+
+```text
+max_num_batched_tokens >= max_model_len
+```
+
+README 命令必须保持这一点。
+
+### 6. KV cache 显存
+
+之前 TP4 OOM 过，后来加了 KV cache block cap：按 `max_model_len/max_num_seqs` 限制分配。现在短 decode TP4 和 TP8 都能跑。
+
+## MoE 当前状态
+
+默认：
+
+```bash
+NANOVLLM_MOE_BACKEND=grouped
+```
+
+Grouped MoE 路径使用：
+
+- `moe_gating_top_k`
+- `npu_moe_init_routing_v2`
+- `npu_grouped_matmul`
+- `npu_moe_token_unpermute`
+
+从 per-expert Python loop 改成 grouped matmul 后，MoE 时延明显下降。
+
+`expert_tokens` 当前保留算子原始 dtype，不再 cast 到 int64。用户日志显示这条路径更快且可跑。
+
+仍保留：
+
+```bash
+NANOVLLM_MOE_BACKEND=loop
+```
+
+作为调试/对照回退。
+
+## 常用命令
+
+短 prompts：
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=4 NANOVLLM_DECODE_ATTENTION_BACKEND=mla NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_SKIP_WARMUP=1 python example/short_prompts.py
+```
+
+长 prompts：
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=4 NANOVLLM_DECODE_ATTENTION_BACKEND=mla NANOVLLM_MAX_GEN_TOKENS=32 NANOVLLM_SKIP_WARMUP=1 python example/long_prompts.py
+```
+
+细粒度 decode timing：
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANOVLLM_GPU_MEMORY_UTILIZATION=0.8 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=8 NANOVLLM_DECODE_ATTENTION_BACKEND=mla NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=0 NANOVLLM_PROFILE_LAYER_IDS=0,mid,last NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_SKIP_WARMUP=1 python example/short_prompts.py
+```
+
+如果要更精确测少数层，可以把：
+
+```bash
+NANOVLLM_DECODE_LAYER_TIMING_SYNC=1
+```
+
+但同步会扰动整体 TPOT。
+
+## 下一步建议
+
+1. 在昇腾机器上跑新增的细粒度 decode timing。
+2. 判断 `attention_total` 主要耗在哪个字段：
+   - `q_b`
+   - `q_up`
+   - `v_up`
+   - `o_proj`
+   - `attention_gap`
+3. 如果 `o_proj` 最大，优先调查 TP all-reduce，考虑通信融合、延迟 all_reduce 或减少同步。
+4. 如果 `q_b/q_up/v_up` 最大，考虑小 batch decode 专用投影算子或融合算子。
+5. 如果 `attention_gap` 最大，继续细拆 timing，查 Python/runtime dispatch 开销。
+6. 长期仍要修 SFA decode core dump，让 decode 回到 sparse attention。
+
+## 记录规则
+
+之后出现以下事件时，要追加到本文件：
+
+- 用户给出新的 runlog 结果
+- 修改关键代码路径
+- 新增或删除重要环境变量
+- 复现或修复 crash
+- 发现新的性能瓶颈
+

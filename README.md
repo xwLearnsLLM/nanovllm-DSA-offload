@@ -63,7 +63,7 @@ PYTHONPATH=$PWD:$PYTHONPATH python -m pip show nano-vllm-ascend
 | `NANOVLLM_LOG_NPU_SFA_INPUTS` | `false` | `deepseek_v32.py` | Logs tensor shape/dtype/stride summaries for SFA input tensors on selected phases. |
 | `NANOVLLM_DUMP_NPU_SFA_INPUTS` | unset | `deepseek_v32.py` | Directory used to dump SFA-style attention inputs as `.pt` files for replay/debug. |
 | `NANOVLLM_DUMP_NPU_SFA_MAX_CALLS` | `1` | `deepseek_v32.py` | Max number of SFA input dumps per attention module. |
-| `NANOVLLM_LOG_DECODE_LAYER_TIMING` | `false` | `deepseek_v32.py` | `true` logs per selected decode layer: broad attention time, narrow decode attention op time, and MoE/MLP time. Combine with `NANOVLLM_PROFILE_LAYER_IDS=all` for all layers. |
+| `NANOVLLM_LOG_DECODE_LAYER_TIMING` | `false` | `deepseek_v32.py` | `true` logs per selected decode layer: broad attention time, qkv/q_b/kv_rope/cache/q_up/attention/v_up/o_proj breakdown, and MoE/MLP time. Combine with `NANOVLLM_PROFILE_LAYER_IDS=all` for all layers. |
 | `NANOVLLM_DECODE_LAYER_TIMING_SYNC` | `true` | `deepseek_v32.py` | `true` synchronizes before/after profiled regions for accurate layer timing; `false` prints lower-overhead approximate timing. |
 | `NANOVLLM_FUSE_QKV_A` | `true` | `deepseek_v32.py` | `true` fuses `q_a_proj` and `kv_a_proj_with_mqa` into one projection after loading; `false` keeps the original two projections. |
 | `NANOVLLM_FREE_KV_B_PROJ` | `true` | `deepseek_v32.py` | `true` frees `kv_b_proj.weight` after preparing `w_uk_t/w_uv`; `false` keeps the original weight for debugging. |
