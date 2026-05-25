@@ -576,3 +576,35 @@ PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ut_ops/prob
 1. `--init-scale 0`：全零输入，验证基础写出是否干净。
 2. `--no-format-cast`：隔离 internal format cast 是否影响。
 3. `--quant-mode per_tensor_quant_asymm`：尝试 vllm-ascend 量化路径使用的 tiling key。
+
+## 2026-05-25：runlog12，定位 BF16 no-quant MLAPO 权重分块问题
+
+用户运行第 42 条诊断命令，结果在 `runlog/runlog12.txt`。
+
+结果：
+
+- `--init-scale 0` 全零输入完全对齐：所有 `MLAPO_DIFF` 都是 0。
+  - 说明 Python 绑定、输出写回、slotmapping/cache 基础写出逻辑大体是通的。
+- `--no-format-cast` 结果和默认路径几乎完全一样。
+  - 说明误差不是 `torch_npu.npu_format_cast(..., 29)` 本身造成的。
+- `--quant-mode per_tensor_quant_asymm` 直接出现 `1e9` 级别误差。
+  - BF16 权重硬走量化 tiling key 缺少量化参数，这条路径不成立。
+
+新的关键判断：
+
+- 之前 probe 给 BF16 no-quant MLAPO 权重使用了 vllm-ascend W8A8 量化路径里的 `transdata(..., block_size=(16, 32))`。
+- 但 BF16 no-quant kernel 的 NZ 读权重逻辑使用 16 宽 C0，也就是应使用 `(16, 16)`。
+- 这能解释为什么 NZ 权重后仍然大误差：权重虽然是 NZ 形状，但物理分块宽度错了。
+
+已修改 `ut_ops/probe_mla_preprocess.py`：
+
+- 新增 `--weight-block-cols`，默认 `16`。
+- BF16 no-quant 默认使用 `transdata(..., block_size=(16, 16))`。
+- 如果需要复现实验，可以显式设置 `--weight-block-cols 32`。
+
+已更新 `README.md` 第 41/42 条：
+
+- 第 41 条默认命令现在代表 BF16 no-quant 正确分块尝试。
+- 第 42 条第三个命令改成 `--weight-block-cols 32`，作为对照诊断，不再推荐 `per_tensor_quant_asymm`。
+
+下一步：让用户不用重编 C++，直接重新运行第 41 条两个 MLAPO probe。

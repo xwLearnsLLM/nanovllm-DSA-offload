@@ -165,7 +165,8 @@ PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANO
 After rebuilding local Ascend ops, run this to compare the new
 `nanovllm.ops.mla_preprocess` binding against the split PyTorch reference on
 the same synthetic BF16 inputs. It checks `ql_nope`, `q_pe`, `ckv_cache`, and
-`kpe_cache`.
+`kpe_cache`. BF16 no-quant MLAPO uses an NZ weight column block size of 16,
+which is the probe default.
 
 ```bash
 PYTHONPATH=$PWD:$PYTHONPATH bash scripts/build_nanovllm_ops.sh
@@ -196,8 +197,10 @@ Use explicit `transdata` storage without `torch_npu.npu_format_cast(..., 29)`:
 PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ut_ops/probe_mla_preprocess.py --device npu:0 --tokens 7 --heads 32 --no-format-cast --warmup 2 --iters 10
 ```
 
-Try the vllm-ascend MLAPO tiling key used by its quantized path:
+For comparison only, try the vllm-ascend W8A8-style weight blocking. This is
+expected to be wrong for BF16 no-quant, but is useful to confirm the block-size
+diagnosis:
 
 ```bash
-PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ut_ops/probe_mla_preprocess.py --device npu:0 --tokens 7 --heads 32 --quant-mode per_tensor_quant_asymm --warmup 2 --iters 10
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ut_ops/probe_mla_preprocess.py --device npu:0 --tokens 7 --heads 32 --weight-block-cols 32 --warmup 2 --iters 10
 ```

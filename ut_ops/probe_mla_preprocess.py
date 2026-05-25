@@ -146,8 +146,9 @@ def build_inputs(args: argparse.Namespace, device: torch.device, dtype: torch.dt
         wuq_ref.view(args.heads, args.nope_dim + args.rope_dim, args.q_lora_rank),
         args.rope_dim,
     ).reshape(args.heads * (args.nope_dim + args.rope_dim), args.q_lora_rank).contiguous()
-    wdqkv = to_mlapo_nz_weight(wdqkv_ref, block_size=(16, 32), use_format_cast=not args.no_format_cast)
-    wuq = to_mlapo_nz_weight(wuq_ref, block_size=(16, 32), use_format_cast=not args.no_format_cast)
+    block_size = (16, args.weight_block_cols)
+    wdqkv = to_mlapo_nz_weight(wdqkv_ref, block_size=block_size, use_format_cast=not args.no_format_cast)
+    wuq = to_mlapo_nz_weight(wuq_ref, block_size=block_size, use_format_cast=not args.no_format_cast)
     wuk = torch.randn(
         args.heads,
         args.nope_dim,
@@ -304,6 +305,12 @@ def main() -> None:
         action="store_true",
         help="Use the explicit transdata tensor without torch_npu.npu_format_cast(..., 29).",
     )
+    parser.add_argument(
+        "--weight-block-cols",
+        type=int,
+        default=16,
+        help="NZ weight column block size. BF16 no-quant MLAPO expects 16; vllm-ascend W8A8 path uses 32.",
+    )
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iters", type=int, default=10)
     args = parser.parse_args()
@@ -320,7 +327,8 @@ def main() -> None:
         f"tokens={args.tokens} heads={args.heads} hidden={args.hidden_size} "
         f"q_lora={args.q_lora_rank} kv_lora={args.kv_lora_rank} "
         f"nope={args.nope_dim} rope={args.rope_dim} cache_mode={args.cache_mode} "
-        f"quant_mode={args.quant_mode} format_cast={not args.no_format_cast}"
+        f"quant_mode={args.quant_mode} format_cast={not args.no_format_cast} "
+        f"weight_block_cols={args.weight_block_cols}"
     )
     for name in (
         "hidden",
