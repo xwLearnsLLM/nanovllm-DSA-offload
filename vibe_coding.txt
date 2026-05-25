@@ -680,3 +680,22 @@ PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ut_ops/prob
 - 这样可以继续保持 prefill cache 与 decode cache 的 RoPE basis 一致。
 
 下一步让用户继续跑 README 第 43 条，观察输出是否恢复，同时看 TPOT 是否仍然明显优于非 MLAPO 路径。
+
+## 2026-05-25：用户接受 MLAPO 质量折中，继续对照 vllm-ascend 看 decode 优化
+
+用户反馈 `runlog15.txt` 中 decode 内容已经比较正常；其中某一个 long prompt 请求不正常可以接受，并且已撤回刚加的诊断/对比代码。后续暂时不纠结这一个样本，继续只看 decode 路径性能。
+
+当前判断：
+- MLAPO 已经是最直接有效的一步，能把 dense MLA decode 的前处理开销显著压下去。
+- 继续对照 vllm-ascend 0.19，剩余 decode 性能差距不太像单个 MLA 算子本身导致，而是来自一组组合差异：
+  - vllm-ascend decode MLA 更偏向 `npu_fused_infer_attention_score_v2`、预分配输出/LSE/workspace、graph task/workspace cache。
+  - vllm-ascend 的 v-up 使用 `torch_npu.npu_transpose_batchmatmul`，本仓当前主要还是 `transpose().contiguous() + torch.bmm`。
+  - vllm-ascend 的 MoE decode 有 AscendFusedMoE、ALLTOALL/MC2/FUSED_MC2、dispatch/combine 等通信融合路径；本仓当前是本地 grouped matmul 后再 `all_reduce`。
+  - vllm-ascend decode 更依赖静态 shape、padding、graph/capture，减少 61 层 Python eager 小算子 launch 开销。
+
+建议后续优先级：
+1. 先尝试把 `_v_up_proj` 替换为 `torch_npu.npu_transpose_batchmatmul`，这是最小且最像 vllm-ascend 的 attention 后处理优化。
+2. 再尝试 dense MLA decode 切到 `npu_fused_infer_attention_score_v2` 的 out/workspace 风格，减少输出分配和调度开销。
+3. 给 MoE 继续细拆 timing，尤其分开 routing、grouped matmul、unpermute、all_reduce，确认 decode TPOT 中通信占比。
+4. 中长期再考虑对齐 vllm-ascend 的 fused MoE comm / MC2 / graph decode；这是收益可能最大但改动也最大的方向。
+5. SFA decode 仍然是最终更接近 DeepSeek V3.2 DSA 的方向，但当前 `npu_sparse_flash_attention` core dump 未解决，短期先以 dense MLA decode 路线提速。
