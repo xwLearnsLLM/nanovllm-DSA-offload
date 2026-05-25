@@ -51,6 +51,12 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _first_tensor(value):
+    if isinstance(value, (tuple, list)):
+        return value[0]
+    return value
+
+
 def _is_rank0() -> bool:
     try:
         return (not dist.is_initialized()) or dist.get_rank() == 0
@@ -482,9 +488,18 @@ class DeepseekV32SparseMoeBlock(nn.Module):
         )
         self.register_parameter("grouped_w13_weight", None)
         self.register_parameter("grouped_w2_weight", None)
+        self.moe_backend = os.environ.get("NANOVLLM_MOE_BACKEND", "grouped").strip().lower()
+        if self.moe_backend not in ("grouped", "loop"):
+            raise ValueError("NANOVLLM_MOE_BACKEND must be 'grouped' or 'loop'.")
+        self.moe_expert_tokens_int64 = _env_flag(
+            "NANOVLLM_MOE_EXPERT_TOKENS_INT64",
+            True,
+        )
 
     def post_load_prepare(self) -> None:
         if self.grouped_w13_weight is not None:
+            return
+        if self.moe_backend != "grouped":
             return
         if not self.local_expert_layers:
             return
@@ -575,7 +590,11 @@ class DeepseekV32SparseMoeBlock(nn.Module):
         shared_output = self.shared_experts(hidden_states)
         router_logits = self.gate(hidden_states)
         routing_weights, selected_experts = self._grouped_topk(router_logits)
-        if self.grouped_w13_weight is not None and hidden_states.device.type == "npu":
+        if (
+            self.moe_backend == "grouped"
+            and self.grouped_w13_weight is not None
+            and hidden_states.device.type == "npu"
+        ):
             routed_hidden_states = self._grouped_experts_forward(
                 hidden_states,
                 selected_experts,
@@ -659,7 +678,8 @@ class DeepseekV32SparseMoeBlock(nn.Module):
                 quant_mode=-1,
             )
         )
-        expert_tokens = expert_tokens.to(torch.int64)
+        if self.moe_expert_tokens_int64:
+            expert_tokens = expert_tokens.to(torch.int64)
 
         gate_up = torch_npu.npu_grouped_matmul(
             x=[sorted_hidden],
@@ -825,6 +845,21 @@ class DeepseekV32DSAAttention(nn.Module):
         self.register_parameter("wd_qkv", None)
         self.w_uk_t = None
         self.w_uv = None
+        self.fuse_qkv_a = _env_flag("NANOVLLM_FUSE_QKV_A", True)
+        self.free_kv_b_proj = _env_flag("NANOVLLM_FREE_KV_B_PROJ", True)
+        self.mla_softmax_lse = _env_flag("NANOVLLM_MLA_SOFTMAX_LSE", True)
+        self.q_up_bmm_trans_max_tokens = _env_int(
+            "NANOVLLM_Q_UP_BMM_TRANS_MAX_TOKENS",
+            1,
+        )
+        self.v_up_bmm_trans_max_tokens = _env_int(
+            "NANOVLLM_V_UP_BMM_TRANS_MAX_TOKENS",
+            BMM_TRANS_MAX_SUPPORTED_TOKENS,
+        )
+        self.decode_timing_sync = _env_flag(
+            "NANOVLLM_DECODE_LAYER_TIMING_SYNC",
+            True,
+        )
         self.use_npu_sfa_decode = _env_flag(
             "NANOVLLM_ENABLE_NPU_SFA_DECODE",
             False,
@@ -870,7 +905,7 @@ class DeepseekV32DSAAttention(nn.Module):
         self.index_cache = index_cache
 
     def post_load_prepare(self) -> None:
-        if self.wd_qkv is None:
+        if self.fuse_qkv_a and self.wd_qkv is None:
             q_weight = self.q_a_proj.weight.detach().cpu()
             kv_weight = self.kv_a_proj_with_mqa.weight.detach().cpu()
             dtype = self.q_a_proj.weight.dtype
@@ -895,13 +930,23 @@ class DeepseekV32DSAAttention(nn.Module):
             del q_weight, kv_weight
             gc.collect()
 
-        weight = self.kv_b_proj.weight.data.view(
-            self.num_local_heads,
-            self.qk_nope_head_dim + self.v_head_dim,
-            self.kv_lora_rank,
-        )
-        self.w_uk_t = weight[:, : self.qk_nope_head_dim, :].contiguous()
-        self.w_uv = weight[:, self.qk_nope_head_dim :, :].transpose(1, 2).contiguous()
+        if self.w_uk_t is None or self.w_uv is None:
+            weight = self.kv_b_proj.weight.data.view(
+                self.num_local_heads,
+                self.qk_nope_head_dim + self.v_head_dim,
+                self.kv_lora_rank,
+            )
+            self.w_uk_t = weight[:, : self.qk_nope_head_dim, :].contiguous()
+            self.w_uv = (
+                weight[:, self.qk_nope_head_dim :, :]
+                .transpose(1, 2)
+                .contiguous()
+            )
+            if self.free_kv_b_proj:
+                self.kv_b_proj._parameters.pop("weight", None)
+                gc.collect()
+                if self.w_uk_t.device.type == "npu":
+                    torch.npu.empty_cache()
 
     @property
     def block_size(self) -> int:
@@ -910,7 +955,10 @@ class DeepseekV32DSAAttention(nn.Module):
         return int(self.ckv_cache.shape[1])
 
     def _flat_slots(self) -> torch.Tensor:
-        slot_mapping = get_context().slot_mapping
+        context = get_context()
+        if context.flat_slot_mapping is not None:
+            return context.flat_slot_mapping
+        slot_mapping = context.slot_mapping
         if slot_mapping.dim() == 2:
             return (
                 slot_mapping[:, 0].to(torch.long) * self.block_size
@@ -1260,8 +1308,8 @@ class DeepseekV32DSAAttention(nn.Module):
         num_tokens = q_nope.shape[0]
         if (
             q_nope.dtype in (torch.float16, torch.bfloat16)
-            and num_tokens == 1
-            and num_tokens <= BMM_TRANS_MAX_SUPPORTED_TOKENS
+            and self.q_up_bmm_trans_max_tokens > 0
+            and num_tokens <= self.q_up_bmm_trans_max_tokens
         ):
             ql_nope = torch.empty(
                 (
@@ -1287,7 +1335,8 @@ class DeepseekV32DSAAttention(nn.Module):
         num_tokens = latent.shape[0]
         if (
             latent.dtype in (torch.float16, torch.bfloat16)
-            and num_tokens <= BMM_TRANS_MAX_SUPPORTED_TOKENS
+            and self.v_up_bmm_trans_max_tokens > 0
+            and num_tokens <= self.v_up_bmm_trans_max_tokens
         ):
             output = torch.empty(
                 (
@@ -1329,7 +1378,7 @@ class DeepseekV32DSAAttention(nn.Module):
         if log_timing:
             _profile_sync(ql_nope.device)
             start = perf_counter()
-        latent, lse = torch_npu.npu_fused_infer_attention_score(
+        mla_result = torch_npu.npu_fused_infer_attention_score(
             ql_nope,
             self.ckv_cache,
             self.ckv_cache,
@@ -1345,11 +1394,11 @@ class DeepseekV32DSAAttention(nn.Module):
             antiquant_scale=None,
             block_table=context.block_tables,
             block_size=self.block_size,
-            softmax_lse_flag=True,
+            softmax_lse_flag=self.mla_softmax_lse,
             actual_seq_lengths=actual_seq_lengths_query.detach().cpu().tolist(),
             actual_seq_lengths_kv=actual_seq_lengths_key.detach().cpu().tolist(),
         )
-        del lse
+        latent = _first_tensor(mla_result)
         if log_timing:
             _profile_sync(ql_nope.device)
             logger.info(
@@ -1458,10 +1507,12 @@ class DeepseekV32DSAAttention(nn.Module):
         actual_seq_lengths_key = context.actual_seq_lengths_kv
         assert actual_seq_lengths_query is not None
         assert actual_seq_lengths_key is not None
-        if self.log_decode_layer_timing:
+        if self.log_decode_layer_timing and self.decode_timing_sync:
             _profile_sync(ql_nope.device)
             start = perf_counter()
-        latent, lse = torch_npu.npu_fused_infer_attention_score(
+        elif self.log_decode_layer_timing:
+            start = perf_counter()
+        mla_result = torch_npu.npu_fused_infer_attention_score(
             ql_nope,
             self.ckv_cache,
             self.ckv_cache,
@@ -1477,13 +1528,15 @@ class DeepseekV32DSAAttention(nn.Module):
             antiquant_scale=None,
             block_table=context.block_tables[:batch_size],
             block_size=self.block_size,
-            softmax_lse_flag=True,
+            softmax_lse_flag=self.mla_softmax_lse,
             actual_seq_lengths=actual_seq_lengths_query,
             actual_seq_lengths_kv=actual_seq_lengths_key,
         )
-        del lse
-        if self.log_decode_layer_timing:
+        latent = _first_tensor(mla_result)
+        if self.log_decode_layer_timing and self.decode_timing_sync:
             _profile_sync(ql_nope.device)
+            self.last_decode_attention_op_time = perf_counter() - start
+        elif self.log_decode_layer_timing:
             self.last_decode_attention_op_time = perf_counter() - start
         return self._v_up_proj(latent)
 
@@ -1521,12 +1574,16 @@ class DeepseekV32DSAAttention(nn.Module):
         q_index: torch.Tensor,
         weights: torch.Tensor,
     ) -> torch.Tensor:
-        if self.log_decode_layer_timing:
+        if self.log_decode_layer_timing and self.decode_timing_sync:
             _profile_sync(ql_nope.device)
             start = perf_counter()
+        elif self.log_decode_layer_timing:
+            start = perf_counter()
         output = self._decode_forward_loop(ql_nope, q_pe, q_index, weights)
-        if self.log_decode_layer_timing:
+        if self.log_decode_layer_timing and self.decode_timing_sync:
             _profile_sync(output.device)
+            self.last_decode_attention_op_time = perf_counter() - start
+        elif self.log_decode_layer_timing:
             self.last_decode_attention_op_time = perf_counter() - start
         return output
 
@@ -1538,15 +1595,19 @@ class DeepseekV32DSAAttention(nn.Module):
         if self.w_uk_t is None or self.w_uv is None:
             self.post_load_prepare()
 
-        if self.wd_qkv is None:
+        if self.fuse_qkv_a and self.wd_qkv is None:
             self.post_load_prepare()
 
-        qkv_a = F.linear(hidden_states, self.wd_qkv)
-        q_c, kv = torch.split(
-            qkv_a,
-            [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
-            dim=-1,
-        )
+        if self.fuse_qkv_a:
+            qkv_a = F.linear(hidden_states, self.wd_qkv)
+            q_c, kv = torch.split(
+                qkv_a,
+                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+                dim=-1,
+            )
+        else:
+            q_c = self.q_a_proj(hidden_states)
+            kv = self.kv_a_proj_with_mqa(hidden_states)
         q_c = self.q_a_layernorm(q_c)
         q = self.q_b_proj(q_c).view(
             -1, self.num_local_heads, self.qk_head_dim
@@ -1633,6 +1694,10 @@ class DeepseekV32DecoderLayer(nn.Module):
             "NANOVLLM_LOG_DECODE_LAYER_TIMING",
             False,
         ) and _profile_layer_selected(self.layer_idx, int(config.num_hidden_layers))
+        self.decode_timing_sync = _env_flag(
+            "NANOVLLM_DECODE_LAYER_TIMING_SYNC",
+            True,
+        )
         self.mlp_kind = (
             "moe" if isinstance(self.mlp, DeepseekV32SparseMoeBlock) else "dense_mlp"
         )
@@ -1650,26 +1715,33 @@ class DeepseekV32DecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         context = get_context()
         profile_decode = self.log_decode_layer_timing and not context.is_prefill
-        if profile_decode:
+        if profile_decode and self.decode_timing_sync:
             _profile_sync(hidden_states.device)
             attention_start = perf_counter()
+        elif profile_decode:
+            attention_start = perf_counter()
         hidden_states = self.self_attn(positions, hidden_states)
-        if profile_decode:
+        if profile_decode and self.decode_timing_sync:
             _profile_sync(hidden_states.device)
+            attention_total = perf_counter() - attention_start
+        elif profile_decode:
             attention_total = perf_counter() - attention_start
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual
         )
-        if profile_decode:
+        if profile_decode and self.decode_timing_sync:
             _profile_sync(hidden_states.device)
             mlp_start = perf_counter()
+        elif profile_decode:
+            mlp_start = perf_counter()
         hidden_states = self.mlp(hidden_states)
-        if profile_decode:
+        if profile_decode and self.decode_timing_sync:
             _profile_sync(hidden_states.device)
+        if profile_decode:
             logger.info(
                 "Decode layer timing: rank=%d layer=%d tokens=%d "
                 "attention_total=%.6fs decode_attention_op=%.6fs "
-                "moe_total=%.6fs mlp_kind=%s backend=%s",
+                "moe_total=%.6fs mlp_kind=%s moe_backend=%s backend=%s",
                 _rank_id(),
                 self.layer_idx,
                 int(hidden_states.shape[0]),
@@ -1677,6 +1749,7 @@ class DeepseekV32DecoderLayer(nn.Module):
                 self.self_attn.last_decode_attention_op_time,
                 perf_counter() - mlp_start,
                 self.mlp_kind,
+                getattr(self.mlp, "moe_backend", "dense"),
                 self.self_attn.decode_attention_backend,
             )
         return hidden_states, residual

@@ -359,6 +359,7 @@ class ModelRunner:
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32).to(self.device)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32).to(self.device)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32).to(self.device)
+        flat_slot_mapping = slot_mapping.to(torch.long)
 
         set_context(True,
                     cu_seqlens_q=cu_seqlens_q,
@@ -366,6 +367,7 @@ class ModelRunner:
                     max_seqlen_q=max_seqlen_q,
                     max_seqlen_k=max_seqlen_k,
                     slot_mapping=slot_mapping,
+                    flat_slot_mapping=flat_slot_mapping,
                     context_lens=None,
                     block_tables=block_tables,
                     block_size=self.config.kvcache_block_size)
@@ -385,11 +387,16 @@ class ModelRunner:
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).to(self.device, non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).to(self.device, non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
+        flat_slot_mapping = (
+            slot_mapping[:, 0].to(torch.long) * self.block_size
+            + slot_mapping[:, 1].to(torch.long)
+        )
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
         block_tables = self._pad_block_tables_to_static_max(block_tables)
         set_context(False,
                     slot_mapping=slot_mapping,
+                    flat_slot_mapping=flat_slot_mapping,
                     context_lens=context_lens,
                     actual_seq_lengths_query=list(range(1, len(seqs) + 1)),
                     actual_seq_lengths_kv=[len(seq) for seq in seqs],
