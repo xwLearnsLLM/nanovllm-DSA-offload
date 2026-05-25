@@ -30,6 +30,7 @@ from nanovllm.utils.logger import init_logger
 
 logger = init_logger(__name__)
 SFA_SPARSE_COUNT = 2048
+ACL_FORMAT_FRACTAL_NZ = 29
 _NPU_MLA_ATTENTION_MASK_CACHE: dict[tuple[str, int], torch.Tensor] = {}
 
 
@@ -111,6 +112,40 @@ def _get_npu_mla_attention_mask(device: torch.device, mask_size: int) -> torch.T
         ).contiguous()
         _NPU_MLA_ATTENTION_MASK_CACHE[key] = mask
     return mask
+
+
+def _round_up(value: int, align: int) -> int:
+    return ((value + align - 1) // align) * align
+
+
+def _trans_rope_weight(weight: torch.Tensor, rope_dim: int) -> torch.Tensor:
+    if rope_dim == 0:
+        return weight.contiguous()
+    nope_part = weight[..., :-rope_dim, :]
+    rope_part = weight[..., -rope_dim:, :]
+    rope_part = torch.cat((rope_part[..., ::2, :], rope_part[..., 1::2, :]), dim=-2)
+    return torch.cat((nope_part, rope_part), dim=-2).contiguous()
+
+
+def _transdata_nz(
+    nd_mat: torch.Tensor,
+    block_size: tuple[int, int] = (16, 16),
+) -> torch.Tensor:
+    rows = _round_up(int(nd_mat.shape[0]), block_size[0])
+    cols = _round_up(int(nd_mat.shape[1]), block_size[1])
+    nd_mat = F.pad(nd_mat, (0, rows - nd_mat.shape[0], 0, cols - nd_mat.shape[1]))
+    nz_mat = nd_mat.reshape(
+        rows // block_size[0],
+        block_size[0],
+        cols // block_size[1],
+        block_size[1],
+    ).permute(2, 0, 1, 3)
+    return nz_mat.reshape(nz_mat.shape[0], nz_mat.shape[1] * nz_mat.shape[2], nz_mat.shape[3])
+
+
+def _to_mlapo_bf16_nz_weight(weight: torch.Tensor) -> torch.Tensor:
+    nz_weight = _transdata_nz(weight, block_size=(16, 16)).unsqueeze(0).contiguous()
+    return torch_npu.npu_format_cast(nz_weight, ACL_FORMAT_FRACTAL_NZ)
 
 
 def yarn_get_mscale(scale: float = 1.0, mscale: float = 1.0) -> float:
@@ -837,8 +872,15 @@ class DeepseekV32DSAAttention(nn.Module):
         self.register_parameter("wd_qkv", None)
         self.w_uk_t = None
         self.w_uv = None
+        self.mlapo_wd_qkv = None
+        self.mlapo_wu_q = None
+        self.mlapo_beta1 = None
         self.fuse_qkv_a = _env_flag("NANOVLLM_FUSE_QKV_A", True)
         self.free_kv_b_proj = _env_flag("NANOVLLM_FREE_KV_B_PROJ", True)
+        self.enable_decode_mlapo = _env_flag(
+            "NANOVLLM_ENABLE_DECODE_MLAPO",
+            False,
+        )
         self.q_up_bmm_trans_max_tokens = _env_int(
             "NANOVLLM_Q_UP_BMM_TRANS_MAX_TOKENS",
             1,
@@ -892,6 +934,7 @@ class DeepseekV32DSAAttention(nn.Module):
             "kv_norm": 0.0,
             "rotary": 0.0,
             "k_squeeze": 0.0,
+            "mlapo": 0.0,
             "indexer": 0.0,
             "cache": 0.0,
             "q_up": 0.0,
@@ -1005,6 +1048,119 @@ class DeepseekV32DSAAttention(nn.Module):
                 gc.collect()
                 if self.w_uk_t.device.type == "npu":
                     torch.npu.empty_cache()
+
+        if self.enable_decode_mlapo:
+            self._prepare_decode_mlapo()
+
+    def _prepare_decode_mlapo(self) -> None:
+        if self.mlapo_wd_qkv is not None and self.mlapo_wu_q is not None:
+            return
+
+        if self.fuse_qkv_a:
+            if self.wd_qkv is None:
+                return
+            q_weight = self.wd_qkv[: self.q_lora_rank].detach()
+            kv_weight = self.wd_qkv[self.q_lora_rank :].detach()
+        else:
+            q_weight = self.q_a_proj.weight.detach()
+            kv_weight = self.kv_a_proj_with_mqa.weight.detach()
+
+        kv_weight = _trans_rope_weight(kv_weight, self.qk_rope_head_dim)
+        wd_qkv = torch.cat((kv_weight, q_weight), dim=0).contiguous()
+        self.mlapo_wd_qkv = _to_mlapo_bf16_nz_weight(wd_qkv)
+
+        wu_q = self.q_b_proj.weight.detach().view(
+            self.num_local_heads,
+            self.qk_head_dim,
+            self.q_lora_rank,
+        )
+        wu_q = _trans_rope_weight(wu_q, self.qk_rope_head_dim)
+        wu_q = wu_q.reshape(
+            self.num_local_heads * self.qk_head_dim,
+            self.q_lora_rank,
+        ).contiguous()
+        self.mlapo_wu_q = _to_mlapo_bf16_nz_weight(wu_q)
+        self.mlapo_beta1 = torch.zeros_like(self.q_a_layernorm.weight)
+        del wd_qkv, wu_q
+        gc.collect()
+        if q_weight.device.type == "npu":
+            torch.npu.empty_cache()
+
+    def _mlapo_cos_sin(
+        self,
+        positions: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        positions = positions.to(torch.long)
+        cos = self.rotary_emb.cos_cache.index_select(0, positions)
+        sin = self.rotary_emb.sin_cache.index_select(0, positions)
+        cos = torch.cat((cos, cos), dim=-1).to(dtype).contiguous()
+        sin = torch.cat((sin, sin), dim=-1).to(dtype).contiguous()
+        return cos, sin
+
+    def _decode_mlapo_preprocess(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        profile_decode: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.mlapo_wd_qkv is None or self.mlapo_wu_q is None:
+            self._prepare_decode_mlapo()
+        if self.mlapo_wd_qkv is None or self.mlapo_wu_q is None:
+            raise RuntimeError("Decode MLAPO weights are not prepared.")
+
+        num_tokens = int(hidden_states.shape[0])
+        ql_nope = torch.empty(
+            num_tokens,
+            self.num_local_heads,
+            self.kv_lora_rank,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        q_pe = torch.empty(
+            num_tokens,
+            self.num_local_heads,
+            self.qk_rope_head_dim,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        inner_out = torch.empty(
+            0,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        cos, sin = self._mlapo_cos_sin(positions, hidden_states.dtype)
+        slotmapping = self._flat_slots()
+        if slotmapping.dtype != torch.int32:
+            slotmapping = slotmapping.to(torch.int32)
+
+        start = self._decode_timer_start(profile_decode, hidden_states.device)
+        ascend_ops.mla_preprocess(
+            hidden_states,
+            self.mlapo_wd_qkv,
+            None,
+            self.q_a_layernorm.weight,
+            self.mlapo_beta1,
+            self.mlapo_wu_q,
+            None,
+            self.kv_a_layernorm.weight,
+            cos,
+            sin,
+            self.w_uk_t,
+            self.ckv_cache,
+            self.kpe_cache,
+            slotmapping,
+            q_out0=ql_nope,
+            kv_cache_out0=self.ckv_cache,
+            q_out1=q_pe,
+            kv_cache_out1=self.kpe_cache,
+            inner_out=inner_out,
+            cache_mode="krope_ctkv",
+            quant_mode="no_quant",
+            enable_inner_out=False,
+        )
+        self._decode_timer_end(profile_decode, "mlapo", start, ql_nope.device)
+        return ql_nope, q_pe
 
     @property
     def block_size(self) -> int:
@@ -1660,6 +1816,20 @@ class DeepseekV32DSAAttention(nn.Module):
         if self.fuse_qkv_a and self.wd_qkv is None:
             self.post_load_prepare()
 
+        use_decode_mlapo = (
+            self.enable_decode_mlapo
+            and not context.is_prefill
+            and self.decode_attention_backend == "mla"
+        )
+        if use_decode_mlapo:
+            ql_nope, q_pe = self._decode_mlapo_preprocess(
+                positions,
+                hidden_states,
+                profile_decode,
+            )
+            attn_output = self._decode_forward(ql_nope, q_pe, None, None)
+            return self._o_proj_forward(attn_output, profile_decode)
+
         start = self._decode_timer_start(profile_decode, hidden_states.device)
         if self.fuse_qkv_a:
             qkv_a = F.linear(hidden_states, self.wd_qkv)
@@ -1848,7 +2018,7 @@ class DeepseekV32DecoderLayer(nn.Module):
                 "Decode layer timing: rank=%d layer=%d tokens=%d "
                 "attention_total=%.6fs qkv_a=%.6fs q_norm=%.6fs "
                 "q_b=%.6fs kv_rope=%.6fs kv_split=%.6fs kv_norm=%.6fs "
-                "rotary=%.6fs k_squeeze=%.6fs indexer=%.6fs cache=%.6fs "
+                "rotary=%.6fs k_squeeze=%.6fs mlapo=%.6fs indexer=%.6fs cache=%.6fs "
                 "q_up=%.6fs decode_attention_op=%.6fs v_up=%.6fs "
                 "o_proj=%.6fs o_linear=%.6fs o_all_reduce=%.6fs "
                 "attention_gap=%.6fs "
@@ -1865,6 +2035,7 @@ class DeepseekV32DecoderLayer(nn.Module):
                 attention_detail["kv_norm"],
                 attention_detail["rotary"],
                 attention_detail["k_squeeze"],
+                attention_detail["mlapo"],
                 attention_detail["indexer"],
                 attention_detail["cache"],
                 attention_detail["q_up"],

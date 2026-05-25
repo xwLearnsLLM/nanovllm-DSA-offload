@@ -608,3 +608,50 @@ PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ut_ops/prob
 - 第 42 条第三个命令改成 `--weight-block-cols 32`，作为对照诊断，不再推荐 `per_tensor_quant_asymm`。
 
 下一步：让用户不用重编 C++，直接重新运行第 41 条两个 MLAPO probe。
+## 2026-05-25：runlog13，BF16 no-quant MLAPO probe 已经对齐
+
+用户重新运行第 41 条 MLAPO probe，结果在 `runlog/runlog13.txt`。
+
+这次 `ut_ops/probe_mla_preprocess.py` 使用：
+- `quant_mode=no_quant`
+- `format_cast=True`
+- `weight_block_cols=16`
+
+结果已经从之前的大误差降到 BF16 舍入量级：
+
+- `tokens=7`
+  - `ql_nope relative_mean_abs_error=0.000262733`
+  - `q_pe relative_mean_abs_error=0.000275258`
+  - `ckv_cache_valid relative_mean_abs_error=0.00013137`
+  - `kpe_cache_valid relative_mean_abs_error=9.27761e-05`
+  - `MLAPO_BENCH avg_ms=0.166826`
+- `tokens=128`
+  - `ql_nope relative_mean_abs_error=0.000242315`
+  - `q_pe relative_mean_abs_error=0.000284219`
+  - `ckv_cache_valid relative_mean_abs_error=0.000112414`
+  - `kpe_cache_valid relative_mean_abs_error=0.000124613`
+  - `MLAPO_BENCH avg_ms=0.196989`
+
+结论：
+- BF16 no-quant MLAPO 的权重 NZ 分块应为 `(16, 16)`。
+- 之前使用 `(16, 32)` 是沿用了 vllm-ascend W8A8/量化 MLAPO 路径，会导致 BF16 no-quant kernel 读错权重。
+- `nanovllm.ops.mla_preprocess` 现在可以作为 decode attention 前处理融合算子的候选集成到 `deepseek_v32.py`。
+
+下一步建议：
+1. 先用开关集成 MLAPO decode 前处理，默认可以暂时关闭，避免一次性引入额外显存和行为变化。
+2. 集成时要注意显存：MLAPO 需要 NZ 版 `wdqkv/wuq`，如果同时保留普通 `wd_qkv/q_b_proj.weight`，每层会多一份较大的 attention 权重。
+3. 如果要默认开启 MLAPO，最好进一步把 prefill 也切到 MLAPO 前处理，或者在只测 decode 的场景中释放普通路径权重，否则 TP4 可能再次逼近显存上限。
+
+已开始把 MLAPO 集成进 `nanovllm/models/deepseek_v32.py`：
+- 新增 `NANOVLLM_ENABLE_DECODE_MLAPO`，默认关闭。
+- 开启后，仅在 `decode_attention_backend=mla` 且 decode 阶段使用 `nanovllm.ops.mla_preprocess`。
+- MLAPO 路径融合：
+  - qkv-a
+  - q RMSNorm
+  - q-b / q-up 到 latent
+  - kv RMSNorm
+  - RoPE
+  - CKV/KPE cache 写入
+- 普通 prefill 路径保持不变，SFA/torch sparse decode 路径保持不变。
+- decode layer timing 中新增 `mlapo` 字段，用来观察融合前处理本身的耗时。
+- README 新增第 43 条 `Decode MLAPO Path`，建议先用 TP8 跑，因为当前还会额外保存 NZ 格式 `wdqkv/wuq` 权重。
