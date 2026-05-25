@@ -727,3 +727,59 @@ README 新增第 44 条命令：
 3. 为每层复用 MLAPO 输出 scratch buffer：`ql_nope`、原始 `q_pe`、空 `inner_out`。这减少每步每层的 NPU tensor 分配压力。
 
 README 新增第 45 条命令，建议对比第 44 条的 TPOT，以及 layer timing 中的 `mlapo` 和 `attention_gap`。
+
+## 2026-05-25：runlog17 小算子缓存结果
+
+用户运行带 timing 和不带 timing 的第 45 条命令，日志在 `runlog/runlog17.txt`。
+
+观察：
+- timing 片段虽然不完整，但 layer 60 足够说明趋势：
+  - `attention_gap` 从 runlog16 的约 `0.25~0.27ms` 降到约 `0.11ms`。
+  - `attention_total` 从 runlog16 的约 `0.86~0.95ms` 降到约 `0.71~0.82ms`。
+  - `mlapo` 仍约 `0.27~0.32ms`，说明 cos/sin/slot/buffer 缓存主要压掉的是 Python/小 tensor/未细分 gap，而不是 MLAPO 算子本体。
+- 无 timing 版本：
+  - 第 3~9 个 decode step 基本在 `0.115~0.117s`。
+  - 总 decode time `1.8899s`，decode TPS `55.56 tok/s`。
+  - 对比 runlog15 的 batch=7 MLAPO decode total `1.9280s` / `54.46 tok/s`，端到端收益约 2%；对比 runlog16 的 timing run `2.0708s` / `50.70 tok/s`，带 timing 下收益更明显。
+
+结论：
+- 这轮小算子缓存是正确方向，但收益已经接近 Python 层小优化的边界。
+- 当前 decode attention 侧剩余主项大致是：`mlapo ~0.3ms/layer`、FIA decode op `~0.12ms/layer`、`v_up ~0.08ms/layer`、`o_proj/all_reduce ~0.12~0.15ms/layer`，再加 MoE `~0.68~0.80ms/layer`。
+- 下一步如果继续只看 attention，优先考虑两条：
+  1. 把 MLAPO 后的 RoPE basis 转换彻底融合/消掉：让 MLAPO 直接产出 interleaved `q_pe/kpe_cache`，或让 prefill/decode cache 全部统一到 neox basis。这需要改 kernel 或更大范围改 RoPE/cache 约定。
+  2. 对齐 vllm-ascend 的 `npu_fused_infer_attention_score_v2` + out/workspace 路径，减少 FIA 调度和分配开销。
+
+## 2026-05-25：新增两个独立 decode attention 实验开关
+
+按用户要求，把上面两条 attention 优化都做成可单独开关，便于其中一个崩了还能测另一个。
+
+新增开关：
+1. `NANOVLLM_MLA_ROPE_NEOX_CACHE`
+   - 默认关。
+   - 开启后，普通 prefill/非 MLAPO 路径在 RoPE 后把 `q_pe/k_pe` 从 interleaved 转成 neox，再写入/使用 cache。
+   - MLAPO decode 路径则跳过原先的 `_rope_neox_to_interleaved(q_pe)` 和当前 token `kpe_cache` 回写转换。
+   - 目标是让 prefill 历史 cache 和 decode 新 token cache 全部统一为 neox basis，从而消掉 MLAPO decode 每层的后转换开销。
+   - 这是实验开关；如果输出变差，直接关掉。
+2. `NANOVLLM_DECODE_MLA_FIA_V2`
+   - 默认关。
+   - 开启后，dense MLA decode 从 `torch_npu.npu_fused_infer_attention_score` 切到 `torch_npu.npu_fused_infer_attention_score_v2.out`。
+   - 使用模块级共享 workspace cache，避免每层各存一份 workspace 导致显存暴涨。
+   - 每层只保留自己的输出/LSE buffer。
+
+README 新增：
+- 第 46 条：只开 `NANOVLLM_MLA_ROPE_NEOX_CACHE=1`。
+- 第 47 条：只开 `NANOVLLM_DECODE_MLA_FIA_V2=1`。
+- 第 48 条：两个开关同时开，建议等 46/47 分别通过后再跑。
+
+补充实现细节：
+- FIA v2 路径对齐 vllm-ascend 的 `input_layout="BNSD_NBSD"`，调用前把本仓库的 paged cache 从逻辑形状 `[num_blocks, block_size, 1, dim]` 视图改成 `[num_blocks, 1, block_size, dim]`。
+- 因为 DeepSeek MLA 的 KV head 数是 1，这个 `view` 不复制大 cache，只是避免把旧的 `PA_BSND` 形状直接喂给 FIA v2。
+- v2 workspace 用模块级 cache，key 包含 batch/device/dtype/block_size/local_heads/latent_dim，避免每层各自保存一份大 workspace。
+
+用户提醒：这种 shape/view 和 RoPE basis 的处理属于“行为正确的 trick”，代码里必须加注释，否则后续接手者容易误以为是 bug。
+
+已补注释：
+- MLAPO decode 后为什么有时要把 neox RoPE 转回 interleaved，有时可以跳过。
+- `NANOVLLM_MLA_ROPE_NEOX_CACHE=1` 为什么需要普通路径也把 q/k 转成 neox，并且为何数学上保持 q/k 同 basis 即可。
+- FIA v2 为什么把 cache 从 `[blocks, block_size, 1, dim]` view 成 `[blocks, 1, block_size, dim]`，以及为什么 kv_heads=1 时不会复制大 cache。
+- FIA v2 输出为什么从 `[heads, tokens, 1, dim]` 转回 `[tokens, heads, dim]`。

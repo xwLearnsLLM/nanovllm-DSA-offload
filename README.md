@@ -57,6 +57,8 @@ PYTHONPATH=$PWD:$PYTHONPATH python -m pip show nano-vllm-ascend
 | `NANOVLLM_IGNORE_EOS` | `true` in `example/test.py`, `false` in prompt examples | examples | `true` keeps decoding until `max_tokens`; `false` stops on EOS. `example/test.py` defaults to `true` so exact decode-length tests are not cut short by EOS. |
 | `NANOVLLM_DECODE_ATTENTION_BACKEND` | `mla` | `deepseek_v32.py` | Decode attention backend. `mla` uses dense paged MLA; `torch` uses the slow PyTorch sparse reference; `sfa` uses `nanovllm.ops.npu_sparse_flash_attention`. |
 | `NANOVLLM_ENABLE_DECODE_MLAPO` | `false` | `deepseek_v32.py` | `true` fuses decode qkv-a, q RMSNorm, q-up, kv RMSNorm, RoPE, cache write, and q-nope-up into `nanovllm.ops.mla_preprocess`. It needs extra NZ attention weights, so TP8 is safer for first tests. |
+| `NANOVLLM_MLA_ROPE_NEOX_CACHE` | `false` | `deepseek_v32.py` | `true` stores MLA RoPE cache in neox basis and skips MLAPO's decode post-conversion back to interleaved. This is experimental; use it with dense MLA paths first. |
+| `NANOVLLM_DECODE_MLA_FIA_V2` | `false` | `deepseek_v32.py` | `true` uses `torch_npu.npu_fused_infer_attention_score_v2.out` for dense MLA decode, with shared workspace cache and per-layer output buffers. Experimental. |
 | `NANOVLLM_ENABLE_NPU_SFA_DECODE` | `false` | `deepseek_v32.py` | Legacy override. `true` forces decode backend to SFA even if `NANOVLLM_DECODE_ATTENTION_BACKEND` is set. This currently reproduces the SFA decode crash. |
 | `NANOVLLM_COMPARE_NPU_SFA_DECODE` | `false` | `deepseek_v32.py` | When SFA decode is enabled, also computes the PyTorch sparse reference and logs the max difference. |
 | `NANOVLLM_PROFILE_LAYER_IDS` | `0,mid,last` | `deepseek_v32.py` | Selects layers for timing/logging/dumps. Accepts comma-separated ids plus `mid`, `last`, `all`, or `*`. |
@@ -243,4 +245,32 @@ timings against section 44.
 
 ```bash
 PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANOVLLM_GPU_MEMORY_UTILIZATION=0.8 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=8 NANOVLLM_DECODE_ATTENTION_BACKEND=mla NANOVLLM_ENABLE_DECODE_MLAPO=1 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=0 NANOVLLM_PROFILE_LAYER_IDS=0,mid,last NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_SKIP_WARMUP=1 python example/short_prompts.py
+```
+
+## 46. Decode Neox RoPE Cache Switch
+
+No rebuild is needed. This stores MLA RoPE cache in neox basis for both prefill
+and decode, so the MLAPO decode path can skip converting `q_pe/kpe_cache` back
+to interleaved after every token. Test this switch alone first.
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANOVLLM_GPU_MEMORY_UTILIZATION=0.8 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=8 NANOVLLM_DECODE_ATTENTION_BACKEND=mla NANOVLLM_ENABLE_DECODE_MLAPO=1 NANOVLLM_MLA_ROPE_NEOX_CACHE=1 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=0 NANOVLLM_PROFILE_LAYER_IDS=0,mid,last NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_SKIP_WARMUP=1 python example/short_prompts.py
+```
+
+## 47. Decode FIA V2 Switch
+
+No rebuild is needed. This switches dense MLA decode to
+`torch_npu.npu_fused_infer_attention_score_v2.out` and reuses a shared
+workspace cache. Test this switch alone first.
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANOVLLM_GPU_MEMORY_UTILIZATION=0.8 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=8 NANOVLLM_DECODE_ATTENTION_BACKEND=mla NANOVLLM_ENABLE_DECODE_MLAPO=1 NANOVLLM_DECODE_MLA_FIA_V2=1 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=0 NANOVLLM_PROFILE_LAYER_IDS=0,mid,last NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_SKIP_WARMUP=1 python example/short_prompts.py
+```
+
+## 48. Decode Neox Cache Plus FIA V2
+
+Run this only after sections 46 and 47 work separately.
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANOVLLM_GPU_MEMORY_UTILIZATION=0.8 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=8 NANOVLLM_DECODE_ATTENTION_BACKEND=mla NANOVLLM_ENABLE_DECODE_MLAPO=1 NANOVLLM_MLA_ROPE_NEOX_CACHE=1 NANOVLLM_DECODE_MLA_FIA_V2=1 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=0 NANOVLLM_PROFILE_LAYER_IDS=0,mid,last NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_SKIP_WARMUP=1 python example/short_prompts.py
 ```

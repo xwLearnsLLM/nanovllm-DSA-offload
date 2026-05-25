@@ -1,0 +1,172 @@
+既然现在 nano-vllm-ascend + deepseek v32 这个基线已经足够完善，下一步我想让你做一件事情，这才是我真正想让你做的，之前的工作都是铺垫。
+
+
+
+
+
+摘要：
+借助 deepseek v32 的稀疏 attention 机制（Deepseek sparse attention, DSA），在 decode 阶段做 KVcache-offloading ，在 prefill 结束时将大部分 KVcache 卸载到 CPU DRAM 上，这样一个请求一旦进入 decode，大部分 HBM KVcache就会被释放，从而降低显存占用，在显存有限的情况下提升 decode batch-size 。
+此外，这项技术最关键的就是要在 HBM 上（也就是这个请求的大部分显存块被释放后，这个请求剩余的 KVcache HBM 块内）维护一些热的 KVcache tokens 作为缓存，并在每个 decode step 动态召回一部分当前急需的 KVcache tokens ，并淘汰另一部分分数最低的 KVcache tokens 。
+
+
+概念说明：
+0. DSA : deepseek sparse attention 
+1. KVcache : deepseekv32 是把原本的 KVcache 压缩成 kpe cache 和 nope cache 。所以本文之后提到 KVcache 是指 kpe cache + nope cache 的统称。 它们的 shape 应该是 .....
+2. Indexcache : 是指 deepseek v3.2 的 indexer 对应的 k 表征 。 Indexcache = [(L, Cidx, B=128, 1, head_dim=128), bf16, npu]
+3. layer_kv_token : 一层的1个token对应的KVcache
+4. ground_truth 2048 : 是指 DSA 在某一decode step的某一层选中的 2048 个 token 。简称 GT2048 。如果 GT2048 全部参与了 attention 计算，我们就认为推理是无损的。如果无法保证 GT2048 全都参与 attention 计算，则认为推理是有损的。
+5 .....
+
+
+符号说明： 
+0. 模型相关
+    L = 61 : 模型层数
+1. nanovllm引擎相关：
+    Cidx  : HBM 上 Indexcache 的物理块数量。也即 IndexBlockManager 管理的物理块数量
+    Chbm  : HBM 上 KVcache 的物理块数量。也即 HBMBlockManager 管理的物理块数量
+    Cdram : DRAM 上 KVcache 的物理块数量。也即 DramBlockManager 管理的物理块数量
+    max_decode_batch : 一次调度允许的最大 decode batch-size
+    max_model_len : 模型最大支持的序列长度。理论上是模型参数，但实际上nanovllm引擎可以设置，所以算引擎参数。
+2. 每次decode 调度相关：
+    bs : decode batch size ，也就是一次 decode llm.step() 的并发处理的请求数
+3. 站在一个请求的角度：
+    3.1  B  : nano-vLLM KVcache block size (典型 B=128)
+    3.2  Sp : 请求的 prefill 序列长度 (tokens)
+    3.3  Sd : 请求的 当前已经 decode 的 token 数量。 prefill阶段 Sd=0, 第一步decode时 Sd=1，第2步decode时 Sd=2
+    3.4  Np : 请求的 prefill 需要的整块的数量， Np = Sp / B (向下取整)
+    3.5  Nr : 请求的 prefill 末尾非满块需要的块数， Nr=(Sp+B-1)/B -  Np ，只可能取 0 或者 1。如果 Sp 刚好能整除 b ，则 r=0 ，如果 Sp 不能整除 b ，则 r=1
+    3.6  Nd : 请求的 prefill 末尾非满块以及 decode 新产生的 token 所需的块数量。 Nd = (Sp+Sd+B-1)/B - Np
+    3.7  Nc : 请求的 Np中命中 DRAM 的块数（前缀缓存）
+    3.8  (Np-Nc) : 请求的 未命中 DRAM 的块数（非前缀缓存）
+    3.9  Ns : 请求的 HBM sparse budget block count ，请求原本有 Np 个 prefill 块，在 prefill 结束后，针对 prefill 块保留 Ns 个块，用来作为 HBM sparse budget blocks 。而 Np 个块则全部被卸载到 DRAM 。因此，HBM上一共有 Ns*B 个稀疏token预算。后续的稀疏都是从 DRAM 上的 Np*B 个 token 中挑选重要的 token 加载到 Ns 个块中，同时淘汰 Ns 个块中不重要的 token 。
+    3.10 Tp=Np*B : 从DRAM上参与稀疏候选的 layer_kv_token 的数量
+    3.11 Ts=Ns*B : 在HBM上存放的被缓存的 layer_kv_token 的数量（或者叫token数量预算更合适）。必然有 Ns ≤ Np
+    3.12 Tx   : 该请求每个 decode step 的每一层，从 DRAM 加载到 HBM 的 token 数量。可能每步每层都不一样，也可能一样。取决于具体采用什么算法。
+
+
+零、背景、deepseek v3.2 的 DSA (deepseek sparse attention) 机制：
+    1. 背景：简要介绍一下 DSA
+    2. 机遇和挑战：长序列下，每个请求占较大的显存，导致decode batch-size首先，GPU/NPU算力用不满，导致算力浪费，TPS远不如短序列decode。
+
+
+一、DSA稀疏卸载算法设计：
+    本节只描述算法，不涉及框架方案，先给读者一个overview。我们使用一种 "动态缓存更新" 的方法来进行 DSA 卸载。算法流程如下：
+    1. 在prefill结束后，卸载全部的 KVcache （也即Np*）到 DRAM 。同时，在 prefill 进行到各层时，使用 prefill 阶段的 indexer 挑选重要的 top Ts 个 layer_kv_token 加载到 HBM 上。
+    2. 在每个decode step的每一层： 
+       2.1 token分数计算：先使用 indexer 机制，对每个 token 打分，得到 score 
+       2.2 缓存更新算法：在 HBM 上已有的 Ts 个 token 中，挑选 Tx 个不重要的（称为 demote tokens）。再在 DRAM 上挑选 Tx 个重要的（称为 promote tokens），把重要的 token 加载来，覆盖掉不重要的。具体有2种算法：
+           2.2.1 无损算法 （Tx不是固定值）： 
+               - 对 score 求 top2048 得到 GT2048 ，
+               - 求 Tx = GT2048 - Ts (求差集，这里写的不是很严谨) 作为 promote tokens 
+               - 在 Ts - GT2048 差集中找出 bottom-Tx (最低Tx的分数) 作为 demote tokens 
+               - 用 promote tokens 加载上来覆盖 demote tokens 。 
+               - 最后，用 MLA 算子计算全部 HBM 上的 Ts 个 tokens 的 attention 。注意这里不是用 sparse_flash_attention (sfa) 而是 MLA ，是因为 Ts 个 token 在 HBM上反倒是 page 粒度存储的，可以用 MLA 。
+               - 由于这种方法能保证 GT2048 全部参与 MLA ，因此被认为是无损。
+           2.2.2 有损算法（Tx会是一个固定值，该固定值可调）： 
+               - 对HBM 上的 Ts 个 token 按分数求 bottom-Tx ，作为 demote tokens 
+               - 对 "HBM上没有，但是DRAM上已有" 的 Tp-Ts 个 tokens 按分数求 top-Tx ，作为 promote tokens 。
+               - 用 promote tokens 加载上来覆盖 demote tokens 。 
+               - 最后，用 MLA 算子计算全部 HBM 上的 Ts 个 tokens 的 attention 。同上。
+           
+       
+
+
+二、框架方案overview （为了支持上述算法，设计了以下推理框架方案）
+1. 站在请求角度：请求在 prefill 阶段，申请 Np+Nr 个 KVcache 块 ，……
+2. 站在框架改造的角度，包括几大改造：
+    1. 块管理器：将 nanovllm 原本的 1 个块管理器 (BlockManager) 拆分为3个，目的是使得它们能被独立申请和释放：
+        1.1 IndexBlockManager (for IndexCache on HBM)，块数 = Cidx
+        1.2 HBMBlockManager (for KVcache on HBM)，块数 = Chbm 
+        1.3 DramBlockManager (for KVcache on DRAM) ，块数 = Cdram
+         * 注意：应该让 Cidx 略大于 Cdram ，Cdram 远远大于 Chbm 。 应该加入一个 nanovllm 超参数来控制 Cdram / Chbm 的比值。
+    2. Sequence对象（请求对象）：需要加入一些元数据成员变量：
+        2.1 index_block_table, hbm_block_table, dram_block_table
+        2.2 Np 等元数据，从而让 worker 能够知道
+        2.3 需要加入 int 形元数据 hbm_cached_tokens_pool_entry
+    3. Scheduler 调度器：
+        3.1 当决定一个请求能否调度，原本只要看 BlockManager 是否能申请到，现在是要看 3 种 BlockManager 是否都能申请到。
+        3.2 在prefill结束时要从 HBMBlockManager 中释放一部分 
+        3.3 需要加入 HBMcachedTokensPoolEntryManager ，每个请求用它来申请 hbm_cached_tokens_pool_entry ，用来指向 hbm_cached_tokens_pool 中的一个槽位。请求结束时，需要释放 hbm_cached_tokens_pool_entry ，以便它能被其它请求使用。
+    4. Worker (ModelRunner)：
+        4.1 需要加入物理块 tensors: IndexCache、hbm_kvcache、cpu_kvcache
+        4.2 需要加入 tensor: hbm_cached_tokens_pool = [(L, max_decode_batch, max_model_len), int32, npu], 该 tensor 用于记录各个请求的各层在当前的 decode step 缓存的 token 索引。（这也是我面的缓存更新算法的关键）。
+             注意： hbm_cached_tokens_pool 是一个池子，一个请求 req 在其中会占用槽位 hbm_cached_tokens_pool[:, req.hbm_cached_tokens_pool_entry, :]
+             * 之所以这里要把 hbm_cached_tokens_pool 做成 "槽位申请释放制" ，是因为 model.forward() 会更新 hbm_cached_tokens_pool , 下一个decode step 也要使用更新后的 hbm_cached_tokens_pool
+        4.3 在 model.forward 开始前，需要额外 tensor 化一些东西，以便后续 model.forward 时能做到全算子化。
+            当前所有组batch进行decode的请求的 req.hbm_cached_tokens_pool_entry 需要算子化成一个 tensor : req_pool_entries = [(bsz,), int32, npu]
+    5. Worker内的模型forward流程（deepseek_v32.py）：
+        5.3 需要加入3个算子：
+            - dsa_indexer_score ：计算分数，相当于原本 npu_lightning_indexer 的前半部分算分数的部分
+            - dsa_index_update ：缓存索引更新算子：挑选 promote 和 demote tokens 。其具体实现决定了是 2.2.1无损算法 还是 2.2.2有损算法 
+            - dsa_scatter_h2d ：根据 dsa_index_update 的结果，执行实际的 H2D 搬移。
+
+
+
+三、站在每个请求的角度讲，应该是以下流程：
+1. prefill阶段：
+    1.1 scheduler侧： 申请 (Np+Nr) 个 HBM blocks 和 Np 个 DRAM blocks 。并用哈希匹配前缀缓存命中，假设 Np 中有 Nc 个前缀块缓存命中。
+    1.2 worker侧： 
+        1.2.1 将 Nc 个命中的块从 DRAM 加载到 HBM (为了简单起见，不需要流水加载，在 model.forward 之前加载就行)
+        1.2.2 运行 model.forward() ，将计算出的 (Np-Nc) 个未命中的 KVcache 块填入 HBM。此外，也要填入 Nr 这个非满块到 HBM 
+              - 每层运行结束后，将 (Np-Nc) 个计算出的块从 HBM 卸载到 DRAM 。然后，挑选重要的 Ts=Ns*B 个 tokens ，放到 Np 个 HBM 块中的前 Ns 个块内。相当于初始化缓存
+    1.3 scheduler侧： worker 工作结束后，释放大部分HBM块（被释放的块后面会允许其它请求占用），保留一小部分。关于保留的数量，是一个分段函数：
+        情况1  Np<64, 不释放。相当于序列长度 <8192 时，不做 decode 卸载，Ns = Np
+        情况2  64  ≤ Np < 128, Ns = Np * 0.30 (向上取整)
+        情况3  128 ≤ Np < 256, Ns = Np * 0.25 (向上取整)
+        情况4  256 ≤ Np < 512, Ns = Np * 0.22 (向上取整)
+        情况5  512 ≤ Np      , Ns = Np * 0.20 (向上取整)
+        实际上，以上参数 0.30, 0.25, 0.22, 0.20 都做成宏定义。
+        注意：应该从每个请求的 block_table 的末尾开始释放，保留前面的 Ns 个块。因为之前 model.forward 中已经挑选了重要的 tokens 到前面 Ns 个块中。
+2. decode阶段：
+    2.1 scheduler侧： 如果一个请求的最后一个 KVcache 块满了，就从 IndexBlockManager 和 HBMBlockManager 申请新块。decode阶段的 KVcache 不参与卸载。
+    2.2 worker侧： 
+        - 每层运行 dsa_indexer_score、dsa_index_update、dsa_scatter_h2d 。
+        - 然后在 Ns 个稀疏budget块和 Nd 个 decode tokens 上计算 MLA （注意这里用MLA而不是SFA）
+
+
+四、块管理器详细设计：
+1. 修改前：
+   原本的 nano-vLLM 只有 BlockManager。对于 deepseekv32 模型来说，当请求进入 prefill 阶段时、或者 decode 攒满一个块时，需要从 BlockManager 中申请 HBM 块号，对于每个请求，会有一个 request.block_table ，也即它申请的块号。 request.block_table 共同管理 KVcache (KVcache包括了 kpe cache 和 nope cache 。以后说 KVcache 都是指 kpe cache + ) 和 IndexCache (IndexCache 是指 deepseek v3.2 的 indexer 对应的 k 表征）。此外，BlockManager 还能通过 hash 匹配，实现 GPU 上的前缀缓存复用（对于 deepseekv32 ，其实 KV）。
+2. 修改后：需要将 BlockManager 解耦为三个 BlockManager
+   2.1  IndexBlockManager : 管理 HBM 上的 IndexCache (包括prefill和decode阶段新产生的)。IndexCache 是不会卸载到 DRAM 的。允许 prefill 阶段的满块进行前缀复用，只有 prefill 阶段的满块会保留合法的 hash 。
+   2.2  HBMBlockManager : 管理 HBM 上的 KVcache 。完全不允许任何前缀复用，因此完全不需要 hash 机制。
+        2.2.1 当一个请求在prefill阶段，HBMBlockManager 管理该请求的 prefill 阶段的全量 KVcache 
+        2.2.2 当一个请求在decode阶段， HBMBlockManager 管理该请求的 prefill 阶段的一部分 KVcache (token粒度打散)，以及 decode 阶段新产生的全部 KVcache . decode 阶段新产生的 KVcache 并不会卸载到 DRAM ，而是全部放在 HBM 上。
+   2.3  DramBlockManager : 管理卸载到 DRAM 上的 KVcache 。只有 prefill 序列的满块会卸载到 DRAM ，且允许前缀复用，这些块都会保留hash。decode阶段 新产生的 KVcache 并不会卸载到 DRAM 。
+
+
+五、 Sequence对象详细设计：
+
+
+六、 Scheduler 详细设计：
+
+
+七、 Worker 详细设计：
+
+
+
+八、 模型forward流程详细设计：
+     
+     8.1 dsa_indexer_score 算子：（定义清楚算子接口）
+     8.2 dsa_index_update 算子： （定义清除算子接口）
+     8.3 dsa_scatter_h2d 算子：（定义清楚算子接口）
+
+
+
+
+
+其它考量：
+1. TP 时怎么做？。只有 tp_rank0 计算 dsa_indexer_score、dsa_index_update ，然后把结果广播到所有rank，好像也行？或者每个请求做冗余重复计算，
+2. 抢占
+3. 所有 TP rank 要拥有相同的 Chbm, Cidx, Cdram
+4. 当前架构设计，只能复用请求的prefill阶段的KVcache，无法复用decode阶段的KVcache。
+5. decode model.forward() 中的算子必须可以组 batch ，不允许 for b in batch-size 这种写法出现，为后续可组图做准备。
+
+
+
+写文档的注意事项：
+1. 先仔细阅读我写的设计文档初稿，如果你对以上的任何细节有疑问，或者觉得我的方案有的细节不够好，找我讨论。然后再开始动笔写文档。
+2. 不能假设读者熟悉 vllm 和 nanovllm ，关键的概念一定要介绍。
+3. 除了专有名词外，不要滥用英文词汇。
+4. 我在写以上提纲时，有时候偷懒把 "一层的1个token对应的KVcache" ，也即 layer_kv_token 简称为 "token" ，其实这不严谨。你写的时候注意把它们都改成 layer_kv_token
+5. 如果我文档里有写错，或者单纯的笔误，提出疑问并和我确认，要有质疑精神。
