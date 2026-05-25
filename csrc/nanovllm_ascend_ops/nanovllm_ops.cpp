@@ -17,12 +17,47 @@ extern void batch_matmul_transpose_impl(
     void* gm_c,
     void* gm_tiling_data,
     const uint32_t block_dim);
+
+extern void mla_preprocess_impl(
+    void* stream,
+    void* hidden_state,
+    void* quant_scale1,
+    void* quant_offset1,
+    void* wdqkv,
+    void* bias1,
+    void* gamma2,
+    void* beta2,
+    void* quant_scale2,
+    void* quant_offset2,
+    void* gamma3,
+    void* sin1,
+    void* cos1,
+    void* sin2,
+    void* cos2,
+    void* keycache,
+    void* slot_mapping,
+    void* wuq,
+    void* bias2,
+    void* wuk,
+    void* descale1,
+    void* descale2,
+    void* ctkv_scale,
+    void* qnope_scale,
+    void* q,
+    void* keycache_out,
+    void* q2,
+    void* keycache_out2,
+    void* inner_out,
+    void* workspace,
+    void* tiling,
+    const uint32_t block_dim);
 }  // namespace vllm_ascend
 
 #include "batch_matmul_transpose/batch_matmul_transpose_torch_adpt.h"
 #include "cann_ops/lightning_indexer_vllm/lightning_indexer_vllm_torch_adpt.h"
 #include "cann_ops/moe_gating_top_k/moe_gating_top_k_torch_adpt.h"
 #include "cann_ops/sparse_flash_attention/sparse_flash_attention_torch_adpt.h"
+#include "mla_preprocess/mla_preprocess_torch_adpt.h"
 
 namespace py = pybind11;
 
@@ -145,6 +180,81 @@ void batch_matmul_transpose_py(
       quant_view);
 }
 
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+mla_preprocess_py(
+    const at::Tensor& hidden_state,
+    const at::Tensor& wdqkv,
+    py::object descale0,
+    const at::Tensor& gamma1,
+    py::object beta1,
+    const at::Tensor& wuq,
+    py::object descale1,
+    const at::Tensor& gamma2,
+    const at::Tensor& cos,
+    const at::Tensor& sin,
+    const at::Tensor& wuk,
+    const at::Tensor& kv_cache,
+    const at::Tensor& kv_cache_rope,
+    const at::Tensor& slotmapping,
+    at::Tensor q_out0,
+    at::Tensor kv_cache_out0,
+    at::Tensor q_out1,
+    at::Tensor kv_cache_out1,
+    at::Tensor inner_out,
+    py::object quant_scale0,
+    py::object quant_offset0,
+    py::object bias0,
+    py::object quant_scale1,
+    py::object quant_offset1,
+    py::object bias1,
+    py::object ctkv_scale,
+    py::object q_nope_scale,
+    py::object cache_mode,
+    py::object quant_mode,
+    bool enable_inner_out) {
+  std::optional<std::string> cache_mode_storage;
+  std::optional<std::string> quant_mode_storage;
+  auto cache_mode_view = optional_string_view(cache_mode, cache_mode_storage);
+  auto quant_mode_view = optional_string_view(quant_mode, quant_mode_storage);
+  vllm_ascend::mla_preprocess(
+      hidden_state,
+      wdqkv,
+      optional_tensor(descale0),
+      gamma1,
+      optional_tensor(beta1),
+      wuq,
+      optional_tensor(descale1),
+      gamma2,
+      cos,
+      sin,
+      wuk,
+      kv_cache,
+      kv_cache_rope,
+      slotmapping,
+      optional_tensor(quant_scale0),
+      optional_tensor(quant_offset0),
+      optional_tensor(bias0),
+      optional_tensor(quant_scale1),
+      optional_tensor(quant_offset1),
+      optional_tensor(bias1),
+      optional_tensor(ctkv_scale),
+      optional_tensor(q_nope_scale),
+      cache_mode_view,
+      quant_mode_view,
+      enable_inner_out,
+      q_out0,
+      kv_cache_out0,
+      q_out1,
+      kv_cache_out1,
+      inner_out);
+  return std::make_tuple(
+      q_out0,
+      kv_cache_out0,
+      q_out1,
+      kv_cache_out1,
+      inner_out);
+}
+
 }  // namespace
 
 PYBIND11_MODULE(_C, m) {
@@ -200,4 +310,37 @@ PYBIND11_MODULE(_C, m) {
       py::arg("tensor_c"),
       py::arg("format_mode") = py::none(),
       py::arg("quant_mode") = py::none());
+  m.def(
+      "mla_preprocess",
+      &mla_preprocess_py,
+      py::arg("hidden_state"),
+      py::arg("wdqkv"),
+      py::arg("descale0"),
+      py::arg("gamma1"),
+      py::arg("beta1"),
+      py::arg("wuq"),
+      py::arg("descale1"),
+      py::arg("gamma2"),
+      py::arg("cos"),
+      py::arg("sin"),
+      py::arg("wuk"),
+      py::arg("kv_cache"),
+      py::arg("kv_cache_rope"),
+      py::arg("slotmapping"),
+      py::arg("q_out0"),
+      py::arg("kv_cache_out0"),
+      py::arg("q_out1"),
+      py::arg("kv_cache_out1"),
+      py::arg("inner_out"),
+      py::arg("quant_scale0") = py::none(),
+      py::arg("quant_offset0") = py::none(),
+      py::arg("bias0") = py::none(),
+      py::arg("quant_scale1") = py::none(),
+      py::arg("quant_offset1") = py::none(),
+      py::arg("bias1") = py::none(),
+      py::arg("ctkv_scale") = py::none(),
+      py::arg("q_nope_scale") = py::none(),
+      py::arg("cache_mode") = py::none(),
+      py::arg("quant_mode") = py::none(),
+      py::arg("enable_inner_out") = false);
 }

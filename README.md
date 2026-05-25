@@ -159,3 +159,21 @@ Timing with less synchronization overhead:
 ```bash
 PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANOVLLM_GPU_MEMORY_UTILIZATION=0.8 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=8 NANOVLLM_DECODE_ATTENTION_BACKEND=mla NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=0 NANOVLLM_PROFILE_LAYER_IDS=0,mid,last NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_SKIP_WARMUP=1 python example/short_prompts.py
 ```
+
+## 41. MLAPO Preprocess Probe
+
+After rebuilding local Ascend ops, run this to compare the new
+`nanovllm.ops.mla_preprocess` binding against the split PyTorch reference on
+the same synthetic BF16 inputs. It checks `ql_nope`, `q_pe`, `ckv_cache`, and
+`kpe_cache`.
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH bash scripts/build_nanovllm_ops.sh
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ut_ops/probe_mla_preprocess.py --device npu:0 --tokens 7 --heads 32 --warmup 2 --iters 10
+```
+
+For a larger decode-shaped micro-batch:
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ut_ops/probe_mla_preprocess.py --device npu:0 --tokens 128 --heads 32 --warmup 2 --iters 10
+```

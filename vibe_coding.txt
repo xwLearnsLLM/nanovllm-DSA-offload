@@ -393,3 +393,128 @@ python -m py_compile nanovllm/models/deepseek_v32.py
 ```
 
 下一步让用户重新运行低扰动 timing 命令即可，优先看 `rotary`、`kv_norm`、`o_linear`、`o_all_reduce`。
+
+## 2026-05-25：runlog9/runlog10 细拆结果
+
+用户运行两组命令：
+
+- `runlog9.txt`：`NANOVLLM_DECODE_LAYER_TIMING_SYNC=0`
+- `runlog10.txt`：`NANOVLLM_DECODE_LAYER_TIMING_SYNC=1`
+
+统计结论：
+
+- `sync=0` 更适合看趋势，decode TPOT 约 `0.16-0.18s`。
+- `sync=1` 会明显扰动流水，decode TPOT 约 `0.20-0.23s`，并把 `o_all_reduce` 等同步相关字段显著放大。
+- `sync=0` 下，三层采样整体平均：
+  - `attention_total` 约 `1.63 ms/layer`
+  - `kv_rope` 约 `0.67 ms/layer`
+  - `rotary` 约 `0.47 ms/layer`
+  - `kv_norm` 约 `0.16 ms/layer`
+  - `decode_attention_op` 约 `0.16 ms/layer`
+  - `o_proj` 约 `0.14 ms/layer`
+  - `o_all_reduce` 约 `0.09 ms/layer`
+  - `moe_total` 约 `0.56 ms/layer`
+- 真正稳定的大头是 `rotary + kv_norm` 和 MoE；MLA attention 算子本体不是瓶颈。
+- `sync=1` 下 `o_all_reduce` 约 `0.88 ms/layer`，但低扰动下只有约 `0.09 ms/layer`，说明同步计时会严重放大通信等待，不应直接按 sync=1 的 `o_all_reduce` 做优化判断。
+
+和 vllm-ascend 0.19 对照：
+
+- vllm-ascend 的 MLA/SFA decode-only 小 token 路径会尝试走 `MLAPO`：
+  - 代码位置：`vllm_ascend/attention/mla_v1.py`
+  - 条件类似：`enable_mlapo and num_decode_tokens <= 1024 and num_prefills == 0`
+  - 调用：`DeviceOperator.mla_preprocess_only_decode(...)`
+  - 核心算子：`torch.ops._C_ascend.mla_preprocess`
+- `mla_preprocess` 会把 decode 前处理融合到一个算子里，包括 qkv-a、q norm、q-up、kv norm、RoPE、写 KV cache 等。
+- 当前 nano-vllm 仍把这些步骤拆成多个小算子，所以 `rotary`/`kv_norm` 的启动和访存开销会被逐层放大。
+- 本仓库 `csrc/nanovllm_ascend_ops/mla_preprocess` 里已经有 MLAPO 源码，但 `nanovllm/ops/__init__.py` 和 `csrc/nanovllm_ascend_ops/nanovllm_ops.cpp` 当前还没有把 `mla_preprocess` 暴露给 Python。
+
+下一步最像 vllm-ascend 的优化路线：
+
+1. 把 `mla_preprocess` 绑定到 `nanovllm.ops.mla_preprocess`。
+2. 在 decode-only 路径加入一个 `NANOVLLM_DECODE_MLAPO=1` 开关，先只用于 decode。
+3. 用当前拆分路径做参考，写一个 `ut_ops/probe_mla_preprocess.py` 对比：
+   - `ql_nope`
+   - `q_pe`
+   - `ckv_cache`
+   - `kpe_cache`
+   - 可选 `q_c`
+4. 对齐后再集成到 `deepseek_v32.py`，预计优先降低 `rotary + kv_norm + q_up/cache` 这一段。
+
+## 2026-05-25：全面对照 vllm / vllm-ascend 的 decode pipeline
+
+用户提醒：不能只看 `rotary`，需要全面对照 vllm 和 vllm-ascend，因为 vllm-ascend 可能把多个步骤融合在一起。
+
+源码对照后的结论：
+
+- vLLM 原生 DeepSeek MLA 已经把 `q_a_proj` 和 `kv_a_proj_with_mqa` 打包成 `fused_qkv_a_proj`；nano-vllm 当前也已经在权重准备阶段做了类似的 `wd_qkv` 合并，所以 `qkv_a` 不是当前最大差距。
+- vllm-ascend MLA/SFA decode-only 路径会优先尝试 `MLAPO`：
+  - `MLAPO_MAX_SUPPORTED_TOKENS = 1024`
+  - 条件大致是 `enable_mlapo and decode_tokens <= 1024 and num_prefills == 0`
+  - 调用 `DeviceOperator.mla_preprocess_only_decode(...)`
+  - 底层算子是 `torch.ops._C_ascend.mla_preprocess`
+- `mla_preprocess` 不是单纯替换 rotary，而是融合一整段 decode 前处理：qkv-a、q RMSNorm、q-up、kv RMSNorm、RoPE、KV cache 写入，并输出 decode 用的 `q_nope/q_pe` 等。
+- vllm-ascend 在非 MLAPO 路径也不是普通 PyTorch 拆分：
+  - KV 侧用 `torch_npu.npu_kv_rmsnorm_rope_cache(...)` 融合 KV RMSNorm、K RoPE、cache 写入。
+  - Q RoPE 用 `torch_npu.npu_interleave_rope(...)`。
+  - dense MLA decode 用 `torch_npu.npu_fused_infer_attention_score_v2(...)`，并带 workspace / graph 参数路径。
+  - v-up 用 `torch_npu.npu_transpose_batchmatmul(...)` 或 `_C_ascend.batch_matmul_transpose(...)`。
+- DeepSeek V3.2 DSA/SFA 路径里，vllm-ascend 还会使用 `npu_lightning_indexer`、`npu_sparse_flash_attention`，并在 SFA 路径里同样尝试 MLAPO。
+- MoE 侧，vllm-ascend 不是简单 per-rank local expert loop，而是有 `AscendFusedMoE`、`build_fused_experts_input`、`moe_comm_method.fused_experts(...)`、`ALLTOALL/MC2/FUSED_MC2`、dispatch/combine、weight prefetch 等整套路径。
+
+因此当前 nano-vllm 和 vllm-ascend 的主要差距不是某一个 `rotary` 算子，而是：
+
+1. Attention decode 前处理没有走 `mla_preprocess` / `npu_kv_rmsnorm_rope_cache` 这种融合路径。
+2. Decode 当前用 dense MLA 替代 SFA，规避了 SFA core dump，但也没有和 vllm-ascend DSA/SFA 路径完全对齐。
+3. MoE 已做了一些局部优化，但还没对齐 vllm-ascend 的 fused MoE + 通信/dispatch/combine 路径。
+
+后续优化优先级：
+
+1. 先暴露并验证 `nanovllm.ops.mla_preprocess`，这是最直接对齐 vllm-ascend 的 decode attention 前处理优化。
+2. 如果 MLAPO 接口一时不好对齐，可以先做中间态：引入 `npu_kv_rmsnorm_rope_cache` 和 `npu_interleave_rope`，减少当前 `kv_norm + rotary + cache` 的小算子拆分。
+3. 接着继续拆 MoE timing，并逐步参考 vllm-ascend 的 fused MoE / MC2 / alltoall 路线。
+4. SFA decode core dump 是最终必须回来的问题；dense MLA decode 只是现阶段性能和可运行性的折中。
+
+## 2026-05-25：开始暴露 MLAPO preprocess
+
+用户决定现在开始做 MLAPO，先做两件事：
+
+1. 把本仓库已有的 `csrc/nanovllm_ascend_ops/mla_preprocess` 暴露成 `nanovllm.ops.mla_preprocess`。
+2. 写 `ut_ops/probe_mla_preprocess.py`，用同一批输入对比：
+   - `ql_nope`
+   - `q_pe`
+   - `ckv_cache`
+   - `kpe_cache`
+
+已完成的代码改动：
+
+- `csrc/nanovllm_ascend_ops/CMakeLists.txt`
+  - 把 `mla_preprocess/op_kernel/mla_preprocess_kernel.cpp` 加入 `NANOVLLM_KERNEL_SRC`。
+  - 增加 `mla_preprocess` 和 `mla_preprocess/op_host` include path。
+- `csrc/nanovllm_ascend_ops/nanovllm_ops.cpp`
+  - 引入 `mla_preprocess/mla_preprocess_torch_adpt.h`。
+  - 增加 pybind 函数 `_C.mla_preprocess(...)`。
+  - C++ 包装函数返回 Tensor 值而不是 Tensor 引用，避免返回局部 Tensor handle 的悬垂引用。
+- `nanovllm/ops/__init__.py`
+  - 增加 Python wrapper：`nanovllm.ops.mla_preprocess(...)`。
+  - 默认 `cache_mode="krope_ctkv"`、`quant_mode="no_quant"`，对应当前 BF16 非量化探针路径。
+- `ut_ops/probe_mla_preprocess.py`
+  - 构造 synthetic BF16 decode 输入。
+  - 使用 MLAPO 期望的 `wdqkv` 顺序：`[kv_lora + rope, q_lora]`。
+  - 用 PyTorch split reference 计算 `ql_nope/q_pe/ckv_cache/kpe_cache`。
+  - 调用 `nanovllm.ops.mla_preprocess` 并打印绝对误差和相对误差。
+- `README.md`
+  - 增加第 41 条 MLAPO probe 命令。
+
+本地只做了 Python 语法检查：
+
+```bash
+python -m py_compile ut_ops/probe_mla_preprocess.py nanovllm/ops/__init__.py
+```
+
+下一步需要在昇腾机器上跑：
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH bash scripts/build_nanovllm_ops.sh
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ut_ops/probe_mla_preprocess.py --device npu:0 --tokens 7 --heads 32 --warmup 2 --iters 10
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ut_ops/probe_mla_preprocess.py --device npu:0 --tokens 128 --heads 32 --warmup 2 --iters 10
+```
