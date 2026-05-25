@@ -233,3 +233,14 @@ Then run the model path:
 ```bash
 PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANOVLLM_GPU_MEMORY_UTILIZATION=0.8 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=8 NANOVLLM_DECODE_ATTENTION_BACKEND=mla NANOVLLM_ENABLE_DECODE_MLAPO=1 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=0 NANOVLLM_PROFILE_LAYER_IDS=0,mid,last NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_SKIP_WARMUP=1 python example/short_prompts.py
 ```
+
+## 45. Decode Small-Op Cache Check
+
+No rebuild is needed. This version reuses decode-step MLAPO `cos/sin`, prepares
+int32 flat slot ids once in `prepare_decode`, and reuses per-layer MLAPO output
+scratch buffers. Compare TPOT and the per-layer `mlapo` / `attention_gap`
+timings against section 44.
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANOVLLM_GPU_MEMORY_UTILIZATION=0.8 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=8 NANOVLLM_DECODE_ATTENTION_BACKEND=mla NANOVLLM_ENABLE_DECODE_MLAPO=1 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=0 NANOVLLM_PROFILE_LAYER_IDS=0,mid,last NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_SKIP_WARMUP=1 python example/short_prompts.py
+```

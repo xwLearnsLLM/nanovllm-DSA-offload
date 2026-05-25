@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import torch
 
 
@@ -20,6 +20,8 @@ class Context:
     is_enforce_eager: bool = True
     real_bs: int = -1
     block_size: int = 256
+    flat_slot_mapping_i32: torch.Tensor | None = None
+    scratch: dict = field(default_factory=dict)
 
 
 _CONTEXT = Context()
@@ -31,11 +33,11 @@ def get_context():
 
 def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0, max_seqlen_k=0, slot_mapping=None,
                 flat_slot_mapping=None, context_lens=None, actual_seq_lengths_query=None, actual_seq_lengths_kv=None,
-                block_tables=None, is_enforce_eager=None, real_bs=None, block_size=None):
+                block_tables=None, is_enforce_eager=None, real_bs=None, block_size=None, flat_slot_mapping_i32=None):
     global _CONTEXT
     _CONTEXT = Context(is_prefill, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping,
                        flat_slot_mapping, context_lens, actual_seq_lengths_query, actual_seq_lengths_kv, block_tables,
-                       is_enforce_eager, real_bs, block_size)
+                       is_enforce_eager, real_bs, block_size, flat_slot_mapping_i32)
     # print(f"_CONTEXT is set to {_CONTEXT}")
 
 

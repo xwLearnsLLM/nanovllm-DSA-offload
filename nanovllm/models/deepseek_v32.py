@@ -928,6 +928,9 @@ class DeepseekV32DSAAttention(nn.Module):
         ) and _profile_layer_selected(self.layer_id, self.num_layers)
         self.last_decode_attention_op_time = 0.0
         self.last_decode_attention_detail: dict[str, float] = {}
+        self._decode_mlapo_ql_nope = None
+        self._decode_mlapo_q_pe = None
+        self._decode_mlapo_inner_out = None
         self._reset_decode_attention_detail()
 
     def _reset_decode_attention_detail(self) -> None:
@@ -1096,12 +1099,70 @@ class DeepseekV32DSAAttention(nn.Module):
         positions: torch.Tensor,
         dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        context = get_context()
+        cache_key = (
+            "mlapo_cos_sin",
+            str(positions.device),
+            dtype,
+            self.qk_rope_head_dim,
+        )
+        cached = context.scratch.get(cache_key)
+        if cached is not None:
+            return cached
+
         positions = positions.to(torch.long)
         cos = self.rotary_emb.cos_cache.index_select(0, positions)
         sin = self.rotary_emb.sin_cache.index_select(0, positions)
         cos = torch.cat((cos, cos), dim=-1).to(dtype).contiguous()
         sin = torch.cat((sin, sin), dim=-1).to(dtype).contiguous()
+        context.scratch[cache_key] = (cos, sin)
         return cos, sin
+
+    def _decode_mlapo_buffers(
+        self,
+        num_tokens: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        ql_shape = (num_tokens, self.num_local_heads, self.kv_lora_rank)
+        qpe_shape = (num_tokens, self.num_local_heads, self.qk_rope_head_dim)
+        if (
+            self._decode_mlapo_ql_nope is None
+            or tuple(self._decode_mlapo_ql_nope.shape) != ql_shape
+            or self._decode_mlapo_ql_nope.dtype != dtype
+            or self._decode_mlapo_ql_nope.device != device
+        ):
+            self._decode_mlapo_ql_nope = torch.empty(
+                ql_shape,
+                dtype=dtype,
+                device=device,
+            )
+        if (
+            self._decode_mlapo_q_pe is None
+            or tuple(self._decode_mlapo_q_pe.shape) != qpe_shape
+            or self._decode_mlapo_q_pe.dtype != dtype
+            or self._decode_mlapo_q_pe.device != device
+        ):
+            self._decode_mlapo_q_pe = torch.empty(
+                qpe_shape,
+                dtype=dtype,
+                device=device,
+            )
+        if (
+            self._decode_mlapo_inner_out is None
+            or self._decode_mlapo_inner_out.dtype != dtype
+            or self._decode_mlapo_inner_out.device != device
+        ):
+            self._decode_mlapo_inner_out = torch.empty(
+                0,
+                dtype=dtype,
+                device=device,
+            )
+        return (
+            self._decode_mlapo_ql_nope,
+            self._decode_mlapo_q_pe,
+            self._decode_mlapo_inner_out,
+        )
 
     def _decode_mlapo_preprocess(
         self,
@@ -1115,29 +1176,13 @@ class DeepseekV32DSAAttention(nn.Module):
             raise RuntimeError("Decode MLAPO weights are not prepared.")
 
         num_tokens = int(hidden_states.shape[0])
-        ql_nope = torch.empty(
+        ql_nope, q_pe, inner_out = self._decode_mlapo_buffers(
             num_tokens,
-            self.num_local_heads,
-            self.kv_lora_rank,
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
-        q_pe = torch.empty(
-            num_tokens,
-            self.num_local_heads,
-            self.qk_rope_head_dim,
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
-        inner_out = torch.empty(
-            0,
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
         cos, sin = self._mlapo_cos_sin(positions, hidden_states.dtype)
-        slotmapping = self._flat_slots()
-        if slotmapping.dtype != torch.int32:
-            slotmapping = slotmapping.to(torch.int32)
+        slotmapping = self._flat_slots_i32()
 
         start = self._decode_timer_start(profile_decode, hidden_states.device)
         ascend_ops.mla_preprocess(
@@ -1166,7 +1211,7 @@ class DeepseekV32DSAAttention(nn.Module):
         )
         q_pe = _rope_neox_to_interleaved(q_pe)
         kpe_flat = self.kpe_cache.view(-1, self.qk_rope_head_dim)
-        slots = slotmapping.to(torch.long)
+        slots = self._flat_slots()
         k_pe = kpe_flat.index_select(0, slots)
         kpe_flat.index_copy_(0, slots, _rope_neox_to_interleaved(k_pe))
         self._decode_timer_end(profile_decode, "mlapo", start, ql_nope.device)
@@ -1189,6 +1234,12 @@ class DeepseekV32DSAAttention(nn.Module):
                 + slot_mapping[:, 1].to(torch.long)
             )
         return slot_mapping.to(torch.long)
+
+    def _flat_slots_i32(self) -> torch.Tensor:
+        context = get_context()
+        if context.flat_slot_mapping_i32 is not None:
+            return context.flat_slot_mapping_i32
+        return self._flat_slots().to(torch.int32)
 
     def _store_cache(
         self,

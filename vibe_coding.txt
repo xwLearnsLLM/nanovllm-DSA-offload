@@ -716,3 +716,14 @@ README 新增第 44 条命令：
 - 再跑 TP8 + MLAPO + layer timing，对比修改前后的 TPOT 和每层 `v_up` timing。
 
 此改动不涉及 C++/AscendC，自身不需要重新 build local ops。
+
+## 2026-05-25：继续压 decode attention 周边小算子
+
+用户运行 `runlog16.txt` 后确认 v-up 优化只有微弱收益：micro probe 从约 `0.077ms` 到 `0.066ms`，整层 `v_up` 约 `0.08ms`，不是主要瓶颈。用户建议转向“继续压 decode attention 周边的小算子”。
+
+本轮实现了三处不改数学的小优化，主要服务 MLAPO decode 路径：
+1. 在 `Context.scratch` 中缓存一次 decode step 内的 MLAPO `cos/sin`。以前每层都会对同一个 `positions` 重复 `index_select + cat + to + contiguous`，现在第一层计算，后续层复用。
+2. 在 `prepare_decode` 中一次性准备 `flat_slot_mapping_i32`，避免每个 attention layer 在 MLAPO 前重复把 flat slot ids 从 int64 转 int32。
+3. 为每层复用 MLAPO 输出 scratch buffer：`ql_nope`、原始 `q_pe`、空 `inner_out`。这减少每步每层的 NPU tensor 分配压力。
+
+README 新增第 45 条命令，建议对比第 44 条的 TPOT，以及 layer timing 中的 `mlapo` 和 `attention_gap`。

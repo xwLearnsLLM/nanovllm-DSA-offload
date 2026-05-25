@@ -391,12 +391,14 @@ class ModelRunner:
             slot_mapping[:, 0].to(torch.long) * self.block_size
             + slot_mapping[:, 1].to(torch.long)
         )
+        flat_slot_mapping_i32 = flat_slot_mapping.to(torch.int32)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
         block_tables = self._pad_block_tables_to_static_max(block_tables)
         set_context(False,
                     slot_mapping=slot_mapping,
                     flat_slot_mapping=flat_slot_mapping,
+                    flat_slot_mapping_i32=flat_slot_mapping_i32,
                     context_lens=context_lens,
                     actual_seq_lengths_query=list(range(1, len(seqs) + 1)),
                     actual_seq_lengths_kv=[len(seq) for seq in seqs],
