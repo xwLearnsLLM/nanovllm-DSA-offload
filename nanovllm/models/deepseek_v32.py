@@ -888,13 +888,17 @@ class DeepseekV32DSAAttention(nn.Module):
             "qkv_a": 0.0,
             "q_norm": 0.0,
             "q_b": 0.0,
-            "kv_rope": 0.0,
+            "kv_split": 0.0,
+            "kv_norm": 0.0,
+            "rotary": 0.0,
+            "k_squeeze": 0.0,
             "indexer": 0.0,
             "cache": 0.0,
             "q_up": 0.0,
             "decode_attention_op": 0.0,
             "v_up": 0.0,
-            "o_proj": 0.0,
+            "o_linear": 0.0,
+            "o_all_reduce": 0.0,
         }
 
     def _decode_timer_start(self, profile_decode: bool, device) -> float | None:
@@ -916,6 +920,37 @@ class DeepseekV32DSAAttention(nn.Module):
         if self.decode_timing_sync:
             _profile_sync(device)
         self.last_decode_attention_detail[name] += perf_counter() - start
+
+    def _o_proj_forward(
+        self,
+        attn_output: torch.Tensor,
+        profile_decode: bool,
+    ) -> torch.Tensor:
+        if not profile_decode:
+            return self.o_proj(attn_output)
+
+        start = self._decode_timer_start(True, attn_output.device)
+        if self.o_proj.disable_tp:
+            output = F.linear(
+                attn_output,
+                self.o_proj.weight,
+                self.o_proj.bias,
+            )
+            self._decode_timer_end(True, "o_linear", start, output.device)
+            return output
+
+        output = F.linear(
+            attn_output,
+            self.o_proj.weight,
+            self.o_proj.bias if self.o_proj.tp_rank == 0 else None,
+        )
+        self._decode_timer_end(True, "o_linear", start, output.device)
+
+        if self.o_proj.tp_size > 1 and self.o_proj.reduce_results:
+            start = self._decode_timer_start(True, output.device)
+            dist.all_reduce(output)
+            self._decode_timer_end(True, "o_all_reduce", start, output.device)
+        return output
 
     def assign_dsa_cache(
         self,
@@ -1659,10 +1694,19 @@ class DeepseekV32DSAAttention(nn.Module):
             [self.kv_lora_rank, self.qk_rope_head_dim],
             dim=-1,
         )
+        self._decode_timer_end(profile_decode, "kv_split", start, kv.device)
+
+        start = self._decode_timer_start(profile_decode, ckv.device)
         ckv = self.kv_a_layernorm(ckv)
+        self._decode_timer_end(profile_decode, "kv_norm", start, ckv.device)
+
+        start = self._decode_timer_start(profile_decode, q_pe.device)
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
+        self._decode_timer_end(profile_decode, "rotary", start, q_pe.device)
+
+        start = self._decode_timer_start(profile_decode, k_pe.device)
         k_pe = k_pe.squeeze(1)
-        self._decode_timer_end(profile_decode, "kv_rope", start, ckv.device)
+        self._decode_timer_end(profile_decode, "k_squeeze", start, k_pe.device)
 
         use_sparse_decode = self.decode_attention_backend in ("sfa", "torch")
         if use_sparse_decode:
@@ -1697,10 +1741,7 @@ class DeepseekV32DSAAttention(nn.Module):
         else:
             attn_output = self._decode_forward(ql_nope, q_pe, q_index, weights)
 
-        start = self._decode_timer_start(profile_decode, attn_output.device)
-        output = self.o_proj(attn_output)
-        self._decode_timer_end(profile_decode, "o_proj", start, output.device)
-        return output
+        return self._o_proj_forward(attn_output, profile_decode)
 
 
 class DeepseekV32DecoderLayer(nn.Module):
@@ -1793,12 +1834,24 @@ class DeepseekV32DecoderLayer(nn.Module):
         if profile_decode:
             attention_detail = self.self_attn.last_decode_attention_detail
             attention_gap = attention_total - sum(attention_detail.values())
+            kv_rope_total = (
+                attention_detail["kv_split"]
+                + attention_detail["kv_norm"]
+                + attention_detail["rotary"]
+                + attention_detail["k_squeeze"]
+            )
+            o_proj_total = (
+                attention_detail["o_linear"]
+                + attention_detail["o_all_reduce"]
+            )
             logger.info(
                 "Decode layer timing: rank=%d layer=%d tokens=%d "
                 "attention_total=%.6fs qkv_a=%.6fs q_norm=%.6fs "
-                "q_b=%.6fs kv_rope=%.6fs indexer=%.6fs cache=%.6fs "
+                "q_b=%.6fs kv_rope=%.6fs kv_split=%.6fs kv_norm=%.6fs "
+                "rotary=%.6fs k_squeeze=%.6fs indexer=%.6fs cache=%.6fs "
                 "q_up=%.6fs decode_attention_op=%.6fs v_up=%.6fs "
-                "o_proj=%.6fs attention_gap=%.6fs "
+                "o_proj=%.6fs o_linear=%.6fs o_all_reduce=%.6fs "
+                "attention_gap=%.6fs "
                 "moe_total=%.6fs mlp_kind=%s moe_backend=%s backend=%s",
                 _rank_id(),
                 self.layer_idx,
@@ -1807,13 +1860,19 @@ class DeepseekV32DecoderLayer(nn.Module):
                 attention_detail["qkv_a"],
                 attention_detail["q_norm"],
                 attention_detail["q_b"],
-                attention_detail["kv_rope"],
+                kv_rope_total,
+                attention_detail["kv_split"],
+                attention_detail["kv_norm"],
+                attention_detail["rotary"],
+                attention_detail["k_squeeze"],
                 attention_detail["indexer"],
                 attention_detail["cache"],
                 attention_detail["q_up"],
                 attention_detail["decode_attention_op"],
                 attention_detail["v_up"],
-                attention_detail["o_proj"],
+                o_proj_total,
+                attention_detail["o_linear"],
+                attention_detail["o_all_reduce"],
                 attention_gap,
                 perf_counter() - mlp_start,
                 self.mlp_kind,

@@ -327,3 +327,69 @@ PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANO
 ```
 
 关注字段：`q_b`、`q_up`、`v_up`、`o_proj`、`attention_gap`。其中 `o_proj` 包含 TP `all_reduce`。
+
+## 2026-05-25：runlog7/runlog8 细粒度 timing 结论
+
+用户运行了两组命令：
+
+- `runlog7.txt`：`NANOVLLM_DECODE_LAYER_TIMING_SYNC=0`，低扰动看趋势
+- `runlog8.txt`：`NANOVLLM_DECODE_LAYER_TIMING_SYNC=1`，同步精确量少数层
+
+结果概要：
+
+- `runlog7.txt`：decode TPS 约 `41.41 tok/s`
+- `runlog8.txt`：decode TPS 约 `38.00 tok/s`
+- `decode_attention_op` 不是主瓶颈，整体平均占比约 `7-9%`
+- `q_b` 很小，整体平均占比约 `4%`
+- `q_up/v_up` 也不大，各自约 `5%`
+- `kv_rope` 是稳定大头：
+  - sync=0 整体约 `0.70 ms/layer`，约 `39% attention_total`
+  - sync=1 整体约 `0.79 ms/layer`，约 `24% attention_total`
+- `o_proj` 很可疑：
+  - sync=0 平均不算特别大，但出现过 rank0/layer60 `o_proj=4.296 ms` 的尖刺
+  - sync=1 整体约 `0.80 ms/layer`，约 `24% attention_total`
+  - `o_proj` 包含 RowParallelLinear 的 TP `all_reduce`，因此大概率暴露出 TP 通信/同步开销
+- `attention_gap` 在 sync=1 下约 `0.46 ms/layer`，可能包含未细拆的 Python/runtime 调度、同步测量扰动和小段代码开销
+
+当前判断：
+
+1. MLA kernel 本身不是 decode 瓶颈。
+2. 投影里的 `q_b/q_up/v_up` 不是首要问题。
+3. 下一步优先看：
+   - `kv_rope`：拆分 RMSNorm、rotary、split/squeeze 的开销，考虑 decode 专用轻量路径
+   - `o_proj`：拆出 `F.linear` 和 TP `all_reduce`，确认是不是通信主导
+4. 如果 `o_proj all_reduce` 确认为主因，再考虑通信优化、延迟/融合 all_reduce，或参考 vllm-ascend 的 TP attention 输出处理。
+
+## 2026-05-25：进一步细拆 kv_rope 和 o_proj
+
+根据 runlog7/runlog8，继续把两个疑似瓶颈拆开：
+
+- `kv_rope` 拆成：
+  - `kv_split`
+  - `kv_norm`
+  - `rotary`
+  - `k_squeeze`
+- `o_proj` 拆成：
+  - `o_linear`
+  - `o_all_reduce`
+
+日志仍会打印聚合字段：
+
+- `kv_rope = kv_split + kv_norm + rotary + k_squeeze`
+- `o_proj = o_linear + o_all_reduce`
+
+但 `attention_gap` 只对原子字段求和，避免把聚合字段重复计算进去。
+
+代码位置：
+
+- `nanovllm/models/deepseek_v32.py`
+- 新增 `_o_proj_forward(...)`，在开启 decode layer timing 时手动拆开 `F.linear` 和 `dist.all_reduce`
+- `README.md` 已同步更新 `NANOVLLM_LOG_DECODE_LAYER_TIMING` 的说明
+
+本地语法检查已通过：
+
+```bash
+python -m py_compile nanovllm/models/deepseek_v32.py
+```
+
+下一步让用户重新运行低扰动 timing 命令即可，优先看 `rotary`、`kv_norm`、`o_linear`、`o_all_reduce`。
