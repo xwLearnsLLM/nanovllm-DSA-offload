@@ -783,3 +783,35 @@ README 新增：
 - `NANOVLLM_MLA_ROPE_NEOX_CACHE=1` 为什么需要普通路径也把 q/k 转成 neox，并且为何数学上保持 q/k 同 basis 即可。
 - FIA v2 为什么把 cache 从 `[blocks, block_size, 1, dim]` view 成 `[blocks, 1, block_size, dim]`，以及为什么 kv_heads=1 时不会复制大 cache。
 - FIA v2 输出为什么从 `[heads, tokens, 1, dim]` 转回 `[tokens, heads, dim]`。
+
+## 2026-05-26：开始设计 decode 阶段 KVcache 卸载
+
+用户说明：当前 `nano-vllm-ascend + DeepSeek V3.2` 基线已经足够完善，真正目标是支持 decode 阶段 KVcache 卸载。用户提供了 `设计文档提纲.txt`，要求先写详细设计文档，不急着写代码。
+
+已新增文档：
+- `dsa_kvcache_offload_design.md`
+
+文档内容：
+- 解释目标、非目标、当前 DeepSeek V3.2 cache 形状。
+- 明确 `KVcache = CKV + KPE`，`IndexCache` 不卸载。
+- 严格使用 `layer_kv_token`，避免把一层一个 token 的 KV 表征和文本 token 混淆。
+- 给出符号表：`L/B/Cidx/Chbm/Cdram/Sp/Sd/Np/Nr/Nd/Nc/Ns/Ts/Tp/Tx/GT2048`。
+- 设计三类 block manager：`IndexBlockManager`、`HBMBlockManager`、`DramBlockManager`。
+- 设计 `Sequence` 新元数据：`index_block_table/hbm_block_table/dram_block_table/hbm_cached_tokens_pool_entry` 等。
+- 设计 Scheduler prefill/decode 准入和 prefill 后 HBM 块释放流程。
+- 设计 Worker 需要新增的物理 cache tensor 和 decode 前 tensor 化元数据。
+- 设计模型 forward 流程：prefill offload、decode score/update/scatter/MLA。
+- 定义三个关键算子接口：`dsa_indexer_score`、`dsa_index_update`、`dsa_scatter_h2d`。
+- 给出 TP 第一版策略：所有 TP rank 冗余执行 update/scatter，后续再考虑 rank0 计算后广播。
+- 给出分阶段落地计划：先拆元数据，再静态卸载，再固定 `Tx` 动态更新，再做无损更新和 DRAM 前缀复用。
+
+主动提出的两个设计修正/疑问：
+1. `hbm_cached_tokens_pool` 不建议按 `(L, max_decode_batch, max_model_len)` 分配。它只需要记录 HBM sparse budget 中的 token id，建议形状为 `(L, pool_capacity, max_sparse_tokens)`，否则长上下文时这个 int32 pool 本身会吃掉接近 GB 级 HBM。
+2. 严格“无损”需要前提：`Ts + decode_kv_tokens >= min(2048, 当前可见上下文长度)`，或者至少 `Ts` 能覆盖 `GT2048` 中落在 prefill 历史的部分。若 `Ts < 2048`，长序列场景不可能保证 GT2048 全覆盖。
+
+用户补充文档写作要求：除了提纲里的注意事项，设计文档要有层次感。每一节要先有一个简短“帽子”，让读者先知道“这一节是什么、为什么要有这一节”，再进入“怎么做”的细节。
+
+已更新 `dsa_kvcache_offload_design.md`：
+- 在文档开头加入写作约定：每一大节先回答“是什么、为什么”，再讲细节。
+- 为第 1 到第 17 节都补了简短导语。
+- 重点让“总体算法、框架改造、BlockManager、Scheduler、Worker、模型 forward、算子接口、TP 策略、落地计划、验证计划”等章节先讲意义，再讲接口或流程。
