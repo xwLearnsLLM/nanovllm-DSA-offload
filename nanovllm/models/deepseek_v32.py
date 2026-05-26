@@ -991,6 +991,9 @@ class DeepseekV32DSAAttention(nn.Module):
             "indexer": 0.0,
             "cache": 0.0,
             "q_up": 0.0,
+            "dsa_indexer_score": 0.0,
+            "dsa_index_update": 0.0,
+            "dsa_scatter_h2d": 0.0,
             "decode_attention_op": 0.0,
             "v_up": 0.0,
             "o_linear": 0.0,
@@ -2115,6 +2118,8 @@ class DeepseekV32DSAAttention(nn.Module):
             q_index.device,
         )
 
+        profile_decode = self.log_decode_layer_timing
+        start = self._decode_timer_start(profile_decode, q_index.device)
         dsa_indexer_score(
             q_index[:batch_size],
             self.index_cache,
@@ -2123,7 +2128,15 @@ class DeepseekV32DSAAttention(nn.Module):
             candidate_lens,
             score_out,
         )
+        self._decode_timer_end(
+            profile_decode,
+            "dsa_indexer_score",
+            start,
+            score_out.device,
+        )
+
         pool_slice = self.hbm_cached_tokens_pool[self.layer_id]
+        start = self._decode_timer_start(profile_decode, score_out.device)
         dsa_index_update(
             score_out,
             pool_slice,
@@ -2135,6 +2148,14 @@ class DeepseekV32DSAAttention(nn.Module):
             req_pool_entries,
             min(self.dsa_offload_fixed_tx, self.dsa_offload_max_copy_tokens),
         )
+        self._decode_timer_end(
+            profile_decode,
+            "dsa_index_update",
+            start,
+            score_out.device,
+        )
+
+        start = self._decode_timer_start(profile_decode, self.ckv_cache.device)
         dsa_scatter_h2d(
             promote_idx,
             demote_idx,
@@ -2145,6 +2166,12 @@ class DeepseekV32DSAAttention(nn.Module):
             self.kpe_cache,
             self.dram_ckv_cache,
             self.dram_kpe_cache,
+        )
+        self._decode_timer_end(
+            profile_decode,
+            "dsa_scatter_h2d",
+            start,
+            self.ckv_cache.device,
         )
 
     def _decode_forward(
@@ -2509,12 +2536,19 @@ class DeepseekV32DecoderLayer(nn.Module):
                 attention_detail["o_linear"]
                 + attention_detail["o_all_reduce"]
             )
+            dsa_total = (
+                attention_detail["dsa_indexer_score"]
+                + attention_detail["dsa_index_update"]
+                + attention_detail["dsa_scatter_h2d"]
+            )
             logger.info(
                 "Decode layer timing: rank=%d layer=%d tokens=%d "
                 "attention_total=%.6fs qkv_a=%.6fs q_norm=%.6fs "
                 "q_b=%.6fs kv_rope=%.6fs kv_split=%.6fs kv_norm=%.6fs "
                 "rotary=%.6fs k_squeeze=%.6fs mlapo=%.6fs indexer=%.6fs cache=%.6fs "
-                "q_up=%.6fs decode_attention_op=%.6fs v_up=%.6fs "
+                "q_up=%.6fs dsa_total=%.6fs dsa_indexer_score=%.6fs "
+                "dsa_index_update=%.6fs dsa_scatter_h2d=%.6fs "
+                "decode_attention_op=%.6fs v_up=%.6fs "
                 "o_proj=%.6fs o_linear=%.6fs o_all_reduce=%.6fs "
                 "attention_gap=%.6fs "
                 "moe_total=%.6fs mlp_kind=%s moe_backend=%s backend=%s",
@@ -2534,6 +2568,10 @@ class DeepseekV32DecoderLayer(nn.Module):
                 attention_detail["indexer"],
                 attention_detail["cache"],
                 attention_detail["q_up"],
+                dsa_total,
+                attention_detail["dsa_indexer_score"],
+                attention_detail["dsa_index_update"],
+                attention_detail["dsa_scatter_h2d"],
                 attention_detail["decode_attention_op"],
                 attention_detail["v_up"],
                 o_proj_total,
