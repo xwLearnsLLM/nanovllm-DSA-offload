@@ -12,6 +12,7 @@ import torch_npu  # noqa: F401
 torch.npu.config.allow_internal_format = True
 
 from nanovllm.config import Config
+from nanovllm.engine.dsa_offload import compute_sparse_blocks
 from nanovllm.engine.sequence import Sequence
 from nanovllm.layers.sampler import Sampler
 from nanovllm.models.deepseek_v32 import DeepseekV32ForCausalLM
@@ -221,60 +222,128 @@ class ModelRunner:
         kv_lora_rank = int(text_config.kv_lora_rank)
         rope_dim = int(text_config.qk_rope_head_dim)
         index_dim = int(text_config.index_head_dim)
-        block_bytes = (
+        hbm_kv_block_bytes = (
             num_layers
             * self.block_size
-            * (kv_lora_rank + rope_dim + index_dim)
+            * (kv_lora_rank + rope_dim)
             * self._dtype_itemsize(cache_dtype)
         )
-        available_blocks = int(available_mem) // block_bytes
-        blocks_per_seq = (config.max_model_len + self.block_size - 1) // self.block_size
-        # Scheduler reserves block 0 as the paged-attention null block and
-        # keeps one final block out of the allocatable pool for padding.
-        max_needed_blocks = max(3, blocks_per_seq * config.max_num_seqs + 2)
-        local_num_blocks = min(available_blocks, max_needed_blocks)
-        config.num_kvcache_blocks = self._sync_kvcache_blocks_across_tp(
-            local_num_blocks,
+        index_block_bytes = (
+            num_layers
+            * self.block_size
+            * index_dim
+            * self._dtype_itemsize(cache_dtype)
         )
-        assert config.num_kvcache_blocks > 2, (
+        blocks_per_seq = (config.max_model_len + self.block_size - 1) // self.block_size
+        max_sparse_blocks = compute_sparse_blocks(blocks_per_seq)
+        max_needed_index_blocks = max(3, blocks_per_seq * config.max_num_seqs + 2)
+        max_prefill_batch_blocks = (
+            config.max_num_batched_tokens + self.block_size - 1
+        ) // self.block_size
+        max_needed_hbm_blocks = max(
+            3,
+            max_prefill_batch_blocks + config.max_num_seqs + 2,
+            (max_sparse_blocks + 2) * config.max_num_seqs + 2,
+        )
+
+        available_mem_int = int(available_mem)
+        original_available_blocks = available_mem_int // (
+            hbm_kv_block_bytes + index_block_bytes
+        )
+        local_index_blocks = min(max_needed_index_blocks, original_available_blocks)
+        remaining_mem = available_mem_int - local_index_blocks * index_block_bytes
+        local_hbm_blocks = min(
+            max_needed_hbm_blocks,
+            max(0, remaining_mem // max(hbm_kv_block_bytes, 1)),
+        )
+
+        config.num_index_cache_blocks = self._sync_kvcache_blocks_across_tp(
+            local_index_blocks,
+        )
+        config.num_hbm_kvcache_blocks = self._sync_kvcache_blocks_across_tp(
+            local_hbm_blocks,
+        )
+        config.num_kvcache_blocks = config.num_hbm_kvcache_blocks
+        config.num_dram_kvcache_blocks = max_needed_index_blocks
+        config.dsa_offload_max_sparse_tokens = max_sparse_blocks * self.block_size
+
+        assert config.num_index_cache_blocks > 2, (
+            "Failed to allocate any DeepSeek DSA IndexCache blocks due to "
+            "insufficient memory."
+        )
+        assert config.num_hbm_kvcache_blocks > 2, (
             "Failed to allocate any DeepSeek DSA cache blocks due to "
             "insufficient memory."
         )
         ckv_shape = (
             num_layers,
-            config.num_kvcache_blocks,
+            config.num_hbm_kvcache_blocks,
             1,
             self.block_size,
             kv_lora_rank,
         )
         kpe_shape = (
             num_layers,
-            config.num_kvcache_blocks,
+            config.num_hbm_kvcache_blocks,
             1,
             self.block_size,
             rope_dim,
         )
         index_shape = (
             num_layers,
-            config.num_kvcache_blocks,
+            config.num_index_cache_blocks,
             self.block_size,
             1,
             index_dim,
         )
+        dram_ckv_shape = (
+            num_layers,
+            config.num_dram_kvcache_blocks,
+            1,
+            self.block_size,
+            kv_lora_rank,
+        )
+        dram_kpe_shape = (
+            num_layers,
+            config.num_dram_kvcache_blocks,
+            1,
+            self.block_size,
+            rope_dim,
+        )
+        pool_shape = (
+            num_layers,
+            config.dsa_offload_pool_capacity,
+            config.dsa_offload_max_sparse_tokens,
+        )
         self._log_cache_allocation(
             total=total,
             used=used,
-            block_bytes=block_bytes,
-            available_blocks=available_blocks,
-            max_needed_blocks=max_needed_blocks,
-            num_blocks=config.num_kvcache_blocks,
+            block_bytes=hbm_kv_block_bytes + index_block_bytes,
+            available_blocks=original_available_blocks,
+            max_needed_blocks=max_needed_index_blocks,
+            num_blocks=config.num_hbm_kvcache_blocks,
             shapes=[
                 ("DeepSeek CKV cache", ckv_shape),
                 ("DeepSeek KPE cache", kpe_shape),
                 ("DeepSeek index cache", index_shape),
+                ("DeepSeek DRAM CKV cache", dram_ckv_shape),
+                ("DeepSeek DRAM KPE cache", dram_kpe_shape),
+                ("DeepSeek sparse token pool", pool_shape),
             ],
         )
-        layer_shapes = (ckv_shape[1:], kpe_shape[1:], index_shape[1:])
+        hbm_cached_tokens_pool = torch.empty(
+            pool_shape,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        hbm_cached_tokens_pool.fill_(-1)
+        layer_shapes = (
+            ckv_shape[1:],
+            kpe_shape[1:],
+            index_shape[1:],
+            dram_ckv_shape[1:],
+            dram_kpe_shape[1:],
+        )
         for module in self.model.modules():
             if hasattr(module, "assign_dsa_cache") and hasattr(module, "layer_id"):
                 ckv_cache = torch.empty(
@@ -286,17 +355,68 @@ class ModelRunner:
                 index_cache = torch.empty(
                     layer_shapes[2], dtype=cache_dtype, device=self.device
                 )
+                dram_ckv_cache = torch.empty(
+                    layer_shapes[3],
+                    dtype=cache_dtype,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                dram_kpe_cache = torch.empty(
+                    layer_shapes[4],
+                    dtype=cache_dtype,
+                    device="cpu",
+                    pin_memory=True,
+                )
                 ckv_cache.zero_()
                 kpe_cache.zero_()
                 index_cache.zero_()
-                module.assign_dsa_cache(ckv_cache, kpe_cache, index_cache)
+                dram_ckv_cache.zero_()
+                dram_kpe_cache.zero_()
+                module.assign_dsa_cache(
+                    ckv_cache,
+                    kpe_cache,
+                    index_cache,
+                    dram_ckv_cache,
+                    dram_kpe_cache,
+                    hbm_cached_tokens_pool,
+                    config.dsa_offload_max_copy_tokens,
+                    config.dsa_offload_fixed_tx,
+                )
 
-    def prepare_block_tables(self, seqs: list[Sequence]):
-        max_len = max(len(seq.block_table) for seq in seqs)
-        block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
+    def prepare_block_tables(
+        self,
+        seqs: list[Sequence],
+        table_name: str = "hbm_block_table",
+    ):
+        static_max_block_cols = (
+            self.config.max_model_len + self.config.kvcache_block_size - 1
+        ) // self.config.kvcache_block_size
+        tables = [getattr(seq, table_name) for seq in seqs]
+        max_len = max(len(table) for table in tables)
+        num_cols = max(max_len, static_max_block_cols)
+        block_tables = [
+            table + [0] * (num_cols - len(table))
+            for table in tables
+        ]
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).to(device=self.device,
                                                                                          non_blocking=True)
         return block_tables
+
+    def _sequence_slots(
+        self,
+        block_table: list[int],
+        seq_len: int,
+    ) -> list[int]:
+        slots: list[int] = []
+        remaining = int(seq_len)
+        for block_id in block_table:
+            if remaining <= 0:
+                break
+            take = min(self.block_size, remaining)
+            start = int(block_id) * self.block_size
+            slots.extend(range(start, start + take))
+            remaining -= take
+        return slots
 
     def _pad_block_tables_to_static_max(self, block_tables: torch.Tensor) -> torch.Tensor:
         block_tables = torch.where(
@@ -325,6 +445,7 @@ class ModelRunner:
         max_seqlen_q = 0
         max_seqlen_k = 0
         slot_mapping = []
+        index_slot_mapping = []
 
         for seq in seqs:
             actual_tokens = seq[:]
@@ -342,17 +463,16 @@ class ModelRunner:
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
 
-            if seq.block_table:
-                for i in range(seq.num_blocks):
-                    start = seq.block_table[i] * self.block_size
-                    if i != seq.num_blocks - 1:
-                        end = start + self.block_size
-                    else:
-                        end = start + seq.last_block_num_tokens
-                    slot_mapping.extend(list(range(start, end)))
+            if seq.hbm_block_table:
+                slot_mapping.extend(
+                    self._sequence_slots(seq.hbm_block_table, seqlen),
+                )
+                index_slot_mapping.extend(
+                    self._sequence_slots(seq.index_block_table, seqlen),
+                )
 
-        block_tables = self.prepare_block_tables(seqs)
-        block_tables = self._pad_block_tables_to_static_max(block_tables)
+        hbm_block_tables = self.prepare_block_tables(seqs, "hbm_block_table")
+        index_block_tables = self.prepare_block_tables(seqs, "index_block_table")
 
         input_ids = torch.tensor(input_ids, dtype=torch.int64).to(self.device)
         positions = torch.tensor(positions, dtype=torch.int64).to(self.device)
@@ -360,6 +480,11 @@ class ModelRunner:
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32).to(self.device)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32).to(self.device)
         flat_slot_mapping = slot_mapping.to(torch.long)
+        index_slot_mapping = torch.tensor(
+            index_slot_mapping,
+            dtype=torch.int32,
+        ).to(self.device)
+        flat_index_slot_mapping = index_slot_mapping.to(torch.long)
 
         set_context(True,
                     cu_seqlens_q=cu_seqlens_q,
@@ -369,7 +494,11 @@ class ModelRunner:
                     slot_mapping=slot_mapping,
                     flat_slot_mapping=flat_slot_mapping,
                     context_lens=None,
-                    block_tables=block_tables,
+                    block_tables=hbm_block_tables,
+                    hbm_block_tables=hbm_block_tables,
+                    index_block_tables=index_block_tables,
+                    index_slot_mapping=index_slot_mapping,
+                    flat_index_slot_mapping=flat_index_slot_mapping,
                     block_size=self.config.kvcache_block_size)
 
         return input_ids, positions
@@ -378,31 +507,82 @@ class ModelRunner:
         input_ids = []
         positions = []
         slot_mapping = []
+        index_slot_mapping = []
         context_lens = []
+        candidate_lens = []
+        sparse_selected_lens = []
+        prefill_tail_lens = []
+        decode_lens = []
+        sparse_kv_lens = []
+        req_pool_entries = []
         for seq in seqs:
             input_ids.append(seq.last_token)
-            positions.append(len(seq) - 1)
-            context_lens.append(len(seq))
-            slot_mapping.append([seq.block_table[-1], seq.last_block_num_tokens - 1])
+            position = len(seq) - 1
+            positions.append(position)
+            decode_len = len(seq) - seq.num_prompt_tokens
+            tail_decode_offset = position - seq.num_prefill_full_blocks * self.block_size
+            hbm_logical_block = seq.num_sparse_blocks + tail_decode_offset // self.block_size
+            hbm_offset = tail_decode_offset % self.block_size
+            hbm_block_id = seq.hbm_block_table[hbm_logical_block]
+            index_logical_block = position // self.block_size
+            index_offset = position % self.block_size
+            index_block_id = seq.index_block_table[index_logical_block]
+
+            slot_mapping.append([hbm_block_id, hbm_offset])
+            index_slot_mapping.append([index_block_id, index_offset])
+            candidate_len = seq.num_prefill_full_blocks * self.block_size
+            sparse_selected_len = seq.num_sparse_tokens
+            sparse_kv_len = sparse_selected_len + seq.prefill_tail_len + decode_len
+
+            context_lens.append(sparse_kv_len)
+            candidate_lens.append(candidate_len)
+            sparse_selected_lens.append(sparse_selected_len)
+            prefill_tail_lens.append(seq.prefill_tail_len)
+            decode_lens.append(decode_len)
+            sparse_kv_lens.append(sparse_kv_len)
+            req_pool_entries.append(seq.hbm_cached_tokens_pool_entry)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).to(self.device, non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).to(self.device, non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
+        index_slot_mapping = torch.tensor(index_slot_mapping, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
         flat_slot_mapping = (
             slot_mapping[:, 0].to(torch.long) * self.block_size
             + slot_mapping[:, 1].to(torch.long)
         )
+        flat_index_slot_mapping = (
+            index_slot_mapping[:, 0].to(torch.long) * self.block_size
+            + index_slot_mapping[:, 1].to(torch.long)
+        )
         flat_slot_mapping_i32 = flat_slot_mapping.to(torch.int32)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
-        block_tables = self.prepare_block_tables(seqs)
-        block_tables = self._pad_block_tables_to_static_max(block_tables)
+        hbm_block_tables = self.prepare_block_tables(seqs, "hbm_block_table")
+        index_block_tables = self.prepare_block_tables(seqs, "index_block_table")
+        dram_block_tables = self.prepare_block_tables(seqs, "dram_block_table")
+        req_pool_entries = torch.tensor(req_pool_entries, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
+        candidate_lens = torch.tensor(candidate_lens, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
+        sparse_selected_lens = torch.tensor(sparse_selected_lens, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
+        prefill_tail_lens = torch.tensor(prefill_tail_lens, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
+        decode_lens = torch.tensor(decode_lens, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
+        sparse_kv_lens_tensor = torch.tensor(sparse_kv_lens, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
         set_context(False,
                     slot_mapping=slot_mapping,
                     flat_slot_mapping=flat_slot_mapping,
                     flat_slot_mapping_i32=flat_slot_mapping_i32,
+                    index_slot_mapping=index_slot_mapping,
+                    flat_index_slot_mapping=flat_index_slot_mapping,
                     context_lens=context_lens,
                     actual_seq_lengths_query=list(range(1, len(seqs) + 1)),
-                    actual_seq_lengths_kv=[len(seq) for seq in seqs],
-                    block_tables=block_tables,
+                    actual_seq_lengths_kv=sparse_kv_lens,
+                    block_tables=hbm_block_tables,
+                    hbm_block_tables=hbm_block_tables,
+                    index_block_tables=index_block_tables,
+                    dram_block_tables=dram_block_tables,
+                    req_pool_entries=req_pool_entries,
+                    candidate_lens=candidate_lens,
+                    sparse_selected_lens=sparse_selected_lens,
+                    prefill_tail_lens=prefill_tail_lens,
+                    decode_lens=decode_lens,
+                    sparse_kv_lens=sparse_kv_lens_tensor,
                     is_enforce_eager=True,
                     real_bs=len(seqs),
                     block_size=self.config.kvcache_block_size)
@@ -426,6 +606,29 @@ class ModelRunner:
         logits = self.model.compute_logits(hidden_states)
         return logits
 
+    @torch.inference_mode()
+    def finalize_prefill_offload(self, seqs: list[Sequence]) -> None:
+        for seq in seqs:
+            if seq.offload_finalized:
+                continue
+            old_hbm_block_table = list(seq.hbm_block_table)
+            for module in self.model.modules():
+                finalize = getattr(module, "finalize_prefill_offload", None)
+                if finalize is not None and hasattr(module, "layer_id"):
+                    finalize(seq, old_hbm_block_table)
+
+            keep_sparse = old_hbm_block_table[: seq.num_sparse_blocks]
+            keep_tail = old_hbm_block_table[
+                seq.num_prefill_full_blocks : seq.num_prefill_blocks
+            ]
+            release_blocks = old_hbm_block_table[
+                seq.num_sparse_blocks : seq.num_prefill_full_blocks
+            ]
+            seq.hbm_block_table = keep_sparse + keep_tail
+            seq.block_table = seq.hbm_block_table
+            seq.hbm_blocks_to_release = release_blocks
+            seq.offload_finalized = True
+
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = (
             self.prepare_prefill(seqs)
@@ -434,6 +637,8 @@ class ModelRunner:
         )
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
+        if is_prefill:
+            self.finalize_prefill_offload(seqs)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids

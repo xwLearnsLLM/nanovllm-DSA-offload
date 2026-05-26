@@ -211,6 +211,8 @@ class LLMEngine:
     def step(self, return_stats: bool = False):
         seqs, is_prefill = self.scheduler.schedule()
         token_ids = self.model_runner.call("run", seqs, is_prefill)
+        if is_prefill:
+            self.scheduler.release_prefill_hbm_blocks(seqs)
         self.scheduler.postprocess(seqs, token_ids)
         outputs = [(seq.seq_id, seq.completion_token_ids, seq.num_prompt_tokens, seq.num_cached_tokens) for seq in seqs
                    if seq.is_finished]

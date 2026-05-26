@@ -115,28 +115,98 @@ IndexCache 不卸载，因为 decode 每步每层都需要用它为候选 prefil
 
 ### 3.3 符号表
 
+基础维度：
+
 | 符号 | 含义 |
 |---|---|
 | `L` | 模型层数，DeepSeek V3.2 为 61 |
 | `B` | KVcache block size，典型值为 128 |
+| `Dckv` | 单个 layer_kv_token 的 CKV 维度，DeepSeek V3.2 中为 512 |
+| `Dkpe` | 单个 layer_kv_token 的 KPE 维度，DeepSeek V3.2 中为 64 |
+| `Dkv` | 单个 layer_kv_token 的 CKV/KPE 合计维度，`Dkv = Dckv + Dkpe = 576` |
+| `Didx` | IndexCache 单 token 维度，DeepSeek V3.2 中为 128 |
+| `Hidx` | DSA indexer 使用的 index head 数 |
 | `Cidx` | HBM 上 IndexCache 物理块数量 |
 | `Chbm` | HBM 上 KVcache 物理块数量 |
 | `Cdram` | DRAM 上 KVcache 物理块数量 |
 | `pool_capacity` | `hbm_cached_tokens_pool` 可同时容纳的请求槽位数 |
-| `max_model_len` | 引擎配置的最大序列长度，设计默认用户不设置超过 131072 |
 | `bs` | 一次 decode step 的 batch size |
+
+单请求长度：
+
+| 符号 | 含义 |
+|---|---|
 | `Sp` | 某请求 prefill token 数量 |
 | `Sd` | 某请求截至当前层 MLA 调用前，已经写入 HBM KVcache、并会参与本次 MLA 的 decode token 数；第一步 decode 时 `Sd=1` |
+| `Nprefill` | prefill 总块数，`Nprefill = ceil(Sp / B)` |
 | `Np` | prefill 满块数量，`Np = Sp // B` |
-| `Nr` | prefill 尾部非满块数量，`Nr = ceil(Sp / B) - Np`，只可能为 0 或 1 |
+| `Nr` | prefill 尾部非满块数量，`Nr = Nprefill - Np`，只可能为 0 或 1 |
 | `tail_len` | prefill 尾部非满块 token 数，`tail_len = Sp - Np * B` |
 | `Nd` | prefill 尾块加 decode 新 token 所需块数，`Nd = ceil((tail_len + Sd) / B)` |
 | `Nc` | prefill 满块中可被前缀复用的块数 |
 | `Ns` | prefill 满块卸载后，在 HBM 中保留的 sparse budget 块数 |
 | `Ts` | HBM 中用于 prefill 历史的 sparse budget token 数，`Ts = Ns * B` |
-| `Tp` | DRAM 中参与候选的 prefill layer_kv_token 数，`Tp = Np * B` |
-| `Tx` | 某请求某层某步从 DRAM 召回到 HBM 的 layer_kv_token 数量 |
+| `Tp` | 参与候选的 prefill 满块 layer_kv_token 数，`Tp = Np * B` |
+| `sparse_kv_len` | MLA 实际看到的 KV 长度，`sparse_kv_len = Ts + tail_len + Sd` |
+
+运行时索引：
+
+| 符号 | 含义 |
+|---|---|
+| `l` | 模型层 id，范围为 `[0, L)` |
+| `b` | decode batch 内请求 id，范围为 `[0, bs)` |
+| `e_b` | 第 `b` 个请求在 `hbm_cached_tokens_pool` 中的 pool entry |
+| `t` | 原始 prefill 满块 token id，范围为 `[0, Tp)` |
+| `s` | HBM sparse budget 本地 slot id，范围为 `[0, Ts)` |
+| `i` | promote/demote 对的序号 |
+| `Tcopy_b` | 第 `b` 个请求在某层某步实际搬运的 token 数，等于 `copy_counts[b]` |
+| `Tx` | 固定有损策略下每请求每层每步搬运的 layer_kv_token 数量 |
 | `GT2048` | DSA 在某 step、某层选择的最多 2048 个 layer_kv_token |
+
+全局容量上限：
+
+| 符号 | 含义 |
+|---|---|
+| `max_model_len` | 引擎配置的最大序列长度，设计默认用户不设置超过 131072 |
+| `Nmax_prefill` | 配置范围内 prefill 总块数上限，`Nmax_prefill = ceil(max_model_len / B)` |
+| `Nmax_sparse` | 配置范围内 sparse budget 块数上限，由 `Ns` 分段函数取最大值得到 |
+| `Tmax_sparse` | `hbm_cached_tokens_pool` 的 token 维上限，`Tmax_sparse = Nmax_sparse * B` |
+| `Tmax_candidate` | `score_out` 的 token 维上限，不超过 `max_model_len` |
+| `Tmax_copy` | `promote_idx/demote_idx` 的 token 维上限；无损策略下为 2048 |
+| `Nmax_index` | tensor 化 `index_block_tables` 的块数上限 |
+| `Nmax_hbm` | tensor 化 `hbm_block_tables` 的块数上限 |
+| `Nmax_dram` | tensor 化 `dram_block_tables` 的块数上限 |
+
+后文如果写作 `Tp_b`、`Ts_b`、`Sd_b`，表示 batch 内第 `b` 个请求对应的取值。
+
+### 3.4 索引映射与不变量
+
+后文统一使用以下辅助函数描述块内寻址：
+
+```text
+blk(x) = x // B
+off(x) = x % B
+```
+
+原始 prefill 满块 token id `t` 使用原始 prefill 语义；它通过 `dram_block_table[blk(t)]` 定位 DRAM 中的源块。HBM sparse slot id `s` 使用 sparse 语义；它通过 `hbm_block_table[blk(s)]` 定位 HBM sparse budget 中的目标块。
+
+对 batch 内第 `b` 个请求、第 `l` 层：
+
+```text
+hbm_cached_tokens_pool[l, e_b, s] = t
+```
+
+表示该层 HBM sparse budget 的本地 slot `s` 当前保存的是原始 prefill 满块 token `t`。因此 `hbm_block_table` 可以保持请求级，不需要按层拆分；逐层差异完全由 `hbm_cached_tokens_pool[l, e_b, :]` 表达。
+
+关键不变量如下：
+
+1. `dram_block_table` 只覆盖 prefill 满块，候选 token 范围始终是 `[0, Tp)`。
+2. `index_block_table` 使用原始序列语义，服务于 DSA indexer 打分。
+3. `hbm_block_table` 在 decode 阶段使用 sparse 语义，前 `Ns` 个逻辑块为 sparse budget。
+4. `hbm_cached_tokens_pool[l, e_b, 0:Ts]` 中的每个值都必须落在 `[0, Tp)`。
+5. `promote_idx[b, i]` 是原始 prefill 满块 token id `t`，`demote_idx[b, i]` 是本地 sparse slot id `s`。
+6. 仅 `0 <= i < Tcopy_b` 的 promote/demote 对有效，`Tcopy_b = copy_counts[b] <= Tmax_copy`。
+7. 启用卸载的请求需要满足 `Ts >= 2048`；默认分段函数下实际最小值为 2560。
 
 ## 4. 总体数据布局
 
@@ -148,11 +218,11 @@ IndexCache 不卸载，因为 decode 每步每层都需要用它为候选 prefil
 
 | cache | 形状 | device | 生命周期 |
 |---|---:|---|---|
-| `index_cache` | `tensor[(L, Cidx, B, 1, 128), bf16, npu]` | NPU | prefill 满块、尾块、decode 新块均常驻 HBM |
-| `hbm_ckv_cache` | `tensor[(L, Chbm, 1, B, 512), bf16, npu]` | NPU | prefill 阶段临时完整保存，decode 阶段仅保存 sparse budget、尾块和 decode 新块 |
-| `hbm_kpe_cache` | `tensor[(L, Chbm, 1, B, 64), bf16, npu]` | NPU | 同上 |
-| `dram_ckv_cache` | `tensor[(L, Cdram, 1, B, 512), bf16, cpu]` | CPU DRAM | 保存 prefill 满块 |
-| `dram_kpe_cache` | `tensor[(L, Cdram, 1, B, 64), bf16, cpu]` | CPU DRAM | 保存 prefill 满块 |
+| `index_cache` | `tensor[(L, Cidx, B, 1, Didx), bf16, npu]` | NPU | prefill 满块、尾块、decode 新块均常驻 HBM |
+| `hbm_ckv_cache` | `tensor[(L, Chbm, 1, B, Dckv), bf16, npu]` | NPU | prefill 阶段临时完整保存，decode 阶段仅保存 sparse budget、尾块和 decode 新块 |
+| `hbm_kpe_cache` | `tensor[(L, Chbm, 1, B, Dkpe), bf16, npu]` | NPU | 同上 |
+| `dram_ckv_cache` | `tensor[(L, Cdram, 1, B, Dckv), bf16, cpu]` | CPU DRAM | 保存 prefill 满块 |
+| `dram_kpe_cache` | `tensor[(L, Cdram, 1, B, Dkpe), bf16, cpu]` | CPU DRAM | 保存 prefill 满块 |
 
 DRAM cache 应优先使用 pinned memory。最终 H2D 路径由 `dsa_scatter_h2d` 负责，底层可替换为 CANN custom op。
 
@@ -193,19 +263,19 @@ flowchart TB
 `hbm_cached_tokens_pool` 记录 HBM sparse budget 中每个 slot 对应的原始 prefill token id：
 
 ```text
-hbm_cached_tokens_pool = tensor[(L, pool_capacity, max_sparse_tokens), int32, npu]
+hbm_cached_tokens_pool = tensor[(L, pool_capacity, Tmax_sparse), int32, npu]
 ```
 
 其中：
 
 ```text
-max_sparse_tokens = B * max_sparse_blocks(max_model_len)
+Tmax_sparse = B * Nmax_sparse
 ```
 
-`max_sparse_blocks(max_model_len)` 由 sparse budget 分段函数在配置的 `max_model_len` 范围内取最大值得到。若 `max_model_len=131072` 且 `B=128`，默认分段函数下 `Np` 最大为 1024，`Ns=ceil(0.20*1024)=205`，因此：
+`Nmax_sparse` 由 sparse budget 分段函数在配置的 `max_model_len` 范围内取最大值得到。若 `max_model_len=131072` 且 `B=128`，默认分段函数下 `Np` 最大为 1024，`Ns=ceil(0.20*1024)=205`，因此：
 
 ```text
-max_sparse_tokens = 205 * 128 = 26240
+Tmax_sparse = 205 * 128 = 26240
 ```
 
 这个形状比 `(L, max_decode_batch, max_model_len)` 更合适，因为 pool 只需要记录 HBM sparse budget 的 slot 到原始 token id 的映射，不记录全量序列。
@@ -375,7 +445,7 @@ flowchart TD
 2. `dsa_index_update` 输出的 `copy_counts` 是固定值还是动态值；
 3. `dsa_scatter_h2d` 根据 `copy_counts` 只搬运每个 batch item 的有效前缀。
 
-只要 `promote_idx/demote_idx` 预留容量为 `max_copy_tokens`，并且接口包含 `copy_counts`，框架其余部分无需因有损/无损策略切换而改接口。无损策略下 `max_copy_tokens` 定义为 2048；固定 `Tx` 有损策略只使用前 `Tx` 个有效槽位。
+只要 `promote_idx/demote_idx` 预留容量为 `Tmax_copy`，并且接口包含 `copy_counts`，框架其余部分无需因有损/无损策略切换而改接口。无损策略下 `Tmax_copy` 定义为 2048；固定 `Tx` 有损策略只使用前 `Tx` 个有效槽位。
 
 ## 8. BlockManager 设计
 
@@ -443,7 +513,7 @@ Nc = min(IndexBlockManager 命中块数, DramBlockManager 命中块数)
 
 ### 8.5 PoolEntryManager
 
-PoolEntryManager 管理 `hbm_cached_tokens_pool` 的槽位。每个启用卸载的请求需要独占一个 `hbm_cached_tokens_pool_entry`，用于索引：
+PoolEntryManager 管理 `hbm_cached_tokens_pool` 的槽位。每个启用卸载的请求需要独占一个 `hbm_cached_tokens_pool_entry`，也就是运行时符号 `e_b`，用于索引：
 
 ```text
 hbm_cached_tokens_pool[:, hbm_cached_tokens_pool_entry, :]
@@ -466,9 +536,10 @@ hbm_cached_tokens_pool[:, hbm_cached_tokens_pool_entry, :]
 | `hbm_block_table` | `list[int]` | HBM CKV/KPE 的物理块号，decode 阶段使用 sparse 语义 |
 | `dram_block_table` | `list[int]` | DRAM CKV/KPE 的物理块号，只覆盖 prefill 满块 |
 | `hbm_cached_tokens_pool_entry` | `int` | 该请求在 `hbm_cached_tokens_pool` 中的槽位 |
+| `num_prefill_blocks` | `int` | `Nprefill` |
 | `num_prefill_full_blocks` | `int` | `Np` |
 | `num_prefill_tail_blocks` | `int` | `Nr` |
-| `num_dram_cached_blocks` | `int` | `Nc` |
+| `num_prefix_cached_blocks` | `int` | `Nc` |
 | `num_sparse_blocks` | `int` | `Ns` |
 | `num_sparse_tokens` | `int` | `Ts` |
 | `prefill_tail_len` | `int` | `tail_len` |
@@ -488,8 +559,8 @@ hbm_cached_tokens_pool[:, hbm_cached_tokens_pool_entry, :]
 
 调度一个等待请求进入 prefill 时，需要同时满足：
 
-1. IndexBlockManager 可分配或复用 `ceil(Sp/B)` 个 IndexCache HBM 块。
-2. HBMBlockManager 可分配 `ceil(Sp/B)` 个 KVcache HBM 块。
+1. IndexBlockManager 可分配或复用 `Nprefill` 个 IndexCache HBM 块。
+2. HBMBlockManager 可分配 `Nprefill` 个 KVcache HBM 块。
 3. DramBlockManager 可分配或复用 `Np` 个 DRAM KVcache 满块。
 4. 若启用卸载，PoolEntryManager 可分配一个 `hbm_cached_tokens_pool_entry`。
 5. 请求长度满足 `max_model_len`、`max_num_batched_tokens` 等引擎限制。
@@ -523,12 +594,12 @@ Worker 初始化时维护：
 
 | tensor | 形状 | device | 说明 |
 |---|---:|---|---|
-| `index_cache` | `tensor[(L, Cidx, B, 1, 128), bf16, npu]` | NPU | DSA indexer 使用 |
-| `hbm_ckv_cache` | `tensor[(L, Chbm, 1, B, 512), bf16, npu]` | NPU | HBM CKV |
-| `hbm_kpe_cache` | `tensor[(L, Chbm, 1, B, 64), bf16, npu]` | NPU | HBM KPE |
-| `dram_ckv_cache` | `tensor[(L, Cdram, 1, B, 512), bf16, cpu]` | CPU DRAM | DRAM CKV |
-| `dram_kpe_cache` | `tensor[(L, Cdram, 1, B, 64), bf16, cpu]` | CPU DRAM | DRAM KPE |
-| `hbm_cached_tokens_pool` | `tensor[(L, pool_capacity, max_sparse_tokens), int32, npu]` | NPU | sparse slot 到原始 token id 的映射 |
+| `index_cache` | `tensor[(L, Cidx, B, 1, Didx), bf16, npu]` | NPU | DSA indexer 使用 |
+| `hbm_ckv_cache` | `tensor[(L, Chbm, 1, B, Dckv), bf16, npu]` | NPU | HBM CKV |
+| `hbm_kpe_cache` | `tensor[(L, Chbm, 1, B, Dkpe), bf16, npu]` | NPU | HBM KPE |
+| `dram_ckv_cache` | `tensor[(L, Cdram, 1, B, Dckv), bf16, cpu]` | CPU DRAM | DRAM CKV |
+| `dram_kpe_cache` | `tensor[(L, Cdram, 1, B, Dkpe), bf16, cpu]` | CPU DRAM | DRAM KPE |
+| `hbm_cached_tokens_pool` | `tensor[(L, pool_capacity, Tmax_sparse), int32, npu]` | NPU | sparse slot 到原始 token id 的映射 |
 
 ### 11.2 Decode 前 tensor 化元数据
 
@@ -536,15 +607,15 @@ Worker 初始化时维护：
 
 | tensor | 形状 | dtype | device | 说明 |
 |---|---:|---|---|---|
-| `index_block_tables` | `tensor[(bs, max_index_blocks), int32, npu]` | int32 | NPU | IndexCache block table |
-| `hbm_block_tables` | `tensor[(bs, max_hbm_blocks), int32, npu]` | int32 | NPU | sparse HBM KVcache block table |
-| `dram_block_tables` | `tensor[(bs, max_dram_blocks), int32, npu]` | int32 | NPU | DRAM KVcache block table |
-| `req_pool_entries` | `tensor[(bs,), int32, npu]` | int32 | NPU | 每个请求对应的 pool entry |
+| `index_block_tables` | `tensor[(bs, Nmax_index), int32, npu]` | int32 | NPU | IndexCache block table |
+| `hbm_block_tables` | `tensor[(bs, Nmax_hbm), int32, npu]` | int32 | NPU | sparse HBM KVcache block table |
+| `dram_block_tables` | `tensor[(bs, Nmax_dram), int32, npu]` | int32 | NPU | DRAM KVcache block table |
+| `req_pool_entries` | `tensor[(bs,), int32, npu]` | int32 | NPU | 每个请求对应的 pool entry，即 `e_b` |
 | `candidate_lens` | `tensor[(bs,), int32, npu]` | int32 | NPU | 每个请求参与候选的 prefill 满块 token 数，等于 `Tp` |
 | `sparse_selected_lens` | `tensor[(bs,), int32, npu]` | int32 | NPU | 每个请求当前 sparse budget 有效长度，等于 `Ts` |
-| `prefill_tail_lens` | `tensor[(bs,), int32, npu]` | int32 | NPU | 每个请求 prefill 尾部非满块 token 数 |
-| `decode_lens` | `tensor[(bs,), int32, npu]` | int32 | NPU | 每个请求 decode 常驻 token 数 |
-| `sparse_kv_lens` | `tensor[(bs,), int32, npu]` | int32 | NPU | MLA 使用的 sparse KV 长度 |
+| `prefill_tail_lens` | `tensor[(bs,), int32, npu]` | int32 | NPU | 每个请求 prefill 尾部非满块 token 数，等于 `tail_len` |
+| `decode_lens` | `tensor[(bs,), int32, npu]` | int32 | NPU | 每个请求 decode 常驻 token 数，等于 `Sd` |
+| `sparse_kv_lens` | `tensor[(bs,), int32, npu]` | int32 | NPU | MLA 使用的 sparse KV 长度，等于 `sparse_kv_len` |
 
 这些 tensor 放入 `Context`，供每层 forward 使用。
 
@@ -624,9 +695,9 @@ def dsa_indexer_score(
     query_index,          # tensor[(bs, Hidx, Didx), bf16, npu]
     index_cache,          # tensor[(Cidx, B, 1, Didx), bf16, npu]
     index_weights,        # tensor[(bs, Hidx), bf16, npu]
-    index_block_table,    # tensor[(bs, max_index_blocks), int32, npu]
+    index_block_table,    # tensor[(bs, Nmax_index), int32, npu]
     candidate_lens,       # tensor[(bs,), int32, npu]
-    score_out,            # tensor[(bs, max_candidate_tokens), bf16, npu]
+    score_out,            # tensor[(bs, Tmax_candidate), bf16, npu]
 ):
     ...
 ```
@@ -634,10 +705,10 @@ def dsa_indexer_score(
 输出语义：
 
 ```text
-score_out[b, t] = 第 b 个请求中原始 prefill token id 为 t 的 layer_kv_token 分数
+score_out[b, t] = 第 b 个请求中原始 prefill 满块 token id 为 t 的 layer_kv_token 分数
 ```
 
-只有 `0 <= t < candidate_lens[b]` 的位置有效。无效位置应被置为足够小的哨兵值。
+只有 `0 <= t < candidate_lens[b]` 的位置有效，其中 `candidate_lens[b] = Tp_b`。无效位置应被置为足够小的哨兵值。
 
 ### 13.2 `dsa_index_update`
 
@@ -647,15 +718,15 @@ score_out[b, t] = 第 b 个请求中原始 prefill token id 为 t 的 layer_kv_t
 
 ```python
 def dsa_index_update(
-    score,                     # tensor[(bs, max_candidate_tokens), bf16, npu], input/output
-    hbm_cached_tokens_pool,    # tensor[(pool_capacity, max_sparse_tokens), int32, npu], input/output，单层切片
-    promote_idx,               # tensor[(bs, max_copy_tokens), int32, npu], output
-    demote_idx,                # tensor[(bs, max_copy_tokens), int32, npu], output
+    score,                     # tensor[(bs, Tmax_candidate), bf16, npu], input/output
+    hbm_cached_tokens_pool,    # tensor[(pool_capacity, Tmax_sparse), int32, npu], input/output，单层切片
+    promote_idx,               # tensor[(bs, Tmax_copy), int32, npu], output
+    demote_idx,                # tensor[(bs, Tmax_copy), int32, npu], output
     copy_counts,               # tensor[(bs,), int32, npu], output
     candidate_lens,            # tensor[(bs,), int32, npu]
     selected_lens,             # tensor[(bs,), int32, npu]
     req_pool_entries,          # tensor[(bs,), int32, npu]
-    max_copy_tokens: int,       # 无损策略取 2048；固定 Tx 策略可小于 2048
+    max_copy_tokens: int,       # 等于 Tmax_copy；无损策略取 2048，固定 Tx 策略可小于 2048
 ):
     ...
 ```
@@ -664,11 +735,11 @@ def dsa_index_update(
 
 | tensor | 语义 |
 |---|---|
-| `promote_idx[b, i]` | 原始 prefill token id，范围为 `[0, candidate_lens[b])` |
-| `demote_idx[b, i]` | HBM sparse budget 本地 slot id，范围为 `[0, selected_lens[b])` |
-| `copy_counts[b]` | 第 `b` 个请求本次有效 promote/demote 对数 |
+| `promote_idx[b, i]` | 原始 prefill 满块 token id `t`，范围为 `[0, candidate_lens[b])` |
+| `demote_idx[b, i]` | HBM sparse budget 本地 slot id `s`，范围为 `[0, selected_lens[b])` |
+| `copy_counts[b]` | 第 `b` 个请求本次有效 promote/demote 对数，即 `Tcopy_b` |
 
-对每个 batch item，仅 `0 <= i < copy_counts[b]` 的 `promote_idx/demote_idx` 有效。剩余位置由实现填充任意合法值或 0，`dsa_scatter_h2d` 必须忽略。
+对每个 batch item，仅 `0 <= i < Tcopy_b` 的 `promote_idx/demote_idx` 有效。剩余位置由实现填充任意合法值或 0，`dsa_scatter_h2d` 必须忽略。
 
 固定 `Tx` 策略中，`copy_counts[b] = Tx`。无损动态策略中，`copy_counts[b]` 等于该请求该层该步中 `GT2048` 尚未驻留 HBM 的 layer_kv_token 数。
 
@@ -680,15 +751,15 @@ def dsa_index_update(
 
 ```python
 def dsa_scatter_h2d(
-    promote_idx,          # tensor[(bs, max_copy_tokens), int32, npu]
-    demote_idx,           # tensor[(bs, max_copy_tokens), int32, npu]
+    promote_idx,          # tensor[(bs, Tmax_copy), int32, npu]
+    demote_idx,           # tensor[(bs, Tmax_copy), int32, npu]
     copy_counts,          # tensor[(bs,), int32, npu]
-    hbm_block_table,      # tensor[(bs, max_hbm_blocks), int32, npu]
-    dram_block_table,     # tensor[(bs, max_dram_blocks), int32, npu]
-    hbm_ckv_cache,        # tensor[(Chbm, 1, B, 512), bf16, npu], input/output，单层切片
-    hbm_kpe_cache,        # tensor[(Chbm, 1, B, 64), bf16, npu], input/output，单层切片
-    dram_ckv_cache,       # tensor[(Cdram, 1, B, 512), bf16, cpu]，单层切片
-    dram_kpe_cache,       # tensor[(Cdram, 1, B, 64), bf16, cpu]，单层切片
+    hbm_block_table,      # tensor[(bs, Nmax_hbm), int32, npu]
+    dram_block_table,     # tensor[(bs, Nmax_dram), int32, npu]
+    hbm_ckv_cache,        # tensor[(Chbm, 1, B, Dckv), bf16, npu], input/output，单层切片
+    hbm_kpe_cache,        # tensor[(Chbm, 1, B, Dkpe), bf16, npu], input/output，单层切片
+    dram_ckv_cache,       # tensor[(Cdram, 1, B, Dckv), bf16, cpu]，单层切片
+    dram_kpe_cache,       # tensor[(Cdram, 1, B, Dkpe), bf16, cpu]，单层切片
 ):
     ...
 ```
@@ -697,22 +768,22 @@ def dsa_scatter_h2d(
 
 ```text
 源地址：
-  global_token_id = promote_idx[b, i]
-  dram_logical_block = global_token_id // B
-  dram_offset = global_token_id % B
+  t = promote_idx[b, i]
+  dram_logical_block = blk(t)
+  dram_offset = off(t)
   dram_physical_block = dram_block_table[b, dram_logical_block]
 
 目的地址：
-  local_sparse_slot = demote_idx[b, i]
-  hbm_logical_block = local_sparse_slot // B
-  hbm_offset = local_sparse_slot % B
+  s = demote_idx[b, i]
+  hbm_logical_block = blk(s)
+  hbm_offset = off(s)
   hbm_physical_block = hbm_block_table[b, hbm_logical_block]
 ```
 
-循环范围由 `copy_counts[b]` 决定：
+循环范围由 `Tcopy_b = copy_counts[b]` 决定：
 
 ```text
-for i in range(copy_counts[b]):
+for i in range(Tcopy_b):
     copy CKV/KPE from DRAM source to HBM destination
 ```
 
@@ -741,10 +812,10 @@ for i in range(copy_counts[b]):
 `dsa_indexer_score` 输出全量候选分数：
 
 ```text
-score_out = tensor[(bs, max_candidate_tokens), bf16, npu]
+score_out = tensor[(bs, Tmax_candidate), bf16, npu]
 ```
 
-在默认最大序列长度 `max_model_len <= 131072` 下，即使 `bs=256`：
+`Tmax_candidate` 不超过 `max_model_len`。在默认最大序列长度 `max_model_len <= 131072` 下，即使 `bs=256`：
 
 ```text
 256 * 131072 * 2 bytes = 64 MiB
@@ -769,7 +840,7 @@ B * 128 * sizeof(bf16)
 61 * 32 KiB ≈ 1.91 MiB
 ```
 
-如果 `max_model_len=131072` 且 `B=128`，满长请求需要 `1024` 个 IndexCache block，全 61 层约：
+如果 `max_model_len=131072` 且 `B=128`，则 `Nmax_prefill=1024`。满长请求需要 `1024` 个 IndexCache block，全 61 层约：
 
 ```text
 1024 * 1.91 MiB ≈ 1.91 GiB

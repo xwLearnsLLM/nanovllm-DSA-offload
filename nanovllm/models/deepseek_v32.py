@@ -15,6 +15,11 @@ import torch.nn.functional as F
 from transformers import PretrainedConfig
 
 import nanovllm.ops as ascend_ops
+from nanovllm.models.dsa_offload_ops import (
+    dsa_index_update,
+    dsa_indexer_score,
+    dsa_scatter_h2d,
+)
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
 from nanovllm.layers.layernorm import RMSNorm
@@ -33,6 +38,9 @@ SFA_SPARSE_COUNT = 2048
 ACL_FORMAT_FRACTAL_NZ = 29
 _NPU_MLA_ATTENTION_MASK_CACHE: dict[tuple[str, int], torch.Tensor] = {}
 _NPU_MLA_V2_WORKSPACE_CACHE: dict[tuple, torch.Tensor] = {}
+_DSA_WARNED_DECODE_MLAPO_DISABLED = False
+_DSA_WARNED_BACKEND_OVERRIDE = False
+_DSA_OFFLOAD_BUFFER_CACHE = {}
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -879,6 +887,11 @@ class DeepseekV32DSAAttention(nn.Module):
         self.ckv_cache = torch.tensor([])
         self.kpe_cache = torch.tensor([])
         self.index_cache = torch.tensor([])
+        self.dram_ckv_cache = torch.tensor([])
+        self.dram_kpe_cache = torch.tensor([])
+        self.hbm_cached_tokens_pool = torch.tensor([])
+        self.dsa_offload_max_copy_tokens = 2048
+        self.dsa_offload_fixed_tx = 64
         self.register_parameter("wd_qkv", None)
         self.w_uk_t = None
         self.w_uv = None
@@ -891,6 +904,15 @@ class DeepseekV32DSAAttention(nn.Module):
             "NANOVLLM_ENABLE_DECODE_MLAPO",
             False,
         )
+        if self.enable_decode_mlapo:
+            global _DSA_WARNED_DECODE_MLAPO_DISABLED
+            if _is_rank0() and not _DSA_WARNED_DECODE_MLAPO_DISABLED:
+                logger.warning(
+                    "DSA offload disables decode MLAPO because IndexCache "
+                    "must be produced during decode."
+                )
+                _DSA_WARNED_DECODE_MLAPO_DISABLED = True
+            self.enable_decode_mlapo = False
         self.mla_rope_neox_cache = _env_flag(
             "NANOVLLM_MLA_ROPE_NEOX_CACHE",
             False,
@@ -915,13 +937,21 @@ class DeepseekV32DSAAttention(nn.Module):
             "NANOVLLM_DECODE_ATTENTION_BACKEND",
             "mla",
         ).strip().lower()
-        if self.use_npu_sfa_decode:
-            self.decode_attention_backend = "sfa"
         if self.decode_attention_backend not in ("mla", "sfa", "torch"):
             raise ValueError(
                 "NANOVLLM_DECODE_ATTENTION_BACKEND must be one of "
                 "'mla', 'sfa', or 'torch'."
             )
+        if self.use_npu_sfa_decode or self.decode_attention_backend != "mla":
+            global _DSA_WARNED_BACKEND_OVERRIDE
+            if _is_rank0() and not _DSA_WARNED_BACKEND_OVERRIDE:
+                logger.warning(
+                    "DSA offload currently uses dense MLA decode; overriding "
+                    "decode attention backend to 'mla'."
+                )
+                _DSA_WARNED_BACKEND_OVERRIDE = True
+            self.use_npu_sfa_decode = False
+            self.decode_attention_backend = "mla"
         self.compare_npu_sfa_decode = _env_flag(
             "NANOVLLM_COMPARE_NPU_SFA_DECODE",
             False,
@@ -1023,10 +1053,20 @@ class DeepseekV32DSAAttention(nn.Module):
         ckv_cache: torch.Tensor,
         kpe_cache: torch.Tensor,
         index_cache: torch.Tensor,
+        dram_ckv_cache: torch.Tensor,
+        dram_kpe_cache: torch.Tensor,
+        hbm_cached_tokens_pool: torch.Tensor,
+        dsa_offload_max_copy_tokens: int,
+        dsa_offload_fixed_tx: int,
     ) -> None:
         self.ckv_cache = ckv_cache
         self.kpe_cache = kpe_cache
         self.index_cache = index_cache
+        self.dram_ckv_cache = dram_ckv_cache
+        self.dram_kpe_cache = dram_kpe_cache
+        self.hbm_cached_tokens_pool = hbm_cached_tokens_pool
+        self.dsa_offload_max_copy_tokens = int(dsa_offload_max_copy_tokens)
+        self.dsa_offload_fixed_tx = int(dsa_offload_fixed_tx)
 
     def post_load_prepare(self) -> None:
         if self.fuse_qkv_a and self.wd_qkv is None:
@@ -1261,6 +1301,68 @@ class DeepseekV32DSAAttention(nn.Module):
             return context.flat_slot_mapping_i32
         return self._flat_slots().to(torch.int32)
 
+    def _flat_index_slots(self) -> torch.Tensor:
+        context = get_context()
+        if context.flat_index_slot_mapping is not None:
+            return context.flat_index_slot_mapping
+        return self._flat_slots()
+
+    def finalize_prefill_offload(
+        self,
+        seq,
+        old_hbm_block_table: list[int],
+    ) -> None:
+        entry = int(seq.hbm_cached_tokens_pool_entry)
+        num_full_blocks = int(seq.num_prefill_full_blocks)
+        num_sparse_blocks = int(seq.num_sparse_blocks)
+        sparse_tokens = int(seq.num_sparse_tokens)
+        pool = self.hbm_cached_tokens_pool[self.layer_id, entry]
+        pool.fill_(-1)
+
+        for logical_block in range(num_full_blocks):
+            hbm_block = int(old_hbm_block_table[logical_block])
+            dram_block = int(seq.dram_block_table[logical_block])
+            self.dram_ckv_cache[dram_block].copy_(
+                self.ckv_cache[hbm_block].to(
+                    device=self.dram_ckv_cache.device,
+                    non_blocking=True,
+                ),
+            )
+            self.dram_kpe_cache[dram_block].copy_(
+                self.kpe_cache[hbm_block].to(
+                    device=self.dram_kpe_cache.device,
+                    non_blocking=True,
+                ),
+            )
+
+        if num_sparse_blocks <= 0:
+            return
+
+        source_start_block = num_full_blocks - num_sparse_blocks
+        for sparse_block in range(num_sparse_blocks):
+            dram_block = int(seq.dram_block_table[source_start_block + sparse_block])
+            hbm_block = int(old_hbm_block_table[sparse_block])
+            self.ckv_cache[hbm_block].copy_(
+                self.dram_ckv_cache[dram_block].to(
+                    device=self.ckv_cache.device,
+                    non_blocking=True,
+                ),
+            )
+            self.kpe_cache[hbm_block].copy_(
+                self.dram_kpe_cache[dram_block].to(
+                    device=self.kpe_cache.device,
+                    non_blocking=True,
+                ),
+            )
+
+        token_start = source_start_block * self.block_size
+        pool[:sparse_tokens] = torch.arange(
+            token_start,
+            token_start + sparse_tokens,
+            dtype=torch.int32,
+            device=pool.device,
+        )
+
     def _store_cache(
         self,
         ckv: torch.Tensor,
@@ -1280,9 +1382,10 @@ class DeepseekV32DSAAttention(nn.Module):
         )
         if index_k is None:
             return
+        index_slots = self._flat_index_slots()
         self.index_cache.view(-1, self.indexer.head_dim).index_copy_(
             0,
-            flat_slots,
+            index_slots,
             index_k,
         )
 
@@ -1651,6 +1754,23 @@ class DeepseekV32DSAAttention(nn.Module):
         )
         return output.reshape(num_tokens, -1)
 
+    def _v_up_proj_head_major(
+        self,
+        latent_by_head: torch.Tensor,
+        num_tokens: int,
+    ) -> torch.Tensor:
+        latent_by_head = latent_by_head.view(
+            self.num_local_heads,
+            num_tokens,
+            self.kv_lora_rank,
+        )
+        output = torch_npu.npu_transpose_batchmatmul(
+            latent_by_head,
+            self.w_uv,
+            perm_y=(1, 0, 2),
+        )
+        return output.reshape(num_tokens, -1)
+
     def _decode_mla_v2_buffers(
         self,
         batch_size: int,
@@ -1786,9 +1906,8 @@ class DeepseekV32DSAAttention(nn.Module):
             out=[out, lse],
         )
         # FIA v2 writes NBSD-like output [heads, tokens, 1, dim], matching
-        # vllm-ascend's trick to avoid an internal transpose. Convert back to
-        # the local latent layout expected by v_up: [tokens, heads, dim].
-        return out.squeeze(2).transpose(0, 1).contiguous()
+        # vllm-ascend's trick to feed v-up without a transpose/copy round trip.
+        return out
 
     def _prefill_forward(
         self,
@@ -1895,6 +2014,139 @@ class DeepseekV32DSAAttention(nn.Module):
             )
         return torch.stack(outputs, dim=0)
 
+    def _dsa_offload_buffers(
+        self,
+        batch_size: int,
+        candidate_capacity: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        global _DSA_OFFLOAD_BUFFER_CACHE
+        copy_capacity = int(self.dsa_offload_max_copy_tokens)
+        key = (str(device), dtype)
+        cached = _DSA_OFFLOAD_BUFFER_CACHE.get(key)
+        if cached is None:
+            cached_batch = cached_candidates = cached_copy = 0
+            buffers = None
+        else:
+            cached_batch, cached_candidates, cached_copy, buffers = cached
+
+        if (
+            buffers is None
+            or cached_batch < batch_size
+            or cached_candidates < candidate_capacity
+            or cached_copy < copy_capacity
+        ):
+            cached_batch = max(cached_batch, batch_size)
+            cached_candidates = max(cached_candidates, candidate_capacity)
+            cached_copy = max(cached_copy, copy_capacity)
+            score_out = torch.empty(
+                (cached_batch, cached_candidates),
+                dtype=dtype,
+                device=device,
+            )
+            promote_idx = torch.empty(
+                (cached_batch, cached_copy),
+                dtype=torch.int32,
+                device=device,
+            )
+            demote_idx = torch.empty(
+                (cached_batch, cached_copy),
+                dtype=torch.int32,
+                device=device,
+            )
+            copy_counts = torch.empty(
+                (cached_batch,),
+                dtype=torch.int32,
+                device=device,
+            )
+            buffers = (score_out, promote_idx, demote_idx, copy_counts)
+            _DSA_OFFLOAD_BUFFER_CACHE[key] = (
+                cached_batch,
+                cached_candidates,
+                cached_copy,
+                buffers,
+            )
+
+        score_out, promote_idx, demote_idx, copy_counts = buffers
+        return (
+            score_out[:batch_size, :candidate_capacity],
+            promote_idx[:batch_size, :copy_capacity],
+            demote_idx[:batch_size, :copy_capacity],
+            copy_counts[:batch_size],
+        )
+
+    def _dsa_offload_update(
+        self,
+        q_index: torch.Tensor,
+        weights: torch.Tensor,
+        batch_size: int,
+    ) -> None:
+        context = get_context()
+        required_context = {
+            "candidate_lens": context.candidate_lens,
+            "sparse_selected_lens": context.sparse_selected_lens,
+            "req_pool_entries": context.req_pool_entries,
+            "index_block_tables": context.index_block_tables,
+            "hbm_block_tables": context.hbm_block_tables,
+            "dram_block_tables": context.dram_block_tables,
+        }
+        missing = [name for name, value in required_context.items() if value is None]
+        if missing:
+            raise RuntimeError(
+                "DSA offload context is missing: " + ", ".join(missing)
+            )
+        candidate_lens = context.candidate_lens[:batch_size]
+        selected_lens = context.sparse_selected_lens[:batch_size]
+        req_pool_entries = context.req_pool_entries[:batch_size]
+        max_candidate = max(
+            int(candidate_lens.max().item()) if candidate_lens.numel() else 0,
+            1,
+        )
+        (
+            score_out,
+            promote_idx,
+            demote_idx,
+            copy_counts,
+        ) = self._dsa_offload_buffers(
+            batch_size,
+            max_candidate,
+            q_index.dtype,
+            q_index.device,
+        )
+
+        dsa_indexer_score(
+            q_index[:batch_size],
+            self.index_cache,
+            weights[:batch_size],
+            context.index_block_tables[:batch_size],
+            candidate_lens,
+            score_out,
+        )
+        pool_slice = self.hbm_cached_tokens_pool[self.layer_id]
+        dsa_index_update(
+            score_out,
+            pool_slice,
+            promote_idx,
+            demote_idx,
+            copy_counts,
+            candidate_lens,
+            selected_lens,
+            req_pool_entries,
+            min(self.dsa_offload_fixed_tx, self.dsa_offload_max_copy_tokens),
+        )
+        dsa_scatter_h2d(
+            promote_idx,
+            demote_idx,
+            copy_counts,
+            context.hbm_block_tables[:batch_size],
+            context.dram_block_tables[:batch_size],
+            self.ckv_cache,
+            self.kpe_cache,
+            self.dram_ckv_cache,
+            self.dram_kpe_cache,
+        )
+
     def _decode_forward(
         self,
         ql_nope: torch.Tensor,
@@ -1904,7 +2156,9 @@ class DeepseekV32DSAAttention(nn.Module):
     ) -> torch.Tensor:
         self.last_decode_attention_op_time = 0.0
         if self.decode_attention_backend == "mla":
-            return self._decode_forward_mla(ql_nope, q_pe)
+            if q_index is None or weights is None:
+                raise RuntimeError("DSA offload decode requires indexer outputs.")
+            return self._decode_forward_mla(ql_nope, q_pe, q_index, weights)
         if q_index is None or weights is None:
             raise RuntimeError(
                 "Sparse decode backends require indexer outputs, but they were "
@@ -1932,6 +2186,8 @@ class DeepseekV32DSAAttention(nn.Module):
         self,
         ql_nope: torch.Tensor,
         q_pe: torch.Tensor,
+        q_index: torch.Tensor,
+        weights: torch.Tensor,
     ) -> torch.Tensor:
         context = get_context()
         batch_size = int(ql_nope.shape[0])
@@ -1941,6 +2197,7 @@ class DeepseekV32DSAAttention(nn.Module):
         assert actual_seq_lengths_key is not None
         block_table = context.block_tables[:batch_size]
         profile_decode = self.log_decode_layer_timing
+        self._dsa_offload_update(q_index, weights, batch_size)
         start = self._decode_timer_start(profile_decode, ql_nope.device)
         if self.decode_mla_fia_v2:
             latent = self._decode_forward_mla_v2(
@@ -1981,7 +2238,10 @@ class DeepseekV32DSAAttention(nn.Module):
             "decode_attention_op"
         ]
         start = self._decode_timer_start(profile_decode, latent.device)
-        output = self._v_up_proj(latent)
+        if self.decode_mla_fia_v2:
+            output = self._v_up_proj_head_major(latent, batch_size)
+        else:
+            output = self._v_up_proj(latent)
         self._decode_timer_end(profile_decode, "v_up", start, output.device)
         return output
 
@@ -2119,25 +2379,19 @@ class DeepseekV32DSAAttention(nn.Module):
             q_pe = _rope_interleaved_to_neox(q_pe)
             k_pe = _rope_interleaved_to_neox(k_pe)
 
-        use_sparse_decode = self.decode_attention_backend in ("sfa", "torch")
-        if use_sparse_decode:
-            start = self._decode_timer_start(profile_decode, hidden_states.device)
-            q_index, index_k, weights = self.indexer(
-                hidden_states,
-                q_c,
-                positions,
-                self.indexer_rotary_emb,
-            )
-            self._decode_timer_end(
-                profile_decode,
-                "indexer",
-                start,
-                hidden_states.device,
-            )
-        else:
-            q_index = None
-            index_k = None
-            weights = None
+        start = self._decode_timer_start(profile_decode, hidden_states.device)
+        q_index, index_k, weights = self.indexer(
+            hidden_states,
+            q_c,
+            positions,
+            self.indexer_rotary_emb,
+        )
+        self._decode_timer_end(
+            profile_decode,
+            "indexer",
+            start,
+            hidden_states.device,
+        )
 
         start = self._decode_timer_start(profile_decode, ckv.device)
         self._store_cache(ckv, k_pe, index_k)

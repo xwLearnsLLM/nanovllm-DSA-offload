@@ -37,6 +37,19 @@ class Sequence:
         self.num_prompt_tokens = len(token_ids)
         self.num_cached_tokens = 0
         self.block_table = []
+        self.index_block_table = []
+        self.hbm_block_table = self.block_table
+        self.dram_block_table = []
+        self.hbm_cached_tokens_pool_entry = -1
+        self.offload_finalized = False
+        self.num_prefill_blocks = 0
+        self.num_prefill_full_blocks = 0
+        self.num_prefill_tail_blocks = 0
+        self.num_prefix_cached_blocks = 0
+        self.num_sparse_blocks = 0
+        self.num_sparse_tokens = 0
+        self.prefill_tail_len = 0
+        self.hbm_blocks_to_release = []
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
@@ -93,6 +106,19 @@ class Sequence:
             "num_prompt_tokens": self.num_prompt_tokens,
             "num_cached_tokens": self.num_cached_tokens,
             "block_table": self.block_table,
+            "index_block_table": self.index_block_table,
+            "hbm_block_table": self.hbm_block_table,
+            "dram_block_table": self.dram_block_table,
+            "hbm_cached_tokens_pool_entry": self.hbm_cached_tokens_pool_entry,
+            "offload_finalized": self.offload_finalized,
+            "num_prefill_blocks": self.num_prefill_blocks,
+            "num_prefill_full_blocks": self.num_prefill_full_blocks,
+            "num_prefill_tail_blocks": self.num_prefill_tail_blocks,
+            "num_prefix_cached_blocks": self.num_prefix_cached_blocks,
+            "num_sparse_blocks": self.num_sparse_blocks,
+            "num_sparse_tokens": self.num_sparse_tokens,
+            "prefill_tail_len": self.prefill_tail_len,
+            "hbm_blocks_to_release": self.hbm_blocks_to_release,
             "token_ids": self.token_ids,
             "status": self.status,
             "temperature": self.temperature,
@@ -109,6 +135,22 @@ class Sequence:
         self.num_prompt_tokens = state["num_prompt_tokens"]
         self.num_cached_tokens = state["num_cached_tokens"]
         self.block_table = state["block_table"]
+        self.index_block_table = state.get("index_block_table", self.block_table)
+        self.hbm_block_table = state.get("hbm_block_table", self.block_table)
+        self.dram_block_table = state.get("dram_block_table", [])
+        self.hbm_cached_tokens_pool_entry = state.get(
+            "hbm_cached_tokens_pool_entry",
+            -1,
+        )
+        self.offload_finalized = state.get("offload_finalized", False)
+        self.num_prefill_blocks = state.get("num_prefill_blocks", 0)
+        self.num_prefill_full_blocks = state.get("num_prefill_full_blocks", 0)
+        self.num_prefill_tail_blocks = state.get("num_prefill_tail_blocks", 0)
+        self.num_prefix_cached_blocks = state.get("num_prefix_cached_blocks", 0)
+        self.num_sparse_blocks = state.get("num_sparse_blocks", 0)
+        self.num_sparse_tokens = state.get("num_sparse_tokens", 0)
+        self.prefill_tail_len = state.get("prefill_tail_len", 0)
+        self.hbm_blocks_to_release = state.get("hbm_blocks_to_release", [])
         self.token_ids = state["token_ids"]
         self.status = state["status"]
         self.temperature = state["temperature"]

@@ -1,23 +1,33 @@
 from collections import deque
 
 from nanovllm.config import Config
-from nanovllm.engine.sequence import Sequence, SequenceStatus, FinishReason
-from nanovllm.engine.block_manager import BlockManager
+from nanovllm.engine.dsa_offload import (
+    PoolEntryManager,
+    SimpleBlockManager,
+    compute_sparse_blocks,
+)
+from nanovllm.engine.sequence import FinishReason, Sequence, SequenceStatus
 
 
 class Scheduler:
-
     def __init__(self, config: Config):
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
+        self.block_size = config.kvcache_block_size
         self.eos = config.eos
-        # DeepSeek-V3.2 Ascend kernels use vLLM's paged-cache convention where
-        # block 0 is a null block; the last block is still reserved for padding.
-        self.block_manager = BlockManager(
-            config.num_kvcache_blocks - 1,
-            config.kvcache_block_size,
+        self.index_block_manager = SimpleBlockManager(
+            config.num_index_cache_blocks - 1,
             reserve_null_block=True,
         )
+        self.hbm_block_manager = SimpleBlockManager(
+            config.num_hbm_kvcache_blocks - 1,
+            reserve_null_block=True,
+        )
+        self.dram_block_manager = SimpleBlockManager(
+            config.num_dram_kvcache_blocks,
+            reserve_null_block=False,
+        )
+        self.pool_entry_manager = PoolEntryManager(config.dsa_offload_pool_capacity)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
         self.max_model_len = config.max_model_len
@@ -28,17 +38,61 @@ class Scheduler:
     def add(self, seq: Sequence):
         self.waiting.append(seq)
 
+    def _prepare_prefill_metadata(self, seq: Sequence) -> None:
+        num_prefill_blocks = seq.num_blocks
+        num_prefill_full_blocks = len(seq) // seq.block_size
+        prefill_tail_len = len(seq) - num_prefill_full_blocks * seq.block_size
+        num_prefill_tail_blocks = num_prefill_blocks - num_prefill_full_blocks
+        num_sparse_blocks = compute_sparse_blocks(num_prefill_full_blocks)
+
+        seq.num_prefill_blocks = num_prefill_blocks
+        seq.num_prefill_full_blocks = num_prefill_full_blocks
+        seq.num_prefill_tail_blocks = num_prefill_tail_blocks
+        seq.prefill_tail_len = prefill_tail_len
+        seq.num_sparse_blocks = num_sparse_blocks
+        seq.num_sparse_tokens = num_sparse_blocks * seq.block_size
+        seq.num_prefix_cached_blocks = 0
+        seq.offload_finalized = False
+
+    def _can_allocate_prefill(self, seq: Sequence) -> bool:
+        self._prepare_prefill_metadata(seq)
+        return (
+            self.index_block_manager.can_allocate_blocks(seq.num_prefill_blocks)
+            and self.hbm_block_manager.can_allocate_blocks(seq.num_prefill_blocks)
+            and self.dram_block_manager.can_allocate_blocks(seq.num_prefill_full_blocks)
+            and self.pool_entry_manager.can_allocate()
+        )
+
+    def _allocate_prefill(self, seq: Sequence) -> None:
+        assert not seq.index_block_table
+        assert not seq.hbm_block_table
+        assert not seq.dram_block_table
+        seq.index_block_table = self.index_block_manager.allocate_blocks(
+            seq.num_prefill_blocks,
+        )
+        seq.hbm_block_table = self.hbm_block_manager.allocate_blocks(
+            seq.num_prefill_blocks,
+        )
+        seq.block_table = seq.hbm_block_table
+        seq.dram_block_table = self.dram_block_manager.allocate_blocks(
+            seq.num_prefill_full_blocks,
+        )
+        seq.hbm_cached_tokens_pool_entry = self.pool_entry_manager.allocate()
+
     def schedule(self) -> tuple[list[Sequence], bool]:
         scheduled_seqs = []
         num_seqs = 0
         num_batched_tokens = 0
-        # prefill
+
         while self.waiting and num_seqs < self.max_num_seqs:
             seq = self.waiting[0]
-            if num_batched_tokens + len(seq) > self.max_num_batched_tokens or not self.block_manager.can_allocate(seq):
+            if (
+                num_batched_tokens + len(seq) > self.max_num_batched_tokens
+                or not self._can_allocate_prefill(seq)
+            ):
                 break
             self.waiting.popleft()
-            self.block_manager.allocate(seq)
+            self._allocate_prefill(seq)
             seq.status = SequenceStatus.RUNNING
             self.running.append(seq)
             scheduled_seqs.append(seq)
@@ -46,10 +100,10 @@ class Scheduler:
             num_batched_tokens += len(seq) - seq.num_cached_tokens
         if scheduled_seqs:
             return scheduled_seqs, True
-        # decode
+
         while self.running and num_seqs < self.max_num_seqs:
             seq = self.running.popleft()
-            while not self.block_manager.can_append(seq):
+            while not self.can_append(seq):
                 if self.running:
                     self.preempt(self.running.pop())
                 else:
@@ -58,18 +112,59 @@ class Scheduler:
                     break
             if seq:
                 num_seqs += 1
-                self.block_manager.may_append(seq)
+                self.may_append(seq)
                 scheduled_seqs.append(seq)
 
-        # 如果当前全都被抢占了，返回空列表
         if scheduled_seqs:
             self.running.extendleft(reversed(scheduled_seqs))
         return scheduled_seqs, False
 
+    def can_append(self, seq: Sequence) -> bool:
+        need_new_block = len(seq) % self.block_size == 1
+        if not need_new_block:
+            return True
+        return (
+            self.index_block_manager.can_allocate_blocks(1)
+            and self.hbm_block_manager.can_allocate_blocks(1)
+        )
+
+    def may_append(self, seq: Sequence) -> None:
+        if len(seq) % self.block_size != 1:
+            return
+        seq.index_block_table.extend(
+            self.index_block_manager.allocate_blocks(1),
+        )
+        seq.hbm_block_table.extend(
+            self.hbm_block_manager.allocate_blocks(1),
+        )
+        seq.block_table = seq.hbm_block_table
+
+    def release_prefill_hbm_blocks(self, seqs: list[Sequence]) -> None:
+        for seq in seqs:
+            if not seq.hbm_blocks_to_release:
+                continue
+            self.hbm_block_manager.free_blocks(seq.hbm_blocks_to_release)
+            seq.hbm_blocks_to_release.clear()
+
+    def deallocate(self, seq: Sequence):
+        self.index_block_manager.free_blocks(seq.index_block_table)
+        self.hbm_block_manager.free_blocks(seq.hbm_block_table)
+        self.hbm_block_manager.free_blocks(seq.hbm_blocks_to_release)
+        self.dram_block_manager.free_blocks(seq.dram_block_table)
+        self.pool_entry_manager.free(seq.hbm_cached_tokens_pool_entry)
+
+        seq.index_block_table.clear()
+        seq.hbm_block_table.clear()
+        seq.block_table = seq.hbm_block_table
+        seq.dram_block_table.clear()
+        seq.hbm_blocks_to_release.clear()
+        seq.hbm_cached_tokens_pool_entry = -1
+        seq.offload_finalized = False
+
     def preempt(self, seq: Sequence):
         seq.status = SequenceStatus.WAITING
         seq.finish_reason = FinishReason.PREEMPTED
-        self.block_manager.deallocate(seq)
+        self.deallocate(seq)
         self.waiting.appendleft(seq)
 
     def abort_seq_group(self, request_id: str) -> None:
@@ -82,7 +177,7 @@ class Scheduler:
     def free_seq(self, seq: Sequence, reason: FinishReason) -> None:
         seq.status = SequenceStatus.FINISHED
         seq.finish_reason = reason
-        self.block_manager.deallocate(seq)
+        self.deallocate(seq)
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int]) -> None:
         for seq, token_id in zip(seqs, token_ids):

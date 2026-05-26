@@ -19,6 +19,13 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
+    num_index_cache_blocks: int = -1
+    num_hbm_kvcache_blocks: int = -1
+    num_dram_kvcache_blocks: int = -1
+    dsa_offload_fixed_tx: int = 64
+    dsa_offload_max_copy_tokens: int = 2048
+    dsa_offload_pool_capacity: int = -1
+    dsa_offload_max_sparse_tokens: int = -1
     hccl_port: int = 28000
     skip_warmup: bool = False
     device = "npu"
@@ -28,6 +35,20 @@ class Config:
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 16 == 0
         assert 1 <= self.tensor_parallel_size <= 8
+        self.dsa_offload_fixed_tx = self._env_int(
+            "NANOVLLM_DSA_OFFLOAD_FIXED_TX",
+            self.dsa_offload_fixed_tx,
+        )
+        self.dsa_offload_max_copy_tokens = self._env_int(
+            "NANOVLLM_DSA_OFFLOAD_MAX_COPY_TOKENS",
+            self.dsa_offload_max_copy_tokens,
+        )
+        self.dsa_offload_pool_capacity = self._env_int(
+            "NANOVLLM_DSA_OFFLOAD_POOL_CAPACITY",
+            self.dsa_offload_pool_capacity,
+        )
+        if self.dsa_offload_max_copy_tokens < self.dsa_offload_fixed_tx:
+            self.dsa_offload_max_copy_tokens = self.dsa_offload_fixed_tx
         self.hf_config = self._load_hf_config()
         setattr(
             self.hf_config,
@@ -54,6 +75,18 @@ class Config:
             self.eos = eos_token_id
 
         assert self.max_num_batched_tokens >= self.max_model_len
+        if self.dsa_offload_pool_capacity < 0:
+            self.dsa_offload_pool_capacity = self.max_num_seqs
+
+    @staticmethod
+    def _env_int(name: str, default: int) -> int:
+        value = os.environ.get(name)
+        if value is None:
+            return int(default)
+        try:
+            return int(value)
+        except ValueError:
+            return int(default)
 
     def _validate_model_format(self):
         quantization_config = getattr(
