@@ -163,7 +163,7 @@ are seconds; the notes below often discuss them as ms/layer.
 | `indexer_k_proj` | Indexer key projection `wk(hidden_states)`. |
 | `indexer_k_norm` | LayerNorm on the projected indexer key. |
 | `indexer_rope` | RoPE application for indexer query/key. |
-| `indexer_rotate` | Final `_rotate_activation` conversion for indexer query/key. |
+| `indexer_rotate` | Legacy Hadamard rotate timing. The BF16 offload scorer skips this to match vllm-ascend's non-C8 indexer path, so this should print `0.000000s`. |
 | `indexer_weights` | Indexer `weights_proj(hidden_states.float())` projection and scale. |
 | `decode_attention_op` | Runs dense MLA decode over the current sparse HBM KV budget plus newly generated decode tokens. |
 | `v_up` | Projects MLA latent output back to hidden dimension using `w_uv`. |
@@ -211,4 +211,22 @@ PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ut_ops/prob
 
 ```bash
 PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ut_ops/probe_v_up_proj.py --device npu:0 --tokens 7 --heads 32 --warmup 5 --iters 20
+```
+
+## Next Run Commands
+
+Run these next on Ascend.
+
+First, verify that removing the BF16 indexer Hadamard keeps score/top-k behavior
+aligned enough for the offload scorer:
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python ut_ops/probe_indexer_hadamard_skip.py --device npu:0 --batch 4 --heads 64 --head-dim 128 --tokens 18000 --topk 512 --warmup 5 --iters 20 2>&1 | tee runlog/hadamard_skip_probe.txt
+```
+
+Then rerun the synchronized decode timing. Check that `indexer_q_path=bmm_transpose`
+and `indexer_rotate=0.000000s`:
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANOVLLM_GPU_MEMORY_UTILIZATION=0.85 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/mnt/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=8 NANOVLLM_PROMPT_LENGTHS=256,12288,14000,18000 NANOVLLM_MAX_MODEL_LEN=18016 NANOVLLM_MAX_BATCHED_TOKENS=44544 NANOVLLM_MAX_NUM_SEQS=4 NANOVLLM_MAX_GEN_TOKENS=3 NANOVLLM_IGNORE_EOS=1 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=1 NANOVLLM_PROFILE_LAYER_IDS=mid NANOVLLM_SKIP_WARMUP=1 python example/test.py 2>&1 | tee runlog/dsa_mixed_indexer_detail_sync_after_skip_hadamard.txt
 ```

@@ -176,27 +176,6 @@ def _rotate_half_interleaved(x: torch.Tensor) -> torch.Tensor:
     return x.flatten(-2)
 
 
-def _hadamard_transform(x: torch.Tensor) -> torch.Tensor:
-    dim = x.shape[-1]
-    if dim == 0 or dim & (dim - 1):
-        raise ValueError(
-            "Hadamard transform expects the last dimension to be a power of 2."
-        )
-    y = x.float().reshape(-1, dim)
-    block = 1
-    while block < dim:
-        y = y.view(-1, dim // (block * 2), 2, block)
-        left = y[:, :, 0, :]
-        right = y[:, :, 1, :]
-        y = torch.cat((left + right, left - right), dim=-1).reshape(-1, dim)
-        block *= 2
-    return y.reshape_as(x.float())
-
-
-def _rotate_activation(x: torch.Tensor) -> torch.Tensor:
-    return _hadamard_transform(x) * (x.shape[-1] ** -0.5)
-
-
 class DeepseekV32Config(PretrainedConfig):
     model_type = "deepseek_v32"
 
@@ -857,8 +836,6 @@ class DeepseekV32Indexer(nn.Module):
             q_pe, k_pe = rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
             q = torch.cat((q_pe, q_nope), dim=-1)
             k = torch.cat((k_pe.squeeze(1), k_nope), dim=-1)
-            q = _rotate_activation(q).to(q.dtype)
-            k = _rotate_activation(k).to(k.dtype)
 
             weights = self.weights_proj(hidden_states.float())
             weights = weights * self.softmax_scale * (self.n_head ** -0.5)
@@ -938,17 +915,6 @@ class DeepseekV32Indexer(nn.Module):
         self._detail_timer_end(
             detail,
             "cat",
-            start,
-            sync_detail,
-            q.device,
-        )
-
-        start = self._detail_timer_start(detail, sync_detail, q.device)
-        q = _rotate_activation(q).to(q.dtype)
-        k = _rotate_activation(k).to(k.dtype)
-        self._detail_timer_end(
-            detail,
-            "rotate_activation",
             start,
             sync_detail,
             q.device,
