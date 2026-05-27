@@ -1,8 +1,6 @@
-不带卸载：
-INFO 05-27 13:02:51,685 deepseek_v32.py:2067] Decode layer timing: rank=2 layer=30 tokens=4 attention_total=0.072236s mlapo=0.000118s indexer=0.002002s index_cache=0.000068s dsa_total=0.069375s dsa_indexer_score=0.001969s dsa_index_update=0.006077s dsa_scatter_h2d=0.061329s decode_attention_op=0.000208s v_up=0.000069s o_proj=0.000153s o_linear=0.000046s o_all_reduce=0.000108s attention_gap=0.000243s moe_total=0.000835s mlp_kind=moe moe_backend=grouped
-带卸载
-INFO 05-27 10:29:18,820 deepseek_v32.py:2277] Decode layer timing: rank=4 layer=30 tokens=4 attention_total=0.000602s mlapo=0.000107s indexer=0.000000s                                                                                                                            decode_attention_op=0.000177s v_up=0.000063s o_proj=0.000133s o_linear=0.000041s o_all_reduce=0.000091s attention_gap=0.000122s moe_total=0.000759s mlp_kind=moe moe_backend=grouped backend=mla
+带卸载：
+INFO 05-27 13:02:51,685 deepseek_v32.py:2067] Decode layer timing: rank=2 layer=30 tokens=4 attention_total=0.072236s mlapo=0.000118s indexerpo=0.001002s index_cache=0.000068s dsa_total=0.069375s dsa_indexer_score=0.001969s dsa_index_update=0.006077s dsa_scatter_h2d=0.061329s decode_attention_op=0.000208s v_up=0.000069s o_proj=0.000153s o_linear=0.000046s o_all_reduce=0.000108s attention_gap=0.000243s moe_total=0.000835s mlp_kind=moe moe_backend=grouped
 
+不带卸载
+INFO 05-27 10:29:18,820 deepseek_v32.py:2277] Decode layer timing: rank=4 layer=30 tokens=4 attention_total=0.000602s mlapo=0.000107s indexerpo=0.000000s                                                                                                                            decode_attention_op=0.000177s v_up=0.000063s o_proj=0.000133s o_linear=0.000041s o_all_reduce=0.000091s attention_gap=0.000122s moe_total=0.000759s mlp_kind=moe moe_backend=grouped backend=mla
 
-
-当前
