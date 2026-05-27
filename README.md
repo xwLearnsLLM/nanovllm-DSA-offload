@@ -157,6 +157,27 @@ are seconds; the notes below often discuss them as ms/layer.
 | `attention_gap` | Residual unaccounted attention time: `attention_total - sum(recorded attention detail fields)`. |
 | `moe_total` | Time spent in the layer MLP/MoE block after attention, printed on the same line for comparison. |
 
+## Indexer Projection Notes
+
+In vllm-ascend 0.19, DSA/SFA uses MLAPO to fuse the MLA preprocess and expose
+`q_c` via `enable_inner_out=True`, but it does not fuse the indexer projection
+into MLAPO. The indexer path is still separate:
+
+| Step | vllm-ascend 0.19 handling | Local implication |
+|---|---|---|
+| `q_c` production | MLAPO returns normalized `q_c`. | Already matched by the DSA offload path. |
+| indexer `q` projection | `wq_b(q_c)` runs after MLAPO. | Still contributes to `indexer` timing. |
+| indexer `k` projection | `wk(hidden_states)` or fused `wk_weights_proj(hidden_states)`. | We can test fusing `wk + weights_proj`. |
+| indexer weights | `weights_proj(hidden_states)` or the weights slice of `wk_weights_proj`. | Fusing may reduce one small GEMM, with BF16-vs-FP32 accuracy to verify. |
+
+Before changing the hot path, run the probe below on Ascend. It compares the
+current PyTorch projection path with candidate fused projection paths and prints
+both numerical differences and average latency.
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python ut_ops/probe_indexer_project.py --device npu:0 --tokens 4 --warmup 10 --iters 100
+```
+
 ## Optional Local Op Probes
 
 These do not load the full model. Use them only when debugging local kernels.
