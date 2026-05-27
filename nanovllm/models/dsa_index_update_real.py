@@ -60,6 +60,12 @@ def binding_version() -> str | None:
     return _C.binding_version()
 
 
+def extension_path() -> str | None:
+    if _C is None:
+        return None
+    return getattr(_C, "__file__", None)
+
+
 def dsa_index_update_real(
     score,
     hbm_cached_tokens_pool,
@@ -93,5 +99,6 @@ __all__ = [
     "availability_error",
     "binding_version",
     "dsa_index_update_real",
+    "extension_path",
     "is_available",
 ]

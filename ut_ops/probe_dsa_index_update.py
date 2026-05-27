@@ -9,6 +9,7 @@ from nanovllm.models.dsa_index_update_real import (
     availability_error,
     binding_version,
     dsa_index_update_real,
+    extension_path,
     is_available as is_real_available,
 )
 from nanovllm.models.dsa_offload_ops import dsa_index_update_torch
@@ -234,7 +235,8 @@ def main() -> None:
         f"device={device} batch_size={args.batch_size} "
         f"max_copy_tokens={args.max_copy_tokens} output_capacity={args.output_capacity} "
         f"real_available={int(is_real_available())} "
-        f"binding_version={binding_version()}"
+        f"binding_version={binding_version()} "
+        f"extension_path={extension_path()}"
     )
     if not is_real_available():
         print(f"DSA_INDEX_UPDATE_REAL_IMPORT_ERROR {availability_error()}")
