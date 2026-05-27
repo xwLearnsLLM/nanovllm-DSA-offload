@@ -26,6 +26,14 @@ def _sync(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
+def _desc(name: str, tensor: torch.Tensor) -> str:
+    return (
+        f"{name}=shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+        f"device={tensor.device} contiguous={tensor.is_contiguous()} "
+        f"stride={tuple(tensor.stride())}"
+    )
+
+
 def _make_lengths(args: argparse.Namespace) -> tuple[list[int], list[int]]:
     default_candidates = [256, 8192, 12288, 18000]
     default_selected = [256, 2048, 3712, 4096]
@@ -231,11 +239,17 @@ def main() -> None:
         if not args.allow_missing_real:
             raise SystemExit(2)
 
+    sample_case = _make_case(args, device)
+    print("DSA_INDEX_UPDATE_TENSOR " + _desc("score", sample_case[0]))
+    print("DSA_INDEX_UPDATE_TENSOR " + _desc("hbm_cached_tokens_pool", sample_case[1]))
+    print("DSA_INDEX_UPDATE_TENSOR " + _desc("promote_idx", sample_case[2]))
+    print("DSA_INDEX_UPDATE_TENSOR " + _desc("candidate_lens", sample_case[5]))
+
     if is_real_available():
         if not _accuracy(args, device):
             raise SystemExit(1)
 
-    torch_case = _make_case(args, device)
+    torch_case = sample_case
     _bench_one(
         "torch",
         _run_torch,

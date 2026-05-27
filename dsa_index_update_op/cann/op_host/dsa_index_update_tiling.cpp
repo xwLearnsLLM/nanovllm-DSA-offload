@@ -73,14 +73,14 @@ static ge::graphStatus DsaIndexUpdateTilingFunc(gert::TilingContext* context)
     OP_CHECK_NULL_WITH_CONTEXT(context, demoteStorage);
     OP_CHECK_NULL_WITH_CONTEXT(context, copyCountsStorage);
 
-    const gert::Shape scoreShape = scoreStorage->GetStorageShape();
-    const gert::Shape poolShape = poolStorage->GetStorageShape();
-    const gert::Shape candidateLensShape = candidateLensStorage->GetStorageShape();
-    const gert::Shape selectedLensShape = selectedLensStorage->GetStorageShape();
-    const gert::Shape reqPoolEntriesShape = reqPoolEntriesStorage->GetStorageShape();
-    const gert::Shape promoteShape = promoteStorage->GetStorageShape();
-    const gert::Shape demoteShape = demoteStorage->GetStorageShape();
-    const gert::Shape copyCountsShape = copyCountsStorage->GetStorageShape();
+    const gert::Shape scoreShape = scoreStorage->GetOriginShape();
+    const gert::Shape poolShape = poolStorage->GetOriginShape();
+    const gert::Shape candidateLensShape = candidateLensStorage->GetOriginShape();
+    const gert::Shape selectedLensShape = selectedLensStorage->GetOriginShape();
+    const gert::Shape reqPoolEntriesShape = reqPoolEntriesStorage->GetOriginShape();
+    const gert::Shape promoteShape = promoteStorage->GetOriginShape();
+    const gert::Shape demoteShape = demoteStorage->GetOriginShape();
+    const gert::Shape copyCountsShape = copyCountsStorage->GetOriginShape();
 
     OP_CHECK_IF(CheckRank(context, scoreShape, 2, "score") != ge::GRAPH_SUCCESS ||
                     CheckRank(context, poolShape, 2, "hbm_cached_tokens_pool") != ge::GRAPH_SUCCESS ||
