@@ -1,0 +1,152 @@
+[root@worker-53212 nano-vllm-ascend-DeepseekV32]# PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANOVLLM_GPU_MEMORY_UTILIZATION=0.85 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=8 NANOVLLM_DECODE_ATTENTION_BACKEND=mla NANOVLLM_ENABLE_DECODE_MLAPO=1 NANOVLLM_MLA_ROPE_NEOX_CACHE=1 NANOVLLM_DECODE_MLA_FIA_V2=1 NANOVLLM_MAX_GEN_TOKENS=5  NANOVLLM_PROMPT_LENGTHS=256,12288,14000,18000     NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=0 NANOVLLM_PROFILE_LAYER_IDS=mid  python example/test.py
+`torch_dtype` is deprecated! Use `dtype` instead!
+INFO 05-27 10:26:47,609 llm_engine.py:58] config: Config(model=/home/models/Deepseek-V3.2-Pruned-95B-BF/, max_num_batched_tokens=44544, max_num_seqs=4, max_model_len=18005, gpu_memory_utilization=0.85, tensor_parallel_size=8, enable_expert_parallel=True, enforce_eager=True, eos=1, kvcache_block_size=128, num_kvcache_blocks=-1, hccl_port=28000, skip_warmup=True, trust_remote_code=True, hf_config=DeepseekV32Config(...))
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+INFO 05-27 10:29:04,268 model_runner.py:183] Total NPU Mem: 62740.00 MB
+INFO 05-27 10:29:04,268 model_runner.py:183] Total NPU Mem: 62748.00 MB
+INFO 05-27 10:29:04,268 model_runner.py:183] Total NPU Mem: 62748.00 MB
+INFO 05-27 10:29:04,268 model_runner.py:184] Used NPU Mem (Weights): 35587.21 MB
+INFO 05-27 10:29:04,268 model_runner.py:184] Used NPU Mem (Weights): 35345.05 MB
+INFO 05-27 10:29:04,268 model_runner.py:183] Total NPU Mem: 62740.00 MB
+INFO 05-27 10:29:04,268 model_runner.py:183] Total NPU Mem: 62740.00 MB
+INFO 05-27 10:29:04,268 model_runner.py:185] Single Block Size: 10.48 MB
+INFO 05-27 10:29:04,268 model_runner.py:184] Used NPU Mem (Weights): 35356.64 MB
+INFO 05-27 10:29:04,268 model_runner.py:185] Single Block Size: 10.48 MB
+INFO 05-27 10:29:04,268 model_runner.py:187] Capping KV cache blocks by request limit: available=1686, max_needed=566.
+INFO 05-27 10:29:04,268 model_runner.py:184] Used NPU Mem (Weights): 35578.84 MB
+INFO 05-27 10:29:04,268 model_runner.py:184] Used NPU Mem (Weights): 35579.28 MB
+INFO 05-27 10:29:04,268 model_runner.py:185] Single Block Size: 10.48 MB
+INFO 05-27 10:29:04,268 model_runner.py:187] Capping KV cache blocks by request limit: available=1710, max_needed=566.
+INFO 05-27 10:29:04,268 model_runner.py:191] Allocating 566 blocks.
+INFO 05-27 10:29:04,268 model_runner.py:185] Single Block Size: 10.48 MB
+INFO 05-27 10:29:04,268 model_runner.py:183] Total NPU Mem: 62748.00 MB
+INFO 05-27 10:29:04,268 model_runner.py:185] Single Block Size: 10.48 MB
+INFO 05-27 10:29:04,268 model_runner.py:191] Allocating 566 blocks.
+INFO 05-27 10:29:04,268 model_runner.py:187] Capping KV cache blocks by request limit: available=1709, max_needed=566.
+INFO 05-27 10:29:04,268 model_runner.py:193] DeepSeek CKV cache allocated successfully shape: (61, 566, 1, 128, 512)
+INFO 05-27 10:29:04,268 model_runner.py:187] Capping KV cache blocks by request limit: available=1687, max_needed=566.
+INFO 05-27 10:29:04,268 model_runner.py:187] Capping KV cache blocks by request limit: available=1687, max_needed=566.
+INFO 05-27 10:29:04,268 model_runner.py:193] DeepSeek CKV cache allocated successfully shape: (61, 566, 1, 128, 512)
+INFO 05-27 10:29:04,269 model_runner.py:191] Allocating 566 blocks.
+INFO 05-27 10:29:04,269 model_runner.py:191] Allocating 566 blocks.
+INFO 05-27 10:29:04,269 model_runner.py:193] DeepSeek KPE cache allocated successfully shape: (61, 566, 1, 128, 64)
+INFO 05-27 10:29:04,269 model_runner.py:191] Allocating 566 blocks.
+INFO 05-27 10:29:04,269 model_runner.py:184] Used NPU Mem (Weights): 35346.62 MB
+INFO 05-27 10:29:04,269 model_runner.py:193] DeepSeek KPE cache allocated successfully shape: (61, 566, 1, 128, 64)
+INFO 05-27 10:29:04,269 model_runner.py:193] DeepSeek CKV cache allocated successfully shape: (61, 566, 1, 128, 512)
+INFO 05-27 10:29:04,269 model_runner.py:193] DeepSeek CKV cache allocated successfully shape: (61, 566, 1, 128, 512)
+INFO 05-27 10:29:04,269 model_runner.py:193] DeepSeek CKV cache allocated successfully shape: (61, 566, 1, 128, 512)
+INFO 05-27 10:29:04,269 model_runner.py:193] DeepSeek index cache allocated successfully shape: (61, 566, 128, 1, 128)
+INFO 05-27 10:29:04,268 model_runner.py:183] Total NPU Mem: 62740.00 MB
+INFO 05-27 10:29:04,269 model_runner.py:185] Single Block Size: 10.48 MB
+INFO 05-27 10:29:04,269 model_runner.py:193] DeepSeek index cache allocated successfully shape: (61, 566, 128, 1, 128)
+INFO 05-27 10:29:04,269 model_runner.py:193] DeepSeek KPE cache allocated successfully shape: (61, 566, 1, 128, 64)
+INFO 05-27 10:29:04,269 model_runner.py:193] DeepSeek KPE cache allocated successfully shape: (61, 566, 1, 128, 64)
+INFO 05-27 10:29:04,269 model_runner.py:193] DeepSeek KPE cache allocated successfully shape: (61, 566, 1, 128, 64)
+INFO 05-27 10:29:04,269 model_runner.py:187] Capping KV cache blocks by request limit: available=1710, max_needed=566.
+INFO 05-27 10:29:04,269 model_runner.py:193] DeepSeek index cache allocated successfully shape: (61, 566, 128, 1, 128)
+INFO 05-27 10:29:04,269 model_runner.py:184] Used NPU Mem (Weights): 35599.17 MB
+INFO 05-27 10:29:04,269 model_runner.py:193] DeepSeek index cache allocated successfully shape: (61, 566, 128, 1, 128)
+INFO 05-27 10:29:04,269 model_runner.py:193] DeepSeek index cache allocated successfully shape: (61, 566, 128, 1, 128)
+INFO 05-27 10:29:04,269 model_runner.py:191] Allocating 566 blocks.
+INFO 05-27 10:29:04,268 model_runner.py:183] Total NPU Mem: 62748.00 MB
+INFO 05-27 10:29:04,269 model_runner.py:185] Single Block Size: 10.48 MB
+INFO 05-27 10:29:04,269 model_runner.py:193] DeepSeek CKV cache allocated successfully shape: (61, 566, 1, 128, 512)
+INFO 05-27 10:29:04,269 model_runner.py:187] Capping KV cache blocks by request limit: available=1685, max_needed=566.
+INFO 05-27 10:29:04,269 model_runner.py:193] DeepSeek KPE cache allocated successfully shape: (61, 566, 1, 128, 64)
+INFO 05-27 10:29:04,269 model_runner.py:191] Allocating 566 blocks.
+INFO 05-27 10:29:04,269 model_runner.py:193] DeepSeek index cache allocated successfully shape: (61, 566, 128, 1, 128)
+INFO 05-27 10:29:04,269 model_runner.py:184] Used NPU Mem (Weights): 35355.32 MB
+INFO 05-27 10:29:04,269 model_runner.py:193] DeepSeek CKV cache allocated successfully shape: (61, 566, 1, 128, 512)
+INFO 05-27 10:29:04,269 model_runner.py:185] Single Block Size: 10.48 MB
+INFO 05-27 10:29:04,269 model_runner.py:193] DeepSeek KPE cache allocated successfully shape: (61, 566, 1, 128, 64)
+INFO 05-27 10:29:04,269 model_runner.py:193] DeepSeek index cache allocated successfully shape: (61, 566, 128, 1, 128)
+INFO 05-27 10:29:04,269 model_runner.py:187] Capping KV cache blocks by request limit: available=1709, max_needed=566.
+INFO 05-27 10:29:04,269 model_runner.py:191] Allocating 566 blocks.
+INFO 05-27 10:29:04,269 model_runner.py:193] DeepSeek CKV cache allocated successfully shape: (61, 566, 1, 128, 512)
+INFO 05-27 10:29:04,269 model_runner.py:193] DeepSeek KPE cache allocated successfully shape: (61, 566, 1, 128, 64)
+INFO 05-27 10:29:04,269 model_runner.py:193] DeepSeek index cache allocated successfully shape: (61, 566, 128, 1, 128)
+INFO 05-27 10:29:04,703 model_runner.py:52] config: Config(model=/home/models/Deepseek-V3.2-Pruned-95B-BF/, max_num_batched_tokens=44544, max_num_seqs=4, max_model_len=18005, gpu_memory_utilization=0.85, tensor_parallel_size=8, enable_expert_parallel=True, enforce_eager=True, eos=1, kvcache_block_size=128, num_kvcache_blocks=566, hccl_port=28000, skip_warmup=True, trust_remote_code=True, hf_config=DeepseekV32Config(...))
+INFO 05-27 10:29:04,729 model_runner.py:52] config: Config(model=/home/models/Deepseek-V3.2-Pruned-95B-BF/, max_num_batched_tokens=44544, max_num_seqs=4, max_model_len=18005, gpu_memory_utilization=0.85, tensor_parallel_size=8, enable_expert_parallel=True, enforce_eager=True, eos=1, kvcache_block_size=128, num_kvcache_blocks=566, hccl_port=28000, skip_warmup=True, trust_remote_code=True, hf_config=DeepseekV32Config(...))
+/usr/local/python3.11.14/lib/python3.11/site-packages/torch/distributed/distributed_c10d.py:4876: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  warnings.warn(  # warn only once
+INFO 05-27 10:29:04,736 model_runner.py:52] config: Config(model=/home/models/Deepseek-V3.2-Pruned-95B-BF/, max_num_batched_tokens=44544, max_num_seqs=4, max_model_len=18005, gpu_memory_utilization=0.85, tensor_parallel_size=8, enable_expert_parallel=True, enforce_eager=True, eos=1, kvcache_block_size=128, num_kvcache_blocks=566, hccl_port=28000, skip_warmup=True, trust_remote_code=True, hf_config=DeepseekV32Config(...))
+INFO 05-27 10:29:04,741 model_runner.py:52] config: Config(model=/home/models/Deepseek-V3.2-Pruned-95B-BF/, max_num_batched_tokens=44544, max_num_seqs=4, max_model_len=18005, gpu_memory_utilization=0.85, tensor_parallel_size=8, enable_expert_parallel=True, enforce_eager=True, eos=1, kvcache_block_size=128, num_kvcache_blocks=566, hccl_port=28000, skip_warmup=True, trust_remote_code=True, hf_config=DeepseekV32Config(...))
+INFO 05-27 10:29:04,752 model_runner.py:52] config: Config(model=/home/models/Deepseek-V3.2-Pruned-95B-BF/, max_num_batched_tokens=44544, max_num_seqs=4, max_model_len=18005, gpu_memory_utilization=0.85, tensor_parallel_size=8, enable_expert_parallel=True, enforce_eager=True, eos=1, kvcache_block_size=128, num_kvcache_blocks=566, hccl_port=28000, skip_warmup=True, trust_remote_code=True, hf_config=DeepseekV32Config(...))
+INFO 05-27 10:29:04,757 model_runner.py:52] config: Config(model=/home/models/Deepseek-V3.2-Pruned-95B-BF/, max_num_batched_tokens=44544, max_num_seqs=4, max_model_len=18005, gpu_memory_utilization=0.85, tensor_parallel_size=8, enable_expert_parallel=True, enforce_eager=True, eos=1, kvcache_block_size=128, num_kvcache_blocks=566, hccl_port=28000, skip_warmup=True, trust_remote_code=True, hf_config=DeepseekV32Config(...))
+INFO 05-27 10:29:04,762 model_runner.py:52] config: Config(model=/home/models/Deepseek-V3.2-Pruned-95B-BF/, max_num_batched_tokens=44544, max_num_seqs=4, max_model_len=18005, gpu_memory_utilization=0.85, tensor_parallel_size=8, enable_expert_parallel=True, enforce_eager=True, eos=1, kvcache_block_size=128, num_kvcache_blocks=566, hccl_port=28000, skip_warmup=True, trust_remote_code=True, hf_config=DeepseekV32Config(...))
+INFO 05-27 10:29:04,788 model_runner.py:52] config: Config(model=/home/models/Deepseek-V3.2-Pruned-95B-BF/, max_num_batched_tokens=44544, max_num_seqs=4, max_model_len=18005, gpu_memory_utilization=0.85, tensor_parallel_size=8, enable_expert_parallel=True, enforce_eager=True, eos=1, kvcache_block_size=128, num_kvcache_blocks=566, hccl_port=28000, skip_warmup=True, trust_remote_code=True, hf_config=DeepseekV32Config(...))
+INFO 05-27 10:29:05,302 llm_engine.py:73] skip warmup enabled, skipping model warmup.
+test config: num_prompts=4, prompt_min=256, prompt_max=18000, max_model_len=18005, max_num_batched_tokens=44544, max_num_seqs=4, max_gen_tokens=5
+prompt 1 token_len=256 first_ids=[0, 128803, 53091, 4374, 1465, 50594, 5671, 22891, 16, 1162, 73615, 10175, 33492, 260, 12092, 852]
+prompt 2 token_len=12288 first_ids=[0, 128803, 53091, 4374, 1465, 50594, 5671, 22891, 16, 1162, 73615, 10175, 33492, 260, 12092, 852]
+prompt 3 token_len=14000 first_ids=[0, 128803, 53091, 4374, 1465, 50594, 5671, 22891, 16, 1162, 73615, 10175, 33492, 260, 12092, 852]
+prompt 4 token_len=18000 first_ids=[0, 128803, 53091, 4374, 1465, 50594, 5671, 22891, 16, 1162, 73615, 10175, 33492, 260, 12092, 852]
+llm.generate 4 start ...
+[step   1 Prefill] bsz=4, num_tokens=44548, TTFT=12.9239 sec, TPS=3446.94 tok/s
+INFO 05-27 10:29:18,445 deepseek_v32.py:2277] Decode layer timing: rank=3 layer=30 tokens=4 attention_total=0.000658s qkv_a=0.000000s q_norm=0.000000s q_b=0.000000s kv_rope=0.000000s kv_split=0.000000s kv_norm=0.000000s rotary=0.000000s k_squeeze=0.000000s mlapo=0.000106s indexer=0.000000s cache=0.000000s q_up=0.000000s decode_attention_op=0.000192s v_up=0.000062s o_proj=0.000128s o_linear=0.000041s o_all_reduce=0.000088s attention_gap=0.000170s moe_total=0.000697s mlp_kind=moe moe_backend=grouped backend=mla
+INFO 05-27 10:29:18,446 deepseek_v32.py:2277] Decode layer timing: rank=1 layer=30 tokens=4 attention_total=0.000630s qkv_a=0.000000s q_norm=0.000000s q_b=0.000000s kv_rope=0.000000s kv_split=0.000000s kv_norm=0.000000s rotary=0.000000s k_squeeze=0.000000s mlapo=0.000111s indexer=0.000000s cache=0.000000s q_up=0.000000s decode_attention_op=0.000192s v_up=0.000059s o_proj=0.000126s o_linear=0.000039s o_all_reduce=0.000086s attention_gap=0.000142s moe_total=0.000706s mlp_kind=moe moe_backend=grouped backend=mla
+INFO 05-27 10:29:18,448 deepseek_v32.py:2277] Decode layer timing: rank=0 layer=30 tokens=4 attention_total=0.000650s qkv_a=0.000000s q_norm=0.000000s q_b=0.000000s kv_rope=0.000000s kv_split=0.000000s kv_norm=0.000000s rotary=0.000000s k_squeeze=0.000000s mlapo=0.000106s indexer=0.000000s cache=0.000000s q_up=0.000000s decode_attention_op=0.000190s v_up=0.000061s o_proj=0.000132s o_linear=0.000044s o_all_reduce=0.000089s attention_gap=0.000160s moe_total=0.000730s mlp_kind=moe moe_backend=grouped backend=mla
+INFO 05-27 10:29:18,449 deepseek_v32.py:2277] Decode layer timing: rank=6 layer=30 tokens=4 attention_total=0.000641s qkv_a=0.000000s q_norm=0.000000s q_b=0.000000s kv_rope=0.000000s kv_split=0.000000s kv_norm=0.000000s rotary=0.000000s k_squeeze=0.000000s mlapo=0.000106s indexer=0.000000s cache=0.000000s q_up=0.000000s decode_attention_op=0.000191s v_up=0.000058s o_proj=0.000127s o_linear=0.000039s o_all_reduce=0.000088s attention_gap=0.000158s moe_total=0.000684s mlp_kind=moe moe_backend=grouped backend=mla
+INFO 05-27 10:29:18,450 deepseek_v32.py:2277] Decode layer timing: rank=2 layer=30 tokens=4 attention_total=0.000693s qkv_a=0.000000s q_norm=0.000000s q_b=0.000000s kv_rope=0.000000s kv_split=0.000000s kv_norm=0.000000s rotary=0.000000s k_squeeze=0.000000s mlapo=0.000115s indexer=0.000000s cache=0.000000s q_up=0.000000s decode_attention_op=0.000207s v_up=0.000064s o_proj=0.000148s o_linear=0.000048s o_all_reduce=0.000100s attention_gap=0.000159s moe_total=0.000754s mlp_kind=moe moe_backend=grouped backend=mla
+INFO 05-27 10:29:18,450 deepseek_v32.py:2277] Decode layer timing: rank=7 layer=30 tokens=4 attention_total=0.000680s qkv_a=0.000000s q_norm=0.000000s q_b=0.000000s kv_rope=0.000000s kv_split=0.000000s kv_norm=0.000000s rotary=0.000000s k_squeeze=0.000000s mlapo=0.000109s indexer=0.000000s cache=0.000000s q_up=0.000000s decode_attention_op=0.000205s v_up=0.000062s o_proj=0.000152s o_linear=0.000047s o_all_reduce=0.000104s attention_gap=0.000153s moe_total=0.000757s mlp_kind=moe moe_backend=grouped backend=mla
+INFO 05-27 10:29:18,461 deepseek_v32.py:2277] Decode layer timing: rank=5 layer=30 tokens=4 attention_total=0.000697s qkv_a=0.000000s q_norm=0.000000s q_b=0.000000s kv_rope=0.000000s kv_split=0.000000s kv_norm=0.000000s rotary=0.000000s k_squeeze=0.000000s mlapo=0.000113s indexer=0.000000s cache=0.000000s q_up=0.000000s decode_attention_op=0.000215s v_up=0.000064s o_proj=0.000151s o_linear=0.000046s o_all_reduce=0.000105s attention_gap=0.000154s moe_total=0.000807s mlp_kind=moe moe_backend=grouped backend=mla
+INFO 05-27 10:29:18,467 deepseek_v32.py:2277] Decode layer timing: rank=4 layer=30 tokens=4 attention_total=0.000859s qkv_a=0.000000s q_norm=0.000000s q_b=0.000000s kv_rope=0.000000s kv_split=0.000000s kv_norm=0.000000s rotary=0.000000s k_squeeze=0.000000s mlapo=0.000149s indexer=0.000000s cache=0.000000s q_up=0.000000s decode_attention_op=0.000246s v_up=0.000086s o_proj=0.000178s o_linear=0.000049s o_all_reduce=0.000129s attention_gap=0.000201s moe_total=0.000957s mlp_kind=moe moe_backend=grouped backend=mla
+[step   2  Decode] bsz=4, num_tokens=4, TPOT=0.1761 sec, TPS=22.71 tok/s
+INFO 05-27 10:29:18,579 deepseek_v32.py:2277] Decode layer timing: rank=0 layer=30 tokens=4 attention_total=0.000594s qkv_a=0.000000s q_norm=0.000000s q_b=0.000000s kv_rope=0.000000s kv_split=0.000000s kv_norm=0.000000s rotary=0.000000s k_squeeze=0.000000s mlapo=0.000103s indexer=0.000000s cache=0.000000s q_up=0.000000s decode_attention_op=0.000178s v_up=0.000062s o_proj=0.000128s o_linear=0.000041s o_all_reduce=0.000087s attention_gap=0.000123s moe_total=0.000677s mlp_kind=moe moe_backend=grouped backend=mla
+INFO 05-27 10:29:18,579 deepseek_v32.py:2277] Decode layer timing: rank=1 layer=30 tokens=4 attention_total=0.000592s qkv_a=0.000000s q_norm=0.000000s q_b=0.000000s kv_rope=0.000000s kv_split=0.000000s kv_norm=0.000000s rotary=0.000000s k_squeeze=0.000000s mlapo=0.000106s indexer=0.000000s cache=0.000000s q_up=0.000000s decode_attention_op=0.000177s v_up=0.000061s o_proj=0.000124s o_linear=0.000038s o_all_reduce=0.000086s attention_gap=0.000124s moe_total=0.000676s mlp_kind=moe moe_backend=grouped backend=mla
+INFO 05-27 10:29:18,579 deepseek_v32.py:2277] Decode layer timing: rank=6 layer=30 tokens=4 attention_total=0.000575s qkv_a=0.000000s q_norm=0.000000s q_b=0.000000s kv_rope=0.000000s kv_split=0.000000s kv_norm=0.000000s rotary=0.000000s k_squeeze=0.000000s mlapo=0.000102s indexer=0.000000s cache=0.000000s q_up=0.000000s decode_attention_op=0.000173s v_up=0.000058s o_proj=0.000118s o_linear=0.000037s o_all_reduce=0.000081s attention_gap=0.000124s moe_total=0.000677s mlp_kind=moe moe_backend=grouped backend=mla
+INFO 05-27 10:29:18,580 deepseek_v32.py:2277] Decode layer timing: rank=3 layer=30 tokens=4 attention_total=0.000596s qkv_a=0.000000s q_norm=0.000000s q_b=0.000000s kv_rope=0.000000s kv_split=0.000000s kv_norm=0.000000s rotary=0.000000s k_squeeze=0.000000s mlapo=0.000105s indexer=0.000000s cache=0.000000s q_up=0.000000s decode_attention_op=0.000174s v_up=0.000062s o_proj=0.000125s o_linear=0.000040s o_all_reduce=0.000086s attention_gap=0.000128s moe_total=0.000693s mlp_kind=moe moe_backend=grouped backend=mla
+INFO 05-27 10:29:18,583 deepseek_v32.py:2277] Decode layer timing: rank=2 layer=30 tokens=4 attention_total=0.000622s qkv_a=0.000000s q_norm=0.000000s q_b=0.000000s kv_rope=0.000000s kv_split=0.000000s kv_norm=0.000000s rotary=0.000000s k_squeeze=0.000000s mlapo=0.000109s indexer=0.000000s cache=0.000000s q_up=0.000000s decode_attention_op=0.000184s v_up=0.000065s o_proj=0.000134s o_linear=0.000041s o_all_reduce=0.000092s attention_gap=0.000130s moe_total=0.000735s mlp_kind=moe moe_backend=grouped backend=mla
+INFO 05-27 10:29:18,583 deepseek_v32.py:2277] Decode layer timing: rank=7 layer=30 tokens=4 attention_total=0.000629s qkv_a=0.000000s q_norm=0.000000s q_b=0.000000s kv_rope=0.000000s kv_split=0.000000s kv_norm=0.000000s rotary=0.000000s k_squeeze=0.000000s mlapo=0.000108s indexer=0.000000s cache=0.000000s q_up=0.000000s decode_attention_op=0.000185s v_up=0.000065s o_proj=0.000141s o_linear=0.000042s o_all_reduce=0.000099s attention_gap=0.000131s moe_total=0.000731s mlp_kind=moe moe_backend=grouped backend=mla
+INFO 05-27 10:29:18,586 deepseek_v32.py:2277] Decode layer timing: rank=5 layer=30 tokens=4 attention_total=0.000601s qkv_a=0.000000s q_norm=0.000000s q_b=0.000000s kv_rope=0.000000s kv_split=0.000000s kv_norm=0.000000s rotary=0.000000s k_squeeze=0.000000s mlapo=0.000113s indexer=0.000000s cache=0.000000s q_up=0.000000s decode_attention_op=0.000175s v_up=0.000060s o_proj=0.000127s o_linear=0.000041s o_all_reduce=0.000085s attention_gap=0.000126s moe_total=0.000702s mlp_kind=moe moe_backend=grouped backend=mla
+INFO 05-27 10:29:18,598 deepseek_v32.py:2277] Decode layer timing: rank=4 layer=30 tokens=4 attention_total=0.000636s qkv_a=0.000000s q_norm=0.000000s q_b=0.000000s kv_rope=0.000000s kv_split=0.000000s kv_norm=0.000000s rotary=0.000000s k_squeeze=0.000000s mlapo=0.000109s indexer=0.000000s cache=0.000000s q_up=0.000000s decode_attention_op=0.000186s v_up=0.000064s o_proj=0.000145s o_linear=0.000042s o_all_reduce=0.000102s attention_gap=0.000133s moe_total=0.000807s mlp_kind=moe moe_backend=grouped backend=mla
+INFO 05-27 10:29:18,703 deepseek_v32.py:2277] Decode layer timing: rank=0 layer=30 tokens=4 attention_total=0.000599s qkv_a=0.000000s q_norm=0.000000s q_b=0.000000s kv_rope=0.000000s kv_split=0.000000s kv_norm=0.000000s rotary=0.000000s k_squeeze=0.000000s mlapo=0.000104s indexer=0.000000s cache=0.000000s q_up=0.000000s decode_attention_op=0.000182s v_up=0.000062s o_proj=0.000127s o_linear=0.000040s o_all_reduce=0.000087s attention_gap=0.000124s moe_total=0.000672s mlp_kind=moe moe_backend=grouped backend=mla
+INFO 05-27 10:29:18,704 deepseek_v32.py:2277] Decode layer timing: rank=6 layer=30 tokens=4 attention_total=0.000576s qkv_a=0.000000s q_norm=0.000000s q_b=0.000000s kv_rope=0.000000s kv_split=0.000000s kv_norm=0.000000s rotary=0.000000s k_squeeze=0.000000s mlapo=0.000100s indexer=0.000000s cache=0.000000s q_up=0.000000s decode_attention_op=0.000176s v_up=0.000059s o_proj=0.000124s o_linear=0.000037s o_all_reduce=0.000087s attention_gap=0.000118s moe_total=0.000698s mlp_kind=moe moe_backend=grouped backend=mla
+INFO 05-27 10:29:18,705 deepseek_v32.py:2277] Decode layer timing: rank=1 layer=30 tokens=4 attention_total=0.000600s qkv_a=0.000000s q_norm=0.000000s q_b=0.000000s kv_rope=0.000000s kv_split=0.000000s kv_norm=0.000000s rotary=0.000000s k_squeeze=0.000000s mlapo=0.000105s indexer=0.000000s cache=0.000000s q_up=0.000000s decode_attention_op=0.000174s v_up=0.000062s o_proj=0.000126s o_linear=0.000038s o_all_reduce=0.000088s attention_gap=0.000133s moe_total=0.000690s mlp_kind=moe moe_backend=grouped backend=mla
+INFO 05-27 10:29:18,705 deepseek_v32.py:2277] Decode layer timing: rank=5 layer=30 tokens=4 attention_total=0.000566s qkv_a=0.000000s q_norm=0.000000s q_b=0.000000s kv_rope=0.000000s kv_split=0.000000s kv_norm=0.000000s rotary=0.000000s k_squeeze=0.000000s mlapo=0.000099s indexer=0.000000s cache=0.000000s q_up=0.000000s decode_attention_op=0.000183s v_up=0.000057s o_proj=0.000114s o_linear=0.000037s o_all_reduce=0.000077s attention_gap=0.000114s moe_total=0.000659s mlp_kind=moe moe_backend=grouped backend=mla
+INFO 05-27 10:29:18,706 deepseek_v32.py:2277] Decode layer timing: rank=3 layer=30 tokens=4 attention_total=0.000604s qkv_a=0.000000s q_norm=0.000000s q_b=0.000000s kv_rope=0.000000s kv_split=0.000000s kv_norm=0.000000s rotary=0.000000s k_squeeze=0.000000s mlapo=0.000108s indexer=0.000000s cache=0.000000s q_up=0.000000s decode_attention_op=0.000179s v_up=0.000063s o_proj=0.000127s o_linear=0.000039s o_all_reduce=0.000088s attention_gap=0.000127s moe_total=0.000697s mlp_kind=moe moe_backend=grouped backend=mla
+INFO 05-27 10:29:18,708 deepseek_v32.py:2277] Decode layer timing: rank=2 layer=30 tokens=4 attention_total=0.000628s qkv_a=0.000000s q_norm=0.000000s q_b=0.000000s kv_rope=0.000000s kv_split=0.000000s kv_norm=0.000000s rotary=0.000000s k_squeeze=0.000000s mlapo=0.000111s indexer=0.000000s cache=0.000000s q_up=0.000000s decode_attention_op=0.000186s v_up=0.000065s o_proj=0.000133s o_linear=0.000041s o_all_reduce=0.000092s attention_gap=0.000132s moe_total=0.000754s mlp_kind=moe moe_backend=grouped backend=mla
+INFO 05-27 10:29:18,709 deepseek_v32.py:2277] Decode layer timing: rank=7 layer=30 tokens=4 attention_total=0.000630s qkv_a=0.000000s q_norm=0.000000s q_b=0.000000s kv_rope=0.000000s kv_split=0.000000s kv_norm=0.000000s rotary=0.000000s k_squeeze=0.000000s mlapo=0.000110s indexer=0.000000s cache=0.000000s q_up=0.000000s decode_attention_op=0.000183s v_up=0.000064s o_proj=0.000140s o_linear=0.000042s o_all_reduce=0.000098s attention_gap=0.000133s moe_total=0.000733s mlp_kind=moe moe_backend=grouped backend=mla
+INFO 05-27 10:29:18,710 deepseek_v32.py:2277] Decode layer timing: rank=4 layer=30 tokens=4 attention_total=0.000608s qkv_a=0.000000s q_norm=0.000000s q_b=0.000000s kv_rope=0.000000s kv_split=0.000000s kv_norm=0.000000s rotary=0.000000s k_squeeze=0.000000s mlapo=0.000107s indexer=0.000000s cache=0.000000s q_up=0.000000s decode_attention_op=0.000179s v_up=0.000063s o_proj=0.000135s o_linear=0.000041s o_all_reduce=0.000094s attention_gap=0.000123s moe_total=0.000765s mlp_kind=moe moe_backend=grouped backend=mla
+INFO 05-27 10:29:18,814 deepseek_v32.py:2277] Decode layer timing: rank=5 layer=30 tokens=4 attention_total=0.000564s qkv_a=0.000000s q_norm=0.000000s q_b=0.000000s kv_rope=0.000000s kv_split=0.000000s kv_norm=0.000000s rotary=0.000000s k_squeeze=0.000000s mlapo=0.000104s indexer=0.000000s cache=0.000000s q_up=0.000000s decode_attention_op=0.000167s v_up=0.000060s o_proj=0.000116s o_linear=0.000037s o_all_reduce=0.000079s attention_gap=0.000117s moe_total=0.000667s mlp_kind=moe moe_backend=grouped backend=mla
+INFO 05-27 10:29:18,814 deepseek_v32.py:2277] Decode layer timing: rank=0 layer=30 tokens=4 attention_total=0.000601s qkv_a=0.000000s q_norm=0.000000s q_b=0.000000s kv_rope=0.000000s kv_split=0.000000s kv_norm=0.000000s rotary=0.000000s k_squeeze=0.000000s mlapo=0.000103s indexer=0.000000s cache=0.000000s q_up=0.000000s decode_attention_op=0.000175s v_up=0.000061s o_proj=0.000142s o_linear=0.000041s o_all_reduce=0.000101s attention_gap=0.000120s moe_total=0.000682s mlp_kind=moe moe_backend=grouped backend=mla
+INFO 05-27 10:29:18,815 deepseek_v32.py:2277] Decode layer timing: rank=1 layer=30 tokens=4 attention_total=0.000587s qkv_a=0.000000s q_norm=0.000000s q_b=0.000000s kv_rope=0.000000s kv_split=0.000000s kv_norm=0.000000s rotary=0.000000s k_squeeze=0.000000s mlapo=0.000104s indexer=0.000000s cache=0.000000s q_up=0.000000s decode_attention_op=0.000173s v_up=0.000061s o_proj=0.000125s o_linear=0.000038s o_all_reduce=0.000088s attention_gap=0.000123s moe_total=0.000684s mlp_kind=moe moe_backend=grouped backend=mla
+INFO 05-27 10:29:18,816 deepseek_v32.py:2277] Decode layer timing: rank=6 layer=30 tokens=4 attention_total=0.000580s qkv_a=0.000000s q_norm=0.000000s q_b=0.000000s kv_rope=0.000000s kv_split=0.000000s kv_norm=0.000000s rotary=0.000000s k_squeeze=0.000000s mlapo=0.000103s indexer=0.000000s cache=0.000000s q_up=0.000000s decode_attention_op=0.000173s v_up=0.000059s o_proj=0.000126s o_linear=0.000038s o_all_reduce=0.000088s attention_gap=0.000120s moe_total=0.001556s mlp_kind=moe moe_backend=grouped backend=mla
+INFO 05-27 10:29:18,817 deepseek_v32.py:2277] Decode layer timing: rank=3 layer=30 tokens=4 attention_total=0.000616s qkv_a=0.000000s q_norm=0.000000s q_b=0.000000s kv_rope=0.000000s kv_split=0.000000s kv_norm=0.000000s rotary=0.000000s k_squeeze=0.000000s mlapo=0.000107s indexer=0.000000s cache=0.000000s q_up=0.000000s decode_attention_op=0.000177s v_up=0.000064s o_proj=0.000137s o_linear=0.000050s o_all_reduce=0.000087s attention_gap=0.000131s moe_total=0.000703s mlp_kind=moe moe_backend=grouped backend=mla
+INFO 05-27 10:29:18,819 deepseek_v32.py:2277] Decode layer timing: rank=2 layer=30 tokens=4 attention_total=0.000624s qkv_a=0.000000s q_norm=0.000000s q_b=0.000000s kv_rope=0.000000s kv_split=0.000000s kv_norm=0.000000s rotary=0.000000s k_squeeze=0.000000s mlapo=0.000112s indexer=0.000000s cache=0.000000s q_up=0.000000s decode_attention_op=0.000187s v_up=0.000065s o_proj=0.000132s o_linear=0.000041s o_all_reduce=0.000091s attention_gap=0.000129s moe_total=0.000722s mlp_kind=moe moe_backend=grouped backend=mla
+INFO 05-27 10:29:18,819 deepseek_v32.py:2277] Decode layer timing: rank=7 layer=30 tokens=4 attention_total=0.000632s qkv_a=0.000000s q_norm=0.000000s q_b=0.000000s kv_rope=0.000000s kv_split=0.000000s kv_norm=0.000000s rotary=0.000000s k_squeeze=0.000000s mlapo=0.000110s indexer=0.000000s cache=0.000000s q_up=0.000000s decode_attention_op=0.000186s v_up=0.000065s o_proj=0.000143s o_linear=0.000043s o_all_reduce=0.000099s attention_gap=0.000130s moe_total=0.000730s mlp_kind=moe moe_backend=grouped backend=mla
+INFO 05-27 10:29:18,820 deepseek_v32.py:2277] Decode layer timing: rank=4 layer=30 tokens=4 attention_total=0.000602s qkv_a=0.000000s q_norm=0.000000s q_b=0.000000s kv_rope=0.000000s kv_split=0.000000s kv_norm=0.000000s rotary=0.000000s k_squeeze=0.000000s mlapo=0.000107s indexer=0.000000s cache=0.000000s q_up=0.000000s decode_attention_op=0.000177s v_up=0.000063s o_proj=0.000133s o_linear=0.000041s o_all_reduce=0.000091s attention_gap=0.000122s moe_total=0.000759s mlp_kind=moe moe_backend=grouped backend=mla
+[step   5  Decode] bsz=4, num_tokens=4, TPOT=0.1099 sec, TPS=36.38 tok/s
+llm.generate 4 requests in 5 steps, e2e latency = 13.45 sec
+    prefill steps = 1, prefill tokens = 44548, total prefill time = 12.9239 sec, prefill TPS = 3446.94 tok/s
+    decode steps = 4, decode tokens = 16, total decode time = 0.5223 sec, decode TPS = 30.64 tok/s
+    e2e input TPS = 3312.65 tok/s, e2e output TPS = 1.49 tok/s
+    TTFT/TPOT are per-step request latencies printed above.
+prompt_len: 256
+prompt    : <random exact-token prompt 1: target_len=256>
+response  : '#<｜begin▁of▁sentence｜><｜begin▁of▁sentence｜><｜begin▁of▁sentence｜><｜begin▁of▁sentence｜>'
+token_ids : [5, 0, 0, 0, 0]
+
+prompt_len: 12288
+prompt    : <random exact-token prompt 2: target_len=12288>
+response  : ' sentence builds a controlled pre'
+token_ids : [10175, 33492, 260, 12092, 852]
+
+prompt_len: 14000
+prompt    : <random exact-token prompt 3: target_len=14000>
+response  : '\n    "DeepSe'
+token_ids : [201, 361, 582, 53091, 4374]
+
+prompt_len: 18000
+prompt    : <random exact-token prompt 4: target_len=18000>
+response  : '\n<｜begin▁of▁sentence｜><｜begin▁of▁sentence｜><｜begin▁of▁sentence｜><｜begin▁of▁sentence｜>'
+token_ids : [201, 0, 0, 0, 0]
+
+[root@worker-53212 nano-vllm-ascend-DeepseekV32]#

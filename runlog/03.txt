@@ -1,0 +1,149 @@
+[root@worker-53232 nano-vllm-ascend-DeepseekV32-dev_dsa_offload]# PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANOVLLM_GPU_MEMORY_UTILIZATION=0.85 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/mnt/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=8 NANOVLLM_DECODE_ATTENTION_BACKEND=mla NANOVLLM_ENABLE_DECODE_MLAPO=1 NANOVLLM_MLA_ROPE_NEOX_CACHE=1 NANOVLLM_DECODE_MLA_FIA_V2=1 NANOVLLM_MAX_GEN_TOKENS=5  NANOVLLM_PROMPT_LENGTHS=256,12288,14000,18000    python example/test.py
+`torch_dtype` is deprecated! Use `dtype` instead!
+INFO 05-27 12:54:35,274 llm_engine.py:58] config: Config(model=/mnt/models/Deepseek-V3.2-Pruned-95B-BF/, max_num_batched_tokens=44544, max_num_seqs=4, max_model_len=18005, gpu_memory_utilization=0.85, tensor_parallel_size=8, enable_expert_parallel=True, enforce_eager=True, eos=1, kvcache_block_size=128, num_kvcache_blocks=-1, num_index_cache_blocks=-1, num_hbm_kvcache_blocks=-1, num_dram_kvcache_blocks=-1, dsa_offload_fixed_tx=64, dsa_offload_max_copy_tokens=2048, dsa_offload_pool_capacity=4, dsa_offload_max_sparse_tokens=-1, hccl_port=28000, skip_warmup=True, trust_remote_code=True, hf_config=DeepseekV32Config(...))
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+INFO 05-27 12:56:47,869 model_runner.py:184] Total NPU Mem: 62740.00 MB
+INFO 05-27 12:56:47,869 model_runner.py:184] Total NPU Mem: 62748.00 MB
+INFO 05-27 12:56:47,869 model_runner.py:185] Used NPU Mem (Weights): 35559.81 MB
+INFO 05-27 12:56:47,869 model_runner.py:184] Total NPU Mem: 62748.00 MB
+INFO 05-27 12:56:47,869 model_runner.py:184] Total NPU Mem: 62740.00 MB
+INFO 05-27 12:56:47,869 model_runner.py:186] Single Block Size: 10.48 MB
+INFO 05-27 12:56:47,869 model_runner.py:184] Total NPU Mem: 62748.00 MB
+INFO 05-27 12:56:47,869 model_runner.py:184] Total NPU Mem: 62740.00 MB
+INFO 05-27 12:56:47,869 model_runner.py:185] Used NPU Mem (Weights): 35351.04 MB
+INFO 05-27 12:56:47,869 model_runner.py:188] Capping KV cache blocks by request limit: available=1689, max_needed=566.
+INFO 05-27 12:56:47,869 model_runner.py:185] Used NPU Mem (Weights): 35350.69 MB
+INFO 05-27 12:56:47,869 model_runner.py:185] Used NPU Mem (Weights): 35350.20 MB
+INFO 05-27 12:56:47,869 model_runner.py:185] Used NPU Mem (Weights): 35559.44 MB
+INFO 05-27 12:56:47,869 model_runner.py:192] Allocating 354 blocks.
+INFO 05-27 12:56:47,869 model_runner.py:186] Single Block Size: 10.48 MB
+INFO 05-27 12:56:47,869 model_runner.py:185] Used NPU Mem (Weights): 35560.51 MB
+INFO 05-27 12:56:47,869 model_runner.py:186] Single Block Size: 10.48 MB
+INFO 05-27 12:56:47,869 model_runner.py:186] Single Block Size: 10.48 MB
+INFO 05-27 12:56:47,869 model_runner.py:186] Single Block Size: 10.48 MB
+INFO 05-27 12:56:47,869 model_runner.py:194] DeepSeek CKV cache allocated successfully shape: (61, 354, 1, 128, 512)
+INFO 05-27 12:56:47,869 model_runner.py:186] Single Block Size: 10.48 MB
+INFO 05-27 12:56:47,869 model_runner.py:188] Capping KV cache blocks by request limit: available=1709, max_needed=566.
+INFO 05-27 12:56:47,869 model_runner.py:188] Capping KV cache blocks by request limit: available=1709, max_needed=566.
+INFO 05-27 12:56:47,869 model_runner.py:188] Capping KV cache blocks by request limit: available=1709, max_needed=566.
+INFO 05-27 12:56:47,869 model_runner.py:188] Capping KV cache blocks by request limit: available=1689, max_needed=566.
+INFO 05-27 12:56:47,869 model_runner.py:188] Capping KV cache blocks by request limit: available=1688, max_needed=566.
+INFO 05-27 12:56:47,869 model_runner.py:192] Allocating 354 blocks.
+INFO 05-27 12:56:47,869 model_runner.py:194] DeepSeek KPE cache allocated successfully shape: (61, 354, 1, 128, 64)
+INFO 05-27 12:56:47,869 model_runner.py:192] Allocating 354 blocks.
+INFO 05-27 12:56:47,869 model_runner.py:192] Allocating 354 blocks.
+INFO 05-27 12:56:47,869 model_runner.py:192] Allocating 354 blocks.
+INFO 05-27 12:56:47,869 model_runner.py:192] Allocating 354 blocks.
+INFO 05-27 12:56:47,869 model_runner.py:194] DeepSeek CKV cache allocated successfully shape: (61, 354, 1, 128, 512)
+INFO 05-27 12:56:47,869 model_runner.py:194] DeepSeek index cache allocated successfully shape: (61, 566, 128, 1, 128)
+INFO 05-27 12:56:47,869 model_runner.py:194] DeepSeek CKV cache allocated successfully shape: (61, 354, 1, 128, 512)
+INFO 05-27 12:56:47,869 model_runner.py:184] Total NPU Mem: 62748.00 MB
+INFO 05-27 12:56:47,869 model_runner.py:194] DeepSeek CKV cache allocated successfully shape: (61, 354, 1, 128, 512)
+INFO 05-27 12:56:47,869 model_runner.py:194] DeepSeek CKV cache allocated successfully shape: (61, 354, 1, 128, 512)
+INFO 05-27 12:56:47,869 model_runner.py:194] DeepSeek CKV cache allocated successfully shape: (61, 354, 1, 128, 512)
+INFO 05-27 12:56:47,869 model_runner.py:194] DeepSeek DRAM CKV cache allocated successfully shape: (61, 566, 1, 128, 512)
+INFO 05-27 12:56:47,869 model_runner.py:194] DeepSeek KPE cache allocated successfully shape: (61, 354, 1, 128, 64)
+INFO 05-27 12:56:47,869 model_runner.py:194] DeepSeek KPE cache allocated successfully shape: (61, 354, 1, 128, 64)
+INFO 05-27 12:56:47,869 model_runner.py:194] DeepSeek DRAM KPE cache allocated successfully shape: (61, 566, 1, 128, 64)
+INFO 05-27 12:56:47,869 model_runner.py:194] DeepSeek KPE cache allocated successfully shape: (61, 354, 1, 128, 64)
+INFO 05-27 12:56:47,869 model_runner.py:194] DeepSeek KPE cache allocated successfully shape: (61, 354, 1, 128, 64)
+INFO 05-27 12:56:47,869 model_runner.py:194] DeepSeek index cache allocated successfully shape: (61, 566, 128, 1, 128)
+INFO 05-27 12:56:47,869 model_runner.py:194] DeepSeek KPE cache allocated successfully shape: (61, 354, 1, 128, 64)
+INFO 05-27 12:56:47,869 model_runner.py:185] Used NPU Mem (Weights): 35350.34 MB
+INFO 05-27 12:56:47,869 model_runner.py:184] Total NPU Mem: 62740.00 MB
+INFO 05-27 12:56:47,869 model_runner.py:194] DeepSeek index cache allocated successfully shape: (61, 566, 128, 1, 128)
+INFO 05-27 12:56:47,869 model_runner.py:194] DeepSeek sparse token pool allocated successfully shape: (61, 4, 4608)
+INFO 05-27 12:56:47,869 model_runner.py:194] DeepSeek index cache allocated successfully shape: (61, 566, 128, 1, 128)
+INFO 05-27 12:56:47,869 model_runner.py:194] DeepSeek DRAM CKV cache allocated successfully shape: (61, 566, 1, 128, 512)
+INFO 05-27 12:56:47,869 model_runner.py:194] DeepSeek index cache allocated successfully shape: (61, 566, 128, 1, 128)
+INFO 05-27 12:56:47,869 model_runner.py:194] DeepSeek index cache allocated successfully shape: (61, 566, 128, 1, 128)
+INFO 05-27 12:56:47,869 model_runner.py:186] Single Block Size: 10.48 MB
+INFO 05-27 12:56:47,869 model_runner.py:194] DeepSeek DRAM CKV cache allocated successfully shape: (61, 566, 1, 128, 512)
+INFO 05-27 12:56:47,869 model_runner.py:194] DeepSeek DRAM CKV cache allocated successfully shape: (61, 566, 1, 128, 512)
+INFO 05-27 12:56:47,869 model_runner.py:194] DeepSeek DRAM KPE cache allocated successfully shape: (61, 566, 1, 128, 64)
+INFO 05-27 12:56:47,869 model_runner.py:194] DeepSeek DRAM CKV cache allocated successfully shape: (61, 566, 1, 128, 512)
+INFO 05-27 12:56:47,869 model_runner.py:194] DeepSeek DRAM CKV cache allocated successfully shape: (61, 566, 1, 128, 512)
+INFO 05-27 12:56:47,869 model_runner.py:185] Used NPU Mem (Weights): 35557.47 MB
+INFO 05-27 12:56:47,869 model_runner.py:194] DeepSeek DRAM KPE cache allocated successfully shape: (61, 566, 1, 128, 64)
+INFO 05-27 12:56:47,869 model_runner.py:188] Capping KV cache blocks by request limit: available=1709, max_needed=566.
+INFO 05-27 12:56:47,869 model_runner.py:194] DeepSeek DRAM KPE cache allocated successfully shape: (61, 566, 1, 128, 64)
+INFO 05-27 12:56:47,869 model_runner.py:194] DeepSeek sparse token pool allocated successfully shape: (61, 4, 4608)
+INFO 05-27 12:56:47,869 model_runner.py:194] DeepSeek DRAM KPE cache allocated successfully shape: (61, 566, 1, 128, 64)
+INFO 05-27 12:56:47,869 model_runner.py:194] DeepSeek DRAM KPE cache allocated successfully shape: (61, 566, 1, 128, 64)
+INFO 05-27 12:56:47,869 model_runner.py:194] DeepSeek sparse token pool allocated successfully shape: (61, 4, 4608)
+INFO 05-27 12:56:47,869 model_runner.py:192] Allocating 354 blocks.
+INFO 05-27 12:56:47,869 model_runner.py:194] DeepSeek sparse token pool allocated successfully shape: (61, 4, 4608)
+INFO 05-27 12:56:47,869 model_runner.py:186] Single Block Size: 10.48 MB
+INFO 05-27 12:56:47,869 model_runner.py:194] DeepSeek sparse token pool allocated successfully shape: (61, 4, 4608)
+INFO 05-27 12:56:47,869 model_runner.py:194] DeepSeek sparse token pool allocated successfully shape: (61, 4, 4608)
+INFO 05-27 12:56:47,869 model_runner.py:194] DeepSeek CKV cache allocated successfully shape: (61, 354, 1, 128, 512)
+INFO 05-27 12:56:47,869 model_runner.py:188] Capping KV cache blocks by request limit: available=1689, max_needed=566.
+INFO 05-27 12:56:47,869 model_runner.py:192] Allocating 354 blocks.
+INFO 05-27 12:56:47,869 model_runner.py:194] DeepSeek KPE cache allocated successfully shape: (61, 354, 1, 128, 64)
+INFO 05-27 12:56:47,870 model_runner.py:194] DeepSeek CKV cache allocated successfully shape: (61, 354, 1, 128, 512)
+INFO 05-27 12:56:47,870 model_runner.py:194] DeepSeek index cache allocated successfully shape: (61, 566, 128, 1, 128)
+INFO 05-27 12:56:47,870 model_runner.py:194] DeepSeek KPE cache allocated successfully shape: (61, 354, 1, 128, 64)
+INFO 05-27 12:56:47,870 model_runner.py:194] DeepSeek DRAM CKV cache allocated successfully shape: (61, 566, 1, 128, 512)
+INFO 05-27 12:56:47,870 model_runner.py:194] DeepSeek index cache allocated successfully shape: (61, 566, 128, 1, 128)
+INFO 05-27 12:56:47,870 model_runner.py:194] DeepSeek DRAM KPE cache allocated successfully shape: (61, 566, 1, 128, 64)
+INFO 05-27 12:56:47,870 model_runner.py:194] DeepSeek DRAM CKV cache allocated successfully shape: (61, 566, 1, 128, 512)
+INFO 05-27 12:56:47,870 model_runner.py:194] DeepSeek sparse token pool allocated successfully shape: (61, 4, 4608)
+INFO 05-27 12:56:47,870 model_runner.py:194] DeepSeek DRAM KPE cache allocated successfully shape: (61, 566, 1, 128, 64)
+INFO 05-27 12:56:47,870 model_runner.py:194] DeepSeek sparse token pool allocated successfully shape: (61, 4, 4608)
+INFO 05-27 12:56:48,584 model_runner.py:53] config: Config(model=/mnt/models/Deepseek-V3.2-Pruned-95B-BF/, max_num_batched_tokens=44544, max_num_seqs=4, max_model_len=18005, gpu_memory_utilization=0.85, tensor_parallel_size=8, enable_expert_parallel=True, enforce_eager=True, eos=1, kvcache_block_size=128, num_kvcache_blocks=354, num_index_cache_blocks=566, num_hbm_kvcache_blocks=354, num_dram_kvcache_blocks=566, dsa_offload_fixed_tx=64, dsa_offload_max_copy_tokens=2048, dsa_offload_pool_capacity=4, dsa_offload_max_sparse_tokens=4608, hccl_port=28000, skip_warmup=True, trust_remote_code=True, hf_config=DeepseekV32Config(...))
+INFO 05-27 12:56:48,654 model_runner.py:53] config: Config(model=/mnt/models/Deepseek-V3.2-Pruned-95B-BF/, max_num_batched_tokens=44544, max_num_seqs=4, max_model_len=18005, gpu_memory_utilization=0.85, tensor_parallel_size=8, enable_expert_parallel=True, enforce_eager=True, eos=1, kvcache_block_size=128, num_kvcache_blocks=354, num_index_cache_blocks=566, num_hbm_kvcache_blocks=354, num_dram_kvcache_blocks=566, dsa_offload_fixed_tx=64, dsa_offload_max_copy_tokens=2048, dsa_offload_pool_capacity=4, dsa_offload_max_sparse_tokens=4608, hccl_port=28000, skip_warmup=True, trust_remote_code=True, hf_config=DeepseekV32Config(...))
+INFO 05-27 12:56:48,682 model_runner.py:53] config: Config(model=/mnt/models/Deepseek-V3.2-Pruned-95B-BF/, max_num_batched_tokens=44544, max_num_seqs=4, max_model_len=18005, gpu_memory_utilization=0.85, tensor_parallel_size=8, enable_expert_parallel=True, enforce_eager=True, eos=1, kvcache_block_size=128, num_kvcache_blocks=354, num_index_cache_blocks=566, num_hbm_kvcache_blocks=354, num_dram_kvcache_blocks=566, dsa_offload_fixed_tx=64, dsa_offload_max_copy_tokens=2048, dsa_offload_pool_capacity=4, dsa_offload_max_sparse_tokens=4608, hccl_port=28000, skip_warmup=True, trust_remote_code=True, hf_config=DeepseekV32Config(...))
+INFO 05-27 12:56:48,716 model_runner.py:53] config: Config(model=/mnt/models/Deepseek-V3.2-Pruned-95B-BF/, max_num_batched_tokens=44544, max_num_seqs=4, max_model_len=18005, gpu_memory_utilization=0.85, tensor_parallel_size=8, enable_expert_parallel=True, enforce_eager=True, eos=1, kvcache_block_size=128, num_kvcache_blocks=354, num_index_cache_blocks=566, num_hbm_kvcache_blocks=354, num_dram_kvcache_blocks=566, dsa_offload_fixed_tx=64, dsa_offload_max_copy_tokens=2048, dsa_offload_pool_capacity=4, dsa_offload_max_sparse_tokens=4608, hccl_port=28000, skip_warmup=True, trust_remote_code=True, hf_config=DeepseekV32Config(...))
+INFO 05-27 12:56:48,723 model_runner.py:53] config: Config(model=/mnt/models/Deepseek-V3.2-Pruned-95B-BF/, max_num_batched_tokens=44544, max_num_seqs=4, max_model_len=18005, gpu_memory_utilization=0.85, tensor_parallel_size=8, enable_expert_parallel=True, enforce_eager=True, eos=1, kvcache_block_size=128, num_kvcache_blocks=354, num_index_cache_blocks=566, num_hbm_kvcache_blocks=354, num_dram_kvcache_blocks=566, dsa_offload_fixed_tx=64, dsa_offload_max_copy_tokens=2048, dsa_offload_pool_capacity=4, dsa_offload_max_sparse_tokens=4608, hccl_port=28000, skip_warmup=True, trust_remote_code=True, hf_config=DeepseekV32Config(...))
+INFO 05-27 12:56:48,759 model_runner.py:53] config: Config(model=/mnt/models/Deepseek-V3.2-Pruned-95B-BF/, max_num_batched_tokens=44544, max_num_seqs=4, max_model_len=18005, gpu_memory_utilization=0.85, tensor_parallel_size=8, enable_expert_parallel=True, enforce_eager=True, eos=1, kvcache_block_size=128, num_kvcache_blocks=354, num_index_cache_blocks=566, num_hbm_kvcache_blocks=354, num_dram_kvcache_blocks=566, dsa_offload_fixed_tx=64, dsa_offload_max_copy_tokens=2048, dsa_offload_pool_capacity=4, dsa_offload_max_sparse_tokens=4608, hccl_port=28000, skip_warmup=True, trust_remote_code=True, hf_config=DeepseekV32Config(...))
+/usr/local/python3.11.14/lib/python3.11/site-packages/torch/distributed/distributed_c10d.py:4876: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  warnings.warn(  # warn only once
+INFO 05-27 12:56:48,772 model_runner.py:53] config: Config(model=/mnt/models/Deepseek-V3.2-Pruned-95B-BF/, max_num_batched_tokens=44544, max_num_seqs=4, max_model_len=18005, gpu_memory_utilization=0.85, tensor_parallel_size=8, enable_expert_parallel=True, enforce_eager=True, eos=1, kvcache_block_size=128, num_kvcache_blocks=354, num_index_cache_blocks=566, num_hbm_kvcache_blocks=354, num_dram_kvcache_blocks=566, dsa_offload_fixed_tx=64, dsa_offload_max_copy_tokens=2048, dsa_offload_pool_capacity=4, dsa_offload_max_sparse_tokens=4608, hccl_port=28000, skip_warmup=True, trust_remote_code=True, hf_config=DeepseekV32Config(...))
+INFO 05-27 12:56:48,781 model_runner.py:53] config: Config(model=/mnt/models/Deepseek-V3.2-Pruned-95B-BF/, max_num_batched_tokens=44544, max_num_seqs=4, max_model_len=18005, gpu_memory_utilization=0.85, tensor_parallel_size=8, enable_expert_parallel=True, enforce_eager=True, eos=1, kvcache_block_size=128, num_kvcache_blocks=354, num_index_cache_blocks=566, num_hbm_kvcache_blocks=354, num_dram_kvcache_blocks=566, dsa_offload_fixed_tx=64, dsa_offload_max_copy_tokens=2048, dsa_offload_pool_capacity=4, dsa_offload_max_sparse_tokens=4608, hccl_port=28000, skip_warmup=True, trust_remote_code=True, hf_config=DeepseekV32Config(...))
+INFO 05-27 12:56:49,299 llm_engine.py:73] skip warmup enabled, skipping model warmup.
+test config: num_prompts=4, prompt_min=256, prompt_max=18000, max_model_len=18005, max_num_batched_tokens=44544, max_num_seqs=4, max_gen_tokens=5
+prompt plan:
+  prompt 1: target_len=256, full_blocks=2, sparse_blocks=2, release_blocks=0
+  prompt 2: target_len=12288, full_blocks=96, sparse_blocks=29, release_blocks=67
+  prompt 3: target_len=14000, full_blocks=109, sparse_blocks=33, release_blocks=76
+  prompt 4: target_len=18000, full_blocks=140, sparse_blocks=35, release_blocks=105
+prompt 1 token_len=256 first_ids=[0, 128803, 53091, 4374, 1465, 50594, 5671, 22891, 16, 1162, 73615, 10175, 33492, 260, 12092, 852]
+prompt 2 token_len=12288 first_ids=[0, 128803, 53091, 4374, 1465, 50594, 5671, 22891, 16, 1162, 73615, 10175, 33492, 260, 12092, 852]
+prompt 3 token_len=14000 first_ids=[0, 128803, 53091, 4374, 1465, 50594, 5671, 22891, 16, 1162, 73615, 10175, 33492, 260, 12092, 852]
+prompt 4 token_len=18000 first_ids=[0, 128803, 53091, 4374, 1465, 50594, 5671, 22891, 16, 1162, 73615, 10175, 33492, 260, 12092, 852]
+llm.generate 4 start ...
+[step   1 Prefill] bsz=4, num_tokens=44548, TTFT=23.9691 sec, TPS=1858.56 tok/s
+[step   2  Decode] bsz=4, num_tokens=4, TPOT=4.8449 sec, TPS=0.83 tok/s
+[step   3  Decode] bsz=4, num_tokens=4, TPOT=4.4958 sec, TPS=0.89 tok/s
+[step   4  Decode] bsz=4, num_tokens=4, TPOT=4.4560 sec, TPS=0.90 tok/s
+[step   5  Decode] bsz=4, num_tokens=4, TPOT=4.4400 sec, TPS=0.90 tok/s
+llm.generate 4 requests in 5 steps, e2e latency = 42.21 sec
+    prefill steps = 1, prefill tokens = 44548, total prefill time = 23.9691 sec, prefill TPS = 1858.56 tok/s
+    decode steps = 4, decode tokens = 16, total decode time = 18.2367 sec, decode TPS = 0.88 tok/s
+    e2e input TPS = 1055.38 tok/s, e2e output TPS = 0.47 tok/s
+    TTFT/TPOT are per-step request latencies printed above.
+prompt_len: 256
+prompt    : <random exact-token prompt 1: target_len=256>
+response  : '#<｜begin▁of▁sentence｜><｜begin▁of▁sentence｜><｜begin▁of▁sentence｜><｜begin▁of▁sentence｜>'
+token_ids : [5, 0, 0, 0, 0]
+
+prompt_len: 12288
+prompt    : <random exact-token prompt 2: target_len=12288>
+response  : ' sentence<｜begin▁of▁sentence｜><｜begin▁of▁sentence｜><｜begin▁of▁sentence｜><｜begin▁of▁sentence｜>'
+token_ids : [10175, 0, 0, 0, 0]
+
+prompt_len: 14000
+prompt    : <random exact-token prompt 3: target_len=14000>
+response  : '\n<｜begin▁of▁sentence｜><｜begin▁of▁sentence｜><｜begin▁of▁sentence｜><｜begin▁of▁sentence｜>'
+token_ids : [201, 0, 0, 0, 0]
+
+prompt_len: 18000
+prompt    : <random exact-token prompt 4: target_len=18000>
+response  : '\n<｜begin▁of▁sentence｜><｜begin▁of▁sentence｜><｜begin▁of▁sentence｜><｜begin▁of▁sentence｜>'
+token_ids : [201, 0, 0, 0, 0]

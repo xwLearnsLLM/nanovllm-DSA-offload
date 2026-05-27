@@ -1,5 +1,5 @@
 __pycache__/
-runlog/
+
 build/
 nanovllm/_C*.so
 nanovllm/libnanovllm_ascend_kernels.so
