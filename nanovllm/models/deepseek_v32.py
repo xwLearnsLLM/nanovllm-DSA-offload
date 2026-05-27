@@ -2120,10 +2120,8 @@ class DeepseekV32DSAAttention(nn.Module):
         candidate_lens = context.candidate_lens[:batch_size]
         selected_lens = context.sparse_selected_lens[:batch_size]
         req_pool_entries = context.req_pool_entries[:batch_size]
-        max_candidate = max(
-            int(candidate_lens.max().item()) if candidate_lens.numel() else 0,
-            1,
-        )
+        max_candidate = max(int(context.max_candidate_len), 1)
+
         (
             score_out,
             promote_idx,

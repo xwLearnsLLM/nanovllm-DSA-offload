@@ -541,6 +541,7 @@ class ModelRunner:
             decode_lens.append(decode_len)
             sparse_kv_lens.append(sparse_kv_len)
             req_pool_entries.append(seq.hbm_cached_tokens_pool_entry)
+        max_candidate_len = max(max(candidate_lens), 1) if candidate_lens else 1
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).to(self.device, non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).to(self.device, non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
@@ -579,6 +580,7 @@ class ModelRunner:
                     dram_block_tables=dram_block_tables,
                     req_pool_entries=req_pool_entries,
                     candidate_lens=candidate_lens,
+                    max_candidate_len=max_candidate_len,
                     sparse_selected_lens=sparse_selected_lens,
                     prefill_tail_lens=prefill_tail_lens,
                     decode_lens=decode_lens,
