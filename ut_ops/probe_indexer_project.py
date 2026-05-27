@@ -168,6 +168,25 @@ def q_project_bmm_transpose(
     return out
 
 
+def q_project_bmm_transpose_cached(
+    q_c: torch.Tensor,
+    wq_b_bmm_t: torch.Tensor,
+    *,
+    n_head: int,
+    head_dim: int,
+) -> torch.Tensor:
+    if ascend_ops is None:
+        raise RuntimeError("nanovllm.ops is not available")
+    q_c_by_head = q_c.unsqueeze(1).expand(-1, n_head, -1).contiguous()
+    out = torch.empty(
+        (q_c.shape[0], n_head, head_dim),
+        dtype=q_c.dtype,
+        device=q_c.device,
+    )
+    ascend_ops.batch_matmul_transpose(q_c_by_head, wq_b_bmm_t, out)
+    return out
+
+
 def bench(fn, warmup: int, iters: int, device: torch.device) -> tuple[object, float]:
     result = None
     for _ in range(warmup):
@@ -309,6 +328,33 @@ def main() -> None:
         assert isinstance(q_bmm, torch.Tensor)
         print("INDEXER_DIFF q_bmm_transpose " + diff_report("q", q_bmm, q_linear))
         print(f"INDEXER_BENCH q_bmm_transpose_avg_ms={q_bmm_ms:.6f}")
+
+        wq_b_bmm_t = (
+            weights["wq_b"]
+            .view(args.heads, args.head_dim, args.q_lora_rank)
+            .transpose(1, 2)
+            .contiguous()
+        )
+        q_bmm_cached, q_bmm_cached_ms = bench(
+            lambda: q_project_bmm_transpose_cached(
+                q_c,
+                wq_b_bmm_t,
+                n_head=args.heads,
+                head_dim=args.head_dim,
+            ),
+            args.warmup,
+            args.iters,
+            device,
+        )
+        assert isinstance(q_bmm_cached, torch.Tensor)
+        print(
+            "INDEXER_DIFF q_bmm_transpose_cached "
+            + diff_report("q", q_bmm_cached, q_linear)
+        )
+        print(
+            "INDEXER_BENCH "
+            f"q_bmm_transpose_cached_avg_ms={q_bmm_cached_ms:.6f}"
+        )
     else:
         print("INDEXER_BENCH q_bmm_transpose skipped")
 

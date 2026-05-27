@@ -766,6 +766,41 @@ class DeepseekV32Indexer(nn.Module):
             self.n_head,
             bias=False,
         ).to(torch.float32)
+        self.q_bmm_trans_max_tokens = _env_int(
+            "NANOVLLM_INDEXER_Q_BMM_TRANS_MAX_TOKENS",
+            8,
+        )
+        self.register_buffer("wq_b_bmm_t", None, persistent=False)
+
+    def prepare_q_bmm_transpose_weight(self) -> None:
+        if self.q_bmm_trans_max_tokens <= 0 or self.wq_b_bmm_t is not None:
+            return
+        weight = self.wq_b.weight.detach()
+        if weight.device.type != "npu":
+            return
+        self.wq_b_bmm_t = (
+            weight.view(self.n_head, self.head_dim, self.q_lora_rank)
+            .transpose(1, 2)
+            .contiguous()
+        )
+
+    def _q_project(self, q_c: torch.Tensor) -> torch.Tensor:
+        num_tokens = q_c.shape[0]
+        if (
+            self.wq_b_bmm_t is not None
+            and q_c.device.type == "npu"
+            and q_c.dtype in (torch.float16, torch.bfloat16)
+            and 0 < num_tokens <= self.q_bmm_trans_max_tokens
+        ):
+            q_c_by_head = q_c.unsqueeze(1).expand(-1, self.n_head, -1).contiguous()
+            q = torch.empty(
+                (num_tokens, self.n_head, self.head_dim),
+                dtype=q_c.dtype,
+                device=q_c.device,
+            )
+            ascend_ops.batch_matmul_transpose(q_c_by_head, self.wq_b_bmm_t, q)
+            return q
+        return self.wq_b(q_c).view(-1, self.n_head, self.head_dim)
 
     def forward(
         self,
@@ -774,7 +809,7 @@ class DeepseekV32Indexer(nn.Module):
         positions: torch.Tensor,
         rotary_emb: DeepseekScalingRotaryEmbedding,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        q = self.wq_b(q_c).view(-1, self.n_head, self.head_dim)
+        q = self._q_project(q_c)
         q_pe, q_nope = torch.split(
             q,
             [self.rope_dim, self.head_dim - self.rope_dim],
@@ -1062,6 +1097,8 @@ class DeepseekV32DSAAttention(nn.Module):
 
         if self.enable_decode_mlapo:
             self._prepare_decode_mlapo()
+
+        self.indexer.prepare_q_bmm_transpose_weight()
 
     def _prepare_decode_mlapo(self) -> None:
         if self.mlapo_wd_qkv is not None and self.mlapo_wu_q is not None:

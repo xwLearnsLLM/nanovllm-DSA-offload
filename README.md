@@ -66,6 +66,7 @@ PYTHONPATH=$PWD:$PYTHONPATH python -m pip show nano-vllm-ascend
 | `NANOVLLM_FUSE_QKV_A` | `true` | `deepseek_v32.py` | `true` fuses `q_a_proj` and `kv_a_proj_with_mqa` into one projection after loading. |
 | `NANOVLLM_FREE_KV_B_PROJ` | `true` | `deepseek_v32.py` | `true` frees `kv_b_proj.weight` after preparing `w_uk_t/w_uv`. |
 | `NANOVLLM_Q_UP_BMM_TRANS_MAX_TOKENS` | `1` | `deepseek_v32.py` | Max token count using local `batch_matmul_transpose` for q-up projection. `0` disables it fully. |
+| `NANOVLLM_INDEXER_Q_BMM_TRANS_MAX_TOKENS` | `8` | `deepseek_v32.py` | Max decode token count using local `batch_matmul_transpose` for indexer `wq_b(q_c)`. `0` disables this optimization. |
 | `NANOVLLM_MOE_BACKEND` | `grouped` | `deepseek_v32.py` | `grouped` packs local experts and uses `npu_grouped_matmul`; `loop` keeps the original per-expert Python loop. |
 
 DSA offload decode no longer has a `NANOVLLM_DECODE_ATTENTION_BACKEND` switch.
@@ -166,7 +167,7 @@ into MLAPO. The indexer path is still separate:
 | Step | vllm-ascend 0.19 handling | Local implication |
 |---|---|---|
 | `q_c` production | MLAPO returns normalized `q_c`. | Already matched by the DSA offload path. |
-| indexer `q` projection | `wq_b(q_c)` runs after MLAPO. | Still contributes to `indexer` timing. |
+| indexer `q` projection | `wq_b(q_c)` runs after MLAPO. | Small decode batches use local `batch_matmul_transpose` with pre-transposed per-head weights. |
 | indexer `k` projection | `wk(hidden_states)` or fused `wk_weights_proj(hidden_states)`. | We can test fusing `wk + weights_proj`. |
 | indexer weights | `weights_proj(hidden_states)` or the weights slice of `wk_weights_proj`. | Fusing may reduce one small GEMM, with BF16-vs-FP32 accuracy to verify. |
 
@@ -177,6 +178,11 @@ both numerical differences and average latency.
 ```bash
 PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python ut_ops/probe_indexer_project.py --device npu:0 --tokens 4 --warmup 10 --iters 100
 ```
+
+Expected reading:
+
+- `fused_wk_weights_bf16_avg_ms` should only be adopted if it is clearly faster and the `weights` diff is acceptable. Early A2 runs showed no useful speedup.
+- `q_bmm_transpose_cached_avg_ms` isolates the optimized `wq_b(q_c)` path now used by decode when `tokens <= NANOVLLM_INDEXER_Q_BMM_TRANS_MAX_TOKENS`.
 
 ## Optional Local Op Probes
 
