@@ -38,7 +38,6 @@ SFA_SPARSE_COUNT = 2048
 ACL_FORMAT_FRACTAL_NZ = 29
 _NPU_MLA_ATTENTION_MASK_CACHE: dict[tuple[str, int], torch.Tensor] = {}
 _NPU_MLA_V2_WORKSPACE_CACHE: dict[tuple, torch.Tensor] = {}
-_DSA_WARNED_DECODE_MLAPO_DISABLED = False
 _DSA_WARNED_BACKEND_OVERRIDE = False
 _DSA_OFFLOAD_BUFFER_CACHE = {}
 
@@ -904,15 +903,6 @@ class DeepseekV32DSAAttention(nn.Module):
             "NANOVLLM_ENABLE_DECODE_MLAPO",
             False,
         )
-        if self.enable_decode_mlapo:
-            global _DSA_WARNED_DECODE_MLAPO_DISABLED
-            if _is_rank0() and not _DSA_WARNED_DECODE_MLAPO_DISABLED:
-                logger.warning(
-                    "DSA offload disables decode MLAPO because IndexCache "
-                    "must be produced during decode."
-                )
-                _DSA_WARNED_DECODE_MLAPO_DISABLED = True
-            self.enable_decode_mlapo = False
         self.mla_rope_neox_cache = _env_flag(
             "NANOVLLM_MLA_ROPE_NEOX_CACHE",
             False,
@@ -990,6 +980,7 @@ class DeepseekV32DSAAttention(nn.Module):
             "mlapo": 0.0,
             "indexer": 0.0,
             "cache": 0.0,
+            "index_cache": 0.0,
             "q_up": 0.0,
             "dsa_indexer_score": 0.0,
             "dsa_index_update": 0.0,
@@ -1184,6 +1175,9 @@ class DeepseekV32DSAAttention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         ql_shape = (num_tokens, self.num_local_heads, self.kv_lora_rank)
         qpe_shape = (num_tokens, self.num_local_heads, self.qk_rope_head_dim)
+        # MLAPO can expose the post-q_a_layernorm latent q_c. Reusing it keeps
+        # DSA decode from recomputing the same q_a projection path.
+        q_c_shape = (num_tokens, self.q_lora_rank)
         if (
             self._decode_mlapo_ql_nope is None
             or tuple(self._decode_mlapo_ql_nope.shape) != ql_shape
@@ -1208,11 +1202,12 @@ class DeepseekV32DSAAttention(nn.Module):
             )
         if (
             self._decode_mlapo_inner_out is None
+            or tuple(self._decode_mlapo_inner_out.shape) != q_c_shape
             or self._decode_mlapo_inner_out.dtype != dtype
             or self._decode_mlapo_inner_out.device != device
         ):
             self._decode_mlapo_inner_out = torch.empty(
-                0,
+                q_c_shape,
                 dtype=dtype,
                 device=device,
             )
@@ -1227,7 +1222,7 @@ class DeepseekV32DSAAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         profile_decode: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.mlapo_wd_qkv is None or self.mlapo_wu_q is None:
             self._prepare_decode_mlapo()
         if self.mlapo_wd_qkv is None or self.mlapo_wu_q is None:
@@ -1265,7 +1260,7 @@ class DeepseekV32DSAAttention(nn.Module):
             inner_out=inner_out,
             cache_mode="krope_ctkv",
             quant_mode="no_quant",
-            enable_inner_out=False,
+            enable_inner_out=True,
         )
         if not self.mla_rope_neox_cache:
             # mla_preprocess produces RoPE vectors in neox order. The normal
@@ -1278,7 +1273,7 @@ class DeepseekV32DSAAttention(nn.Module):
             k_pe = kpe_flat.index_select(0, slots)
             kpe_flat.index_copy_(0, slots, _rope_neox_to_interleaved(k_pe))
         self._decode_timer_end(profile_decode, "mlapo", start, ql_nope.device)
-        return ql_nope, q_pe
+        return ql_nope, q_pe, inner_out
 
     @property
     def block_size(self) -> int:
@@ -1366,11 +1361,10 @@ class DeepseekV32DSAAttention(nn.Module):
             device=pool.device,
         )
 
-    def _store_cache(
+    def _store_mla_cache(
         self,
         ckv: torch.Tensor,
         kpe: torch.Tensor,
-        index_k: torch.Tensor | None,
     ) -> None:
         flat_slots = self._flat_slots()
         self.ckv_cache.view(-1, self.kv_lora_rank).index_copy_(
@@ -1383,6 +1377,8 @@ class DeepseekV32DSAAttention(nn.Module):
             flat_slots,
             kpe,
         )
+
+    def _store_index_cache(self, index_k: torch.Tensor | None) -> None:
         if index_k is None:
             return
         index_slots = self._flat_index_slots()
@@ -1391,6 +1387,28 @@ class DeepseekV32DSAAttention(nn.Module):
             index_slots,
             index_k,
         )
+
+    def _run_indexer(
+        self,
+        hidden_states: torch.Tensor,
+        q_c: torch.Tensor,
+        positions: torch.Tensor,
+        profile_decode: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        start = self._decode_timer_start(profile_decode, hidden_states.device)
+        q_index, index_k, weights = self.indexer(
+            hidden_states,
+            q_c,
+            positions,
+            self.indexer_rotary_emb,
+        )
+        self._decode_timer_end(
+            profile_decode,
+            "indexer",
+            start,
+            hidden_states.device,
+        )
+        return q_index, index_k, weights
 
     def _get_sequence_slots_from_block_table(
         self,
@@ -2342,12 +2360,27 @@ class DeepseekV32DSAAttention(nn.Module):
             and self.decode_attention_backend == "mla"
         )
         if use_decode_mlapo:
-            ql_nope, q_pe = self._decode_mlapo_preprocess(
+            ql_nope, q_pe, q_c = self._decode_mlapo_preprocess(
                 positions,
                 hidden_states,
                 profile_decode,
             )
-            attn_output = self._decode_forward(ql_nope, q_pe, None, None)
+            q_index, index_k, weights = self._run_indexer(
+                hidden_states,
+                q_c,
+                positions,
+                profile_decode,
+            )
+            start = self._decode_timer_start(profile_decode, index_k.device)
+            self._store_index_cache(index_k)
+            self._decode_timer_end(
+                profile_decode,
+                "index_cache",
+                start,
+                index_k.device,
+            )
+
+            attn_output = self._decode_forward(ql_nope, q_pe, q_index, weights)
             return self._o_proj_forward(attn_output, profile_decode)
 
         start = self._decode_timer_start(profile_decode, hidden_states.device)
@@ -2406,23 +2439,25 @@ class DeepseekV32DSAAttention(nn.Module):
             q_pe = _rope_interleaved_to_neox(q_pe)
             k_pe = _rope_interleaved_to_neox(k_pe)
 
-        start = self._decode_timer_start(profile_decode, hidden_states.device)
-        q_index, index_k, weights = self.indexer(
+        q_index, index_k, weights = self._run_indexer(
             hidden_states,
             q_c,
             positions,
-            self.indexer_rotary_emb,
-        )
-        self._decode_timer_end(
             profile_decode,
-            "indexer",
-            start,
-            hidden_states.device,
         )
 
         start = self._decode_timer_start(profile_decode, ckv.device)
-        self._store_cache(ckv, k_pe, index_k)
+        self._store_mla_cache(ckv, k_pe)
         self._decode_timer_end(profile_decode, "cache", start, ckv.device)
+
+        start = self._decode_timer_start(profile_decode, index_k.device)
+        self._store_index_cache(index_k)
+        self._decode_timer_end(
+            profile_decode,
+            "index_cache",
+            start,
+            index_k.device,
+        )
 
         start = self._decode_timer_start(profile_decode, q_nope.device)
         ql_nope = self._q_nope_up_proj(q_nope)
@@ -2545,7 +2580,8 @@ class DeepseekV32DecoderLayer(nn.Module):
                 "Decode layer timing: rank=%d layer=%d tokens=%d "
                 "attention_total=%.6fs qkv_a=%.6fs q_norm=%.6fs "
                 "q_b=%.6fs kv_rope=%.6fs kv_split=%.6fs kv_norm=%.6fs "
-                "rotary=%.6fs k_squeeze=%.6fs mlapo=%.6fs indexer=%.6fs cache=%.6fs "
+                "rotary=%.6fs k_squeeze=%.6fs mlapo=%.6fs indexer=%.6fs "
+                "cache=%.6fs index_cache=%.6fs "
                 "q_up=%.6fs dsa_total=%.6fs dsa_indexer_score=%.6fs "
                 "dsa_index_update=%.6fs dsa_scatter_h2d=%.6fs "
                 "decode_attention_op=%.6fs v_up=%.6fs "
@@ -2567,6 +2603,7 @@ class DeepseekV32DecoderLayer(nn.Module):
                 attention_detail["mlapo"],
                 attention_detail["indexer"],
                 attention_detail["cache"],
+                attention_detail["index_cache"],
                 attention_detail["q_up"],
                 dsa_total,
                 attention_detail["dsa_indexer_score"],
