@@ -2,6 +2,11 @@ from __future__ import annotations
 
 import torch
 
+from nanovllm.models.dsa_index_update_real import (
+    dsa_index_update_real,
+    is_available as is_dsa_index_update_real_available,
+)
+
 
 def _flatten_index_cache(index_cache: torch.Tensor) -> torch.Tensor:
     return index_cache.view(-1, index_cache.shape[-1])
@@ -44,7 +49,7 @@ def dsa_indexer_score(
         )
 
 
-def dsa_index_update(
+def dsa_index_update_torch(
     score: torch.Tensor,
     hbm_cached_tokens_pool: torch.Tensor,
     promote_idx: torch.Tensor,
@@ -112,6 +117,58 @@ def dsa_index_update(
             pool_entry,
             demote_slots.to(torch.long),
         ] = promote_tokens
+
+
+def dsa_index_update(
+    score: torch.Tensor,
+    hbm_cached_tokens_pool: torch.Tensor,
+    promote_idx: torch.Tensor,
+    demote_idx: torch.Tensor,
+    copy_counts: torch.Tensor,
+    candidate_lens: torch.Tensor,
+    selected_lens: torch.Tensor,
+    req_pool_entries: torch.Tensor,
+    max_copy_tokens: int,
+) -> None:
+    """Dispatch to the Ascend op when it is built, otherwise use the prototype."""
+    if (
+        is_dsa_index_update_real_available()
+        and score.device.type == "npu"
+        and score.dtype == torch.bfloat16
+        and int(max_copy_tokens) <= 128
+        and score.is_contiguous()
+        and hbm_cached_tokens_pool.is_contiguous()
+        and promote_idx.is_contiguous()
+        and demote_idx.is_contiguous()
+        and copy_counts.is_contiguous()
+        and candidate_lens.is_contiguous()
+        and selected_lens.is_contiguous()
+        and req_pool_entries.is_contiguous()
+    ):
+        dsa_index_update_real(
+            score,
+            hbm_cached_tokens_pool,
+            promote_idx,
+            demote_idx,
+            copy_counts,
+            candidate_lens,
+            selected_lens,
+            req_pool_entries,
+            int(max_copy_tokens),
+        )
+        return
+
+    dsa_index_update_torch(
+        score,
+        hbm_cached_tokens_pool,
+        promote_idx,
+        demote_idx,
+        copy_counts,
+        candidate_lens,
+        selected_lens,
+        req_pool_entries,
+        int(max_copy_tokens),
+    )
 
 
 def dsa_scatter_h2d(

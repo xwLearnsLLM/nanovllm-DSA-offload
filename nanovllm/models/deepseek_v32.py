@@ -1864,7 +1864,7 @@ class DeepseekV32DSAAttention(nn.Module):
 
         score_out, promote_idx, demote_idx, copy_counts = buffers
         return (
-            score_out[:batch_size, :candidate_capacity],
+            score_out[:batch_size, :cached_candidates],
             promote_idx[:batch_size, :copy_capacity],
             demote_idx[:batch_size, :copy_capacity],
             copy_counts[:batch_size],
