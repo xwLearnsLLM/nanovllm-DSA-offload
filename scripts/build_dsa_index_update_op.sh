@@ -36,9 +36,23 @@ find "${OP_ROOT}" -type f \
   \( -name "*.sh" -o -name "*.cmake" -o -name "CMakeLists.txt" -o -name "*.cpp" -o -name "*.h" \) \
   -exec sed -i 's/\r$//' {} +
 
-echo "[dsa_index_update] extension source markers"
-grep -n "AclTensorGuard\|aclCreateTensor\|EXEC_NPU_CMD(aclnnDsaIndexUpdate" \
+echo "[dsa_index_update] source markers"
+grep -n "KERNEL_TYPE_AIV_ONLY" \
+  "${OP_ROOT}/cann/op_kernel/dsa_index_update.cpp" || true
+grep -n "manual_acl_tensor_aiv_only_v2\|AclTensorGuard\|aclCreateTensor\|EXEC_NPU_CMD(aclnnDsaIndexUpdate" \
   "${OP_ROOT}/torch_extension/dsa_index_update_ext.cpp" || true
+grep -n "manual_acl_tensor_aiv_only_v2" \
+  "${ROOT_DIR}/nanovllm/models/dsa_index_update_real.py" || true
+if ! grep -q "KERNEL_TYPE_AIV_ONLY" \
+    "${OP_ROOT}/cann/op_kernel/dsa_index_update.cpp"; then
+  echo "[dsa_index_update] ERROR: AIV-only kernel marker is missing." >&2
+  exit 1
+fi
+if ! grep -q "manual_acl_tensor_aiv_only_v2" \
+    "${OP_ROOT}/torch_extension/dsa_index_update_ext.cpp"; then
+  echo "[dsa_index_update] ERROR: binding version marker is missing." >&2
+  exit 1
+fi
 if grep -q "EXEC_NPU_CMD(aclnnDsaIndexUpdate" \
     "${OP_ROOT}/torch_extension/dsa_index_update_ext.cpp"; then
   echo "[dsa_index_update] ERROR: stale EXEC_NPU_CMD binding is still present." >&2

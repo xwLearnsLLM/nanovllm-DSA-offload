@@ -9,7 +9,7 @@ thread_local int g_hashOffset = 0;
 
 namespace {
 
-constexpr const char* kDsaIndexUpdateBindingVersion = "manual_acl_tensor_v1";
+constexpr const char* kDsaIndexUpdateBindingVersion = "manual_acl_tensor_aiv_only_v2";
 
 class AclTensorGuard {
 public:

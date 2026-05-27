@@ -222,6 +222,7 @@ extern "C" __global__ __aicore__ void dsa_index_update(GM_ADDR score, GM_ADDR hb
     GM_ADDR promoteIdx, GM_ADDR demoteIdx, GM_ADDR copyCounts,
     GM_ADDR workspace, GM_ADDR tiling)
 {
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     (void)workspace;
     REGISTER_TILING_DEFAULT(DsaIndexUpdateTilingData);
     GET_TILING_DATA_WITH_STRUCT(DsaIndexUpdateTilingData, tilingData, tiling);
