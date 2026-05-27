@@ -771,6 +771,7 @@ class DeepseekV32Indexer(nn.Module):
             8,
         )
         self.register_buffer("wq_b_bmm_t", None, persistent=False)
+        self.last_q_project_path = "unprepared"
 
     def prepare_q_bmm_transpose_weight(self) -> None:
         if self.q_bmm_trans_max_tokens <= 0 or self.wq_b_bmm_t is not None:
@@ -799,8 +800,36 @@ class DeepseekV32Indexer(nn.Module):
                 device=q_c.device,
             )
             ascend_ops.batch_matmul_transpose(q_c_by_head, self.wq_b_bmm_t, q)
+            self.last_q_project_path = "bmm_transpose"
             return q
+        self.last_q_project_path = "linear"
         return self.wq_b(q_c).view(-1, self.n_head, self.head_dim)
+
+    def _detail_timer_start(
+        self,
+        detail: dict[str, float] | None,
+        sync: bool,
+        device: torch.device,
+    ) -> float | None:
+        if detail is None:
+            return None
+        if sync:
+            _profile_sync(device)
+        return perf_counter()
+
+    def _detail_timer_end(
+        self,
+        detail: dict[str, float] | None,
+        name: str,
+        start: float | None,
+        sync: bool,
+        device: torch.device,
+    ) -> None:
+        if detail is None or start is None:
+            return
+        if sync:
+            _profile_sync(device)
+        detail[name] = detail.get(name, 0.0) + perf_counter() - start
 
     def forward(
         self,
@@ -808,28 +837,133 @@ class DeepseekV32Indexer(nn.Module):
         q_c: torch.Tensor,
         positions: torch.Tensor,
         rotary_emb: DeepseekScalingRotaryEmbedding,
+        detail: dict[str, float] | None = None,
+        sync_detail: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if detail is None:
+            q = self._q_project(q_c)
+            q_pe, q_nope = torch.split(
+                q,
+                [self.rope_dim, self.head_dim - self.rope_dim],
+                dim=-1,
+            )
+
+            k = self.k_norm(self.wk(hidden_states))
+            k_pe, k_nope = torch.split(
+                k,
+                [self.rope_dim, self.head_dim - self.rope_dim],
+                dim=-1,
+            )
+            q_pe, k_pe = rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
+            q = torch.cat((q_pe, q_nope), dim=-1)
+            k = torch.cat((k_pe.squeeze(1), k_nope), dim=-1)
+            q = _rotate_activation(q).to(q.dtype)
+            k = _rotate_activation(k).to(k.dtype)
+
+            weights = self.weights_proj(hidden_states.float())
+            weights = weights * self.softmax_scale * (self.n_head ** -0.5)
+            return q, k, weights.to(hidden_states.dtype)
+
+        start = self._detail_timer_start(detail, sync_detail, q_c.device)
         q = self._q_project(q_c)
+        self._detail_timer_end(
+            detail,
+            "q_proj",
+            start,
+            sync_detail,
+            q_c.device,
+        )
+
+        start = self._detail_timer_start(detail, sync_detail, q.device)
         q_pe, q_nope = torch.split(
             q,
             [self.rope_dim, self.head_dim - self.rope_dim],
             dim=-1,
         )
+        self._detail_timer_end(
+            detail,
+            "q_split",
+            start,
+            sync_detail,
+            q.device,
+        )
 
-        k = self.k_norm(self.wk(hidden_states))
+        start = self._detail_timer_start(detail, sync_detail, hidden_states.device)
+        k = self.wk(hidden_states)
+        self._detail_timer_end(
+            detail,
+            "k_proj",
+            start,
+            sync_detail,
+            hidden_states.device,
+        )
+
+        start = self._detail_timer_start(detail, sync_detail, k.device)
+        k = self.k_norm(k)
+        self._detail_timer_end(
+            detail,
+            "k_norm",
+            start,
+            sync_detail,
+            k.device,
+        )
+
+        start = self._detail_timer_start(detail, sync_detail, k.device)
         k_pe, k_nope = torch.split(
             k,
             [self.rope_dim, self.head_dim - self.rope_dim],
             dim=-1,
         )
+        self._detail_timer_end(
+            detail,
+            "k_split",
+            start,
+            sync_detail,
+            k.device,
+        )
+
+        start = self._detail_timer_start(detail, sync_detail, q.device)
         q_pe, k_pe = rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
+        self._detail_timer_end(
+            detail,
+            "rope",
+            start,
+            sync_detail,
+            q.device,
+        )
+
+        start = self._detail_timer_start(detail, sync_detail, q.device)
         q = torch.cat((q_pe, q_nope), dim=-1)
         k = torch.cat((k_pe.squeeze(1), k_nope), dim=-1)
+        self._detail_timer_end(
+            detail,
+            "cat",
+            start,
+            sync_detail,
+            q.device,
+        )
+
+        start = self._detail_timer_start(detail, sync_detail, q.device)
         q = _rotate_activation(q).to(q.dtype)
         k = _rotate_activation(k).to(k.dtype)
+        self._detail_timer_end(
+            detail,
+            "rotate_activation",
+            start,
+            sync_detail,
+            q.device,
+        )
 
+        start = self._detail_timer_start(detail, sync_detail, hidden_states.device)
         weights = self.weights_proj(hidden_states.float())
         weights = weights * self.softmax_scale * (self.n_head ** -0.5)
+        self._detail_timer_end(
+            detail,
+            "weights_proj",
+            start,
+            sync_detail,
+            hidden_states.device,
+        )
         return q, k, weights.to(hidden_states.dtype)
 
 
@@ -950,6 +1084,8 @@ class DeepseekV32DSAAttention(nn.Module):
         ) and _profile_layer_selected(self.layer_id, self.num_layers)
         self.last_decode_attention_op_time = 0.0
         self.last_decode_attention_detail: dict[str, float] = {}
+        self.last_decode_indexer_detail: dict[str, float] = {}
+        self.last_decode_indexer_q_path = "unprepared"
         self._decode_mlapo_ql_nope = None
         self._decode_mlapo_q_pe = None
         self._decode_mlapo_inner_out = None
@@ -978,6 +1114,17 @@ class DeepseekV32DSAAttention(nn.Module):
             "v_up": 0.0,
             "o_linear": 0.0,
             "o_all_reduce": 0.0,
+        }
+        self.last_decode_indexer_detail = {
+            "q_proj": 0.0,
+            "q_split": 0.0,
+            "k_proj": 0.0,
+            "k_norm": 0.0,
+            "k_split": 0.0,
+            "rope": 0.0,
+            "cat": 0.0,
+            "rotate_activation": 0.0,
+            "weights_proj": 0.0,
         }
 
     def _decode_timer_start(self, profile_decode: bool, device) -> float | None:
@@ -1387,12 +1534,22 @@ class DeepseekV32DSAAttention(nn.Module):
         profile_decode: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         start = self._decode_timer_start(profile_decode, hidden_states.device)
+        indexer_detail = (
+            {key: 0.0 for key in self.last_decode_indexer_detail}
+            if profile_decode
+            else None
+        )
         q_index, index_k, weights = self.indexer(
             hidden_states,
             q_c,
             positions,
             self.indexer_rotary_emb,
+            indexer_detail,
+            self.decode_timing_sync,
         )
+        if indexer_detail is not None:
+            self.last_decode_indexer_detail = indexer_detail
+            self.last_decode_indexer_q_path = self.indexer.last_q_project_path
         self._decode_timer_end(
             profile_decode,
             "indexer",
@@ -2085,6 +2242,7 @@ class DeepseekV32DecoderLayer(nn.Module):
             _profile_sync(hidden_states.device)
         if profile_decode:
             attention_detail = self.self_attn.last_decode_attention_detail
+            indexer_detail = self.self_attn.last_decode_indexer_detail
             attention_gap = attention_total - sum(attention_detail.values())
             kv_rope_total = (
                 attention_detail["kv_split"]
@@ -2106,6 +2264,10 @@ class DeepseekV32DecoderLayer(nn.Module):
                 "attention_total=%.6fs qkv_a=%.6fs q_norm=%.6fs "
                 "q_b=%.6fs kv_rope=%.6fs kv_split=%.6fs kv_norm=%.6fs "
                 "rotary=%.6fs k_squeeze=%.6fs mlapo=%.6fs indexer=%.6fs "
+                "indexer_q_proj=%.6fs indexer_k_proj=%.6fs "
+                "indexer_k_norm=%.6fs indexer_rope=%.6fs "
+                "indexer_rotate=%.6fs indexer_weights=%.6fs "
+                "indexer_q_path=%s "
                 "cache=%.6fs index_cache=%.6fs "
                 "q_up=%.6fs dsa_total=%.6fs dsa_indexer_score=%.6fs "
                 "dsa_index_update=%.6fs dsa_scatter_h2d=%.6fs "
@@ -2127,6 +2289,13 @@ class DeepseekV32DecoderLayer(nn.Module):
                 attention_detail["k_squeeze"],
                 attention_detail["mlapo"],
                 attention_detail["indexer"],
+                indexer_detail["q_proj"],
+                indexer_detail["k_proj"],
+                indexer_detail["k_norm"],
+                indexer_detail["rope"],
+                indexer_detail["rotate_activation"],
+                indexer_detail["weights_proj"],
+                self.self_attn.last_decode_indexer_q_path,
                 attention_detail["cache"],
                 attention_detail["index_cache"],
                 attention_detail["q_up"],

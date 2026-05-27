@@ -136,6 +136,13 @@ PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANO
 
 If the timing log is too large, keep `NANOVLLM_PROFILE_LAYER_IDS=0,mid,last`.
 Use `NANOVLLM_PROFILE_LAYER_IDS=all` only when we need every layer.
+For accurate indexer sub-step attribution, rerun one short timing pass with
+`NANOVLLM_DECODE_LAYER_TIMING_SYNC=1`; the async `=0` mode is useful for
+lower-overhead trend checks but can smear time across adjacent operators.
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANOVLLM_GPU_MEMORY_UTILIZATION=0.85 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=8 NANOVLLM_PROMPT_LENGTHS=256,12288,14000,18000 NANOVLLM_MAX_MODEL_LEN=18016 NANOVLLM_MAX_BATCHED_TOKENS=44544 NANOVLLM_MAX_NUM_SEQS=4 NANOVLLM_MAX_GEN_TOKENS=3 NANOVLLM_IGNORE_EOS=1 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=1 NANOVLLM_PROFILE_LAYER_IDS=mid NANOVLLM_SKIP_WARMUP=1 python example/test.py 2>&1 | tee runlog/dsa_mixed_indexer_detail_sync.txt
+```
 
 ## Decode Timing Fields
 
@@ -152,6 +159,12 @@ are seconds; the notes below often discuss them as ms/layer.
 | `indexer` | Runs `DeepseekV32Indexer`, producing `q_index`, `index_k`, and indexer weights for DSA scoring. |
 | `mlapo` | Runs decode MLA preprocess, including fused qkv-a/q norm/q-up/kv norm/RoPE/cache-write/q-nope-up work. |
 | `index_cache` | Writes the current token's `index_k` into the HBM resident `IndexCache`. |
+| `indexer_q_proj` | Indexer query projection `wq_b(q_c)`. `indexer_q_path` shows whether this used `linear` or `bmm_transpose`. |
+| `indexer_k_proj` | Indexer key projection `wk(hidden_states)`. |
+| `indexer_k_norm` | LayerNorm on the projected indexer key. |
+| `indexer_rope` | RoPE application for indexer query/key. |
+| `indexer_rotate` | Final `_rotate_activation` conversion for indexer query/key. |
+| `indexer_weights` | Indexer `weights_proj(hidden_states.float())` projection and scale. |
 | `decode_attention_op` | Runs dense MLA decode over the current sparse HBM KV budget plus newly generated decode tokens. |
 | `v_up` | Projects MLA latent output back to hidden dimension using `w_uv`. |
 | `o_proj` | Output projection after attention, including local linear projection and tensor-parallel all-reduce. |

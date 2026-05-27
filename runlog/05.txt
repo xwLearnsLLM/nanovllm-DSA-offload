@@ -1,0 +1,14 @@
+[root@worker-53232 nano-vllm-ascend-DeepseekV32-dev_dsa_offload]# PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python ut_ops/probe_indexer_project.py --device npu:0 --toens 4 --warmup 10 --iters 100
+
+
+INDEXER_PROBE config device=npu:0 tokens=4 hidden_size=7168 q_lora_rank=1536 heads=64 head_dim=128 rope_dim=64 warmup=10 iters=100 seed=0 skip_bmm_transpose=False
+INDEXER_PROBE hidden_states=shape=(4, 7168) dtype=torch.bfloat16 device=npu:0 contiguous=True stride=(7168, 1)
+INDEXER_PROBE q_c=shape=(4, 1536) dtype=torch.bfloat16 device=npu:0 contiguous=True stride=(1536, 1)
+INDEXER_DIFF fused_wk_weights_bf16 q: max_abs=0 mean_abs=0 max_rel=0
+INDEXER_DIFF fused_wk_weights_bf16 k: max_abs=0 mean_abs=0 max_rel=0
+INDEXER_DIFF fused_wk_weights_bf16 weights: max_abs=0.015625 mean_abs=0.00182985 max_rel=0.00458716
+INDEXER_BENCH current_avg_ms=0.335333 fused_wk_weights_bf16_avg_ms=0.342260
+INDEXER_DIFF q_bmm_transpose q: max_abs=0 mean_abs=0 max_rel=0
+INDEXER_BENCH q_bmm_transpose_avg_ms=0.079206
+INDEXER_DIFF q_bmm_transpose_cached q: max_abs=0 mean_abs=0 max_rel=0
+INDEXER_BENCH q_bmm_transpose_cached_avg_ms=0.056715
