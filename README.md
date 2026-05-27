@@ -217,6 +217,21 @@ PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ut_ops/prob
 
 Run these next on Ascend.
 
+For the current `dsa_index_update` debug round, the CANN op does not need to be
+rebuilt if the previous probe already printed `binding_version=manual_acl_tensor_v1`.
+Run the diagnostic probe below first. It prints both real and torch
+`copy_counts` values:
+
+```bash
+mkdir -p runlog && PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python ut_ops/probe_dsa_index_update.py --device npu:0 --batch-size 4 --candidate-lens 256,8192,12288,18000 --selected-lens 256,2048,3712,4096 --max-selected-len 8192 --output-capacity 2048 --max-copy-tokens 64 --warmup 5 --iters 50 2>&1 | tee runlog/probe_dsa_index_update_counts_debug.txt
+```
+
+Then isolate whether the large `promote_idx/demote_idx` capacity is involved:
+
+```bash
+mkdir -p runlog && PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python ut_ops/probe_dsa_index_update.py --device npu:0 --batch-size 4 --candidate-lens 256,8192,12288,18000 --selected-lens 256,2048,3712,4096 --max-selected-len 8192 --output-capacity 64 --max-copy-tokens 64 --warmup 5 --iters 50 2>&1 | tee runlog/probe_dsa_index_update_counts_debug_cap64.txt
+```
+
 First, confirm the source tree contains the manual aclTensor binding. This
 should print `manual_acl_tensor_v1`, `AclTensorGuard`, and `aclCreateTensor`;
 it should not print `EXEC_NPU_CMD(aclnnDsaIndexUpdate`:

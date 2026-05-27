@@ -90,13 +90,14 @@ def _make_case(args: argparse.Namespace, device: torch.device):
             dtype=torch.int32,
         )
 
-    promote = torch.empty(
+    promote = torch.full(
         (batch_size, args.output_capacity),
+        -777,
         dtype=torch.int32,
         device=device,
     )
-    demote = torch.empty_like(promote)
-    copy_counts = torch.empty((batch_size,), dtype=torch.int32, device=device)
+    demote = torch.full_like(promote, -777)
+    copy_counts = torch.full((batch_size,), -777, dtype=torch.int32, device=device)
     candidate_lens = torch.tensor(candidate_lens_list, dtype=torch.int32, device=device)
     selected_lens = torch.tensor(selected_lens_list, dtype=torch.int32, device=device)
     req_entries = torch.tensor(req_entries_list, dtype=torch.int32, device=device)
@@ -144,9 +145,13 @@ def _check_equal(name: str, lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
     if not ok:
         diff = (lhs_cpu != rhs_cpu).nonzero()
         first = diff[0].tolist() if diff.numel() else []
+        lhs_flat = lhs_cpu.reshape(-1)
+        rhs_flat = rhs_cpu.reshape(-1)
+        show = min(int(lhs_flat.numel()), 16)
         print(
             f"DSA_INDEX_UPDATE_DIFF {name}: mismatch_count={diff.shape[0]} "
-            f"first={first}"
+            f"first={first} real_first={lhs_flat[:show].tolist()} "
+            f"torch_first={rhs_flat[:show].tolist()}"
         )
     return ok
 
@@ -162,6 +167,11 @@ def _accuracy(args: argparse.Namespace, device: torch.device) -> bool:
 
     _, pool_t, promote_t, demote_t, counts_t, _, selected_lens, req_entries = torch_case
     _, pool_r, promote_r, demote_r, counts_r, _, _, _ = real_case
+    print(
+        "DSA_INDEX_UPDATE_COUNTS "
+        f"real={counts_r.detach().cpu().tolist()} "
+        f"torch={counts_t.detach().cpu().tolist()}"
+    )
     ok = _check_equal("copy_counts", counts_r, counts_t)
 
     counts_cpu = counts_t.detach().cpu().tolist()
@@ -248,6 +258,12 @@ def main() -> None:
     print("DSA_INDEX_UPDATE_TENSOR " + _desc("hbm_cached_tokens_pool", sample_case[1]))
     print("DSA_INDEX_UPDATE_TENSOR " + _desc("promote_idx", sample_case[2]))
     print("DSA_INDEX_UPDATE_TENSOR " + _desc("candidate_lens", sample_case[5]))
+    print(
+        "DSA_INDEX_UPDATE_LENS "
+        f"candidate_lens={sample_case[5].detach().cpu().tolist()} "
+        f"selected_lens={sample_case[6].detach().cpu().tolist()} "
+        f"req_pool_entries={sample_case[7].detach().cpu().tolist()}"
+    )
 
     if is_real_available():
         if not _accuracy(args, device):
