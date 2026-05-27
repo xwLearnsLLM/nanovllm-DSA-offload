@@ -784,6 +784,57 @@ class DeepseekV32Indexer(nn.Module):
         self.last_q_project_path = "linear"
         return self.wq_b(q_c).view(-1, self.n_head, self.head_dim)
 
+    def _rope_cos_sin(
+        self,
+        positions: torch.Tensor,
+        rotary_emb: DeepseekScalingRotaryEmbedding,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        context = get_context()
+        cache_key = (
+            "indexer_rope_cos_sin",
+            str(positions.device),
+            dtype,
+            self.rope_dim,
+        )
+        cached = context.scratch.get(cache_key)
+        if cached is not None:
+            return cached
+
+        positions = positions.to(torch.long)
+        cos = rotary_emb.cos_cache.index_select(0, positions)
+        sin = rotary_emb.sin_cache.index_select(0, positions)
+        cos = torch.cat((cos, cos), dim=-1).to(dtype).contiguous()
+        sin = torch.cat((sin, sin), dim=-1).to(dtype).contiguous()
+        cos = cos.view(cos.shape[0], 1, 1, self.rope_dim)
+        sin = sin.view(sin.shape[0], 1, 1, self.rope_dim)
+        context.scratch[cache_key] = (cos, sin)
+        return cos, sin
+
+    def _apply_rope(
+        self,
+        positions: torch.Tensor,
+        q_pe: torch.Tensor,
+        k_pe: torch.Tensor,
+        rotary_emb: DeepseekScalingRotaryEmbedding,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if (
+            q_pe.device.type == "npu"
+            and q_pe.dtype in (torch.float16, torch.bfloat16)
+            and rotary_emb.is_neox_style
+        ):
+            cos, sin = self._rope_cos_sin(positions, rotary_emb, q_pe.dtype)
+            q_pe = torch_npu.npu_rotary_mul(q_pe.unsqueeze(2), cos, sin).squeeze(2)
+            k_pe = torch_npu.npu_rotary_mul(
+                k_pe.unsqueeze(1).unsqueeze(2),
+                cos,
+                sin,
+            ).squeeze(2).squeeze(1)
+            return q_pe, k_pe
+
+        q_pe, k_pe = rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
+        return q_pe, k_pe.squeeze(1)
+
     def _detail_timer_start(
         self,
         detail: dict[str, float] | None,
@@ -833,9 +884,9 @@ class DeepseekV32Indexer(nn.Module):
                 [self.rope_dim, self.head_dim - self.rope_dim],
                 dim=-1,
             )
-            q_pe, k_pe = rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
+            q_pe, k_pe = self._apply_rope(positions, q_pe, k_pe, rotary_emb)
             q = torch.cat((q_pe, q_nope), dim=-1)
-            k = torch.cat((k_pe.squeeze(1), k_nope), dim=-1)
+            k = torch.cat((k_pe, k_nope), dim=-1)
 
             weights = self.weights_proj(hidden_states.float())
             weights = weights * self.softmax_scale * (self.n_head ** -0.5)
@@ -900,7 +951,7 @@ class DeepseekV32Indexer(nn.Module):
         )
 
         start = self._detail_timer_start(detail, sync_detail, q.device)
-        q_pe, k_pe = rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
+        q_pe, k_pe = self._apply_rope(positions, q_pe, k_pe, rotary_emb)
         self._detail_timer_end(
             detail,
             "rope",
@@ -911,7 +962,7 @@ class DeepseekV32Indexer(nn.Module):
 
         start = self._detail_timer_start(detail, sync_detail, q.device)
         q = torch.cat((q_pe, q_nope), dim=-1)
-        k = torch.cat((k_pe.squeeze(1), k_nope), dim=-1)
+        k = torch.cat((k_pe, k_nope), dim=-1)
         self._detail_timer_end(
             detail,
             "cat",

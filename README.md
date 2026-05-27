@@ -217,23 +217,22 @@ PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ut_ops/prob
 
 Run these next on Ascend.
 
-First, probe the indexer RoPE candidates before changing the hot path. This
-compares the current manual RoPE against `torch_npu.npu_rotary_mul`, and also
-separates cached-cos/sin cost from per-call `index_select` cost:
+First, verify the `torch_npu.npu_rotary_mul` indexer RoPE hot-path change. Check
+that `indexer_q_path=bmm_transpose`, `indexer_rotate=0.000000s`, and
+`indexer_rope` drops versus the previous ~0.4-0.5 ms/layer:
 
 ```bash
-PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python ut_ops/probe_indexer_rope.py --device npu:0 --tokens 4 --heads 64 --rope-dim 64 --max-position 18016 --dtype bf16 --warmup 10 --iters 100 2>&1 | tee runlog/indexer_rope_probe.txt
+mkdir -p runlog && PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANOVLLM_GPU_MEMORY_UTILIZATION=0.85 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/mnt/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=8 NANOVLLM_PROMPT_LENGTHS=256,12288,14000,18000 NANOVLLM_MAX_MODEL_LEN=18016 NANOVLLM_MAX_BATCHED_TOKENS=44544 NANOVLLM_MAX_NUM_SEQS=4 NANOVLLM_MAX_GEN_TOKENS=3 NANOVLLM_IGNORE_EOS=1 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=1 NANOVLLM_PROFILE_LAYER_IDS=mid NANOVLLM_SKIP_WARMUP=1 python example/test.py 2>&1 | tee runlog/dsa_mixed_indexer_rope_npu_sync.txt
 ```
 
-Measure the current real TPOT after the indexer q-projection and Hadamard-skip
-changes. This run disables per-layer timing to avoid timing/log overhead:
+Then measure real TPOT with per-layer timing disabled:
 
 ```bash
-PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANOVLLM_GPU_MEMORY_UTILIZATION=0.85 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/mnt/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=8 NANOVLLM_PROMPT_LENGTHS=256,12288,14000,18000 NANOVLLM_MAX_MODEL_LEN=18016 NANOVLLM_MAX_BATCHED_TOKENS=44544 NANOVLLM_MAX_NUM_SEQS=4 NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_IGNORE_EOS=1 NANOVLLM_SKIP_WARMUP=1 python example/test.py 2>&1 | tee runlog/dsa_mixed_no_timing_after_indexer_opt.txt
+mkdir -p runlog && PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANOVLLM_GPU_MEMORY_UTILIZATION=0.85 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/mnt/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=8 NANOVLLM_PROMPT_LENGTHS=256,12288,14000,18000 NANOVLLM_MAX_MODEL_LEN=18016 NANOVLLM_MAX_BATCHED_TOKENS=44544 NANOVLLM_MAX_NUM_SEQS=4 NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_IGNORE_EOS=1 NANOVLLM_SKIP_WARMUP=1 python example/test.py 2>&1 | tee runlog/dsa_mixed_no_timing_after_indexer_rope_npu.txt
 ```
 
 If TPOT still looks noisy, rerun once with more decode tokens:
 
 ```bash
-PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANOVLLM_GPU_MEMORY_UTILIZATION=0.85 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/mnt/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=8 NANOVLLM_PROMPT_LENGTHS=256,12288,14000,18000 NANOVLLM_MAX_MODEL_LEN=18016 NANOVLLM_MAX_BATCHED_TOKENS=44544 NANOVLLM_MAX_NUM_SEQS=4 NANOVLLM_MAX_GEN_TOKENS=32 NANOVLLM_IGNORE_EOS=1 NANOVLLM_SKIP_WARMUP=1 python example/test.py 2>&1 | tee runlog/dsa_mixed_no_timing_after_indexer_opt_32tok.txt
+mkdir -p runlog && PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANOVLLM_GPU_MEMORY_UTILIZATION=0.85 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/mnt/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=8 NANOVLLM_PROMPT_LENGTHS=256,12288,14000,18000 NANOVLLM_MAX_MODEL_LEN=18016 NANOVLLM_MAX_BATCHED_TOKENS=44544 NANOVLLM_MAX_NUM_SEQS=4 NANOVLLM_MAX_GEN_TOKENS=32 NANOVLLM_IGNORE_EOS=1 NANOVLLM_SKIP_WARMUP=1 python example/test.py 2>&1 | tee runlog/dsa_mixed_no_timing_after_indexer_rope_npu_32tok.txt
 ```
