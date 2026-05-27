@@ -302,3 +302,8 @@
 2. 以前我针对稠密 GQA attention 模型（Qwen），也开发了一版本 nanovllm 改造，改造之前的基线 nanovllm 代码在 D:\work\1.92_bakup\nano-vllm\ ，改造后的代码在 D:\work\1.92_bakup\nano-vllm-kvstar-0321\ 。里面有一部分机制和我们要实现的东西非常像，你仔细读一下代码，选择性的参考。
 
 继续改文档吧
+
+
+
+1. _dsa_offload_update 进入三大算子前有一次 NPU -> CPU 同步  :   刚刚已经解决
+2. 

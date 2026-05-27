@@ -4,7 +4,6 @@ import json
 import math
 import os
 import gc
-from pathlib import Path
 from time import perf_counter
 
 import torch
@@ -34,11 +33,9 @@ from nanovllm.utils.logger import init_logger
 
 
 logger = init_logger(__name__)
-SFA_SPARSE_COUNT = 2048
 ACL_FORMAT_FRACTAL_NZ = 29
 _NPU_MLA_ATTENTION_MASK_CACHE: dict[tuple[str, int], torch.Tensor] = {}
 _NPU_MLA_V2_WORKSPACE_CACHE: dict[tuple, torch.Tensor] = {}
-_DSA_WARNED_BACKEND_OVERRIDE = False
 _DSA_OFFLOAD_BUFFER_CACHE = {}
 
 
@@ -63,13 +60,6 @@ def _first_tensor(value):
     if isinstance(value, (tuple, list)):
         return value[0]
     return value
-
-
-def _is_rank0() -> bool:
-    try:
-        return (not dist.is_initialized()) or dist.get_rank() == 0
-    except Exception:
-        return True
 
 
 def _rank_id() -> int:
@@ -901,15 +891,15 @@ class DeepseekV32DSAAttention(nn.Module):
         self.free_kv_b_proj = _env_flag("NANOVLLM_FREE_KV_B_PROJ", True)
         self.enable_decode_mlapo = _env_flag(
             "NANOVLLM_ENABLE_DECODE_MLAPO",
-            False,
+            True,
         )
         self.mla_rope_neox_cache = _env_flag(
             "NANOVLLM_MLA_ROPE_NEOX_CACHE",
-            False,
+            True,
         )
         self.decode_mla_fia_v2 = _env_flag(
             "NANOVLLM_DECODE_MLA_FIA_V2",
-            False,
+            True,
         )
         self.q_up_bmm_trans_max_tokens = _env_int(
             "NANOVLLM_Q_UP_BMM_TRANS_MAX_TOKENS",
@@ -919,42 +909,6 @@ class DeepseekV32DSAAttention(nn.Module):
             "NANOVLLM_DECODE_LAYER_TIMING_SYNC",
             True,
         )
-        self.use_npu_sfa_decode = _env_flag(
-            "NANOVLLM_ENABLE_NPU_SFA_DECODE",
-            False,
-        )
-        self.decode_attention_backend = os.environ.get(
-            "NANOVLLM_DECODE_ATTENTION_BACKEND",
-            "mla",
-        ).strip().lower()
-        if self.decode_attention_backend not in ("mla", "sfa", "torch"):
-            raise ValueError(
-                "NANOVLLM_DECODE_ATTENTION_BACKEND must be one of "
-                "'mla', 'sfa', or 'torch'."
-            )
-        if self.use_npu_sfa_decode or self.decode_attention_backend != "mla":
-            global _DSA_WARNED_BACKEND_OVERRIDE
-            if _is_rank0() and not _DSA_WARNED_BACKEND_OVERRIDE:
-                logger.warning(
-                    "DSA offload currently uses dense MLA decode; overriding "
-                    "decode attention backend to 'mla'."
-                )
-                _DSA_WARNED_BACKEND_OVERRIDE = True
-            self.use_npu_sfa_decode = False
-            self.decode_attention_backend = "mla"
-        self.compare_npu_sfa_decode = _env_flag(
-            "NANOVLLM_COMPARE_NPU_SFA_DECODE",
-            False,
-        )
-        self.sfa_dump_dir = os.environ.get("NANOVLLM_DUMP_NPU_SFA_INPUTS")
-        self.sfa_dump_max_calls = _env_int("NANOVLLM_DUMP_NPU_SFA_MAX_CALLS", 1)
-        self.sfa_dump_count = 0
-        self.log_npu_sfa_inputs = _env_flag("NANOVLLM_LOG_NPU_SFA_INPUTS", False)
-        self.log_npu_sfa_timing = _env_flag(
-            "NANOVLLM_LOG_NPU_SFA_TIMING",
-            False,
-        ) and _profile_layer_selected(self.layer_id, self.num_layers)
-        self._npu_sfa_logged = {"prefill": False, "decode": False}
         self.log_decode_layer_timing = _env_flag(
             "NANOVLLM_LOG_DECODE_LAYER_TIMING",
             False,
@@ -1410,333 +1364,6 @@ class DeepseekV32DSAAttention(nn.Module):
         )
         return q_index, index_k, weights
 
-    def _get_sequence_slots_from_block_table(
-        self,
-        block_table_row: torch.Tensor,
-        seq_len: int,
-    ) -> torch.Tensor:
-        num_blocks = (seq_len + self.block_size - 1) // self.block_size
-        blocks = block_table_row[:num_blocks].to(torch.long).tolist()
-        slots: list[int] = []
-        remaining = seq_len
-        for block in blocks:
-            take = min(self.block_size, remaining)
-            start = block * self.block_size
-            slots.extend(range(start, start + take))
-            remaining -= take
-        return torch.tensor(
-            slots,
-            device=self.ckv_cache.device,
-            dtype=torch.long,
-        )
-
-    @staticmethod
-    def _tensor_desc(name: str, tensor: torch.Tensor) -> str:
-        return (
-            f"{name}=shape={tuple(tensor.shape)} dtype={tensor.dtype} "
-            f"device={tensor.device} contiguous={tensor.is_contiguous()} "
-            f"stride={tuple(tensor.stride())} storage_offset={tensor.storage_offset()}"
-        )
-
-    @staticmethod
-    def _tensor_range_desc(name: str, tensor: torch.Tensor) -> str:
-        desc = DeepseekV32DSAAttention._tensor_desc(name, tensor)
-        if tensor.numel() == 0:
-            return f"{desc} empty=True"
-        try:
-            min_value = tensor.min().item()
-            max_value = tensor.max().item()
-        except Exception as exc:
-            return f"{desc} range_error={exc!r}"
-        return f"{desc} min={min_value:.6g} max={max_value:.6g}"
-
-    def _maybe_log_npu_sfa_inputs(
-        self,
-        phase: str,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        sparse_indices: torch.Tensor,
-        block_table: torch.Tensor,
-        actual_seq_lengths_query: torch.Tensor,
-        actual_seq_lengths_key: torch.Tensor,
-        query_rope: torch.Tensor,
-        key_rope: torch.Tensor,
-    ) -> None:
-        if not self.log_npu_sfa_inputs or self._npu_sfa_logged[phase]:
-            return
-        if not _is_rank0():
-            return
-        self._npu_sfa_logged[phase] = True
-        logger.info(
-            "NPU SFA input summary: phase=%s layer=%d %s %s %s %s "
-            "%s %s %s %s sparse_count=%d scale=%.8f",
-            phase,
-            self.layer_id,
-            self._tensor_desc("query", query),
-            self._tensor_desc("key", key),
-            self._tensor_desc("sparse_indices", sparse_indices),
-            self._tensor_desc("block_table", block_table),
-            self._tensor_desc("actual_seq_lengths_query", actual_seq_lengths_query),
-            self._tensor_desc("actual_seq_lengths_key", actual_seq_lengths_key),
-            self._tensor_desc("query_rope", query_rope),
-            self._tensor_desc("key_rope", key_rope),
-            SFA_SPARSE_COUNT,
-            self.scale,
-        )
-
-    def _maybe_dump_npu_sfa_inputs(
-        self,
-        phase: str,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        sparse_indices: torch.Tensor,
-        block_table: torch.Tensor,
-        actual_seq_lengths_query: torch.Tensor,
-        actual_seq_lengths_key: torch.Tensor,
-        query_rope: torch.Tensor,
-        key_rope: torch.Tensor,
-    ) -> None:
-        if not self.sfa_dump_dir:
-            return
-        if self.sfa_dump_count >= self.sfa_dump_max_calls:
-            return
-        if not _profile_layer_selected(self.layer_id, self.num_layers):
-            return
-        dump_dir = Path(self.sfa_dump_dir)
-        dump_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            rank = dist.get_rank() if dist.is_initialized() else 0
-        except Exception:
-            rank = 0
-        path = (
-            dump_dir
-            / f"sfa_rank{rank}_layer{self.layer_id:03d}_"
-            f"seq{self.sfa_dump_count:03d}_{phase}.pt"
-        )
-        payload = {
-            "rank": rank,
-            "layer_id": self.layer_id,
-            "phase": phase,
-            "scale_value": float(self.scale),
-            "sparse_block_size": 1,
-            "sparse_mode": 3,
-            "sparse_count": SFA_SPARSE_COUNT,
-            "layout_query": "TND",
-            "layout_kv": "PA_BSND",
-            "query": query.detach().cpu(),
-            "key": key.detach().cpu(),
-            "value": value.detach().cpu(),
-            "sparse_indices": sparse_indices.detach().cpu(),
-            "block_table": block_table.detach().cpu(),
-            "actual_seq_lengths_query": actual_seq_lengths_query.detach().cpu(),
-            "actual_seq_lengths_kv": actual_seq_lengths_key.detach().cpu(),
-            "query_rope": query_rope.detach().cpu(),
-            "key_rope": key_rope.detach().cpu(),
-        }
-        torch.save(payload, path)
-        self.sfa_dump_count += 1
-        if _is_rank0():
-            logger.info("Dumped NPU SFA inputs to %s", path)
-
-    def _log_npu_sfa_compare(
-        self,
-        phase: str,
-        actual: torch.Tensor,
-        expected: torch.Tensor,
-    ) -> None:
-        if not _is_rank0():
-            return
-        diff = (actual.float() - expected.float()).abs()
-        max_abs = float(diff.max().item()) if diff.numel() else 0.0
-        denom = expected.float().abs().max().clamp_min(1e-6)
-        max_rel = float((diff.max() / denom).item()) if diff.numel() else 0.0
-        logger.info(
-            "NPU SFA compare: phase=%s layer=%d max_abs=%.6g max_rel=%.6g "
-            "actual_shape=%s expected_shape=%s",
-            phase,
-            self.layer_id,
-            max_abs,
-            max_rel,
-            tuple(actual.shape),
-            tuple(expected.shape),
-        )
-
-    def _npu_sfa_forward(
-        self,
-        ql_nope: torch.Tensor,
-        q_pe: torch.Tensor,
-        q_index: torch.Tensor,
-        weights: torch.Tensor,
-        actual_seq_lengths_query: torch.Tensor,
-        actual_seq_lengths_key: torch.Tensor,
-        block_table: torch.Tensor,
-        phase: str,
-    ) -> torch.Tensor:
-        log_timing = self.log_npu_sfa_timing
-        if log_timing:
-            _profile_sync(ql_nope.device)
-            start = perf_counter()
-        ckv_cache = self.ckv_cache.transpose(1, 2).contiguous()
-        kpe_cache = self.kpe_cache.transpose(1, 2).contiguous()
-        topk_indices = ascend_ops.npu_lightning_indexer(
-            query=q_index,
-            key=self.index_cache,
-            weights=weights,
-            actual_seq_lengths_query=actual_seq_lengths_query,
-            actual_seq_lengths_key=actual_seq_lengths_key,
-            block_table=block_table,
-            layout_query="TND",
-            layout_key="PA_BSND",
-            sparse_count=SFA_SPARSE_COUNT,
-            sparse_mode=3,
-        )
-        if log_timing:
-            _profile_sync(ql_nope.device)
-            logger.info(
-                "NPU SFA timing: rank=%d phase=%s layer=%d op=indexer "
-                "elapsed=%.6fs %s actual_seq_lengths_query=%s "
-                "actual_seq_lengths_key=%s block_table_shape=%s",
-                _rank_id(),
-                phase,
-                self.layer_id,
-                perf_counter() - start,
-                self._tensor_range_desc("topk_indices", topk_indices),
-                actual_seq_lengths_query.detach().cpu().tolist(),
-                actual_seq_lengths_key.detach().cpu().tolist(),
-                tuple(block_table.shape),
-            )
-            start = perf_counter()
-        self._maybe_log_npu_sfa_inputs(
-            phase,
-            ql_nope,
-            ckv_cache,
-            topk_indices,
-            block_table,
-            actual_seq_lengths_query,
-            actual_seq_lengths_key,
-            q_pe,
-            kpe_cache,
-        )
-        self._maybe_dump_npu_sfa_inputs(
-            phase,
-            ql_nope,
-            ckv_cache,
-            ckv_cache,
-            topk_indices,
-            block_table,
-            actual_seq_lengths_query,
-            actual_seq_lengths_key,
-            q_pe,
-            kpe_cache,
-        )
-        if phase == "decode" and self.log_decode_layer_timing:
-            _profile_sync(ql_nope.device)
-            attention_op_start = perf_counter()
-        latent = ascend_ops.npu_sparse_flash_attention(
-            query=ql_nope,
-            key=ckv_cache,
-            value=ckv_cache,
-            sparse_indices=topk_indices,
-            scale_value=float(self.scale),
-            sparse_block_size=1,
-            block_table=block_table,
-            actual_seq_lengths_query=actual_seq_lengths_query,
-            actual_seq_lengths_kv=actual_seq_lengths_key,
-            query_rope=q_pe,
-            key_rope=kpe_cache,
-            layout_query="TND",
-            layout_kv="PA_BSND",
-            sparse_mode=3,
-        )
-        if phase == "decode" and self.log_decode_layer_timing:
-            _profile_sync(ql_nope.device)
-            self.last_decode_attention_op_time = (
-                perf_counter() - attention_op_start
-            )
-            self.last_decode_attention_detail["decode_attention_op"] = (
-                self.last_decode_attention_op_time
-            )
-        if log_timing:
-            _profile_sync(ql_nope.device)
-            logger.info(
-                "NPU SFA timing: rank=%d phase=%s layer=%d op=sfa "
-                "elapsed=%.6fs %s",
-                _rank_id(),
-                phase,
-                self.layer_id,
-                perf_counter() - start,
-                self._tensor_range_desc("latent", latent),
-            )
-            start = perf_counter()
-        if phase == "decode":
-            profile_decode = self.log_decode_layer_timing
-            v_up_start = self._decode_timer_start(profile_decode, latent.device)
-            output = self._v_up_proj(latent)
-            self._decode_timer_end(
-                profile_decode,
-                "v_up",
-                v_up_start,
-                output.device,
-            )
-        else:
-            output = self._v_up_proj(latent)
-        if log_timing:
-            _profile_sync(output.device)
-            logger.info(
-                "NPU SFA timing: rank=%d phase=%s layer=%d op=v_up "
-                "elapsed=%.6fs %s",
-                _rank_id(),
-                phase,
-                self.layer_id,
-                perf_counter() - start,
-                self._tensor_range_desc("output", output),
-            )
-        return output
-
-    def _compute_npu_indexer_indices(
-        self,
-        q_index: torch.Tensor,
-        weights: torch.Tensor,
-        block_table_row: torch.Tensor,
-        valid_len: int,
-    ) -> torch.Tensor:
-        device = q_index.device
-        seq_lengths_query = torch.ones((1,), dtype=torch.int32, device=device)
-        seq_lengths_key = torch.tensor([valid_len], dtype=torch.int32, device=device)
-        topk_indices = ascend_ops.npu_lightning_indexer(
-            query=q_index.unsqueeze(0),
-            key=self.index_cache,
-            weights=weights.unsqueeze(0),
-            actual_seq_lengths_query=seq_lengths_query,
-            actual_seq_lengths_key=seq_lengths_key,
-            block_table=block_table_row.unsqueeze(0),
-            layout_query="TND",
-            layout_key="PA_BSND",
-            sparse_count=SFA_SPARSE_COUNT,
-            sparse_mode=3,
-        )
-        topk = min(SFA_SPARSE_COUNT, valid_len)
-        return topk_indices.flatten()[:topk].to(torch.long)
-
-    def _sparse_attention_single(
-        self,
-        ql_nope: torch.Tensor,
-        q_pe: torch.Tensor,
-        selected_ckv: torch.Tensor,
-        selected_kpe: torch.Tensor,
-    ) -> torch.Tensor:
-        scores = torch.einsum("hl,sl->hs", ql_nope.float(), selected_ckv.float())
-        scores = scores + torch.einsum(
-            "hr,sr->hs",
-            q_pe.float(),
-            selected_kpe.float(),
-        )
-        scores = scores * self.scale
-        probs = torch.softmax(scores, dim=-1).to(selected_ckv.dtype)
-        latent = torch.einsum("hs,sl->hl", probs, selected_ckv)
-        return self._v_up_proj(latent.unsqueeze(0)).reshape(-1)
-
     def _q_nope_up_proj(self, q_nope: torch.Tensor) -> torch.Tensor:
         num_tokens = q_nope.shape[0]
         if (
@@ -1946,10 +1573,6 @@ class DeepseekV32DSAAttention(nn.Module):
         cu_seqlens = context.cu_seqlens_q
         actual_seq_lengths_query = cu_seqlens[1:]
         actual_seq_lengths_key = cu_seqlens[1:] - cu_seqlens[:-1]
-        log_timing = self.log_npu_sfa_timing
-        if log_timing:
-            _profile_sync(ql_nope.device)
-            start = perf_counter()
         mla_result = torch_npu.npu_fused_infer_attention_score(
             ql_nope,
             self.ckv_cache,
@@ -1971,69 +1594,8 @@ class DeepseekV32DSAAttention(nn.Module):
             actual_seq_lengths_kv=actual_seq_lengths_key.detach().cpu().tolist(),
         )
         latent = _first_tensor(mla_result)
-        if log_timing:
-            _profile_sync(ql_nope.device)
-            logger.info(
-                "NPU MLA timing: rank=%d phase=prefill layer=%d op=mla "
-                "elapsed=%.6fs %s actual_seq_lengths_query=%s "
-                "actual_seq_lengths_key=%s block_table_shape=%s",
-                _rank_id(),
-                self.layer_id,
-                perf_counter() - start,
-                self._tensor_range_desc("latent", latent),
-                actual_seq_lengths_query.detach().cpu().tolist(),
-                actual_seq_lengths_key.detach().cpu().tolist(),
-                tuple(context.block_tables.shape),
-            )
-            start = perf_counter()
         output = self._v_up_proj(latent)
-        if log_timing:
-            _profile_sync(output.device)
-            logger.info(
-                "NPU MLA timing: rank=%d phase=prefill layer=%d op=v_up "
-                "elapsed=%.6fs %s",
-                _rank_id(),
-                self.layer_id,
-                perf_counter() - start,
-                self._tensor_range_desc("output", output),
-            )
         return output
-
-    def _decode_forward_loop(
-        self,
-        ql_nope: torch.Tensor,
-        q_pe: torch.Tensor,
-        q_index: torch.Tensor,
-        weights: torch.Tensor,
-    ) -> torch.Tensor:
-        context = get_context()
-        outputs: list[torch.Tensor] = []
-        for seq_idx, seq_len in enumerate(context.context_lens.to(torch.long).tolist()):
-            seq_slots = self._get_sequence_slots_from_block_table(
-                context.block_tables[seq_idx],
-                seq_len,
-            )
-            seq_ckv = self.ckv_cache.view(-1, self.kv_lora_rank).index_select(
-                0, seq_slots
-            )
-            seq_kpe = self.kpe_cache.view(-1, self.qk_rope_head_dim).index_select(
-                0, seq_slots
-            )
-            selected = self._compute_npu_indexer_indices(
-                q_index[seq_idx],
-                weights[seq_idx],
-                context.block_tables[seq_idx],
-                seq_len,
-            )
-            outputs.append(
-                self._sparse_attention_single(
-                    ql_nope[seq_idx],
-                    q_pe[seq_idx],
-                    seq_ckv.index_select(0, selected),
-                    seq_kpe.index_select(0, selected),
-                )
-            )
-        return torch.stack(outputs, dim=0)
 
     def _dsa_offload_buffers(
         self,
@@ -2198,32 +1760,9 @@ class DeepseekV32DSAAttention(nn.Module):
         weights: torch.Tensor | None,
     ) -> torch.Tensor:
         self.last_decode_attention_op_time = 0.0
-        if self.decode_attention_backend == "mla":
-            if q_index is None or weights is None:
-                raise RuntimeError("DSA offload decode requires indexer outputs.")
-            return self._decode_forward_mla(ql_nope, q_pe, q_index, weights)
         if q_index is None or weights is None:
-            raise RuntimeError(
-                "Sparse decode backends require indexer outputs, but they were "
-                "not computed for this forward pass."
-            )
-        if self.decode_attention_backend == "sfa":
-            sfa_output = self._decode_forward_sfa(
-                ql_nope,
-                q_pe,
-                q_index,
-                weights,
-            )
-            if self.compare_npu_sfa_decode:
-                reference = self._decode_forward_torch(
-                    ql_nope,
-                    q_pe,
-                    q_index,
-                    weights,
-                )
-                self._log_npu_sfa_compare("decode", sfa_output, reference)
-            return sfa_output
-        return self._decode_forward_torch(ql_nope, q_pe, q_index, weights)
+            raise RuntimeError("DSA offload decode requires indexer outputs.")
+        return self._decode_forward_mla(ql_nope, q_pe, q_index, weights)
 
     def _decode_forward_mla(
         self,
@@ -2288,54 +1827,6 @@ class DeepseekV32DSAAttention(nn.Module):
         self._decode_timer_end(profile_decode, "v_up", start, output.device)
         return output
 
-    def _decode_forward_sfa(
-        self,
-        ql_nope: torch.Tensor,
-        q_pe: torch.Tensor,
-        q_index: torch.Tensor,
-        weights: torch.Tensor,
-    ) -> torch.Tensor:
-        context = get_context()
-        batch_size = int(ql_nope.shape[0])
-        actual_seq_lengths_query = torch.arange(
-            1,
-            batch_size + 1,
-            dtype=torch.int32,
-            device=ql_nope.device,
-        )
-        actual_seq_lengths_key = context.context_lens[:batch_size]
-        return self._npu_sfa_forward(
-            ql_nope[:batch_size],
-            q_pe[:batch_size],
-            q_index[:batch_size],
-            weights[:batch_size],
-            actual_seq_lengths_query,
-            actual_seq_lengths_key,
-            context.block_tables[:batch_size],
-            "decode",
-        )
-
-    def _decode_forward_torch(
-        self,
-        ql_nope: torch.Tensor,
-        q_pe: torch.Tensor,
-        q_index: torch.Tensor,
-        weights: torch.Tensor,
-    ) -> torch.Tensor:
-        profile_decode = self.log_decode_layer_timing
-        start = self._decode_timer_start(profile_decode, ql_nope.device)
-        output = self._decode_forward_loop(ql_nope, q_pe, q_index, weights)
-        self._decode_timer_end(
-            profile_decode,
-            "decode_attention_op",
-            start,
-            output.device,
-        )
-        self.last_decode_attention_op_time = self.last_decode_attention_detail[
-            "decode_attention_op"
-        ]
-        return output
-
     def forward(
         self,
         positions: torch.Tensor,
@@ -2355,7 +1846,6 @@ class DeepseekV32DSAAttention(nn.Module):
         use_decode_mlapo = (
             self.enable_decode_mlapo
             and not context.is_prefill
-            and self.decode_attention_backend == "mla"
         )
         if use_decode_mlapo:
             ql_nope, q_pe, q_c = self._decode_mlapo_preprocess(
@@ -2585,7 +2075,7 @@ class DeepseekV32DecoderLayer(nn.Module):
                 "decode_attention_op=%.6fs v_up=%.6fs "
                 "o_proj=%.6fs o_linear=%.6fs o_all_reduce=%.6fs "
                 "attention_gap=%.6fs "
-                "moe_total=%.6fs mlp_kind=%s moe_backend=%s backend=%s",
+                "moe_total=%.6fs mlp_kind=%s moe_backend=%s",
                 _rank_id(),
                 self.layer_idx,
                 int(hidden_states.shape[0]),
@@ -2616,7 +2106,6 @@ class DeepseekV32DecoderLayer(nn.Module):
                 perf_counter() - mlp_start,
                 self.mlp_kind,
                 getattr(self.mlp, "moe_backend", "dense"),
-                self.self_attn.decode_attention_backend,
             )
         return hidden_states, residual
 
