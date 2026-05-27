@@ -7,6 +7,7 @@ import torch
 
 from nanovllm.models.dsa_index_update_real import (
     availability_error,
+    binding_version,
     dsa_index_update_real,
     is_available as is_real_available,
 )
@@ -232,7 +233,8 @@ def main() -> None:
         "DSA_INDEX_UPDATE_CONFIG "
         f"device={device} batch_size={args.batch_size} "
         f"max_copy_tokens={args.max_copy_tokens} output_capacity={args.output_capacity} "
-        f"real_available={int(is_real_available())}"
+        f"real_available={int(is_real_available())} "
+        f"binding_version={binding_version()}"
     )
     if not is_real_available():
         print(f"DSA_INDEX_UPDATE_REAL_IMPORT_ERROR {availability_error()}")

@@ -1,0 +1,310 @@
+[root@worker-53232 nano-vllm-ascend-DeepseekV32-dev_dsa_offload]# SOC_VERSION=ascend910_9391 bash scripts/build_dsa_index_update_op.sh
+[dsa_index_update] root: /home/w00916487/nano-vllm-ascend-DeepseekV32-dev_dsa_offload
+[dsa_index_update] python: /usr/local/python3.11.14/bin/python
+[dsa_index_update] soc: raw=ascend910_9391, cann_opp=ascend910_93
+[dsa_index_update] ascend: /usr/local/Ascend/cann-8.5.1
+[dsa_index_update] normalize line endings
+[INFO] Configuring for ascend910_93
+-- The C compiler identification is GNU 12.3.1
+-- The CXX compiler identification is GNU 12.3.1
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- set package config: INSTALL_PATH;/home/w00916487/nano-vllm-ascend-DeepseekV32-dev_dsa_offload/dsa_index_update_op/cann/build
+-- Opbuild generating sources
+-- Opbuild generating sources - done
+INFO target name: cust_optiling
+INFO target name: cust_opapi
+INFO target name: cust_op_proto
+CMake Warning (dev) at /usr/local/Ascend/cann-8.5.1/compiler/tikcpp/ascendc_kernel_cmake/fwk_modules/func.cmake:876 (install):
+  Policy CMP0177 is not set: install() DESTINATION paths are normalized.  Run
+  "cmake --help-policy CMP0177" for policy details.  Use the cmake_policy
+  command to set the policy and suppress this warning.
+Call Stack (most recent call first):
+  op_host/CMakeLists.txt:93 (npu_op_package_add)
+This warning is for project developers.  Use -Wno-dev to suppress it.
+
+CMake Warning (dev) at /usr/local/Ascend/cann-8.5.1/compiler/tikcpp/ascendc_kernel_cmake/fwk_modules/func.cmake:904 (install):
+  Policy CMP0177 is not set: install() DESTINATION paths are normalized.  Run
+  "cmake --help-policy CMP0177" for policy details.  Use the cmake_policy
+  command to set the policy and suppress this warning.
+Call Stack (most recent call first):
+  op_host/CMakeLists.txt:93 (npu_op_package_add)
+This warning is for project developers.  Use -Wno-dev to suppress it.
+
+CMake Warning (dev) at /usr/local/Ascend/cann-8.5.1/compiler/tikcpp/ascendc_kernel_cmake/fwk_modules/func.cmake:908 (install):
+  Policy CMP0177 is not set: install() DESTINATION paths are normalized.  Run
+  "cmake --help-policy CMP0177" for policy details.  Use the cmake_policy
+  command to set the policy and suppress this warning.
+Call Stack (most recent call first):
+  op_host/CMakeLists.txt:93 (npu_op_package_add)
+This warning is for project developers.  Use -Wno-dev to suppress it.
+
+CMake Warning (dev) at /usr/local/Ascend/cann-8.5.1/compiler/tikcpp/ascendc_kernel_cmake/fwk_modules/func.cmake:944 (install):
+  Policy CMP0177 is not set: install() DESTINATION paths are normalized.  Run
+  "cmake --help-policy CMP0177" for policy details.  Use the cmake_policy
+  command to set the policy and suppress this warning.
+Call Stack (most recent call first):
+  op_host/CMakeLists.txt:93 (npu_op_package_add)
+This warning is for project developers.  Use -Wno-dev to suppress it.
+
+CMake Warning (dev) at /usr/local/Ascend/cann-8.5.1/compiler/tikcpp/ascendc_kernel_cmake/fwk_modules/func.cmake:948 (install):
+  Policy CMP0177 is not set: install() DESTINATION paths are normalized.  Run
+  "cmake --help-policy CMP0177" for policy details.  Use the cmake_policy
+  command to set the policy and suppress this warning.
+Call Stack (most recent call first):
+  op_host/CMakeLists.txt:93 (npu_op_package_add)
+This warning is for project developers.  Use -Wno-dev to suppress it.
+
+INFO target name: ascendc_kernels
+CMake Warning (dev) at /usr/local/Ascend/cann-8.5.1/compiler/tikcpp/ascendc_kernel_cmake/fwk_modules/func.cmake:1121 (install):
+  Policy CMP0177 is not set: install() DESTINATION paths are normalized.  Run
+  "cmake --help-policy CMP0177" for policy details.  Use the cmake_policy
+  command to set the policy and suppress this warning.
+Call Stack (most recent call first):
+  op_kernel/CMakeLists.txt:12 (npu_op_package_add)
+This warning is for project developers.  Use -Wno-dev to suppress it.
+
+CMake Warning (dev) at /usr/local/Ascend/cann-8.5.1/compiler/tikcpp/ascendc_kernel_cmake/fwk_modules/func.cmake:1125 (install):
+  Policy CMP0177 is not set: install() DESTINATION paths are normalized.  Run
+  "cmake --help-policy CMP0177" for policy details.  Use the cmake_policy
+  command to set the policy and suppress this warning.
+Call Stack (most recent call first):
+  op_kernel/CMakeLists.txt:12 (npu_op_package_add)
+This warning is for project developers.  Use -Wno-dev to suppress it.
+
+CMake Warning at CMakeLists.txt:36 (message):
+  cmake default target does not build kernel binary.  Use: bash build.sh
+  --soc=<soc>
+
+
+-- Configuring done (2.0s)
+-- Generating done (0.0s)
+-- Build files have been written to: /home/w00916487/nano-vllm-ascend-DeepseekV32-dev_dsa_offload/dsa_index_update_op/cann/build
+[INFO] Building
+[  6%] Generating scripts/install.sh, scripts/upgrade.sh
+[  6%] Built target modify_vendor
+grep: /usr/local/Ascend/cann-8.5.1/toolkit/version.info: No such file or directory
+[  6%] Built target gen_version_info
+[ 12%] Building CXX object op_host/CMakeFiles/cust_optiling.dir/dsa_index_update_def.cpp.o
+[ 18%] Building CXX object op_host/CMakeFiles/cust_optiling.dir/dsa_index_update_infershape.cpp.o
+[ 25%] Building CXX object op_host/CMakeFiles/cust_optiling.dir/dsa_index_update_tiling.cpp.o
+[ 25%] Built target cust_optiling
+[ 31%] Building CXX object op_host/CMakeFiles/cust_opapi.dir/__/op_api/aclnn_dsa_index_update.cpp.o
+[ 37%] Building CXX object op_host/CMakeFiles/cust_opapi.dir/__/op_api/dsa_index_update.cpp.o
+[ 37%] Built target cust_opapi
+[ 43%] Building CXX object op_host/CMakeFiles/cust_op_proto.dir/dsa_index_update_def.cpp.o
+[ 50%] Building CXX object op_host/CMakeFiles/cust_op_proto.dir/dsa_index_update_infershape.cpp.o
+[ 56%] Building CXX object op_host/CMakeFiles/cust_op_proto.dir/dsa_index_update_tiling.cpp.o
+[ 62%] Building CXX object op_host/CMakeFiles/cust_op_proto.dir/__/autogen/op_proto.cc.o
+[ 62%] Built target cust_op_proto
+[ 68%] Linking CXX shared library libcust_opmaster_rt2.0.so
+[ 68%] Built target dsa_index_update_custom_ascendc_cust_optiling
+[ 68%] Built target optiling_compat
+[ 75%] Linking CXX shared library libcust_opsproto_rt2.0.so
+[ 75%] Built target dsa_index_update_custom_ascendc_cust_op_proto
+[ 81%] Linking CXX shared library libcust_opapi.so
+[ 81%] Built target dsa_index_update_custom_ascendc_cust_opapi
+[ 87%] Generating ../autogen/copy_kernel_src.timestamp
+[ 87%] Built target ascendc_kernels_copy_kernel_srcs
+[ 93%] Generating ascendc_kernels/tbe/op_info_cfg/ai_core/ascend910_93/aic-ascend910_93-ops-info.json
+
+
+==============check valid for ops info start==============
+==============check valid for ops info end================
+
+
+Compile op info cfg successfully.
+[ 93%] Built target ascendc_kernels_ops_info_gen_ascend910_93
+[100%] Generating ascendc_kernels/tbe/op_info_cfg/ai_core/npu_supported_ops.json
+/home/w00916487/nano-vllm-ascend-DeepseekV32-dev_dsa_offload/dsa_index_update_op/cann/build/autogen /home/w00916487/nano-vllm-ascend-DeepseekV32-dev_dsa_offload/dsa_index_update_op/cann/build/op_kernel/ascendc_kernels/tbe/op_info_cfg/ai_core
+[INFO] Succed generated /home/w00916487/nano-vllm-ascend-DeepseekV32-dev_dsa_offload/dsa_index_update_op/cann/build/op_kernel/ascendc_kernels/tbe/op_info_cfg/ai_core/npu_supported_ops.json
+[100%] Built target dsa_index_update_custom_npu_supported_ops
+[ 16%] Built target ascendc_kernels_copy_kernel_srcs
+[ 33%] Built target ascendc_kernels_ops_info_gen_ascend910_93
+[ 83%] Built target cust_optiling
+[100%] Built target dsa_index_update_custom_ascendc_cust_optiling
+[ascend910_93] Generating DsaIndexUpdate_eb3aabeec299ead3627bb6d008ffd71f ...
+Opc tool start working now, please wait for a moment.
+[ascend910_93] Generating DsaIndexUpdate_eb3aabeec299ead3627bb6d008ffd71f Done
+[100%] Built target DsaIndexUpdate_ascend910_93
+[100%] Built target ascendc_kernels_ascendc_bin_ascend910_93_gen_ops_config
+[100%] Built target binary
+Run CPack packaging tool...
+CPack: Create package using External
+CPack: Install projects
+CPack: - Run preinstall target for: dsa_index_update_op_prj
+CPack: - Install project: dsa_index_update_op_prj []
+CPack: Create package
+
+About to compress 1792 KB of data...
+Adding files to archive named "custom_opp_openEuler_aarch64.run"...
+./help.info
+./install.sh
+./packages/vendors/dsa_index_update_custom/framework/plugin/npu_supported_ops.json
+./packages/vendors/dsa_index_update_custom/op_api/include/aclnn_dsa_index_update.h
+./packages/vendors/dsa_index_update_custom/op_api/lib/libcust_opapi.so
+./packages/vendors/dsa_index_update_custom/op_impl/ai_core/tbe/config/ascend910_93/aic-ascend910_93-ops-info.json
+./packages/vendors/dsa_index_update_custom/op_impl/ai_core/tbe/dsa_index_update_custom_impl/dynamic/dsa_index_update.cpp
+./packages/vendors/dsa_index_update_custom/op_impl/ai_core/tbe/dsa_index_update_custom_impl/dynamic/dsa_index_update.py
+./packages/vendors/dsa_index_update_custom/op_impl/ai_core/tbe/dsa_index_update_custom_impl/dynamic/dsa_index_update_tiling_data.h
+./packages/vendors/dsa_index_update_custom/op_impl/ai_core/tbe/kernel/ascend910_93/dsa_index_update/DsaIndexUpdate_eb3aabeec299ead3627bb6d008ffd71f.json
+./packages/vendors/dsa_index_update_custom/op_impl/ai_core/tbe/kernel/ascend910_93/dsa_index_update/DsaIndexUpdate_eb3aabeec299ead3627bb6d008ffd71f.o
+./packages/vendors/dsa_index_update_custom/op_impl/ai_core/tbe/kernel/config/ascend910_93/binary_info_config.json
+./packages/vendors/dsa_index_update_custom/op_impl/ai_core/tbe/kernel/config/ascend910_93/dsa_index_update.json
+./packages/vendors/dsa_index_update_custom/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64/libcust_opmaster_rt2.0.so
+./packages/vendors/dsa_index_update_custom/op_impl/ai_core/tbe/op_tiling/liboptiling.so
+./packages/vendors/dsa_index_update_custom/op_proto/inc/op_proto.h
+./packages/vendors/dsa_index_update_custom/op_proto/lib/linux/aarch64/libcust_opsproto_rt2.0.so
+./packages/vendors/dsa_index_update_custom/version.info
+./uninstall.sh
+./upgrade.sh
+CRC: 1167627088
+SHA256: 50a10a7862c65600d47a655db9cf52e12179b89c12809eda78073140a3c63c4c
+Skipping md5sum at user request
+
+Self-extractable archive "custom_opp_openEuler_aarch64.run" successfully created.
+Copy /home/w00916487/nano-vllm-ascend-DeepseekV32-dev_dsa_offload/dsa_index_update_op/cann/build/_CPack_Packages/Linux/External/custom_opp_openEuler_aarch64.run/custom_opp_openEuler_aarch64.run to /home/w00916487/nano-vllm-ascend-DeepseekV32-dev_dsa_offload/dsa_index_update_op/cann/build/
+CPack: - package: /home/w00916487/nano-vllm-ascend-DeepseekV32-dev_dsa_offload/dsa_index_update_op/cann/build/custom_opp_openEuler_aarch64.run.json generated.
+CPack: - package: /home/w00916487/nano-vllm-ascend-DeepseekV32-dev_dsa_offload/dsa_index_update_op/cann/build/custom_opp_openEuler_aarch64.run generated.
+[INFO] Build completed: /home/w00916487/nano-vllm-ascend-DeepseekV32-dev_dsa_offload/dsa_index_update_op/cann/build/custom_opp_openEuler_aarch64.run
+Verifying archive integrity...  100%   SHA256 checksums are OK. All good.
+Uncompressing version:1.0  100%
+[ops_custom] [2026-05-27 21:34:51] [INFO] create /home/w00916487/nano-vllm-ascend-DeepseekV32-dev_dsa_offload/nanovllm/_dsa_index_update_custom/vendors.
+[ops_custom] [2026-05-27 21:34:51] [INFO] create /home/w00916487/nano-vllm-ascend-DeepseekV32-dev_dsa_offload/nanovllm/_dsa_index_update_custom/vendors/dsa_index_update_custom.
+[ops_custom] [2026-05-27 21:34:51] [INFO] upgrade framework
+[ops_custom] [2026-05-27 21:34:51] [INFO] create /home/w00916487/nano-vllm-ascend-DeepseekV32-dev_dsa_offload/nanovllm/_dsa_index_update_custom/vendors/dsa_index_update_custom/framework.
+[ops_custom] [2026-05-27 21:34:51] [INFO] copy new ops framework files ......
+[ops_custom] [2026-05-27 21:34:51] [INFO] upgrade op proto
+[ops_custom] [2026-05-27 21:34:51] [INFO] create /home/w00916487/nano-vllm-ascend-DeepseekV32-dev_dsa_offload/nanovllm/_dsa_index_update_custom/vendors/dsa_index_update_custom/op_proto.
+[ops_custom] [2026-05-27 21:34:51] [INFO] copy new ops op_proto files ......
+[ops_custom] [2026-05-27 21:34:52] [INFO] upgrade op impl
+[ops_custom] [2026-05-27 21:34:52] [INFO] create /home/w00916487/nano-vllm-ascend-DeepseekV32-dev_dsa_offload/nanovllm/_dsa_index_update_custom/vendors/dsa_index_update_custom/op_impl.
+[ops_custom] [2026-05-27 21:34:52] [INFO] copy new ops op_impl files ......
+[ops_custom] [2026-05-27 21:34:52] [INFO] upgrade op api
+[ops_custom] [2026-05-27 21:34:52] [INFO] create /home/w00916487/nano-vllm-ascend-DeepseekV32-dev_dsa_offload/nanovllm/_dsa_index_update_custom/vendors/dsa_index_update_custom/op_api.
+[ops_custom] [2026-05-27 21:34:52] [INFO] copy new ops op_api files ......
+[ops_custom] [2026-05-27 21:34:52] [INFO] upgrade uninstall
+[ops_custom] [2026-05-27 21:34:52] [INFO] copy new uninstall.sh files ......
+[ops_custom] [2026-05-27 21:34:52] [INFO] upgrade version.info
+[ops_custom] [2026-05-27 21:34:52] [INFO] copy new version.info files ......
+[ops_custom] [2026-05-27 21:34:52] [INFO] no need to upgrade custom.proto files
+[ops_custom] [2026-05-27 21:34:52] [INFO] using requirements: when custom module install finished or before you run the custom module, execute the command [ source /home/w00916487/nano-vllm-ascend-DeepseekV32-dev_dsa_offload/nanovllm/_dsa_index_update_custom/vendors/dsa_index_update_custom/bin/set_env.bash ] to set the environment path
+SUCCESS
+-- The C compiler identification is GNU 12.3.1
+-- The CXX compiler identification is GNU 12.3.1
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+CMake Warning (dev) at /usr/local/python3.11.14/lib/python3.11/site-packages/pybind11/share/cmake/pybind11/FindPythonLibsNew.cmake:101 (message):
+  Policy CMP0148 is not set: The FindPythonInterp and FindPythonLibs modules
+  are removed.  Run "cmake --help-policy CMP0148" for policy details.  Use
+  the cmake_policy command to set the policy and suppress this warning, or
+  preferably upgrade to using FindPython, either by calling it explicitly
+  before pybind11, or by setting PYBIND11_FINDPYTHON ON before pybind11.
+Call Stack (most recent call first):
+  /usr/local/python3.11.14/lib/python3.11/site-packages/pybind11/share/cmake/pybind11/pybind11Tools.cmake:44 (find_package)
+  /usr/local/python3.11.14/lib/python3.11/site-packages/pybind11/share/cmake/pybind11/pybind11Common.cmake:237 (include)
+  /usr/local/python3.11.14/lib/python3.11/site-packages/pybind11/share/cmake/pybind11/pybind11Config.cmake:257 (include)
+  CMakeLists.txt:31 (find_package)
+This warning is for project developers.  Use -Wno-dev to suppress it.
+
+CMake Deprecation Warning at /usr/local/python3.11.14/lib/python3.11/site-packages/pybind11/share/cmake/pybind11/FindPythonLibsNew.cmake:110 (cmake_policy):
+  The OLD behavior for policy CMP0148 will be removed from a future version
+  of CMake.
+
+  The cmake-policies(7) manual explains that the OLD behaviors of all
+  policies are deprecated and that a policy should be set to OLD only under
+  specific short-term circumstances.  Projects should be ported to the NEW
+  behavior and not rely on setting a policy to OLD.
+Call Stack (most recent call first):
+  /usr/local/python3.11.14/lib/python3.11/site-packages/pybind11/share/cmake/pybind11/pybind11Tools.cmake:44 (find_package)
+  /usr/local/python3.11.14/lib/python3.11/site-packages/pybind11/share/cmake/pybind11/pybind11Common.cmake:237 (include)
+  /usr/local/python3.11.14/lib/python3.11/site-packages/pybind11/share/cmake/pybind11/pybind11Config.cmake:257 (include)
+  CMakeLists.txt:31 (find_package)
+
+
+-- Found PythonInterp: /usr/local/python3.11.14/bin/python (found suitable version "3.11.14", minimum required is "3.8")
+-- Found PythonLibs: /usr/local/python3.11.14/lib/libpython3.11.so
+-- Performing Test HAS_FLTO_AUTO
+-- Performing Test HAS_FLTO_AUTO - Success
+-- Found pybind11: /usr/local/python3.11.14/lib/python3.11/site-packages/pybind11/include (found version "3.0.4")
+CMake Warning at /usr/local/python3.11.14/lib/python3.11/site-packages/torch/share/cmake/Torch/TorchConfig.cmake:22 (message):
+  static library kineto_LIBRARY-NOTFOUND not found.
+Call Stack (most recent call first):
+  /usr/local/python3.11.14/lib/python3.11/site-packages/torch/share/cmake/Torch/TorchConfig.cmake:125 (append_torchlib_if_found)
+  CMakeLists.txt:37 (find_package)
+
+
+-- Found Torch: /usr/local/python3.11.14/lib/python3.11/site-packages/torch/lib/libtorch.so
+-- Configuring done (6.3s)
+-- Generating done (0.0s)
+-- Build files have been written to: /home/w00916487/nano-vllm-ascend-DeepseekV32-dev_dsa_offload/build/dsa_index_update_ext
+[ 25%] Building CXX object CMakeFiles/_dsa_index_update_C.dir/dsa_index_update_ext.cpp.o
+In file included from /home/w00916487/nano-vllm-ascend-DeepseekV32-dev_dsa_offload/dsa_index_update_op/torch_extension/dsa_index_update_ext.cpp:3:
+/home/w00916487/nano-vllm-ascend-DeepseekV32-dev_dsa_offload/dsa_index_update_op/torch_extension/dsa_index_update_ext.cpp: In function ‘void {anonymous}::DsaIndexUpdatePy(const at::Tensor&, at::Tensor, at::Tensor, at::Tensor, at::Tensor, const at::Tensor&, const at::Tensor&, const at::Tensor&, int64_t)’:
+/home/w00916487/nano-vllm-ascend-DeepseekV32-dev_dsa_offload/dsa_index_update_op/torch_extension/../../csrc/nanovllm_ascend_ops/aclnn_torch_adapter/op_api_common.h:562:22: warning: narrowing conversion of ‘workspace_size’ from ‘uint64_t’ {aka ‘long unsigned int’} to ‘long int’ [-Wnarrowing]
+  562 |           at::empty({workspace_size}, options.dtype(kByte));                  \
+      |                      ^~~~~~~~~~~~~~
+/home/w00916487/nano-vllm-ascend-DeepseekV32-dev_dsa_offload/dsa_index_update_op/torch_extension/../../csrc/nanovllm_ascend_ops/aclnn_torch_adapter/op_api_common.h:562:22: note: in definition of macro ‘EXEC_NPU_CMD’
+  562 |           at::empty({workspace_size}, options.dtype(kByte));                  \
+      |                      ^~~~~~~~~~~~~~
+/home/w00916487/nano-vllm-ascend-DeepseekV32-dev_dsa_offload/dsa_index_update_op/torch_extension/../../csrc/nanovllm_ascend_ops/aclnn_torch_adapter/op_api_common.h:562:22: warning: narrowing conversion of ‘workspace_size’ from ‘uint64_t’ {aka ‘long unsigned int’} to ‘long int’ [-Wnarrowing]
+  562 |           at::empty({workspace_size}, options.dtype(kByte));                  \
+      |                      ^~~~~~~~~~~~~~
+/home/w00916487/nano-vllm-ascend-DeepseekV32-dev_dsa_offload/dsa_index_update_op/torch_extension/../../csrc/nanovllm_ascend_ops/aclnn_torch_adapter/op_api_common.h:562:22: note: in definition of macro ‘EXEC_NPU_CMD’
+  562 |           at::empty({workspace_size}, options.dtype(kByte));                  \
+      |                      ^~~~~~~~~~~~~~
+[ 50%] Building CXX object CMakeFiles/_dsa_index_update_C.dir/home/w00916487/nano-vllm-ascend-DeepseekV32-dev_dsa_offload/csrc/nanovllm_ascend_ops/aclnn_torch_adapter/NPUBridge.cpp.o
+[ 75%] Building CXX object CMakeFiles/_dsa_index_update_C.dir/home/w00916487/nano-vllm-ascend-DeepseekV32-dev_dsa_offload/csrc/nanovllm_ascend_ops/aclnn_torch_adapter/NPUStorageImpl.cpp.o
+[100%] Linking CXX shared module _dsa_index_update_C.cpython-311-aarch64-linux-gnu.so
+[100%] Built target _dsa_index_update_C
+Install the project...
+-- Install configuration: "Release"
+-- Installing: /home/w00916487/nano-vllm-ascend-DeepseekV32-dev_dsa_offload/nanovllm/./_dsa_index_update_C.cpython-311-aarch64-linux-gnu.so
+-- Set non-toolchain portion of runtime path of "/home/w00916487/nano-vllm-ascend-DeepseekV32-dev_dsa_offload/nanovllm/./_dsa_index_update_C.cpython-311-aarch64-linux-gnu.so" to ""
+-rwxr-xr-x. 1 root root 133K May 27 21:35 /home/w00916487/nano-vllm-ascend-DeepseekV32-dev_dsa_offload/nanovllm/_dsa_index_update_C.cpython-311-aarch64-linux-gnu.so
+[dsa_index_update] built nanovllm/_dsa_index_update_C*.so and nanovllm/_dsa_index_update_custom/
+[root@worker-53232 nano-vllm-ascend-DeepseekV32-dev_dsa_offload]#
+[root@worker-53232 nano-vllm-ascend-DeepseekV32-dev_dsa_offload]#
+[root@worker-53232 nano-vllm-ascend-DeepseekV32-dev_dsa_offload]# PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python ut_ops/probe_dsa_index_update.py --device npu:0 --batch-size 4 --candidate-lens 256,8192,12288,18000 --selected-lens 256,2048,3712,4096 --max-selected-len 8192 --output-capacity 2048 --max-copy-tokens 64 --warmup 5 --iters 50
+
+DSA_INDEX_UPDATE_CONFIG device=npu:0 batch_size=4 max_copy_tokens=64 output_capacity=2048 real_available=1
+/home/w00916487/nano-vllm-ascend-DeepseekV32-dev_dsa_offload/ut_ops/probe_dsa_index_update.py:88: UserWarning: Cannot create tensor with interal format while allow_internel_format=False, tensor will be created with base format. (Triggered internally at build/CMakeFiles/torch_npu.dir/compiler_depend.ts:338.)
+  demote = torch.empty_like(promote)
+Traceback (most recent call last):
+  File "/home/w00916487/nano-vllm-ascend-DeepseekV32-dev_dsa_offload/ut_ops/probe_dsa_index_update.py", line 262, in <module>
+    main()
+  File "/home/w00916487/nano-vllm-ascend-DeepseekV32-dev_dsa_offload/ut_ops/probe_dsa_index_update.py", line 235, in main
+    if not _accuracy(args, device):
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/w00916487/nano-vllm-ascend-DeepseekV32-dev_dsa_offload/ut_ops/probe_dsa_index_update.py", line 150, in _accuracy
+    _run_real(real_case, args.max_copy_tokens)
+  File "/home/w00916487/nano-vllm-ascend-DeepseekV32-dev_dsa_offload/ut_ops/probe_dsa_index_update.py", line 113, in _run_real
+    dsa_index_update_real(
+  File "/home/w00916487/nano-vllm-ascend-DeepseekV32-dev_dsa_offload/nanovllm/models/dsa_index_update_real.py", line 64, in dsa_index_update_real
+    _C.dsa_index_update(
+RuntimeError: call aclnnDsaIndexUpdate failed, detail:EZ9999: Inner Error!
+EZ9999[PID: 101031] 2026-05-27-21:36:13.803.656 (EZ9999):  DsaIndexUpdate: score rank must be 2, got 1.[FUNC:CheckRank][FILE:dsa_index_update_tiling.cpp][LINE:37]
+        TraceBack (most recent call last):
+       DsaIndexUpdate: rank check failed.[FUNC:DsaIndexUpdateTilingFunc][FILE:dsa_index_update_tiling.cpp][LINE:93]
+       Tiling failed
+       Tiling Failed.
+       Kernel GetWorkspace failed. opType: 24
+       DsaIndexUpdateAiCore failed.
+
+[ERROR] 2026-05-27-21:36:15 (PID:101031, Device:0, RankID:-1) ERR99999 UNKNOWN applicaiton exception

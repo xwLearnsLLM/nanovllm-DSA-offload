@@ -29,12 +29,21 @@ if _CUSTOM_OPP_VENDOR.exists():
 
 _C = None
 _IMPORT_ERROR: Exception | None = None
+_EXPECTED_BINDING_VERSION = "manual_acl_tensor_v1"
 try:
     import torch_npu  # type: ignore  # noqa: F401
 
     _C = importlib.import_module("nanovllm._dsa_index_update_C")
+    actual_version = getattr(_C, "binding_version", lambda: "missing")()
+    if actual_version != _EXPECTED_BINDING_VERSION:
+        raise RuntimeError(
+            "dsa_index_update binding version mismatch: "
+            f"expected {_EXPECTED_BINDING_VERSION}, got {actual_version}. "
+            "Rebuild with `bash scripts/build_dsa_index_update_op.sh`."
+        )
 except Exception as exc:  # pragma: no cover - depends on Ascend build env.
     _IMPORT_ERROR = exc
+    _C = None
 
 
 def is_available() -> bool:
@@ -43,6 +52,12 @@ def is_available() -> bool:
 
 def availability_error() -> Exception | None:
     return _IMPORT_ERROR
+
+
+def binding_version() -> str | None:
+    if _C is None:
+        return None
+    return _C.binding_version()
 
 
 def dsa_index_update_real(
@@ -76,6 +91,7 @@ def dsa_index_update_real(
 
 __all__ = [
     "availability_error",
+    "binding_version",
     "dsa_index_update_real",
     "is_available",
 ]

@@ -40,6 +40,15 @@ static ge::graphStatus CheckRank(gert::TilingContext* context, const gert::Shape
     return ge::GRAPH_SUCCESS;
 }
 
+static gert::Shape PickShape(const gert::StorageShape* storage, size_t expectedRank)
+{
+    const gert::Shape originShape = storage->GetOriginShape();
+    if (originShape.GetDimNum() == expectedRank) {
+        return originShape;
+    }
+    return storage->GetStorageShape();
+}
+
 static ge::graphStatus DsaIndexUpdateTilingFunc(gert::TilingContext* context)
 {
     int64_t platformCoreNum = 0;
@@ -73,14 +82,14 @@ static ge::graphStatus DsaIndexUpdateTilingFunc(gert::TilingContext* context)
     OP_CHECK_NULL_WITH_CONTEXT(context, demoteStorage);
     OP_CHECK_NULL_WITH_CONTEXT(context, copyCountsStorage);
 
-    const gert::Shape scoreShape = scoreStorage->GetOriginShape();
-    const gert::Shape poolShape = poolStorage->GetOriginShape();
-    const gert::Shape candidateLensShape = candidateLensStorage->GetOriginShape();
-    const gert::Shape selectedLensShape = selectedLensStorage->GetOriginShape();
-    const gert::Shape reqPoolEntriesShape = reqPoolEntriesStorage->GetOriginShape();
-    const gert::Shape promoteShape = promoteStorage->GetOriginShape();
-    const gert::Shape demoteShape = demoteStorage->GetOriginShape();
-    const gert::Shape copyCountsShape = copyCountsStorage->GetOriginShape();
+    const gert::Shape scoreShape = PickShape(scoreStorage, 2);
+    const gert::Shape poolShape = PickShape(poolStorage, 2);
+    const gert::Shape candidateLensShape = PickShape(candidateLensStorage, 1);
+    const gert::Shape selectedLensShape = PickShape(selectedLensStorage, 1);
+    const gert::Shape reqPoolEntriesShape = PickShape(reqPoolEntriesStorage, 1);
+    const gert::Shape promoteShape = PickShape(promoteStorage, 2);
+    const gert::Shape demoteShape = PickShape(demoteStorage, 2);
+    const gert::Shape copyCountsShape = PickShape(copyCountsStorage, 1);
 
     OP_CHECK_IF(CheckRank(context, scoreShape, 2, "score") != ge::GRAPH_SUCCESS ||
                     CheckRank(context, poolShape, 2, "hbm_cached_tokens_pool") != ge::GRAPH_SUCCESS ||

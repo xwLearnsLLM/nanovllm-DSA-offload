@@ -36,6 +36,19 @@ find "${OP_ROOT}" -type f \
   \( -name "*.sh" -o -name "*.cmake" -o -name "CMakeLists.txt" -o -name "*.cpp" -o -name "*.h" \) \
   -exec sed -i 's/\r$//' {} +
 
+echo "[dsa_index_update] extension source markers"
+grep -n "AclTensorGuard\|aclCreateTensor\|EXEC_NPU_CMD(aclnnDsaIndexUpdate" \
+  "${OP_ROOT}/torch_extension/dsa_index_update_ext.cpp" || true
+if grep -q "EXEC_NPU_CMD(aclnnDsaIndexUpdate" \
+    "${OP_ROOT}/torch_extension/dsa_index_update_ext.cpp"; then
+  echo "[dsa_index_update] ERROR: stale EXEC_NPU_CMD binding is still present." >&2
+  exit 1
+fi
+
+echo "[dsa_index_update] clean previous build artifacts"
+rm -rf "${ROOT_DIR}/build/dsa_index_update_ext"
+rm -f "${ROOT_DIR}/nanovllm"/_dsa_index_update_C*.so
+
 if [[ "${NANOVLLM_SKIP_DSA_INDEX_UPDATE_CANN_BUILD:-0}" == "1" ]]; then
   echo "[dsa_index_update] skip CANN custom OPP build"
 else
