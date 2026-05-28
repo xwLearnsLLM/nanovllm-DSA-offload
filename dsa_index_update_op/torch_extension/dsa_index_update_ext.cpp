@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 
+#include <c10/core/DeviceGuard.h>
+
 #include "aclnn_torch_adapter/op_api_common.h"
 
 thread_local char g_hashBuf[kHashBufSize];
@@ -16,7 +18,7 @@ namespace {
 #endif
 
 constexpr const char* kDsaIndexUpdateBindingVersion =
-    "manual_acl_tensor_aiv_only_v6_single_block_batch_loop";
+    "manual_acl_tensor_aiv_only_v7_workspace_score_device";
 constexpr const char* kDsaIndexUpdateCustOpApiPath =
     DSA_INDEX_UPDATE_CUST_OPAPI_PATH;
 
@@ -156,6 +158,8 @@ void DsaIndexUpdatePy(
                     demoteIdx.size(1) == promoteIdx.size(1),
         "promote/demote output capacity must be >= max_copy_tokens and equal.");
 
+    c10::OptionalDeviceGuard deviceGuard(score.device());
+
     static const auto getWorkspaceSizeFuncAddr =
         GetDsaIndexUpdateCustOpApiFuncAddr("aclnnDsaIndexUpdateGetWorkspaceSize");
     static const auto opApiFuncAddr =
@@ -229,12 +233,11 @@ void DsaIndexUpdatePy(
     void* workspaceAddr = nullptr;
     at::Tensor workspaceTensor;
     if (workspaceSize != 0) {
-        at::TensorOptions options =
-            at::TensorOptions(torch_npu::utils::get_npu_device_type());
+        at::TensorOptions options = score.options().dtype(kByte);
         workspaceTensor = at::empty(
             {static_cast<int64_t>(workspaceSize)},
-            options.dtype(kByte));
-        workspaceAddr = const_cast<void*>(workspaceTensor.storage().data());
+            options);
+        workspaceAddr = workspaceTensor.data_ptr();
     }
 
     auto aclStream = c10_npu::getCurrentNPUStream().stream(false);

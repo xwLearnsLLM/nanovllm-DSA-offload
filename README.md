@@ -229,22 +229,28 @@ PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ut_ops/prob
 先确认源码树包含 AIV-only kernel 修复、单 block batch 串行调度、以及 DSA
 standalone `libcust_opapi.so` 直连加载。grep 应打印 `KERNEL_TYPE_AIV_ONLY`、
 `GetBlockIdx`、`SetBlockDim(1)`、`DSA_INDEX_UPDATE_CUST_OPAPI_PATH`、
-`manual_acl_tensor_aiv_only_v6_single_block_batch_loop`：
+`manual_acl_tensor_aiv_only_v7_workspace_score_device`：
 
 ```bash
-grep -n "KERNEL_TYPE_AIV_ONLY\|GetBlockIdx\|SetBlockDim(1)\|DSA_INDEX_UPDATE_CUST_OPAPI_PATH\|manual_acl_tensor_aiv_only_v6_single_block_batch_loop\|EXEC_NPU_CMD(aclnnDsaIndexUpdate" dsa_index_update_op/cann/op_kernel/dsa_index_update.cpp dsa_index_update_op/cann/op_host/dsa_index_update_tiling.cpp dsa_index_update_op/torch_extension/dsa_index_update_ext.cpp dsa_index_update_op/torch_extension/CMakeLists.txt nanovllm/models/dsa_index_update_real.py
+grep -n "KERNEL_TYPE_AIV_ONLY\|GetBlockIdx\|SetBlockDim(1)\|DSA_INDEX_UPDATE_CUST_OPAPI_PATH\|manual_acl_tensor_aiv_only_v7_workspace_score_device\|EXEC_NPU_CMD(aclnnDsaIndexUpdate" dsa_index_update_op/cann/op_kernel/dsa_index_update.cpp dsa_index_update_op/cann/op_host/dsa_index_update_tiling.cpp dsa_index_update_op/torch_extension/dsa_index_update_ext.cpp dsa_index_update_op/torch_extension/CMakeLists.txt nanovllm/models/dsa_index_update_real.py
 ```
 
 然后清理旧 standalone-op 产物，构建 `dsa_index_update` CANN op 和 Python binding：
 
 ```bash
-rm -rf dsa_index_update_op/cann/build dsa_index_update_op/cann/output build/dsa_index_update_ext nanovllm/_dsa_index_update_custom nanovllm/_dsa_index_update_C*.so && mkdir -p runlog && SOC_VERSION=ascend910_9391 bash scripts/build_dsa_index_update_op.sh 2>&1 | tee runlog/build_dsa_index_update_op_single_block_batch_loop_v6.txt
+rm -rf dsa_index_update_op/cann/build dsa_index_update_op/cann/output build/dsa_index_update_ext nanovllm/_dsa_index_update_custom nanovllm/_dsa_index_update_C*.so && mkdir -p runlog && SOC_VERSION=ascend910_9391 bash scripts/build_dsa_index_update_op.sh 2>&1 | tee runlog/build_dsa_index_update_op_workspace_score_device_v7.txt
 ```
 
 再跑 standalone 正确性/性能 probe：
 
 ```bash
-mkdir -p runlog && PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python ut_ops/probe_dsa_index_update.py --device npu:0 --batch-size 4 --candidate-lens 256,8192,12288,18000 --selected-lens 256,2048,3712,4096 --max-selected-len 8192 --output-capacity 2048 --max-copy-tokens 64 --warmup 5 --iters 50 2>&1 | tee runlog/probe_dsa_index_update_single_block_batch_loop_v6.txt
+mkdir -p runlog && PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python ut_ops/probe_dsa_index_update.py --device npu:0 --batch-size 4 --candidate-lens 256,8192,12288,18000 --selected-lens 256,2048,3712,4096 --max-selected-len 8192 --output-capacity 2048 --max-copy-tokens 64 --warmup 5 --iters 50 2>&1 | tee runlog/probe_dsa_index_update_workspace_score_device_v7.txt
+```
+
+然后先跑一条长序列 TP8 sync timing，用来复现并验证 `runlog/23.txt` 里的多进程同步问题：
+
+```bash
+mkdir -p runlog && PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANOVLLM_GPU_MEMORY_UTILIZATION=0.85 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/mnt/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=8 NANOVLLM_PROMPT_LENGTHS=12288 NANOVLLM_MAX_MODEL_LEN=18016 NANOVLLM_MAX_BATCHED_TOKENS=44544 NANOVLLM_MAX_NUM_SEQS=4 NANOVLLM_MAX_GEN_TOKENS=3 NANOVLLM_IGNORE_EOS=1 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=1 NANOVLLM_PROFILE_LAYER_IDS=mid NANOVLLM_SKIP_WARMUP=1 python example/test.py 2>&1 | tee runlog/dsa_single_long_dsa_index_update_real_sync_workspace_score_device_v7.txt
 ```
 
 如果需要只绕过真实 `dsa_index_update` 算子，用 PyTorch 伪算子隔离推理链路，运行：
@@ -256,11 +262,11 @@ mkdir -p runlog && PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable
 如果 probe 打印 `DSA_INDEX_UPDATE_ACCURACY ok=1`，再跑一次 sync timing：
 
 ```bash
-mkdir -p runlog && PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANOVLLM_GPU_MEMORY_UTILIZATION=0.85 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/mnt/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=8 NANOVLLM_PROMPT_LENGTHS=256,12288,14000,18000 NANOVLLM_MAX_MODEL_LEN=18016 NANOVLLM_MAX_BATCHED_TOKENS=44544 NANOVLLM_MAX_NUM_SEQS=4 NANOVLLM_MAX_GEN_TOKENS=3 NANOVLLM_IGNORE_EOS=1 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=1 NANOVLLM_PROFILE_LAYER_IDS=mid NANOVLLM_SKIP_WARMUP=1 python example/test.py 2>&1 | tee runlog/dsa_mixed_dsa_index_update_real_sync_single_block_batch_loop_v6.txt
+mkdir -p runlog && PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANOVLLM_GPU_MEMORY_UTILIZATION=0.85 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/mnt/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=8 NANOVLLM_PROMPT_LENGTHS=256,12288,14000,18000 NANOVLLM_MAX_MODEL_LEN=18016 NANOVLLM_MAX_BATCHED_TOKENS=44544 NANOVLLM_MAX_NUM_SEQS=4 NANOVLLM_MAX_GEN_TOKENS=3 NANOVLLM_IGNORE_EOS=1 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=1 NANOVLLM_PROFILE_LAYER_IDS=mid NANOVLLM_SKIP_WARMUP=1 python example/test.py 2>&1 | tee runlog/dsa_mixed_dsa_index_update_real_sync_workspace_score_device_v7.txt
 ```
 
 最后关掉 layer timing 测 TPOT：
 
 ```bash
-mkdir -p runlog && PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANOVLLM_GPU_MEMORY_UTILIZATION=0.85 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/mnt/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=8 NANOVLLM_PROMPT_LENGTHS=256,12288,14000,18000 NANOVLLM_MAX_MODEL_LEN=18016 NANOVLLM_MAX_BATCHED_TOKENS=44544 NANOVLLM_MAX_NUM_SEQS=4 NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_IGNORE_EOS=1 NANOVLLM_SKIP_WARMUP=1 python example/test.py 2>&1 | tee runlog/dsa_mixed_dsa_index_update_real_no_timing_single_block_batch_loop_v6.txt
+mkdir -p runlog && PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANOVLLM_GPU_MEMORY_UTILIZATION=0.85 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/mnt/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=8 NANOVLLM_PROMPT_LENGTHS=256,12288,14000,18000 NANOVLLM_MAX_MODEL_LEN=18016 NANOVLLM_MAX_BATCHED_TOKENS=44544 NANOVLLM_MAX_NUM_SEQS=4 NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_IGNORE_EOS=1 NANOVLLM_SKIP_WARMUP=1 python example/test.py 2>&1 | tee runlog/dsa_mixed_dsa_index_update_real_no_timing_workspace_score_device_v7.txt
 ```
