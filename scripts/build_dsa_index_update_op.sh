@@ -37,37 +37,37 @@ find "${OP_ROOT}" -type f \
   -exec sed -i 's/\r$//' {} +
 
 echo "[dsa_index_update] source markers"
-grep -n "KERNEL_TYPE_AIV_ONLY\|rawBlockId\|SetBlockDim(usedCoreNum \\* 2)" \
+grep -n "KERNEL_TYPE_AIV_ONLY\|GetBlockIdx\|SetBlockDim(1)" \
   "${OP_ROOT}/cann/op_kernel/dsa_index_update.cpp" || true
-grep -n "SetBlockDim(usedCoreNum \\* 2)" \
+grep -n "SetBlockDim(1)" \
   "${OP_ROOT}/cann/op_host/dsa_index_update_tiling.cpp" || true
-grep -n "manual_acl_tensor_aiv_only_v5_even_block_map\|DSA_INDEX_UPDATE_CUST_OPAPI_PATH\|AclTensorGuard\|aclCreateTensor\|EXEC_NPU_CMD(aclnnDsaIndexUpdate" \
+grep -n "manual_acl_tensor_aiv_only_v6_single_block_batch_loop\|DSA_INDEX_UPDATE_CUST_OPAPI_PATH\|AclTensorGuard\|aclCreateTensor\|EXEC_NPU_CMD(aclnnDsaIndexUpdate" \
   "${OP_ROOT}/torch_extension/dsa_index_update_ext.cpp" || true
 grep -n "DSA_INDEX_UPDATE_CUST_OPAPI_PATH" \
   "${OP_ROOT}/torch_extension/CMakeLists.txt" || true
-grep -n "manual_acl_tensor_aiv_only_v5_even_block_map" \
+grep -n "manual_acl_tensor_aiv_only_v6_single_block_batch_loop" \
   "${ROOT_DIR}/nanovllm/models/dsa_index_update_real.py" || true
 if ! grep -q "KERNEL_TYPE_AIV_ONLY" \
     "${OP_ROOT}/cann/op_kernel/dsa_index_update.cpp"; then
   echo "[dsa_index_update] ERROR: AIV-only kernel marker is missing." >&2
   exit 1
 fi
-if ! grep -q "rawBlockId" \
+if ! grep -q "GetBlockIdx" \
     "${OP_ROOT}/cann/op_kernel/dsa_index_update.cpp"; then
-  echo "[dsa_index_update] ERROR: even-block logical id marker is missing." >&2
+  echo "[dsa_index_update] ERROR: block-id marker is missing." >&2
   exit 1
 fi
-if ! grep -q "SetBlockDim(usedCoreNum \\* 2)" \
+if ! grep -q "SetBlockDim(1)" \
     "${OP_ROOT}/cann/op_host/dsa_index_update_tiling.cpp"; then
-  echo "[dsa_index_update] ERROR: double blockDim marker is missing." >&2
+  echo "[dsa_index_update] ERROR: single blockDim marker is missing." >&2
   exit 1
 fi
-if ! grep -q "manual_acl_tensor_aiv_only_v5_even_block_map" \
+if ! grep -q "manual_acl_tensor_aiv_only_v6_single_block_batch_loop" \
     "${OP_ROOT}/torch_extension/dsa_index_update_ext.cpp"; then
   echo "[dsa_index_update] ERROR: binding version marker is missing." >&2
   exit 1
 fi
-if ! grep -q "manual_acl_tensor_aiv_only_v5_even_block_map" \
+if ! grep -q "manual_acl_tensor_aiv_only_v6_single_block_batch_loop" \
     "${ROOT_DIR}/nanovllm/models/dsa_index_update_real.py"; then
   echo "[dsa_index_update] ERROR: Python binding-version guard is stale." >&2
   exit 1

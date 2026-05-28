@@ -16,7 +16,7 @@ namespace {
 #endif
 
 constexpr const char* kDsaIndexUpdateBindingVersion =
-    "manual_acl_tensor_aiv_only_v5_even_block_map";
+    "manual_acl_tensor_aiv_only_v6_single_block_batch_loop";
 constexpr const char* kDsaIndexUpdateCustOpApiPath =
     DSA_INDEX_UPDATE_CUST_OPAPI_PATH;
 

@@ -155,7 +155,8 @@ static ge::graphStatus DsaIndexUpdateTilingFunc(gert::TilingContext* context)
         OP_LOGE(context, "DsaIndexUpdate: memset tiling failed."),
         return ge::GRAPH_FAILED);
 
-    int64_t usedCoreNum = batchSize < platformCoreNum ? batchSize : platformCoreNum;
+    (void)platformCoreNum;
+    int64_t usedCoreNum = 1;
     const int64_t coreNumPerBatch = 1;
 
     OP_CHECK_IF(GetWorkspaceSize(context) != ge::GRAPH_SUCCESS,
@@ -171,7 +172,7 @@ static ge::graphStatus DsaIndexUpdateTilingFunc(gert::TilingContext* context)
     tiling->usedCoreNum = usedCoreNum;
     tiling->coreNumPerBatch = coreNumPerBatch;
 
-    context->SetBlockDim(usedCoreNum * 2);
+    context->SetBlockDim(1);
     return ge::GRAPH_SUCCESS;
 }
 
