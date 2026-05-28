@@ -36,8 +36,9 @@ public:
 
     __aicore__ inline void Process()
     {
-        const int64_t blockIdx = AscendC::GetBlockIdx();
-        for (int64_t batch = blockIdx; batch < batchSize_; batch += usedCoreNum_) {
+        const int64_t blockId =
+            static_cast<int64_t>(AscendC::GetBlockIdx() / AscendC::GetTaskRation());
+        for (int64_t batch = blockId; batch < batchSize_; batch += usedCoreNum_) {
             ProcessBatch(batch);
         }
     }

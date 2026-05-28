@@ -29,7 +29,7 @@ if _CUSTOM_OPP_VENDOR.exists():
 
 _C = None
 _IMPORT_ERROR: Exception | None = None
-_EXPECTED_BINDING_VERSION = "manual_acl_tensor_aiv_only_v3_direct_cust_opapi"
+_EXPECTED_BINDING_VERSION = "manual_acl_tensor_aiv_only_v4_task_ratio"
 try:
     import torch_npu  # type: ignore  # noqa: F401
 

@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+import os
+
 import torch
 
 from nanovllm.models.dsa_index_update_real import (
     dsa_index_update_real,
     is_available as is_dsa_index_update_real_available,
 )
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _flatten_index_cache(index_cache: torch.Tensor) -> torch.Tensor:
@@ -132,7 +141,8 @@ def dsa_index_update(
 ) -> None:
     """Dispatch to the Ascend op when it is built, otherwise use the prototype."""
     if (
-        is_dsa_index_update_real_available()
+        not _env_flag("NANOVLLM_DSA_INDEX_UPDATE_FORCE_TORCH")
+        and is_dsa_index_update_real_available()
         and score.device.type == "npu"
         and score.dtype == torch.bfloat16
         and int(max_copy_tokens) <= 128
