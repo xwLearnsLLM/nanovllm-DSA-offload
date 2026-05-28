@@ -24,6 +24,7 @@ class Context:
     flat_index_slot_mapping: torch.Tensor | None = None
     req_pool_entries: torch.Tensor | None = None
     candidate_lens: torch.Tensor | None = None
+    candidate_query_lens: torch.Tensor | None = None
     max_candidate_len: int = 0
     sparse_selected_lens: torch.Tensor | None = None
     prefill_tail_lens: torch.Tensor | None = None
@@ -47,8 +48,8 @@ def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0
                 flat_slot_mapping=None, context_lens=None, actual_seq_lengths_query=None, actual_seq_lengths_kv=None,
                 block_tables=None, index_block_tables=None, hbm_block_tables=None, dram_block_tables=None,
                 index_slot_mapping=None, flat_index_slot_mapping=None, req_pool_entries=None, candidate_lens=None,
-                max_candidate_len=None, sparse_selected_lens=None, prefill_tail_lens=None, decode_lens=None,
-                sparse_kv_lens=None,
+                candidate_query_lens=None, max_candidate_len=None, sparse_selected_lens=None, prefill_tail_lens=None,
+                decode_lens=None, sparse_kv_lens=None,
                 is_enforce_eager=None, real_bs=None, block_size=None, flat_slot_mapping_i32=None):
     global _CONTEXT
     if is_enforce_eager is None:
@@ -78,6 +79,7 @@ def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0
         flat_index_slot_mapping=flat_index_slot_mapping,
         req_pool_entries=req_pool_entries,
         candidate_lens=candidate_lens,
+        candidate_query_lens=candidate_query_lens,
         max_candidate_len=max_candidate_len,
         sparse_selected_lens=sparse_selected_lens,
         prefill_tail_lens=prefill_tail_lens,

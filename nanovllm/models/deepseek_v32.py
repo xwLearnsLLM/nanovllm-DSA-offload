@@ -1891,6 +1891,7 @@ class DeepseekV32DSAAttention(nn.Module):
                 "DSA offload context is missing: " + ", ".join(missing)
             )
         candidate_lens = context.candidate_lens[:batch_size]
+        candidate_query_lens = context.candidate_query_lens[:batch_size]
         selected_lens = context.sparse_selected_lens[:batch_size]
         req_pool_entries = context.req_pool_entries[:batch_size]
         max_candidate = max(int(context.max_candidate_len), 1)

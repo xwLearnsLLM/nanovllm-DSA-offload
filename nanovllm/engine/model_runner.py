@@ -565,6 +565,7 @@ class ModelRunner:
         prefill_tail_lens = torch.tensor(prefill_tail_lens, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
         decode_lens = torch.tensor(decode_lens, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
         sparse_kv_lens_tensor = torch.tensor(sparse_kv_lens, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
+        candidate_query_lens = torch.arange(1, len(seqs) + 1, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
         set_context(False,
                     slot_mapping=slot_mapping,
                     flat_slot_mapping=flat_slot_mapping,
@@ -580,6 +581,7 @@ class ModelRunner:
                     dram_block_tables=dram_block_tables,
                     req_pool_entries=req_pool_entries,
                     candidate_lens=candidate_lens,
+                    candidate_query_lens=candidate_query_lens,
                     max_candidate_len=max_candidate_len,
                     sparse_selected_lens=sparse_selected_lens,
                     prefill_tail_lens=prefill_tail_lens,
