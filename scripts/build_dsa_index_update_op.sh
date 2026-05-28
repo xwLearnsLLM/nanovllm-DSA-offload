@@ -39,18 +39,25 @@ find "${OP_ROOT}" -type f \
 echo "[dsa_index_update] source markers"
 grep -n "KERNEL_TYPE_AIV_ONLY" \
   "${OP_ROOT}/cann/op_kernel/dsa_index_update.cpp" || true
-grep -n "manual_acl_tensor_aiv_only_v2\|AclTensorGuard\|aclCreateTensor\|EXEC_NPU_CMD(aclnnDsaIndexUpdate" \
+grep -n "manual_acl_tensor_aiv_only_v3_direct_cust_opapi\|DSA_INDEX_UPDATE_CUST_OPAPI_PATH\|AclTensorGuard\|aclCreateTensor\|EXEC_NPU_CMD(aclnnDsaIndexUpdate" \
   "${OP_ROOT}/torch_extension/dsa_index_update_ext.cpp" || true
-grep -n "manual_acl_tensor_aiv_only_v2" \
+grep -n "DSA_INDEX_UPDATE_CUST_OPAPI_PATH" \
+  "${OP_ROOT}/torch_extension/CMakeLists.txt" || true
+grep -n "manual_acl_tensor_aiv_only_v3_direct_cust_opapi" \
   "${ROOT_DIR}/nanovllm/models/dsa_index_update_real.py" || true
 if ! grep -q "KERNEL_TYPE_AIV_ONLY" \
     "${OP_ROOT}/cann/op_kernel/dsa_index_update.cpp"; then
   echo "[dsa_index_update] ERROR: AIV-only kernel marker is missing." >&2
   exit 1
 fi
-if ! grep -q "manual_acl_tensor_aiv_only_v2" \
+if ! grep -q "manual_acl_tensor_aiv_only_v3_direct_cust_opapi" \
     "${OP_ROOT}/torch_extension/dsa_index_update_ext.cpp"; then
   echo "[dsa_index_update] ERROR: binding version marker is missing." >&2
+  exit 1
+fi
+if ! grep -q "DSA_INDEX_UPDATE_CUST_OPAPI_PATH" \
+    "${OP_ROOT}/torch_extension/CMakeLists.txt"; then
+  echo "[dsa_index_update] ERROR: direct custom opapi path definition is missing." >&2
   exit 1
 fi
 if grep -q "EXEC_NPU_CMD(aclnnDsaIndexUpdate" \

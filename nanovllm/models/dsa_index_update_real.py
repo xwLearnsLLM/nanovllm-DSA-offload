@@ -29,7 +29,7 @@ if _CUSTOM_OPP_VENDOR.exists():
 
 _C = None
 _IMPORT_ERROR: Exception | None = None
-_EXPECTED_BINDING_VERSION = "manual_acl_tensor_aiv_only_v2"
+_EXPECTED_BINDING_VERSION = "manual_acl_tensor_aiv_only_v3_direct_cust_opapi"
 try:
     import torch_npu  # type: ignore  # noqa: F401
 
@@ -66,6 +66,12 @@ def extension_path() -> str | None:
     return getattr(_C, "__file__", None)
 
 
+def custom_opapi_path() -> str | None:
+    if _C is None:
+        return None
+    return _C.custom_opapi_path()
+
+
 def dsa_index_update_real(
     score,
     hbm_cached_tokens_pool,
@@ -98,6 +104,7 @@ def dsa_index_update_real(
 __all__ = [
     "availability_error",
     "binding_version",
+    "custom_opapi_path",
     "dsa_index_update_real",
     "extension_path",
     "is_available",

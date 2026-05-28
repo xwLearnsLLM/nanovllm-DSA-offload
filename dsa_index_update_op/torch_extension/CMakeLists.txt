@@ -73,6 +73,9 @@ target_include_directories(_dsa_index_update_C BEFORE PRIVATE
   ${ROOT_DIR}/csrc/nanovllm_ascend_ops
   ${ADAPTER_DIR})
 
+target_compile_definitions(_dsa_index_update_C PRIVATE
+  DSA_INDEX_UPDATE_CUST_OPAPI_PATH=\"${DSA_INDEX_UPDATE_VENDOR_DIR}/op_api/lib/libcust_opapi.so\")
+
 target_link_directories(_dsa_index_update_C PRIVATE
   ${DSA_INDEX_UPDATE_VENDOR_DIR}/op_api/lib
   ${TORCH_LIBRARY_DIRS}

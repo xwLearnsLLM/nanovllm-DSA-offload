@@ -1,5 +1,7 @@
 #include <torch/extension.h>
 
+#include <dlfcn.h>
+#include <string>
 #include <vector>
 
 #include "aclnn_torch_adapter/op_api_common.h"
@@ -9,7 +11,54 @@ thread_local int g_hashOffset = 0;
 
 namespace {
 
-constexpr const char* kDsaIndexUpdateBindingVersion = "manual_acl_tensor_aiv_only_v2";
+#ifndef DSA_INDEX_UPDATE_CUST_OPAPI_PATH
+#define DSA_INDEX_UPDATE_CUST_OPAPI_PATH ""
+#endif
+
+constexpr const char* kDsaIndexUpdateBindingVersion =
+    "manual_acl_tensor_aiv_only_v3_direct_cust_opapi";
+constexpr const char* kDsaIndexUpdateCustOpApiPath =
+    DSA_INDEX_UPDATE_CUST_OPAPI_PATH;
+
+std::string& DsaIndexUpdateCustOpApiLoadError()
+{
+    static std::string loadError;
+    return loadError;
+}
+
+void* GetDsaIndexUpdateCustOpApiHandler()
+{
+    static void* handler = []() -> void* {
+        if (kDsaIndexUpdateCustOpApiPath[0] != '\0') {
+            dlerror();
+            void* pathHandler = dlopen(kDsaIndexUpdateCustOpApiPath, RTLD_NOW | RTLD_LOCAL);
+            if (pathHandler == nullptr) {
+                const char* err = dlerror();
+                DsaIndexUpdateCustOpApiLoadError() =
+                    err != nullptr ? err : "unknown dlopen error";
+            }
+            return pathHandler;
+        }
+        dlerror();
+        void* defaultHandler = dlopen(GetCustOpApiLibName(), RTLD_NOW | RTLD_LOCAL);
+        if (defaultHandler == nullptr) {
+            const char* err = dlerror();
+            DsaIndexUpdateCustOpApiLoadError() =
+                err != nullptr ? err : "unknown dlopen error";
+        }
+        return defaultHandler;
+    }();
+    return handler;
+}
+
+void* GetDsaIndexUpdateCustOpApiFuncAddr(const char* apiName)
+{
+    void* handler = GetDsaIndexUpdateCustOpApiHandler();
+    if (handler == nullptr) {
+        return nullptr;
+    }
+    return dlsym(handler, apiName);
+}
 
 class AclTensorGuard {
 public:
@@ -108,14 +157,19 @@ void DsaIndexUpdatePy(
         "promote/demote output capacity must be >= max_copy_tokens and equal.");
 
     static const auto getWorkspaceSizeFuncAddr =
-        GetOpApiFuncAddr("aclnnDsaIndexUpdateGetWorkspaceSize");
-    static const auto opApiFuncAddr = GetOpApiFuncAddr("aclnnDsaIndexUpdate");
+        GetDsaIndexUpdateCustOpApiFuncAddr("aclnnDsaIndexUpdateGetWorkspaceSize");
+    static const auto opApiFuncAddr =
+        GetDsaIndexUpdateCustOpApiFuncAddr("aclnnDsaIndexUpdate");
     static const auto initMemAddr = GetOpApiFuncAddr("InitHugeMemThreadLocal");
     static const auto unInitMemAddr = GetOpApiFuncAddr("UnInitHugeMemThreadLocal");
     static const auto releaseMemAddr = GetOpApiFuncAddr("ReleaseHugeMem");
     TORCH_CHECK(
         getWorkspaceSizeFuncAddr != nullptr && opApiFuncAddr != nullptr,
-        "aclnnDsaIndexUpdate or aclnnDsaIndexUpdateGetWorkspaceSize not found.");
+        "aclnnDsaIndexUpdate or aclnnDsaIndexUpdateGetWorkspaceSize not found in ",
+        kDsaIndexUpdateCustOpApiPath[0] != '\0' ? kDsaIndexUpdateCustOpApiPath : GetCustOpApiLibName(),
+        ", dlerror: ",
+        DsaIndexUpdateCustOpApiLoadError(),
+        ".");
 
     AclTensorGuard scoreAcl(score);
     AclTensorGuard poolAcl(hbmCachedTokensPool);
@@ -212,6 +266,9 @@ PYBIND11_MODULE(_dsa_index_update_C, m)
 {
     m.def("binding_version", []() {
         return kDsaIndexUpdateBindingVersion;
+    });
+    m.def("custom_opapi_path", []() {
+        return kDsaIndexUpdateCustOpApiPath;
     });
     m.def("dsa_index_update", &DsaIndexUpdatePy,
         pybind11::arg("score"),
