@@ -171,7 +171,7 @@ static ge::graphStatus DsaIndexUpdateTilingFunc(gert::TilingContext* context)
     tiling->usedCoreNum = usedCoreNum;
     tiling->coreNumPerBatch = coreNumPerBatch;
 
-    context->SetBlockDim(usedCoreNum);
+    context->SetBlockDim(usedCoreNum * 2);
     return ge::GRAPH_SUCCESS;
 }
 

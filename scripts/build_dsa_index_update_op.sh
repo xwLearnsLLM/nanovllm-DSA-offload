@@ -37,30 +37,37 @@ find "${OP_ROOT}" -type f \
   -exec sed -i 's/\r$//' {} +
 
 echo "[dsa_index_update] source markers"
-grep -n "KERNEL_TYPE_AIV_ONLY\|GetTaskRation" \
+grep -n "KERNEL_TYPE_AIV_ONLY\|rawBlockId\|SetBlockDim(usedCoreNum \\* 2)" \
   "${OP_ROOT}/cann/op_kernel/dsa_index_update.cpp" || true
-grep -n "manual_acl_tensor_aiv_only_v4_task_ratio\|DSA_INDEX_UPDATE_CUST_OPAPI_PATH\|AclTensorGuard\|aclCreateTensor\|EXEC_NPU_CMD(aclnnDsaIndexUpdate" \
+grep -n "SetBlockDim(usedCoreNum \\* 2)" \
+  "${OP_ROOT}/cann/op_host/dsa_index_update_tiling.cpp" || true
+grep -n "manual_acl_tensor_aiv_only_v5_even_block_map\|DSA_INDEX_UPDATE_CUST_OPAPI_PATH\|AclTensorGuard\|aclCreateTensor\|EXEC_NPU_CMD(aclnnDsaIndexUpdate" \
   "${OP_ROOT}/torch_extension/dsa_index_update_ext.cpp" || true
 grep -n "DSA_INDEX_UPDATE_CUST_OPAPI_PATH" \
   "${OP_ROOT}/torch_extension/CMakeLists.txt" || true
-grep -n "manual_acl_tensor_aiv_only_v4_task_ratio" \
+grep -n "manual_acl_tensor_aiv_only_v5_even_block_map" \
   "${ROOT_DIR}/nanovllm/models/dsa_index_update_real.py" || true
 if ! grep -q "KERNEL_TYPE_AIV_ONLY" \
     "${OP_ROOT}/cann/op_kernel/dsa_index_update.cpp"; then
   echo "[dsa_index_update] ERROR: AIV-only kernel marker is missing." >&2
   exit 1
 fi
-if ! grep -q "GetTaskRation" \
+if ! grep -q "rawBlockId" \
     "${OP_ROOT}/cann/op_kernel/dsa_index_update.cpp"; then
-  echo "[dsa_index_update] ERROR: logical block-id task-ratio marker is missing." >&2
+  echo "[dsa_index_update] ERROR: even-block logical id marker is missing." >&2
   exit 1
 fi
-if ! grep -q "manual_acl_tensor_aiv_only_v4_task_ratio" \
+if ! grep -q "SetBlockDim(usedCoreNum \\* 2)" \
+    "${OP_ROOT}/cann/op_host/dsa_index_update_tiling.cpp"; then
+  echo "[dsa_index_update] ERROR: double blockDim marker is missing." >&2
+  exit 1
+fi
+if ! grep -q "manual_acl_tensor_aiv_only_v5_even_block_map" \
     "${OP_ROOT}/torch_extension/dsa_index_update_ext.cpp"; then
   echo "[dsa_index_update] ERROR: binding version marker is missing." >&2
   exit 1
 fi
-if ! grep -q "manual_acl_tensor_aiv_only_v4_task_ratio" \
+if ! grep -q "manual_acl_tensor_aiv_only_v5_even_block_map" \
     "${ROOT_DIR}/nanovllm/models/dsa_index_update_real.py"; then
   echo "[dsa_index_update] ERROR: Python binding-version guard is stale." >&2
   exit 1

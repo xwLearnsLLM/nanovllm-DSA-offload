@@ -218,27 +218,27 @@ PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ut_ops/prob
 
 Run these next on Ascend.
 
-First, confirm this source tree contains the AIV-only kernel fix, the logical
-block-id fix, and the direct DSA `libcust_opapi.so` loader. The grep should
-print `KERNEL_TYPE_AIV_ONLY`, `GetTaskRation`,
+First, confirm this source tree contains the AIV-only kernel fix, the even raw
+block-id mapping, and the direct DSA `libcust_opapi.so` loader. The grep should
+print `KERNEL_TYPE_AIV_ONLY`, `rawBlockId`, `SetBlockDim(usedCoreNum * 2)`,
 `DSA_INDEX_UPDATE_CUST_OPAPI_PATH`, and
-`manual_acl_tensor_aiv_only_v4_task_ratio`:
+`manual_acl_tensor_aiv_only_v5_even_block_map`:
 
 ```bash
-grep -n "KERNEL_TYPE_AIV_ONLY\|GetTaskRation\|DSA_INDEX_UPDATE_CUST_OPAPI_PATH\|manual_acl_tensor_aiv_only_v4_task_ratio\|EXEC_NPU_CMD(aclnnDsaIndexUpdate" dsa_index_update_op/cann/op_kernel/dsa_index_update.cpp dsa_index_update_op/torch_extension/dsa_index_update_ext.cpp dsa_index_update_op/torch_extension/CMakeLists.txt nanovllm/models/dsa_index_update_real.py
+grep -n "KERNEL_TYPE_AIV_ONLY\|rawBlockId\|SetBlockDim(usedCoreNum \\* 2)\|DSA_INDEX_UPDATE_CUST_OPAPI_PATH\|manual_acl_tensor_aiv_only_v5_even_block_map\|EXEC_NPU_CMD(aclnnDsaIndexUpdate" dsa_index_update_op/cann/op_kernel/dsa_index_update.cpp dsa_index_update_op/cann/op_host/dsa_index_update_tiling.cpp dsa_index_update_op/torch_extension/dsa_index_update_ext.cpp dsa_index_update_op/torch_extension/CMakeLists.txt nanovllm/models/dsa_index_update_real.py
 ```
 
 Then clean stale standalone-op artifacts, build the `dsa_index_update` CANN op
 and its Python binding:
 
 ```bash
-rm -rf dsa_index_update_op/cann/build dsa_index_update_op/cann/output build/dsa_index_update_ext nanovllm/_dsa_index_update_custom nanovllm/_dsa_index_update_C*.so && mkdir -p runlog && SOC_VERSION=ascend910_9391 bash scripts/build_dsa_index_update_op.sh 2>&1 | tee runlog/build_dsa_index_update_op_task_ratio_v4.txt
+rm -rf dsa_index_update_op/cann/build dsa_index_update_op/cann/output build/dsa_index_update_ext nanovllm/_dsa_index_update_custom nanovllm/_dsa_index_update_C*.so && mkdir -p runlog && SOC_VERSION=ascend910_9391 bash scripts/build_dsa_index_update_op.sh 2>&1 | tee runlog/build_dsa_index_update_op_even_block_map_v5.txt
 ```
 
 Then run the standalone correctness/performance probe:
 
 ```bash
-mkdir -p runlog && PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python ut_ops/probe_dsa_index_update.py --device npu:0 --batch-size 4 --candidate-lens 256,8192,12288,18000 --selected-lens 256,2048,3712,4096 --max-selected-len 8192 --output-capacity 2048 --max-copy-tokens 64 --warmup 5 --iters 50 2>&1 | tee runlog/probe_dsa_index_update_task_ratio_v4.txt
+mkdir -p runlog && PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python ut_ops/probe_dsa_index_update.py --device npu:0 --batch-size 4 --candidate-lens 256,8192,12288,18000 --selected-lens 256,2048,3712,4096 --max-selected-len 8192 --output-capacity 2048 --max-copy-tokens 64 --warmup 5 --iters 50 2>&1 | tee runlog/probe_dsa_index_update_even_block_map_v5.txt
 ```
 
 If you need to bypass only the real `dsa_index_update` op during inference,
@@ -251,11 +251,11 @@ mkdir -p runlog && PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable
 If the probe prints `DSA_INDEX_UPDATE_ACCURACY ok=1`, run one sync timing pass:
 
 ```bash
-mkdir -p runlog && PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANOVLLM_GPU_MEMORY_UTILIZATION=0.85 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/mnt/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=8 NANOVLLM_PROMPT_LENGTHS=256,12288,14000,18000 NANOVLLM_MAX_MODEL_LEN=18016 NANOVLLM_MAX_BATCHED_TOKENS=44544 NANOVLLM_MAX_NUM_SEQS=4 NANOVLLM_MAX_GEN_TOKENS=3 NANOVLLM_IGNORE_EOS=1 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=1 NANOVLLM_PROFILE_LAYER_IDS=mid NANOVLLM_SKIP_WARMUP=1 python example/test.py 2>&1 | tee runlog/dsa_mixed_dsa_index_update_real_sync_task_ratio_v4.txt
+mkdir -p runlog && PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANOVLLM_GPU_MEMORY_UTILIZATION=0.85 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/mnt/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=8 NANOVLLM_PROMPT_LENGTHS=256,12288,14000,18000 NANOVLLM_MAX_MODEL_LEN=18016 NANOVLLM_MAX_BATCHED_TOKENS=44544 NANOVLLM_MAX_NUM_SEQS=4 NANOVLLM_MAX_GEN_TOKENS=3 NANOVLLM_IGNORE_EOS=1 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=1 NANOVLLM_PROFILE_LAYER_IDS=mid NANOVLLM_SKIP_WARMUP=1 python example/test.py 2>&1 | tee runlog/dsa_mixed_dsa_index_update_real_sync_even_block_map_v5.txt
 ```
 
 Finally, measure TPOT with layer timing disabled:
 
 ```bash
-mkdir -p runlog && PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANOVLLM_GPU_MEMORY_UTILIZATION=0.85 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/mnt/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=8 NANOVLLM_PROMPT_LENGTHS=256,12288,14000,18000 NANOVLLM_MAX_MODEL_LEN=18016 NANOVLLM_MAX_BATCHED_TOKENS=44544 NANOVLLM_MAX_NUM_SEQS=4 NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_IGNORE_EOS=1 NANOVLLM_SKIP_WARMUP=1 python example/test.py 2>&1 | tee runlog/dsa_mixed_dsa_index_update_real_no_timing_task_ratio_v4.txt
+mkdir -p runlog && PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANOVLLM_GPU_MEMORY_UTILIZATION=0.85 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/mnt/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=8 NANOVLLM_PROMPT_LENGTHS=256,12288,14000,18000 NANOVLLM_MAX_MODEL_LEN=18016 NANOVLLM_MAX_BATCHED_TOKENS=44544 NANOVLLM_MAX_NUM_SEQS=4 NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_IGNORE_EOS=1 NANOVLLM_SKIP_WARMUP=1 python example/test.py 2>&1 | tee runlog/dsa_mixed_dsa_index_update_real_no_timing_even_block_map_v5.txt
 ```
