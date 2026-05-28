@@ -25,6 +25,7 @@ OP_ROOT="${ROOT_DIR}/dsa_index_update_op"
 CANN_ROOT="${OP_ROOT}/cann"
 INSTALL_ROOT="${ROOT_DIR}/nanovllm/_dsa_index_update_custom"
 VENDOR_DIR="${INSTALL_ROOT}/vendors/dsa_index_update_custom"
+EXPECTED_BINDING_VERSION="manual_acl_tensor_aiv_only_v7_workspace_score_device"
 
 echo "[dsa_index_update] root: ${ROOT_DIR}"
 echo "[dsa_index_update] python: $(${PYTHON_BIN} -c 'import sys; print(sys.executable)')"
@@ -41,11 +42,11 @@ grep -n "KERNEL_TYPE_AIV_ONLY\|GetBlockIdx\|SetBlockDim(1)" \
   "${OP_ROOT}/cann/op_kernel/dsa_index_update.cpp" || true
 grep -n "SetBlockDim(1)" \
   "${OP_ROOT}/cann/op_host/dsa_index_update_tiling.cpp" || true
-grep -n "manual_acl_tensor_aiv_only_v7_workspace_score_device\|DSA_INDEX_UPDATE_CUST_OPAPI_PATH\|AclTensorGuard\|aclCreateTensor\|EXEC_NPU_CMD(aclnnDsaIndexUpdate" \
+grep -n "${EXPECTED_BINDING_VERSION}\|DSA_INDEX_UPDATE_CUST_OPAPI_PATH\|AclTensorGuard\|aclCreateTensor\|EXEC_NPU_CMD(aclnnDsaIndexUpdate" \
   "${OP_ROOT}/torch_extension/dsa_index_update_ext.cpp" || true
 grep -n "DSA_INDEX_UPDATE_CUST_OPAPI_PATH" \
   "${OP_ROOT}/torch_extension/CMakeLists.txt" || true
-grep -n "manual_acl_tensor_aiv_only_v7_workspace_score_device" \
+grep -n "${EXPECTED_BINDING_VERSION}" \
   "${ROOT_DIR}/nanovllm/models/dsa_index_update_real.py" || true
 if ! grep -q "KERNEL_TYPE_AIV_ONLY" \
     "${OP_ROOT}/cann/op_kernel/dsa_index_update.cpp"; then
@@ -62,14 +63,24 @@ if ! grep -q "SetBlockDim(1)" \
   echo "[dsa_index_update] ERROR: single blockDim marker is missing." >&2
   exit 1
 fi
-if ! grep -q "manual_acl_tensor_aiv_only_v7_workspace_score_device" \
+if ! grep -q "${EXPECTED_BINDING_VERSION}" \
     "${OP_ROOT}/torch_extension/dsa_index_update_ext.cpp"; then
-  echo "[dsa_index_update] ERROR: binding version marker is missing." >&2
+  echo "[dsa_index_update] ERROR: binding version marker is missing in torch extension." >&2
+  echo "[dsa_index_update] expected: ${EXPECTED_BINDING_VERSION}" >&2
+  echo "[dsa_index_update] current binding-version lines:" >&2
+  grep -n "kDsaIndexUpdateBindingVersion\|manual_acl_tensor" \
+    "${OP_ROOT}/torch_extension/dsa_index_update_ext.cpp" >&2 || true
+  echo "[dsa_index_update] first 35 lines of dsa_index_update_ext.cpp:" >&2
+  sed -n '1,35p' "${OP_ROOT}/torch_extension/dsa_index_update_ext.cpp" >&2 || true
+  echo "[dsa_index_update] hint: the build script is newer than dsa_index_update_ext.cpp; resync the whole repo or at least dsa_index_update_op/torch_extension/dsa_index_update_ext.cpp." >&2
   exit 1
 fi
-if ! grep -q "manual_acl_tensor_aiv_only_v7_workspace_score_device" \
+if ! grep -q "${EXPECTED_BINDING_VERSION}" \
     "${ROOT_DIR}/nanovllm/models/dsa_index_update_real.py"; then
   echo "[dsa_index_update] ERROR: Python binding-version guard is stale." >&2
+  echo "[dsa_index_update] expected: ${EXPECTED_BINDING_VERSION}" >&2
+  grep -n "_EXPECTED_BINDING_VERSION\|manual_acl_tensor" \
+    "${ROOT_DIR}/nanovllm/models/dsa_index_update_real.py" >&2 || true
   exit 1
 fi
 if ! grep -q "DSA_INDEX_UPDATE_CUST_OPAPI_PATH" \

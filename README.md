@@ -233,6 +233,7 @@ standalone `libcust_opapi.so` 直连加载。grep 应打印 `KERNEL_TYPE_AIV_ONL
 
 ```bash
 grep -n "KERNEL_TYPE_AIV_ONLY\|GetBlockIdx\|SetBlockDim(1)\|DSA_INDEX_UPDATE_CUST_OPAPI_PATH\|manual_acl_tensor_aiv_only_v7_workspace_score_device\|EXEC_NPU_CMD(aclnnDsaIndexUpdate" dsa_index_update_op/cann/op_kernel/dsa_index_update.cpp dsa_index_update_op/cann/op_host/dsa_index_update_tiling.cpp dsa_index_update_op/torch_extension/dsa_index_update_ext.cpp dsa_index_update_op/torch_extension/CMakeLists.txt nanovllm/models/dsa_index_update_real.py
+grep -n "kDsaIndexUpdateBindingVersion\|manual_acl_tensor" dsa_index_update_op/torch_extension/dsa_index_update_ext.cpp nanovllm/models/dsa_index_update_real.py
 ```
 
 然后清理旧 standalone-op 产物，构建 `dsa_index_update` CANN op 和 Python binding：
