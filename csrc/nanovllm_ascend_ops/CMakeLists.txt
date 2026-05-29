@@ -103,6 +103,8 @@ target_include_directories(_C BEFORE PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/mla_preprocess/op_host
   ${CMAKE_CURRENT_SOURCE_DIR}/cann_ops
   ${CMAKE_CURRENT_SOURCE_DIR}/cann_ops/lightning_indexer_vllm
+  ${CMAKE_CURRENT_SOURCE_DIR}/cann_ops/paged_scatter_copy_h2d
+  ${CMAKE_CURRENT_SOURCE_DIR}/cann_ops/qk_score
   ${CMAKE_CURRENT_SOURCE_DIR}/cann_ops/sparse_flash_attention
   ${CMAKE_CURRENT_SOURCE_DIR}/cann_ops/moe_gating_top_k)
 

@@ -1786,10 +1786,10 @@ class DeepseekV32DSAAttention(nn.Module):
         actual_seq_lengths_key = cu_seqlens[1:] - cu_seqlens[:-1]
         mla_result = torch_npu.npu_fused_infer_attention_score(
             ql_nope,
-            self.ckv_cache,
-            self.ckv_cache,
+            self.ckv_cache.transpose(1, 2),
+            self.ckv_cache.transpose(1, 2),
             query_rope=q_pe,
-            key_rope=self.kpe_cache,
+            key_rope=self.kpe_cache.transpose(1, 2),
             num_heads=self.num_local_heads,
             num_key_value_heads=1,
             input_layout="TND",
@@ -1882,6 +1882,7 @@ class DeepseekV32DSAAttention(nn.Module):
             "sparse_selected_lens": context.sparse_selected_lens,
             "req_pool_entries": context.req_pool_entries,
             "index_block_tables": context.index_block_tables,
+            "candidate_query_lens": context.candidate_query_lens,
             "hbm_block_tables": context.hbm_block_tables,
             "dram_block_tables": context.dram_block_tables,
         }
@@ -1917,6 +1918,7 @@ class DeepseekV32DSAAttention(nn.Module):
             context.index_block_tables[:batch_size],
             candidate_lens,
             score_out,
+            actual_seq_lengths_query=candidate_query_lens,
         )
         self._decode_timer_end(
             profile_decode,

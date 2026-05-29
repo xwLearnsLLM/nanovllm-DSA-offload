@@ -41,7 +41,12 @@ except ImportError as exc:
 
 moe_gating_top_k = _C.moe_gating_top_k
 npu_lightning_indexer = _C.npu_lightning_indexer
+npu_qk_score = _C.npu_qk_score
 npu_sparse_flash_attention = _C.npu_sparse_flash_attention
+paged_scatter_copy_h2d = _C.paged_scatter_copy_h2d
+paged_scatter_copy_h2d_alloc_host_mapped_empty = (
+    _C.paged_scatter_copy_h2d_alloc_host_mapped_empty
+)
 batch_matmul_transpose = _C.batch_matmul_transpose
 
 
@@ -117,5 +122,8 @@ __all__ = [
     "mla_preprocess",
     "moe_gating_top_k",
     "npu_lightning_indexer",
+    "npu_qk_score",
     "npu_sparse_flash_attention",
+    "paged_scatter_copy_h2d",
+    "paged_scatter_copy_h2d_alloc_host_mapped_empty",
 ]

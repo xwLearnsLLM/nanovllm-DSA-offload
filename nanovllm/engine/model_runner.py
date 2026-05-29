@@ -9,6 +9,8 @@ import torch
 import torch.distributed as dist
 import torch_npu  # noqa: F401
 
+import nanovllm.ops as ascend_ops
+
 torch.npu.config.allow_internal_format = True
 
 from nanovllm.config import Config
@@ -278,15 +280,15 @@ class ModelRunner:
         ckv_shape = (
             num_layers,
             config.num_hbm_kvcache_blocks,
-            1,
             self.block_size,
+            1,
             kv_lora_rank,
         )
         kpe_shape = (
             num_layers,
             config.num_hbm_kvcache_blocks,
-            1,
             self.block_size,
+            1,
             rope_dim,
         )
         index_shape = (
@@ -299,15 +301,15 @@ class ModelRunner:
         dram_ckv_shape = (
             num_layers,
             config.num_dram_kvcache_blocks,
-            1,
             self.block_size,
+            1,
             kv_lora_rank,
         )
         dram_kpe_shape = (
             num_layers,
             config.num_dram_kvcache_blocks,
-            1,
             self.block_size,
+            1,
             rope_dim,
         )
         pool_shape = (
@@ -344,6 +346,7 @@ class ModelRunner:
             dram_ckv_shape[1:],
             dram_kpe_shape[1:],
         )
+        host_cache_template = torch.empty((), dtype=cache_dtype, device="cpu")
         for module in self.model.modules():
             if hasattr(module, "assign_dsa_cache") and hasattr(module, "layer_id"):
                 ckv_cache = torch.empty(
@@ -355,17 +358,13 @@ class ModelRunner:
                 index_cache = torch.empty(
                     layer_shapes[2], dtype=cache_dtype, device=self.device
                 )
-                dram_ckv_cache = torch.empty(
+                dram_ckv_cache = ascend_ops.paged_scatter_copy_h2d_alloc_host_mapped_empty(
+                    host_cache_template,
                     layer_shapes[3],
-                    dtype=cache_dtype,
-                    device="cpu",
-                    pin_memory=True,
                 )
-                dram_kpe_cache = torch.empty(
+                dram_kpe_cache = ascend_ops.paged_scatter_copy_h2d_alloc_host_mapped_empty(
+                    host_cache_template,
                     layer_shapes[4],
-                    dtype=cache_dtype,
-                    device="cpu",
-                    pin_memory=True,
                 )
                 ckv_cache.zero_()
                 kpe_cache.zero_()

@@ -1,7 +1,9 @@
 #include <optional>
 #include <string>
+#include <vector>
 
 #include <torch/extension.h>
+#include <pybind11/stl.h>
 #include <acl/acl.h>
 
 #include "aclnn_torch_adapter/op_api_common.h"
@@ -56,6 +58,8 @@ extern void mla_preprocess_impl(
 #include "batch_matmul_transpose/batch_matmul_transpose_torch_adpt.h"
 #include "cann_ops/lightning_indexer_vllm/lightning_indexer_vllm_torch_adpt.h"
 #include "cann_ops/moe_gating_top_k/moe_gating_top_k_torch_adpt.h"
+#include "cann_ops/paged_scatter_copy_h2d/paged_scatter_copy_h2d_torch_adpt.h"
+#include "cann_ops/qk_score/qk_score_torch_adpt.h"
 #include "cann_ops/sparse_flash_attention/sparse_flash_attention_torch_adpt.h"
 #include "mla_preprocess/mla_preprocess_torch_adpt.h"
 
@@ -102,6 +106,58 @@ at::Tensor npu_lightning_indexer_py(
       c10::string_view(layout_key.data(), layout_key.size()),
       sparse_count,
       sparse_mode);
+}
+
+at::Tensor npu_qk_score_py(
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& weights,
+    py::object actual_seq_lengths_query,
+    py::object actual_seq_lengths_key,
+    py::object block_table,
+    std::string layout_query,
+    std::string layout_key) {
+  return vllm_ascend::npu_qk_score(
+      query,
+      key,
+      weights,
+      optional_tensor(actual_seq_lengths_query),
+      optional_tensor(actual_seq_lengths_key),
+      optional_tensor(block_table),
+      c10::string_view(layout_query.data(), layout_query.size()),
+      c10::string_view(layout_key.data(), layout_key.size()));
+}
+
+void paged_scatter_copy_h2d_py(
+    at::Tensor npu_krope_cache,
+    at::Tensor npu_knope_cache,
+    const at::Tensor& cpu_krope_cache,
+    const at::Tensor& cpu_knope_cache,
+    const at::Tensor& npu_block_table,
+    const at::Tensor& cpu_block_table,
+    const at::Tensor& npu_dst_token_index,
+    const at::Tensor& cpu_src_token_index,
+    const at::Tensor& copy_counts,
+    int64_t block_size) {
+  vllm_ascend::paged_scatter_copy_h2d(
+      npu_krope_cache,
+      npu_knope_cache,
+      cpu_krope_cache,
+      cpu_knope_cache,
+      npu_block_table,
+      cpu_block_table,
+      npu_dst_token_index,
+      cpu_src_token_index,
+      copy_counts,
+      block_size);
+}
+
+at::Tensor paged_scatter_copy_h2d_alloc_host_mapped_empty_py(
+    const at::Tensor& dtype_template,
+    std::vector<int64_t> sizes) {
+  return vllm_ascend::paged_scatter_copy_h2d_alloc_host_mapped_empty(
+      dtype_template,
+      at::IntArrayRef(sizes));
 }
 
 at::Tensor npu_sparse_flash_attention_py(
@@ -271,6 +327,35 @@ PYBIND11_MODULE(_C, m) {
       py::arg("layout_key") = "BSND",
       py::arg("sparse_count") = 2048,
       py::arg("sparse_mode") = 3);
+  m.def(
+      "npu_qk_score",
+      &npu_qk_score_py,
+      py::arg("query"),
+      py::arg("key"),
+      py::arg("weights"),
+      py::arg("actual_seq_lengths_query") = py::none(),
+      py::arg("actual_seq_lengths_key") = py::none(),
+      py::arg("block_table") = py::none(),
+      py::arg("layout_query") = "BSND",
+      py::arg("layout_key") = "PA_BSND");
+  m.def(
+      "paged_scatter_copy_h2d",
+      &paged_scatter_copy_h2d_py,
+      py::arg("npu_krope_cache"),
+      py::arg("npu_knope_cache"),
+      py::arg("cpu_krope_cache"),
+      py::arg("cpu_knope_cache"),
+      py::arg("npu_block_table"),
+      py::arg("cpu_block_table"),
+      py::arg("npu_dst_token_index"),
+      py::arg("cpu_src_token_index"),
+      py::arg("copy_counts"),
+      py::arg("block_size") = 128);
+  m.def(
+      "paged_scatter_copy_h2d_alloc_host_mapped_empty",
+      &paged_scatter_copy_h2d_alloc_host_mapped_empty_py,
+      py::arg("dtype_template"),
+      py::arg("sizes"));
   m.def(
       "npu_sparse_flash_attention",
       &npu_sparse_flash_attention_py,

@@ -4,6 +4,7 @@ import os
 
 import torch
 
+import nanovllm.ops as ascend_ops
 from nanovllm.models.dsa_index_update_real import (
     dsa_index_update_real,
     is_available as is_dsa_index_update_real_available,
@@ -17,14 +18,6 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _flatten_index_cache(index_cache: torch.Tensor) -> torch.Tensor:
-    return index_cache.view(-1, index_cache.shape[-1])
-
-
-def _flatten_kv_cache(cache: torch.Tensor) -> torch.Tensor:
-    return cache.view(-1, cache.shape[-1])
-
-
 def dsa_indexer_score(
     query_index: torch.Tensor,
     index_cache: torch.Tensor,
@@ -32,30 +25,29 @@ def dsa_indexer_score(
     index_block_table: torch.Tensor,
     candidate_lens: torch.Tensor,
     score_out: torch.Tensor,
+    *,
+    actual_seq_lengths_query: torch.Tensor | None,
 ) -> None:
-    """PyTorch prototype for the full-candidate DSA score operator."""
+    """Score DSA candidates with the Ascend qk_score op."""
     score_out.fill_(-float("inf"))
     block_size = int(index_cache.shape[1])
-    flat_index = _flatten_index_cache(index_cache)
-    bs = int(query_index.shape[0])
-    local_offsets = torch.arange(block_size, device=query_index.device)
-    for b in range(bs):
-        candidate_len = int(candidate_lens[b].item())
-        if candidate_len <= 0:
-            continue
-        num_blocks = (candidate_len + block_size - 1) // block_size
-        blocks = index_block_table[b, :num_blocks].to(torch.long)
-        slots = (blocks[:, None] * block_size + local_offsets[None, :]).reshape(-1)
-        keys = flat_index.index_select(0, slots)[:candidate_len]
-        scores = torch.einsum(
-            "hd,td->ht",
-            query_index[b].float(),
-            keys.float(),
-        )
-        weights = index_weights[b].float().view(-1, 1)
-        score_out[b, :candidate_len] = (scores * weights).sum(dim=0).to(
-            score_out.dtype,
-        )
+    score_capacity = int(score_out.shape[1])
+    if score_capacity <= 0:
+        return
+
+    block_count = (score_capacity + block_size - 1) // block_size
+    scores = ascend_ops.npu_qk_score(
+        query_index.contiguous(),
+        index_cache,
+        index_weights.contiguous(),
+        actual_seq_lengths_query.contiguous(),
+        candidate_lens.contiguous(),
+        index_block_table[:, :block_count].contiguous(),
+        "TND",
+        "PA_BSND",
+    )
+    copy_len = min(score_capacity, int(scores.shape[-1]))
+    score_out[:, :copy_len].copy_(scores[:, 0, :copy_len].to(score_out.dtype))
 
 
 def dsa_index_update_torch(
@@ -192,27 +184,16 @@ def dsa_scatter_h2d(
     dram_ckv_cache: torch.Tensor,
     dram_kpe_cache: torch.Tensor,
 ) -> None:
-    """PyTorch prototype for DRAM-to-HBM sparse slot refill."""
-    block_size = int(hbm_ckv_cache.shape[2])
-    bs = int(promote_idx.shape[0])
-    flat_hbm_ckv = _flatten_kv_cache(hbm_ckv_cache)
-    flat_hbm_kpe = _flatten_kv_cache(hbm_kpe_cache)
-    flat_dram_ckv = _flatten_kv_cache(dram_ckv_cache)
-    flat_dram_kpe = _flatten_kv_cache(dram_kpe_cache)
-    device = hbm_ckv_cache.device
-    for b in range(bs):
-        copy_count = int(copy_counts[b].item())
-        for i in range(copy_count):
-            t = int(promote_idx[b, i].item())
-            s = int(demote_idx[b, i].item())
-            dram_block = int(dram_block_table[b, t // block_size].item())
-            assert dram_block > 0, f"invalid dram block={dram_block}"
-            hbm_block = int(hbm_block_table[b, s // block_size].item())
-            dram_slot = dram_block * block_size + (t % block_size)
-            hbm_slot = hbm_block * block_size + (s % block_size)
-            flat_hbm_ckv[hbm_slot].copy_(
-                flat_dram_ckv[dram_slot].to(device=device, non_blocking=True),
-            )
-            flat_hbm_kpe[hbm_slot].copy_(
-                flat_dram_kpe[dram_slot].to(device=device, non_blocking=True),
-            )
+    block_size = int(hbm_ckv_cache.shape[1])
+    ascend_ops.paged_scatter_copy_h2d(
+        hbm_kpe_cache,
+        hbm_ckv_cache,
+        dram_kpe_cache,
+        dram_ckv_cache,
+        hbm_block_table,
+        dram_block_table,
+        demote_idx,
+        promote_idx,
+        copy_counts,
+        block_size,
+    )
