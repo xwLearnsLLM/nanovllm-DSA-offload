@@ -1,5 +1,24 @@
 import os
 import random
+import ctypes
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+custom_so_path = (
+PROJECT_ROOT
+/ "nanovllm"
+/ "_cann_ops_custom"
+/ "vendors"
+/ "nanovllm-ascend"
+/ "op_api"
+/ "lib"
+/ "libopapi.so"
+)
+so_str = str(custom_so_path)
+try:
+    ctypes.CDLL(so_str, mode=ctypes.RTLD_GLOBAL)
+except Exception as e:
+    print("load custom op failed.")
 
 from _deepseek_example_utils import (
     DEEPSEEK_ASSISTANT_TOKEN,

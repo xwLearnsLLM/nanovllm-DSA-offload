@@ -87,4 +87,6 @@ cp -f "${NANOVLLM_KERNEL_LIB}" "${ROOT_DIR}/nanovllm/"
 
 ls -lh "${ROOT_DIR}/nanovllm"/_C*.so "${ROOT_DIR}/nanovllm/libnanovllm_ascend_kernels.so"
 
+ln -s ${ROOT_DIR}/nanovllm/_cann_ops_custom/vendors/nanovllm-ascend/op_api/lib/libcust_opapi.so ${ROOT_DIR}/nanovllm/_cann_ops_custom/vendors/nanovllm-ascend/op_api/lib/libopapi.so
+
 echo "[nanovllm ops] built nanovllm/_C*.so and nanovllm/_cann_ops_custom/"
