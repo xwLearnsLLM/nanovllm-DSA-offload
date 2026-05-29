@@ -25,7 +25,7 @@ class Scheduler:
         )
         self.dram_block_manager = SimpleBlockManager(
             config.num_dram_kvcache_blocks,
-            reserve_null_block=False,
+            reserve_null_block=True,
         )
         self.pool_entry_manager = PoolEntryManager(config.dsa_offload_pool_capacity)
         self.waiting: deque[Sequence] = deque()

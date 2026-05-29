@@ -240,6 +240,8 @@ DRAM cache 应优先使用 pinned memory。最终 H2D 路径由 `dsa_scatter_h2d
 
 三种 block table 都是请求级元数据，不需要按层拆分。不同层的 sparse budget 选中集合可能不同，但它们共享同一组 HBM sparse slot 物理位置；每一层的 sparse slot 到原始 prefill token id 的映射由 `hbm_cached_tokens_pool[layer, entry, :]` 区分。
 
+三种 block_table 均统一使用**0**作为**null/padding block id**；真实物理块从**1**开始分配。
+
 三类 block table 与物理 cache、逐层 sparse 映射的关系如下：
 
 ```mermaid

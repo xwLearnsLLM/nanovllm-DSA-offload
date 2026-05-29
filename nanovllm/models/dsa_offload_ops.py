@@ -206,6 +206,7 @@ def dsa_scatter_h2d(
             t = int(promote_idx[b, i].item())
             s = int(demote_idx[b, i].item())
             dram_block = int(dram_block_table[b, t // block_size].item())
+            assert dram_block > 0, f"invalid dram block={dram_block}"
             hbm_block = int(hbm_block_table[b, s // block_size].item())
             dram_slot = dram_block * block_size + (t % block_size)
             hbm_slot = hbm_block * block_size + (s % block_size)

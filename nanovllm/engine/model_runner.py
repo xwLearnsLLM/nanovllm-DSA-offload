@@ -264,7 +264,7 @@ class ModelRunner:
             local_hbm_blocks,
         )
         config.num_kvcache_blocks = config.num_hbm_kvcache_blocks
-        config.num_dram_kvcache_blocks = max_needed_index_blocks
+        config.num_dram_kvcache_blocks = max_needed_index_blocks + 1
         config.dsa_offload_max_sparse_tokens = max_sparse_blocks * self.block_size
 
         assert config.num_index_cache_blocks > 2, (
