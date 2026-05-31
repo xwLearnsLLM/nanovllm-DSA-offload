@@ -79,7 +79,8 @@ include(${ASCENDC_CMAKE_DIR}/ascendc.cmake)
 
 set(NANOVLLM_KERNEL_SRC
   ${CMAKE_CURRENT_SOURCE_DIR}/mla_preprocess/op_kernel/mla_preprocess_kernel.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/batch_matmul_transpose/op_kernel/batch_matmul_transpose_kernel.cpp)
+  ${CMAKE_CURRENT_SOURCE_DIR}/batch_matmul_transpose/op_kernel/batch_matmul_transpose_kernel.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/dsa_indexer_project/op_kernel/dsa_indexer_project_kernel.cpp)
 
 ascendc_library(nanovllm_ascend_kernels SHARED ${NANOVLLM_KERNEL_SRC})
 
@@ -99,6 +100,7 @@ target_include_directories(_C BEFORE PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/aclnn_torch_adapter
   ${CMAKE_CURRENT_SOURCE_DIR}/batch_matmul_transpose
   ${CMAKE_CURRENT_SOURCE_DIR}/batch_matmul_transpose/op_host
+  ${CMAKE_CURRENT_SOURCE_DIR}/dsa_indexer_project
   ${CMAKE_CURRENT_SOURCE_DIR}/mla_preprocess
   ${CMAKE_CURRENT_SOURCE_DIR}/mla_preprocess/op_host
   ${CMAKE_CURRENT_SOURCE_DIR}/cann_ops

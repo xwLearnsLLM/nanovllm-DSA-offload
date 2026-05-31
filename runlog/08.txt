@@ -1,5 +1,0 @@
-[root@worker-53232 nano-vllm-ascend-DeepseekV32-dev_dsa_offload]# PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python ut_ops/probe_indexer_hadamard_skip.py --device npu:0 --batch 4 --heads 64 --head-dim 128 --tokens 18000 --topk 512 --warmup 5 --iters 20
-HADAMARD_SKIP config device=npu:0 batch=4 heads=64 head_dim=128 tokens=18000 topk=512 warmup=5 iters=20 seed=0
-HADAMARD_SKIP score: max_abs=0.96936 mean_abs=0.176032 max_rel=111.717 mean_rel=0.021326
-HADAMARD_SKIP topk_overlap b0=0.998047 b1=1.000000 b2=0.996094 b3=1.000000 avg=0.998535
-HADAMARD_SKIP bench raw_score_avg_ms=0.100203 rotated_score_avg_ms=2.019757

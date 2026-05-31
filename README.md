@@ -1,52 +1,59 @@
 # nano-vllm-ascend DeepSeek V3.2 DSA 卸载说明
 
-当前仓库是扁平目录结构。所有命令默认在仓库根目录运行，也就是能看到
-`nanovllm/`、`example/`、`scripts/`、`requirements.txt` 的目录。
+在昇腾上利用DSA原生稀疏机制，在decode阶段将KVcache卸载到DRAM侧，提升decode并发。
 
-不需要 editable install。运行时使用 `PYTHONPATH=$PWD:$PYTHONPATH`，这样
-Python 能导入本地 `nanovllm`，`pip show nano-vllm-ascend` 也能看到
+# 运行说明
+
+当前仓库是扁平目录结构。所有命令默认在仓库根目录运行。
+
+### 构建昇腾算子
+
+克隆代码仓到昇腾环境上，cd进去，然后运行以下命令来编译所需的算子：
+
+```bash
+SOC_VERSION=ascend910_9391 PYTHONPATH=$PWD:$PYTHONPATH bash scripts/build_nanovllm_ops.sh   # 编译
+ls -lh nanovllm/_C*.so nanovllm/libnanovllm_ascend_kernels.so                               # 查看编译结果
+```
+
+注意事项：
+
+- `SOC_VERSION=ascend910_9391` 请按实际情况设置。这里 `ascend910_9391` 对应的是 910C
+- 脚本内部会使用两种 SoC 名称：`ascend910_93` 用于 CANN custom OPP 包，类似 `ascend910_9391` 的详细值用于 AscendC extension 构建。
+- CANN custom OPP 默认串行构建，方便看日志；可以用 `NANOVLLM_CANN_BUILD_JOBS=8` 加速编译
+- 如果 CANN custom OPP 包已经构建过，只改了 pybind extension，可以设置 `NANOVLLM_SKIP_CANN_OPP_BUILD=1` 跳过较慢的 OPP 重构建。
+
+### 运行模型推理
+
+运行不需要 `pip install -e .` 。只需使用 `PYTHONPATH=$PWD:$PYTHONPATH`，这样 Python 能导入本地 `nanovllm`，`pip show nano-vllm-ascend` 也能看到
 `nano_vllm_ascend-0.1.0.dist-info/` 里的本地元数据。
 
-## 构建本地 Ascend 算子
-
-克隆后，或者修改 `csrc/` 后，在昇腾机器上运行一次主 custom op 构建。
-纯 Python 的 DSA 卸载修改不需要重新构建主 custom op。
+跑混合长短序列，随机tokens (并打印时延分解) ：
 
 ```bash
-PYTHONPATH=$PWD:$PYTHONPATH bash scripts/build_nanovllm_ops.sh
-ls -lh nanovllm/_C*.so nanovllm/libnanovllm_ascend_kernels.so
+PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True ASCEND_LAUNCH_BLOCKING=0 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/mnt/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_GPU_MEMORY_UTILIZATION=0.85 NANOVLLM_TP_SIZE=8 NANOVLLM_MAX_MODEL_LEN=65536 NANOVLLM_MAX_BATCHED_TOKENS=65536 NANOVLLM_PROMPT_LENGTHS=256,12288,14000,18000 NANOVLLM_MAX_NUM_SEQS=4 NANOVLLM_MAX_GEN_TOKENS=5 NANOVLLM_IGNORE_EOS=1 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=0 NANOVLLM_PROFILE_LAYER_IDS=mid NANOVLLM_SKIP_WARMUP=1 python3 example/test.py
 ```
 
-rm -rf dsa_index_update_op/cann/build dsa_index_update_op/cann/output build/dsa_index_update_ext nanovllm/_dsa_index_update_custom nanovllm/_dsa_index_update_C*.so && mkdir -p runlog && SOC_VERSION=ascend910_9391 bash scripts/build_dsa_index_update_op.sh
-
-如果 CANN custom OPP 包已经构建过，只改了 pybind extension，可以设置
-`NANOVLLM_SKIP_CANN_OPP_BUILD=1` 跳过较慢的 OPP 重构建。
-
-如果 worker 不是 `ascend910_9391`，在命令前设置 `SOC_VERSION=...`。
-脚本内部会使用两种 SoC 名称：`ascend910_93` 用于 CANN custom OPP 包，
-类似 `ascend910_9391` 的详细值用于 AscendC extension 构建。CANN custom
-OPP 默认串行构建，方便看日志；需要加速时可以设置
-`NANOVLLM_CANN_BUILD_JOBS=8`。
-
-### 构建 standalone `dsa_index_update`
-
-`dsa_index_update` 当前是 standalone CANN 算子，不和 `csrc/` 里的主 custom
-op 一起编译。这个真算子仍在调试中；推理时可以用
-`NANOVLLM_DSA_INDEX_UPDATE_FORCE_TORCH=1` 临时绕过它，改用 PyTorch 伪算子。
+跑混合长短序列，随机tokens ：
 
 ```bash
-rm -rf dsa_index_update_op/cann/build dsa_index_update_op/cann/output build/dsa_index_update_ext nanovllm/_dsa_index_update_custom nanovllm/_dsa_index_update_C*.so
-SOC_VERSION=ascend910_9391 bash scripts/build_dsa_index_update_op.sh
+PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True ASCEND_LAUNCH_BLOCKING=0 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/mnt/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_GPU_MEMORY_UTILIZATION=0.85 NANOVLLM_TP_SIZE=8 NANOVLLM_MAX_MODEL_LEN=65536 NANOVLLM_MAX_BATCHED_TOKENS=65536 NANOVLLM_PROMPT_LENGTHS=256,12288,14000,18000 NANOVLLM_MAX_NUM_SEQS=4 NANOVLLM_MAX_GEN_TOKENS=5 NANOVLLM_IGNORE_EOS=1 NANOVLLM_SKIP_WARMUP=1 python3 example/test.py
 ```
 
-## 通用准备
+跑一批真实短请求 ：
 
 ```bash
-mkdir -p runlog
-PYTHONPATH=$PWD:$PYTHONPATH python -m pip show nano-vllm-ascend
+PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True ASCEND_LAUNCH_BLOCKING=0 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/mnt/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_GPU_MEMORY_UTILIZATION=0.85 NANOVLLM_TP_SIZE=8 NANOVLLM_MAX_MODEL_LEN=65536 NANOVLLM_MAX_BATCHED_TOKENS=65536 NANOVLLM_MAX_NUM_SEQS=4 NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_IGNORE_EOS=1 NANOVLLM_SKIP_WARMUP=1 python3 example/short_prompts.py
 ```
 
-## NANOVLLM 环境变量
+跑一批真实长请求 ：
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True ASCEND_LAUNCH_BLOCKING=0 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/mnt/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_GPU_MEMORY_UTILIZATION=0.85 NANOVLLM_TP_SIZE=8 NANOVLLM_MAX_MODEL_LEN=65536 NANOVLLM_MAX_BATCHED_TOKENS=65536 NANOVLLM_MAX_NUM_SEQS=4 NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_IGNORE_EOS=1 NANOVLLM_SKIP_WARMUP=1 python3 example/long_prompts.py
+```
+
+
+
+# 运行环境变量
 
 | 变量 | 默认值 | 使用位置 | 含义 |
 |---|---:|---|---|
@@ -76,88 +83,16 @@ PYTHONPATH=$PWD:$PYTHONPATH python -m pip show nano-vllm-ascend
 | `NANOVLLM_PROFILE_LAYER_IDS` | `0,mid,last` | `deepseek_v32.py` | 选择打印 decode timing 的层。支持逗号分隔层号，以及 `mid`、`last`、`all`、`*`。 |
 | `NANOVLLM_LOG_DECODE_LAYER_TIMING` | `false` | `deepseek_v32.py` | `true` 时打印选中 decode layer 的时延，包括 `dsa_indexer_score`、`dsa_index_update`、`dsa_scatter_h2d`。 |
 | `NANOVLLM_DECODE_LAYER_TIMING_SYNC` | `true` | `deepseek_v32.py` | `true` 时在 profiling 区间前后同步；`false` 时低开销近似计时。 |
-| `NANOVLLM_DSA_INDEX_UPDATE_FORCE_TORCH` | `false` | `dsa_offload_ops.py` | `true` 时绕过真实 `dsa_index_update` custom op，推理中改用 PyTorch 伪算子。只用于正确性隔离，预期会慢很多。 |
 | `NANOVLLM_FUSE_QKV_A` | `true` | `deepseek_v32.py` | `true` 时加载权重后融合 `q_a_proj` 和 `kv_a_proj_with_mqa`。 |
 | `NANOVLLM_FREE_KV_B_PROJ` | `true` | `deepseek_v32.py` | `true` 时准备好 `w_uk_t/w_uv` 后释放 `kv_b_proj.weight`。 |
 | `NANOVLLM_Q_UP_BMM_TRANS_MAX_TOKENS` | `1` | `deepseek_v32.py` | q-up projection 使用本地 `batch_matmul_transpose` 的最大 token 数。`0` 表示完全关闭。 |
-| `NANOVLLM_INDEXER_Q_BMM_TRANS_MAX_TOKENS` | `8` | `deepseek_v32.py` | indexer `wq_b(q_c)` 使用本地 `batch_matmul_transpose` 的最大 decode token 数。`0` 表示关闭该优化。 |
 | `NANOVLLM_MOE_BACKEND` | `grouped` | `deepseek_v32.py` | `grouped` 打包本地 experts 并使用 `npu_grouped_matmul`；`loop` 保留原逐 expert Python loop。 |
 
-DSA offload decode 已经不再有 `NANOVLLM_DECODE_ATTENTION_BACKEND` 开关。
-卸载路径先更新 sparse HBM budget，然后在 sparse budget 加新产生 decode token
-上执行 dense MLA。
 
-## 每次同步到昇腾后的运行手册
 
-除非命令显式 `cd` 到别的目录，否则都在 DSA offload 仓库根目录运行。仅改
-Python 时不需要 rebuild；修改 `csrc/` 后需要重新构建主 custom op。如果 worker
-上的模型在 `/mnt/models`，只替换命令里的 `NANOVLLM_MODEL`。
+# Decode 时延字段
 
-先跑一个便宜的 Python 语法检查：
-
-```bash
-PYTHONPATH=$PWD:$PYTHONPATH python -m py_compile nanovllm/models/deepseek_v32.py nanovllm/engine/model_runner.py nanovllm/utils/context.py
-```
-
-DSA offload 主 TPOT/timing 命令。每次同步后优先回传这份日志：
-
-```bash
-mkdir -p runlog
-PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANOVLLM_GPU_MEMORY_UTILIZATION=0.85 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=8 NANOVLLM_PROMPT_LENGTHS=256,12288,14000,18000 NANOVLLM_MAX_GEN_TOKENS=5 NANOVLLM_IGNORE_EOS=1 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=0 NANOVLLM_PROFILE_LAYER_IDS=mid NANOVLLM_SKIP_WARMUP=1 python example/test.py 2>&1 | tee runlog/run_offload.txt
-```
-
-baseline TPOT/timing 命令。需要和非卸载 baseline 做同 workload 对比时，在
-baseline 仓库运行：
-
-```bash
-cd ../nano-vllm-ascend-DSA
-mkdir -p runlog
-PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANOVLLM_GPU_MEMORY_UTILIZATION=0.85 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=8 NANOVLLM_DECODE_ATTENTION_BACKEND=mla NANOVLLM_ENABLE_DECODE_MLAPO=1 NANOVLLM_MLA_ROPE_NEOX_CACHE=1 NANOVLLM_DECODE_MLA_FIA_V2=1 NANOVLLM_PROMPT_LENGTHS=256,12288,14000,18000 NANOVLLM_MAX_GEN_TOKENS=5 NANOVLLM_IGNORE_EOS=1 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=0 NANOVLLM_PROFILE_LAYER_IDS=mid NANOVLLM_SKIP_WARMUP=1 python example/test.py 2>&1 | tee runlog/run_baseline.txt
-```
-
-单条短序列。用于覆盖不释放 KV / 不触发重度卸载的情况：
-
-```bash
-PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANOVLLM_GPU_MEMORY_UTILIZATION=0.85 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=8 NANOVLLM_PROMPT_LENGTHS=256 NANOVLLM_MAX_GEN_TOKENS=4 NANOVLLM_IGNORE_EOS=1 NANOVLLM_SKIP_WARMUP=1 python example/test.py 2>&1 | tee runlog/dsa_single_short.txt
-```
-
-单条长序列。应触发 DSA KV 卸载：
-
-```bash
-PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANOVLLM_GPU_MEMORY_UTILIZATION=0.85 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=8 NANOVLLM_PROMPT_LENGTHS=12288 NANOVLLM_MAX_GEN_TOKENS=4 NANOVLLM_IGNORE_EOS=1 NANOVLLM_SKIP_WARMUP=1 python example/test.py 2>&1 | tee runlog/dsa_single_long.txt
-```
-
-一批短序列：
-
-```bash
-PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANOVLLM_GPU_MEMORY_UTILIZATION=0.85 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=8 NANOVLLM_PROMPT_LENGTHS=128,256,384,512 NANOVLLM_MAX_GEN_TOKENS=4 NANOVLLM_IGNORE_EOS=1 NANOVLLM_SKIP_WARMUP=1 python example/test.py 2>&1 | tee runlog/dsa_batch_short.txt
-```
-
-长短混合序列。当前主要功能回归测试：
-
-```bash
-PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANOVLLM_GPU_MEMORY_UTILIZATION=0.85 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=8 NANOVLLM_PROMPT_LENGTHS=256,12288,14000,18000 NANOVLLM_MAX_MODEL_LEN=18016 NANOVLLM_MAX_BATCHED_TOKENS=44544 NANOVLLM_MAX_NUM_SEQS=4 NANOVLLM_MAX_GEN_TOKENS=4 NANOVLLM_IGNORE_EOS=1 NANOVLLM_SKIP_WARMUP=1 python example/test.py 2>&1 | tee runlog/dsa_mixed_functional.txt
-```
-
-长短混合序列 + decode timing。用于和非卸载 baseline 对比 TPOT 和逐层时延分解：
-
-```bash
-PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANOVLLM_GPU_MEMORY_UTILIZATION=0.85 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=8 NANOVLLM_PROMPT_LENGTHS=256,12288,14000,18000 NANOVLLM_MAX_MODEL_LEN=18016 NANOVLLM_MAX_BATCHED_TOKENS=44544 NANOVLLM_MAX_NUM_SEQS=4 NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_IGNORE_EOS=1 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=0 NANOVLLM_PROFILE_LAYER_IDS=0,mid,last NANOVLLM_SKIP_WARMUP=1 python example/test.py 2>&1 | tee runlog/dsa_mixed_timing.txt
-```
-
-如果 timing 日志太大，保持 `NANOVLLM_PROFILE_LAYER_IDS=0,mid,last`。只有需要
-每一层细节时再使用 `NANOVLLM_PROFILE_LAYER_IDS=all`。如果要准确归因 indexer
-子步骤，短跑一轮 `NANOVLLM_DECODE_LAYER_TIMING_SYNC=1`；异步 `=0` 适合看低开销
-趋势，但时间可能串到相邻算子上。
-
-```bash
-PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANOVLLM_GPU_MEMORY_UTILIZATION=0.85 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/home/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=8 NANOVLLM_PROMPT_LENGTHS=256,12288,14000,18000 NANOVLLM_MAX_MODEL_LEN=18016 NANOVLLM_MAX_BATCHED_TOKENS=44544 NANOVLLM_MAX_NUM_SEQS=4 NANOVLLM_MAX_GEN_TOKENS=3 NANOVLLM_IGNORE_EOS=1 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=1 NANOVLLM_PROFILE_LAYER_IDS=mid NANOVLLM_SKIP_WARMUP=1 python example/test.py 2>&1 | tee runlog/dsa_mixed_indexer_detail_sync.txt
-```
-
-## Decode 时延字段
-
-timing 行会按选中的 layer 和 TP rank 打印。日志里的单位是秒；分析时经常换算为
-ms/layer。
+timing 行会按选中的 layer 和 TP rank 打印。日志里的单位是秒
 
 | 字段 | 含义 |
 |---|---|
@@ -166,14 +101,13 @@ ms/layer。
 | `dsa_scatter_h2d` | 根据 `promote_idx/copy_counts`，把 promoted KV token 从 DRAM KV cache 拷贝进 HBM KV cache。 |
 | `dsa_indexer_score` | 根据当前 decode query/indexer projection 和 `IndexCache` 计算候选 token 分数。 |
 | `dsa_index_update` | 更新每个请求的 sparse HBM token budget，并输出 promote/demote token id 和 copy count。 |
-| `indexer` | 执行 `DeepseekV32Indexer`，产出 `q_index`、`index_k` 和 DSA score 所需权重。 |
+| `indexer_project` | 执行 `DeepseekV32Indexer` / `dsa_indexer_project`，产出 `q_index`、`index_k` 和 DSA score 所需权重。 |
 | `mlapo` | 执行 decode MLA preprocess，包括融合 qkv-a/q norm/q-up/kv norm/RoPE/cache-write/q-nope-up。 |
 | `index_cache` | 把当前 token 的 `index_k` 写入常驻 HBM 的 `IndexCache`。 |
-| `indexer_q_proj` | Indexer query projection：`wq_b(q_c)`。`indexer_q_path` 表示走 `linear` 还是 `bmm_transpose`。 |
+| `indexer_q_proj` | Indexer query projection：`wq_b(q_c)`。`indexer_q_path=linear+ascendc_post` 表示已走到 AscendC post 算子。 |
 | `indexer_k_proj` | Indexer key projection：`wk(hidden_states)`。 |
 | `indexer_k_norm` | 对 indexer key projection 执行 LayerNorm。 |
 | `indexer_rope` | 对 indexer query/key 应用 RoPE。 |
-| `indexer_rotate` | 旧版 Hadamard rotate 计时。BF16 offload scorer 跳过该步骤以对齐 vllm-ascend 的非 C8 indexer 路径，所以应打印 `0.000000s`。 |
 | `indexer_weights` | Indexer `weights_proj(hidden_states.float())` 投影和缩放。 |
 | `decode_attention_op` | 在当前 sparse HBM KV budget 加新产生 decode token 上执行 dense MLA decode。 |
 | `v_up` | 使用 `w_uv` 把 MLA latent output 投影回 hidden dimension。 |
@@ -181,21 +115,21 @@ ms/layer。
 | `attention_gap` | 未被细分字段覆盖的 attention 时间：`attention_total - sum(recorded attention detail fields)`。 |
 | `moe_total` | attention 后 MLP/MoE block 的耗时，打印在同一行方便对比。 |
 
-## Indexer 投影说明
 
-vllm-ascend 0.19 中，DSA/SFA 使用 MLAPO 融合 MLA preprocess，并通过
-`enable_inner_out=True` 暴露 `q_c`，但没有把 indexer projection 融进 MLAPO。
-indexer 路径仍然是单独执行的。
+
+# Indexer projection 说明
+
+vllm-ascend 0.19 中，DSA/SFA 使用 MLAPO 融合 MLA preprocess，并通过`enable_inner_out=True` 暴露 `q_c`，但没有把 indexer projection 融进 MLAPO。indexer projection 路径仍然是单独执行的。
 
 | 步骤 | vllm-ascend 0.19 的处理 | 当前本地含义 |
 |---|---|---|
 | 产生 `q_c` | MLAPO 返回归一化后的 `q_c`。 | 当前 DSA offload 路径已经对齐。 |
-| indexer `q` 投影 | `wq_b(q_c)` 在 MLAPO 后执行。 | 小 decode batch 使用本地 `batch_matmul_transpose` 和预转置 per-head 权重。 |
-| indexer `k` 投影 | `wk(hidden_states)` 或 fused `wk_weights_proj(hidden_states)`。 | 可以测试融合 `wk + weights_proj`。 |
-| indexer weights | `weights_proj(hidden_states)` 或 `wk_weights_proj` 的 weights slice。 | 融合可能减少一个小 GEMM，需要验证 BF16 vs FP32 精度。 |
+| indexer `q` 投影 | `wq_b(q_c)` 在 MLAPO 后执行。 | 当前由 `dsa_indexer_project` Python wrapper 调用成熟 GEMM。 |
+| indexer `k` 投影 | `wk(hidden_states)`。 | 当前由 `dsa_indexer_project` Python wrapper 调用成熟 GEMM。 |
+| indexer weights | `weights_proj(hidden_states.float())`。 | 保持 FP32 权重投影，避免 BF16 融合路径引入精度差异。 |
 
-改热路径前，先在昇腾上跑下面的 probe。它会比较当前 PyTorch 投影路径和候选融合投影路径，
-并打印数值差异和平均耗时。
+改热路径后，先在昇腾上跑下面的 probe。它会比较 `dsa_indexer_project`
+和 model reference 的数值差异，并打印平均耗时。
 
 ```bash
 PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python ut_ops/probe_indexer_project.py --device npu:0 --tokens 4 --warmup 10 --iters 100
@@ -203,71 +137,5 @@ PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python ut_ops/probe_inde
 
 结果解读：
 
-- 只有当 `fused_wk_weights_bf16_avg_ms` 明显更快，且 `weights` diff 可接受时，才考虑采用融合路径。早期 A2 结果没有显示有用收益。
-- `q_bmm_transpose_cached_avg_ms` 用于隔离当前 decode 中已经使用的优化版 `wq_b(q_c)` 路径；触发条件是 `tokens <= NANOVLLM_INDEXER_Q_BMM_TRANS_MAX_TOKENS`。
-
-## 可选本地算子探针
-
-这些命令不会加载完整模型，只在调试本地 kernel 时使用。
-
-```bash
-PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ut_ops/probe_moe_grouped.py --device npu:0 --tokens 3 --hidden-size 512 --intermediate-size 256 --num-experts 32 --num-local-experts 8 --local-start 0 --topk 8 --topk-dtype int32 --warmup 5 --iters 20
-```
-
-```bash
-PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ut_ops/probe_mla_preprocess.py --device npu:0 --tokens 128 --heads 32 --warmup 2 --iters 10
-```
-
-```bash
-PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python ut_ops/probe_v_up_proj.py --device npu:0 --tokens 7 --heads 32 --warmup 5 --iters 20
-```
-
-## 下一次运行命令
-
-下面这些命令下一次在昇腾机器上运行。
-
-先确认源码树包含 AIV-only kernel 修复、单 block batch 串行调度、以及 DSA
-standalone `libcust_opapi.so` 直连加载。grep 应打印 `KERNEL_TYPE_AIV_ONLY`、
-`GetBlockIdx`、`SetBlockDim(1)`、`DSA_INDEX_UPDATE_CUST_OPAPI_PATH`、
-`manual_acl_tensor_aiv_only_v7_workspace_score_device`：
-
-```bash
-grep -n "KERNEL_TYPE_AIV_ONLY\|GetBlockIdx\|SetBlockDim(1)\|DSA_INDEX_UPDATE_CUST_OPAPI_PATH\|manual_acl_tensor_aiv_only_v7_workspace_score_device\|EXEC_NPU_CMD(aclnnDsaIndexUpdate" dsa_index_update_op/cann/op_kernel/dsa_index_update.cpp dsa_index_update_op/cann/op_host/dsa_index_update_tiling.cpp dsa_index_update_op/torch_extension/dsa_index_update_ext.cpp dsa_index_update_op/torch_extension/CMakeLists.txt nanovllm/models/dsa_index_update_real.py
-grep -n "kDsaIndexUpdateBindingVersion\|manual_acl_tensor" dsa_index_update_op/torch_extension/dsa_index_update_ext.cpp nanovllm/models/dsa_index_update_real.py
-```
-
-然后清理旧 standalone-op 产物，构建 `dsa_index_update` CANN op 和 Python binding：
-
-```bash
-rm -rf dsa_index_update_op/cann/build dsa_index_update_op/cann/output build/dsa_index_update_ext nanovllm/_dsa_index_update_custom nanovllm/_dsa_index_update_C*.so && mkdir -p runlog && SOC_VERSION=ascend910_9391 bash scripts/build_dsa_index_update_op.sh 2>&1 | tee runlog/build_dsa_index_update_op_workspace_score_device_v7.txt
-```
-
-再跑 standalone 正确性/性能 probe：
-
-```bash
-mkdir -p runlog && PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python ut_ops/probe_dsa_index_update.py --device npu:0 --batch-size 4 --candidate-lens 256,8192,12288,18000 --selected-lens 256,2048,3712,4096 --max-selected-len 8192 --output-capacity 2048 --max-copy-tokens 64 --warmup 5 --iters 50 2>&1 | tee runlog/probe_dsa_index_update_workspace_score_device_v7.txt
-```
-
-然后先跑一条长序列 TP8 sync timing，用来复现并验证 `runlog/23.txt` 里的多进程同步问题：
-
-```bash
-mkdir -p runlog && PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANOVLLM_GPU_MEMORY_UTILIZATION=0.85 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/mnt/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=8 NANOVLLM_PROMPT_LENGTHS=12288 NANOVLLM_MAX_MODEL_LEN=18016 NANOVLLM_MAX_BATCHED_TOKENS=44544 NANOVLLM_MAX_NUM_SEQS=4 NANOVLLM_MAX_GEN_TOKENS=3 NANOVLLM_IGNORE_EOS=1 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=1 NANOVLLM_PROFILE_LAYER_IDS=mid NANOVLLM_SKIP_WARMUP=1 python example/test.py 2>&1 | tee runlog/dsa_single_long_dsa_index_update_real_sync_workspace_score_device_v7.txt
-```
-
-如果需要只绕过真实 `dsa_index_update` 算子，用 PyTorch 伪算子隔离推理链路，运行：
-
-```bash
-mkdir -p runlog && PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANOVLLM_DSA_INDEX_UPDATE_FORCE_TORCH=1 NANOVLLM_GPU_MEMORY_UTILIZATION=0.85 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/mnt/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=8 NANOVLLM_PROMPT_LENGTHS=256,12288,14000,18000 NANOVLLM_MAX_MODEL_LEN=18016 NANOVLLM_MAX_BATCHED_TOKENS=44544 NANOVLLM_MAX_NUM_SEQS=4 NANOVLLM_MAX_GEN_TOKENS=3 NANOVLLM_IGNORE_EOS=1 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=1 NANOVLLM_PROFILE_LAYER_IDS=mid NANOVLLM_SKIP_WARMUP=1 python example/test.py 2>&1 | tee runlog/dsa_mixed_force_torch_index_update_sync.txt
-```
-
-如果 probe 打印 `DSA_INDEX_UPDATE_ACCURACY ok=1`，再跑一次 sync timing：
-
-```bash
-mkdir -p runlog && PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANOVLLM_GPU_MEMORY_UTILIZATION=0.85 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/mnt/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=8 NANOVLLM_PROMPT_LENGTHS=256,12288,14000,18000 NANOVLLM_MAX_MODEL_LEN=18016 NANOVLLM_MAX_BATCHED_TOKENS=44544 NANOVLLM_MAX_NUM_SEQS=4 NANOVLLM_MAX_GEN_TOKENS=3 NANOVLLM_IGNORE_EOS=1 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=1 NANOVLLM_PROFILE_LAYER_IDS=mid NANOVLLM_SKIP_WARMUP=1 python example/test.py 2>&1 | tee runlog/dsa_mixed_dsa_index_update_real_sync_workspace_score_device_v7.txt
-```
-
-最后关掉 layer timing 测 TPOT：
-
-```bash
-mkdir -p runlog && PYTHONPATH=$PWD:$PYTHONPATH PYTORCH_NPU_ALLOC_CONF=expandable_segments:True NANOVLLM_GPU_MEMORY_UTILIZATION=0.85 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NANOVLLM_MODEL=/mnt/models/Deepseek-V3.2-Pruned-95B-BF/ NANOVLLM_TP_SIZE=8 NANOVLLM_PROMPT_LENGTHS=256,12288,14000,18000 NANOVLLM_MAX_MODEL_LEN=18016 NANOVLLM_MAX_BATCHED_TOKENS=44544 NANOVLLM_MAX_NUM_SEQS=4 NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_IGNORE_EOS=1 NANOVLLM_SKIP_WARMUP=1 python example/test.py 2>&1 | tee runlog/dsa_mixed_dsa_index_update_real_no_timing_workspace_score_device_v7.txt
-```
+- `dsa_indexer_project_vs_model_ref` 的 `q/k/weights` diff 应当通过阈值检查。
+- `INDEXER_DETAIL` 会拆出 `q_proj/k_proj/k_norm/rope/weights_proj`，用于观察 wrapper 和 AscendC post 子算子的收益。

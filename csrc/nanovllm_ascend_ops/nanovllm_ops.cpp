@@ -61,11 +61,15 @@ extern void mla_preprocess_impl(
 #include "cann_ops/paged_scatter_copy_h2d/paged_scatter_copy_h2d_torch_adpt.h"
 #include "cann_ops/qk_score/qk_score_torch_adpt.h"
 #include "cann_ops/sparse_flash_attention/sparse_flash_attention_torch_adpt.h"
+#include "dsa_indexer_project/dsa_indexer_project_torch_adpt.h"
 #include "mla_preprocess/mla_preprocess_torch_adpt.h"
 
 namespace py = pybind11;
 
 namespace {
+
+constexpr const char* kDsaIndexerProjectBindingVersion =
+    "dsa_indexer_project_post_csrc_v1";
 
 c10::optional<at::Tensor> optional_tensor(const py::object& obj) {
   if (obj.is_none()) {
@@ -428,4 +432,30 @@ PYBIND11_MODULE(_C, m) {
       py::arg("cache_mode") = py::none(),
       py::arg("quant_mode") = py::none(),
       py::arg("enable_inner_out") = false);
+  m.def(
+      "dsa_indexer_project_binding_version",
+      []() { return kDsaIndexerProjectBindingVersion; });
+  m.def(
+      "dsa_indexer_project_post",
+      &vllm_ascend::dsa_indexer_project_post,
+      py::arg("q_in"),
+      py::arg("k_in"),
+      py::arg("weights_in"),
+      py::arg("cos"),
+      py::arg("sin"),
+      py::arg("score_scale"),
+      py::arg("rope_dim"));
+  m.def(
+      "dsa_indexer_project_post_out",
+      &vllm_ascend::dsa_indexer_project_post_out,
+      py::arg("q_in"),
+      py::arg("k_in"),
+      py::arg("weights_in"),
+      py::arg("cos"),
+      py::arg("sin"),
+      py::arg("q_out"),
+      py::arg("k_out"),
+      py::arg("weights_out"),
+      py::arg("score_scale"),
+      py::arg("rope_dim"));
 }

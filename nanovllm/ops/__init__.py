@@ -50,6 +50,18 @@ paged_scatter_copy_h2d_alloc_host_mapped_empty = (
 batch_matmul_transpose = _C.batch_matmul_transpose
 
 
+def _missing_dsa_indexer_project(*args, **kwargs):
+    raise RuntimeError(
+        "dsa_indexer_project_post is not built into nanovllm._C. "
+        "Run `bash scripts/build_nanovllm_ops.sh` on the Ascend machine first."
+    )
+
+
+dsa_indexer_project_binding_version = getattr(_C, "dsa_indexer_project_binding_version", lambda: "missing")
+dsa_indexer_project_post = getattr(_C, "dsa_indexer_project_post", _missing_dsa_indexer_project)
+dsa_indexer_project_post_out = getattr(_C, "dsa_indexer_project_post_out", _missing_dsa_indexer_project)
+
+
 def mla_preprocess(
     hidden_state,
     wdqkv,
@@ -119,6 +131,9 @@ def mla_preprocess(
 
 __all__ = [
     "batch_matmul_transpose",
+    "dsa_indexer_project_binding_version",
+    "dsa_indexer_project_post",
+    "dsa_indexer_project_post_out",
     "mla_preprocess",
     "moe_gating_top_k",
     "npu_lightning_indexer",

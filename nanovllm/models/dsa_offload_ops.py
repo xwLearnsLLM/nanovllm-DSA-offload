@@ -1,21 +1,8 @@
 from __future__ import annotations
 
-import os
-
 import torch
 
 import nanovllm.ops as ascend_ops
-from nanovllm.models.dsa_index_update_real import (
-    dsa_index_update_real,
-    is_available as is_dsa_index_update_real_available,
-)
-
-
-def _env_flag(name: str, default: bool = False) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def dsa_indexer_score(
@@ -131,35 +118,11 @@ def dsa_index_update(
     req_pool_entries: torch.Tensor,
     max_copy_tokens: int,
 ) -> None:
-    """Dispatch to the Ascend op when it is built, otherwise use the prototype."""
-    if (
-        not _env_flag("NANOVLLM_DSA_INDEX_UPDATE_FORCE_TORCH")
-        and is_dsa_index_update_real_available()
-        and score.device.type == "npu"
-        and score.dtype == torch.bfloat16
-        and int(max_copy_tokens) <= 128
-        and score.is_contiguous()
-        and hbm_cached_tokens_pool.is_contiguous()
-        and promote_idx.is_contiguous()
-        and demote_idx.is_contiguous()
-        and copy_counts.is_contiguous()
-        and candidate_lens.is_contiguous()
-        and selected_lens.is_contiguous()
-        and req_pool_entries.is_contiguous()
-    ):
-        dsa_index_update_real(
-            score,
-            hbm_cached_tokens_pool,
-            promote_idx,
-            demote_idx,
-            copy_counts,
-            candidate_lens,
-            selected_lens,
-            req_pool_entries,
-            int(max_copy_tokens),
-        )
-        return
+    """Update sparse HBM budget with the PyTorch prototype.
 
+    Keep this function as the stable framework-facing interface. The current
+    implementation is intentionally the PyTorch prototype.
+    """
     dsa_index_update_torch(
         score,
         hbm_cached_tokens_pool,
