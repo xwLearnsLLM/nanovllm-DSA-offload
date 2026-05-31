@@ -565,7 +565,7 @@ hbm_cached_tokens_pool[:, hbm_cached_tokens_pool_entry, :]
 2. HBMBlockManager 可分配 `Nprefill` 个 KVcache HBM 块。
 3. DramBlockManager 可分配或复用 `Np` 个 DRAM KVcache 满块。
 4. 若启用卸载，PoolEntryManager 可分配一个 `hbm_cached_tokens_pool_entry`。
-5. 请求长度满足 `max_model_len`、`max_num_batched_tokens` 等引擎限制。
+5. 请求长度满足 `max_model_len`，且 prefill/decode 调度满足 `max_num_prefill_seqs_per_step`、`max_num_decode_seqs_per_step` 等引擎限制。
 
 对启用前缀复用的请求，Scheduler 先分别查询 IndexBlockManager 和 DramBlockManager 的前缀命中块数，再按 `Nc = min(index_hits, dram_hits)` 记录可复用前缀。
 
@@ -1168,4 +1168,3 @@ B * 128 * sizeof(bf16)
 13. "如果 Ns 太小，输出质量可能明显下降。" ，是的，所以我在想，分段函数可能改成宏定义可配，这样可以调整预算。不过不管怎么配，你都可以假设 Ts >= 2048
 
 ````
-

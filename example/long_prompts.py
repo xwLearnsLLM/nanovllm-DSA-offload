@@ -452,8 +452,8 @@ used for urgent inland emergency messages when the landline fails?
 if __name__ == "__main__":
     llm = make_llm(
         max_model_len=4096,
-        max_num_batched_tokens=8192,
-        max_num_seqs=3,
+        max_num_prefill_seqs_per_step=1,
+        max_num_decode_seqs_per_step=3,
     )
     tokenizer = prompt_tokenizer(llm)
     prompt_token_ids = encode_prompts(tokenizer, prompts)

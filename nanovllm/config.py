@@ -8,10 +8,9 @@ from nanovllm.models.deepseek_v32 import DeepseekV32Config
 @dataclass
 class Config:
     model: str
-    max_num_batched_tokens: int = 16384
-    max_num_seqs: int = 256
+    max_num_prefill_seqs_per_step: int = 1
+    max_num_decode_seqs_per_step: int = 256
     max_model_len: int = 4096
-    gpu_memory_utilization: float = 0.7
     tensor_parallel_size: int = 1
     enable_expert_parallel: bool = False
     enforce_eager: bool = False
@@ -24,10 +23,8 @@ class Config:
     num_dram_kvcache_blocks: int = -1
     dsa_offload_fixed_tx: int = 64
     dsa_offload_max_copy_tokens: int = 2048
-    dsa_offload_pool_capacity: int = -1
     dsa_offload_max_sparse_tokens: int = -1
     hccl_port: int = 28000
-    skip_warmup: bool = False
     device = "npu"
     trust_remote_code: bool = False
 
@@ -43,10 +40,39 @@ class Config:
             "NANOVLLM_DSA_OFFLOAD_MAX_COPY_TOKENS",
             self.dsa_offload_max_copy_tokens,
         )
-        self.dsa_offload_pool_capacity = self._env_int(
-            "NANOVLLM_DSA_OFFLOAD_POOL_CAPACITY",
-            self.dsa_offload_pool_capacity,
+        self.max_num_prefill_seqs_per_step = self._env_int(
+            "NANOVLLM_MAX_PREFILL_SEQS_PER_STEP",
+            self.max_num_prefill_seqs_per_step,
         )
+        self.max_num_decode_seqs_per_step = self._env_int(
+            "NANOVLLM_MAX_DECODE_SEQS_PER_STEP",
+            self.max_num_decode_seqs_per_step,
+        )
+        self.num_hbm_kvcache_blocks = self._env_int(
+            "NANOVLLM_HBM_NUM_BLOCKS",
+            self.num_hbm_kvcache_blocks,
+        )
+        self.num_dram_kvcache_blocks = self._env_int(
+            "NANOVLLM_DRAM_NUM_BLOCKS",
+            self.num_dram_kvcache_blocks,
+        )
+        if self.num_hbm_kvcache_blocks <= 2:
+            raise ValueError(
+                "NANOVLLM_HBM_NUM_BLOCKS must be set to a value > 2. "
+                "It directly controls HBM KV cache block count."
+            )
+        if self.num_dram_kvcache_blocks <= 2:
+            raise ValueError(
+                "NANOVLLM_DRAM_NUM_BLOCKS must be set to a value > 2. "
+                "It directly controls both DRAM KV cache and IndexCache block counts."
+            )
+        if self.max_num_prefill_seqs_per_step <= 0:
+            raise ValueError("NANOVLLM_MAX_PREFILL_SEQS_PER_STEP must be > 0.")
+        if self.max_num_decode_seqs_per_step <= 0:
+            raise ValueError("NANOVLLM_MAX_DECODE_SEQS_PER_STEP must be > 0.")
+        self.num_kvcache_blocks = self.num_hbm_kvcache_blocks
+        self.num_index_cache_blocks = self.num_dram_kvcache_blocks
+        self.dsa_offload_pool_capacity = self.max_num_decode_seqs_per_step
         if self.dsa_offload_max_copy_tokens < self.dsa_offload_fixed_tx:
             self.dsa_offload_max_copy_tokens = self.dsa_offload_fixed_tx
         self.hf_config = self._load_hf_config()
@@ -74,10 +100,6 @@ class Config:
         if eos_token_id is not None:
             self.eos = eos_token_id
 
-        assert self.max_num_batched_tokens >= self.max_model_len
-        if self.dsa_offload_pool_capacity < 0:
-            self.dsa_offload_pool_capacity = self.max_num_seqs
-
     @staticmethod
     def _env_int(name: str, default: int) -> int:
         value = os.environ.get(name)
@@ -86,7 +108,7 @@ class Config:
         try:
             return int(value)
         except ValueError:
-            return int(default)
+            raise ValueError(f"{name} must be an integer, got {value!r}.")
 
     def _validate_model_format(self):
         quantization_config = getattr(

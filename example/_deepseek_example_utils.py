@@ -33,8 +33,8 @@ def model_path() -> str:
 def make_llm(
     *,
     max_model_len: int,
-    max_num_batched_tokens: int,
-    max_num_seqs: int,
+    max_num_prefill_seqs_per_step: int,
+    max_num_decode_seqs_per_step: int,
 ) -> LLM:
     return LLM(
         model_path(),
@@ -42,12 +42,10 @@ def make_llm(
         tensor_parallel_size=env_int("NANOVLLM_TP_SIZE", TP_SIZE),
         enable_expert_parallel=env_bool("NANOVLLM_ENABLE_EXPERT_PARALLEL", True),
         max_model_len=max_model_len,
-        max_num_batched_tokens=max_num_batched_tokens,
-        max_num_seqs=max_num_seqs,
+        max_num_prefill_seqs_per_step=max_num_prefill_seqs_per_step,
+        max_num_decode_seqs_per_step=max_num_decode_seqs_per_step,
         kvcache_block_size=env_int("NANOVLLM_KVCACHE_BLOCK_SIZE", 128),
-        skip_warmup=env_bool("NANOVLLM_SKIP_WARMUP", True),
         trust_remote_code=True,
-        gpu_memory_utilization=env_float("NANOVLLM_GPU_MEMORY_UTILIZATION", 0.95),
     )
 
 

@@ -21,8 +21,8 @@ prompts = [
 if __name__ == "__main__":
     llm = make_llm(
         max_model_len=512,
-        max_num_batched_tokens=4096,
-        max_num_seqs=len(prompts),
+        max_num_prefill_seqs_per_step=1,
+        max_num_decode_seqs_per_step=len(prompts),
     )
     tokenizer = prompt_tokenizer(llm)
     prompt_token_ids = encode_prompts(tokenizer, prompts)

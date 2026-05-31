@@ -135,27 +135,18 @@ def main() -> None:
             f"{max_prompt_len + max_gen_tokens}."
         )
 
-    max_num_batched_tokens = env_int(
-        "NANOVLLM_MAX_BATCHED_TOKENS",
-        max(sum(prompt_lengths), max_model_len),
-    )
-    max_num_seqs = env_int("NANOVLLM_MAX_NUM_SEQS", len(prompt_lengths))
-    if max_num_seqs < len(prompt_lengths):
-        raise ValueError(
-            "NANOVLLM_MAX_NUM_SEQS must be >= number of prompts: "
-            f"got {max_num_seqs}, need {len(prompt_lengths)}."
-        )
-    if max_num_batched_tokens < max_model_len:
-        raise ValueError(
-            "NANOVLLM_MAX_BATCHED_TOKENS must be >= NANOVLLM_MAX_MODEL_LEN: "
-            f"got {max_num_batched_tokens}, need at least {max_model_len}."
-        )
+    max_num_prefill_seqs_per_step = env_int("NANOVLLM_MAX_PREFILL_SEQS_PER_STEP", 1)
+    max_num_decode_seqs_per_step = env_int("NANOVLLM_MAX_DECODE_SEQS_PER_STEP", len(prompt_lengths))
+    if max_num_prefill_seqs_per_step <= 0:
+        raise ValueError("NANOVLLM_MAX_PREFILL_SEQS_PER_STEP must be > 0.")
+    if max_num_decode_seqs_per_step <= 0:
+        raise ValueError("NANOVLLM_MAX_DECODE_SEQS_PER_STEP must be > 0.")
     block_size = env_int("NANOVLLM_KVCACHE_BLOCK_SIZE", 128)
 
     llm = make_llm(
         max_model_len=max_model_len,
-        max_num_batched_tokens=max_num_batched_tokens,
-        max_num_seqs=max_num_seqs,
+        max_num_prefill_seqs_per_step=max_num_prefill_seqs_per_step,
+        max_num_decode_seqs_per_step=max_num_decode_seqs_per_step,
     )
     tokenizer = prompt_tokenizer(llm)
 
@@ -174,8 +165,8 @@ def main() -> None:
         f"prompt_min={min(prompt_lengths)}, "
         f"prompt_max={max(prompt_lengths)}, "
         f"max_model_len={max_model_len}, "
-        f"max_num_batched_tokens={max_num_batched_tokens}, "
-        f"max_num_seqs={max_num_seqs}, "
+        f"max_num_prefill_seqs_per_step={max_num_prefill_seqs_per_step}, "
+        f"max_num_decode_seqs_per_step={max_num_decode_seqs_per_step}, "
         f"max_gen_tokens={max_gen_tokens}"
     )
     print_prompt_plan([len(ids) for ids in prompt_token_ids], block_size)

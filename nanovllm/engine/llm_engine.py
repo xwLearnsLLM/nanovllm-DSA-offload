@@ -5,7 +5,6 @@
 import atexit
 import os
 from dataclasses import fields
-from random import randint
 from time import perf_counter
 
 import torch
@@ -69,10 +68,6 @@ class LLMEngine:
         self.tokenizer = self._load_tokenizer(config)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
-        if config.skip_warmup:
-            logger.info("skip warmup enabled, skipping model warmup.")
-        else:
-            self.warmup_model()
         atexit.register(self.exit)
 
     @staticmethod
@@ -157,35 +152,6 @@ class LLMEngine:
             .replace("ĉ", "\n")
             .replace("Ġ", " ")
         )
-
-    def prefill_warmup(self):
-        max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
-        num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs)
-        prompt_token_ids = [[randint(0, 10000) for _ in range(max_model_len)] for _ in range(num_seqs)]
-        sampling_params = [SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=1) for
-                           _ in range(num_seqs)]
-        # prefill max_num_batched_tokens
-        self.generate(prompt_token_ids, sampling_params)
-
-    def decode_warmup(self):
-        max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
-        num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs)
-        # decode max_num_seqs
-        prompt_token_ids = [[randint(0, 10000) for _ in range(randint(10, 50))] for _ in
-                            range(self.config.max_num_seqs)]
-        sampling_params = [SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=2) for
-                           _ in range(num_seqs)]
-        self.generate(prompt_token_ids, sampling_params)
-
-    def warmup_model(self):
-        logger.info(f"warmup start !!!!!!")
-        start_time = perf_counter()
-        self.prefill_warmup()
-        self.decode_warmup()
-        end_time = perf_counter()
-        duration = end_time - start_time
-        logger.info(f"warmup end !!!!!!")
-        logger.info(f"Successfully finished model warmup in {duration:.2f} seconds.")
 
     def exit(self):
         self.model_runner.call("exit")

@@ -159,15 +159,6 @@ class ModelRunner:
     def allocate_kv_cache(self):
         self._allocate_deepseek_dsa_cache()
 
-    def _get_available_cache_mem(self):
-        config = self.config
-        free, total = torch.npu.mem_get_info()
-        used = total - free
-        peak = torch.npu.memory_stats()["allocated_bytes.all.peak"]
-        current = torch.npu.memory_stats()["allocated_bytes.all.current"]
-        available_mem = total * config.gpu_memory_utilization - used - peak + current
-        return available_mem, used, total
-
     @staticmethod
     def _dtype_itemsize(dtype: torch.dtype) -> int:
         return torch.empty((), dtype=dtype).element_size()
@@ -175,50 +166,17 @@ class ModelRunner:
     def _log_cache_allocation(
         self,
         *,
-        total: int,
-        used: int,
         block_bytes: int,
-        available_blocks: int,
-        max_needed_blocks: int,
-        num_blocks: int,
         shapes: list[tuple[str, tuple[int, ...]]],
     ) -> None:
-        logger.info(f"Total NPU Mem: {total / 1024 ** 2:.2f} MB")
-        logger.info(f"Used NPU Mem (Weights): {used / 1024 ** 2:.2f} MB")
-        logger.info(f"Single Block Size: {block_bytes / 1024 ** 2:.2f} MB")
-        if available_blocks > max_needed_blocks:
-            logger.info(
-                "Capping KV cache blocks by request limit: "
-                f"available={available_blocks}, max_needed={max_needed_blocks}."
-            )
-        logger.info(f"Allocating {num_blocks} blocks.")
+        logger.info(f"Single HBM KV Block Size: {block_bytes / 1024 ** 2:.2f} MB")
         for name, shape in shapes:
             logger.info(f"{name} allocated successfully shape: {shape}")
-
-    def _sync_kvcache_blocks_across_tp(self, local_num_blocks: int) -> int:
-        if self.world_size <= 1 or not dist.is_initialized():
-            return local_num_blocks
-        blocks = torch.tensor(
-            [local_num_blocks],
-            dtype=torch.int32,
-            device=self.device,
-        )
-        dist.all_reduce(blocks, op=dist.ReduceOp.MIN)
-        synced_num_blocks = int(blocks.item())
-        if synced_num_blocks != local_num_blocks:
-            logger.info(
-                "Using TP-wide minimum KV cache blocks: rank=%d local=%d synced=%d",
-                self.rank,
-                local_num_blocks,
-                synced_num_blocks,
-            )
-        return synced_num_blocks
 
     def _allocate_deepseek_dsa_cache(self):
         config = self.config
         hf_config = config.hf_config
         text_config = getattr(hf_config, "text_config", hf_config)
-        available_mem, used, total = self._get_available_cache_mem()
         cache_dtype = self._set_torch_dtype(text_config)
         num_layers = int(text_config.num_hidden_layers)
         kv_lora_rank = int(text_config.kv_lora_rank)
@@ -230,53 +188,22 @@ class ModelRunner:
             * (kv_lora_rank + rope_dim)
             * self._dtype_itemsize(cache_dtype)
         )
-        index_block_bytes = (
-            num_layers
-            * self.block_size
-            * index_dim
-            * self._dtype_itemsize(cache_dtype)
-        )
         blocks_per_seq = (config.max_model_len + self.block_size - 1) // self.block_size
         max_sparse_blocks = compute_sparse_blocks(blocks_per_seq)
-        max_needed_index_blocks = max(3, blocks_per_seq * config.max_num_seqs + 2)
-        max_prefill_batch_blocks = (
-            config.max_num_batched_tokens + self.block_size - 1
-        ) // self.block_size
-        max_needed_hbm_blocks = max(
-            3,
-            max_prefill_batch_blocks + config.max_num_seqs + 2,
-            (max_sparse_blocks + 2) * config.max_num_seqs + 2,
-        )
-
-        available_mem_int = int(available_mem)
-        original_available_blocks = available_mem_int // (
-            hbm_kv_block_bytes + index_block_bytes
-        )
-        local_index_blocks = min(max_needed_index_blocks, original_available_blocks)
-        remaining_mem = available_mem_int - local_index_blocks * index_block_bytes
-        local_hbm_blocks = min(
-            max_needed_hbm_blocks,
-            max(0, remaining_mem // max(hbm_kv_block_bytes, 1)),
-        )
-
-        config.num_index_cache_blocks = self._sync_kvcache_blocks_across_tp(
-            local_index_blocks,
-        )
-        config.num_hbm_kvcache_blocks = self._sync_kvcache_blocks_across_tp(
-            local_hbm_blocks,
-        )
-        config.num_kvcache_blocks = config.num_hbm_kvcache_blocks
-        config.num_dram_kvcache_blocks = max_needed_index_blocks + 1
         config.dsa_offload_max_sparse_tokens = max_sparse_blocks * self.block_size
 
-        assert config.num_index_cache_blocks > 2, (
-            "Failed to allocate any DeepSeek DSA IndexCache blocks due to "
-            "insufficient memory."
+        # Block counts are intentionally explicit. NANOVLLM_HBM_NUM_BLOCKS controls HBM KV,
+        # and NANOVLLM_DRAM_NUM_BLOCKS controls both DRAM KV and IndexCache capacity.
+        config.num_kvcache_blocks = config.num_hbm_kvcache_blocks
+        config.num_index_cache_blocks = config.num_dram_kvcache_blocks
+        logger.info(
+            "Using explicit DSA cache blocks: hbm=%d, dram=%d, index=%d, max_sparse_tokens=%d",
+            config.num_hbm_kvcache_blocks,
+            config.num_dram_kvcache_blocks,
+            config.num_index_cache_blocks,
+            config.dsa_offload_max_sparse_tokens,
         )
-        assert config.num_hbm_kvcache_blocks > 2, (
-            "Failed to allocate any DeepSeek DSA cache blocks due to "
-            "insufficient memory."
-        )
+
         ckv_shape = (
             num_layers,
             config.num_hbm_kvcache_blocks,
@@ -318,12 +245,7 @@ class ModelRunner:
             config.dsa_offload_max_sparse_tokens,
         )
         self._log_cache_allocation(
-            total=total,
-            used=used,
-            block_bytes=hbm_kv_block_bytes + index_block_bytes,
-            available_blocks=original_available_blocks,
-            max_needed_blocks=max_needed_index_blocks,
-            num_blocks=config.num_hbm_kvcache_blocks,
+            block_bytes=hbm_kv_block_bytes,
             shapes=[
                 ("DeepSeek CKV cache", ckv_shape),
                 ("DeepSeek KPE cache", kpe_shape),

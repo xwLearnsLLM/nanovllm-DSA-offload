@@ -11,8 +11,8 @@ from nanovllm.engine.sequence import FinishReason, Sequence, SequenceStatus
 
 class Scheduler:
     def __init__(self, config: Config):
-        self.max_num_seqs = config.max_num_seqs
-        self.max_num_batched_tokens = config.max_num_batched_tokens
+        self.max_num_prefill_seqs_per_step = config.max_num_prefill_seqs_per_step
+        self.max_num_decode_seqs_per_step = config.max_num_decode_seqs_per_step
         self.block_size = config.kvcache_block_size
         self.eos = config.eos
         self.index_block_manager = SimpleBlockManager(
@@ -81,27 +81,23 @@ class Scheduler:
 
     def schedule(self) -> tuple[list[Sequence], bool]:
         scheduled_seqs = []
-        num_seqs = 0
-        num_batched_tokens = 0
-
-        while self.waiting and num_seqs < self.max_num_seqs:
+        # running is the decode concurrency set. Keep it capped so DSA pool entries,
+        # HBM sparse budget, and decode batch size all share one clear upper bound.
+        decode_room = self.max_num_decode_seqs_per_step - len(self.running)
+        prefill_slots = max(0, min(self.max_num_prefill_seqs_per_step, decode_room))
+        while self.waiting and len(scheduled_seqs) < prefill_slots:
             seq = self.waiting[0]
-            if (
-                num_batched_tokens + len(seq) > self.max_num_batched_tokens
-                or not self._can_allocate_prefill(seq)
-            ):
+            if not self._can_allocate_prefill(seq):
                 break
             self.waiting.popleft()
             self._allocate_prefill(seq)
             seq.status = SequenceStatus.RUNNING
             self.running.append(seq)
             scheduled_seqs.append(seq)
-            num_seqs += 1
-            num_batched_tokens += len(seq) - seq.num_cached_tokens
         if scheduled_seqs:
             return scheduled_seqs, True
 
-        while self.running and num_seqs < self.max_num_seqs:
+        while self.running and len(scheduled_seqs) < self.max_num_decode_seqs_per_step:
             seq = self.running.popleft()
             while not self.can_append(seq):
                 if self.running:
@@ -111,7 +107,6 @@ class Scheduler:
                     seq = None
                     break
             if seq:
-                num_seqs += 1
                 self.may_append(seq)
                 scheduled_seqs.append(seq)
 
