@@ -367,6 +367,9 @@ class ModelRunner:
         max_seqlen_k = 0
         slot_mapping = []
         index_slot_mapping = []
+        candidate_lens = []
+        sparse_selected_lens = []
+        req_pool_entries = []
 
         for seq in seqs:
             actual_tokens = seq[:]
@@ -391,9 +394,13 @@ class ModelRunner:
                 index_slot_mapping.extend(
                     self._sequence_slots(seq.index_block_table, seqlen),
                 )
+            candidate_lens.append(seq.num_prefill_full_blocks * self.block_size)
+            sparse_selected_lens.append(seq.num_sparse_tokens)
+            req_pool_entries.append(seq.hbm_cached_tokens_pool_entry)
 
         hbm_block_tables = self.prepare_block_tables(seqs, "hbm_block_table")
         index_block_tables = self.prepare_block_tables(seqs, "index_block_table")
+        dram_block_tables = self.prepare_block_tables(seqs, "dram_block_table")
 
         input_ids = torch.tensor(input_ids, dtype=torch.int64).to(self.device)
         positions = torch.tensor(positions, dtype=torch.int64).to(self.device)
@@ -406,6 +413,9 @@ class ModelRunner:
             dtype=torch.int32,
         ).to(self.device)
         flat_index_slot_mapping = index_slot_mapping.to(torch.long)
+        req_pool_entries = torch.tensor(req_pool_entries, dtype=torch.int32).to(self.device)
+        candidate_lens = torch.tensor(candidate_lens, dtype=torch.int32).to(self.device)
+        sparse_selected_lens = torch.tensor(sparse_selected_lens, dtype=torch.int32).to(self.device)
 
         set_context(True,
                     cu_seqlens_q=cu_seqlens_q,
@@ -418,8 +428,13 @@ class ModelRunner:
                     block_tables=hbm_block_tables,
                     hbm_block_tables=hbm_block_tables,
                     index_block_tables=index_block_tables,
+                    dram_block_tables=dram_block_tables,
                     index_slot_mapping=index_slot_mapping,
                     flat_index_slot_mapping=flat_index_slot_mapping,
+                    req_pool_entries=req_pool_entries,
+                    candidate_lens=candidate_lens,
+                    sparse_selected_lens=sparse_selected_lens,
+                    real_bs=len(seqs),
                     block_size=self.config.kvcache_block_size)
 
         return input_ids, positions

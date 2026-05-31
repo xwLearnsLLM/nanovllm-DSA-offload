@@ -1297,8 +1297,10 @@ class DeepseekV32DSAAttention(nn.Module):
         num_sparse_blocks = int(seq.num_sparse_blocks)
         sparse_tokens = int(seq.num_sparse_tokens)
         pool = self.hbm_cached_tokens_pool[self.layer_id, entry]
-        pool.fill_(-1)
 
+        # Full prefill attention already used HBM full blocks. After model.forward,
+        # persist those full blocks to DRAM first, then rebuild HBM sparse budget
+        # from the token ids selected during this layer's prefill forward.
         for logical_block in range(num_full_blocks):
             hbm_block = int(old_hbm_block_table[logical_block])
             dram_block = int(seq.dram_block_table[logical_block])
@@ -1318,30 +1320,90 @@ class DeepseekV32DSAAttention(nn.Module):
         if num_sparse_blocks <= 0:
             return
 
-        source_start_block = num_full_blocks - num_sparse_blocks
-        for sparse_block in range(num_sparse_blocks):
-            dram_block = int(seq.dram_block_table[source_start_block + sparse_block])
-            hbm_block = int(old_hbm_block_table[sparse_block])
-            self.ckv_cache[hbm_block].copy_(
-                self.dram_ckv_cache[dram_block].to(
-                    device=self.ckv_cache.device,
-                    non_blocking=True,
-                ),
-            )
-            self.kpe_cache[hbm_block].copy_(
-                self.dram_kpe_cache[dram_block].to(
-                    device=self.kpe_cache.device,
-                    non_blocking=True,
-                ),
-            )
+        selected_tokens = pool[:sparse_tokens].to(torch.long)
+        valid = (selected_tokens >= 0) & (selected_tokens < num_full_blocks * self.block_size)
+        if int(valid.sum().item()) != sparse_tokens:
+            # Debug fallback: if prefill top-budget selection did not run for this
+            # layer, preserve the old suffix-block behavior instead of corrupting decode.
+            token_start = (num_full_blocks - num_sparse_blocks) * self.block_size
+            selected_tokens = torch.arange(token_start, token_start + sparse_tokens, dtype=torch.long, device=pool.device)
+            pool.fill_(-1)
+            pool[:sparse_tokens] = selected_tokens.to(torch.int32)
 
-        token_start = source_start_block * self.block_size
-        pool[:sparse_tokens] = torch.arange(
-            token_start,
-            token_start + sparse_tokens,
-            dtype=torch.int32,
-            device=pool.device,
-        )
+        self._load_prefill_sparse_budget_from_dram(seq, old_hbm_block_table, selected_tokens, sparse_tokens)
+
+    def _load_prefill_sparse_budget_from_dram(
+        self,
+        seq,
+        old_hbm_block_table: list[int],
+        selected_tokens: torch.Tensor,
+        sparse_tokens: int,
+    ) -> None:
+        if sparse_tokens <= 0:
+            return
+        device = self.ckv_cache.device
+        block_size = self.block_size
+        selected_cpu = selected_tokens.detach().to("cpu", dtype=torch.long)
+        dram_blocks_cpu = torch.tensor(seq.dram_block_table, dtype=torch.long)
+        src_flat_cpu = dram_blocks_cpu[selected_cpu // block_size] * block_size + selected_cpu % block_size
+        hbm_blocks = torch.tensor(old_hbm_block_table[: int(seq.num_sparse_blocks)], dtype=torch.long, device=device)
+        dst_offsets = torch.arange(sparse_tokens, dtype=torch.long, device=device)
+        dst_flat = hbm_blocks[dst_offsets // block_size] * block_size + dst_offsets % block_size
+
+        ckv_src_index = src_flat_cpu.to(self.dram_ckv_cache.device)
+        kpe_src_index = src_flat_cpu.to(self.dram_kpe_cache.device)
+        ckv_values = self.dram_ckv_cache.view(-1, self.kv_lora_rank).index_select(0, ckv_src_index).to(device=device, non_blocking=True)
+        kpe_values = self.dram_kpe_cache.view(-1, self.qk_rope_head_dim).index_select(0, kpe_src_index).to(device=device, non_blocking=True)
+        self.ckv_cache.view(-1, self.kv_lora_rank).index_copy_(0, dst_flat, ckv_values)
+        self.kpe_cache.view(-1, self.qk_rope_head_dim).index_copy_(0, dst_flat, kpe_values)
+
+    def _prefill_select_sparse_budget(
+        self,
+        q_index: torch.Tensor,
+        index_k: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> None:
+        context = get_context()
+        if (
+            context.cu_seqlens_q is None
+            or context.req_pool_entries is None
+            or context.candidate_lens is None
+            or context.sparse_selected_lens is None
+        ):
+            return
+
+        cu_seqlens = context.cu_seqlens_q.detach().cpu().tolist()
+        req_entries = context.req_pool_entries.detach().cpu().tolist()
+        candidate_lens = context.candidate_lens.detach().cpu().tolist()
+        selected_lens = context.sparse_selected_lens.detach().cpu().tolist()
+        for b in range(max(0, len(cu_seqlens) - 1)):
+            entry = int(req_entries[b])
+            candidate_len = int(candidate_lens[b])
+            selected_len = int(selected_lens[b])
+            pool = self.hbm_cached_tokens_pool[self.layer_id, entry]
+            pool.fill_(-1)
+            if candidate_len <= 0 or selected_len <= 0:
+                continue
+            start = int(cu_seqlens[b])
+            end = int(cu_seqlens[b + 1])
+            candidate_len = min(candidate_len, end - start)
+            selected_len = min(selected_len, candidate_len, int(pool.shape[0]))
+            if selected_len <= 0:
+                continue
+            if selected_len == candidate_len:
+                selected_tokens = torch.arange(candidate_len, dtype=torch.int32, device=pool.device)
+            else:
+                query_pos = end - 1
+                key = index_k[start : start + candidate_len].float()
+                query = q_index[query_pos].float()
+                query_weights = weights[query_pos].float()
+                scores = (key @ query.transpose(0, 1)) * query_weights
+                selected_tokens = torch.topk(scores.sum(dim=-1), k=selected_len, largest=True).indices.to(torch.int32)
+                selected_tokens = torch.sort(selected_tokens).values
+            pool[:selected_len] = selected_tokens
+
+        # Old suffix-block initialization used to live in finalize_prefill_offload.
+        # Selection now happens here; finalize only materializes the chosen ids.
 
     def _store_mla_cache(
         self,
@@ -1994,6 +2056,7 @@ class DeepseekV32DSAAttention(nn.Module):
 
         if context.is_prefill:
             attn_output = self._prefill_forward(ql_nope, q_pe)
+            self._prefill_select_sparse_budget(q_index, index_k, weights)
         else:
             attn_output = self._decode_forward(ql_nope, q_pe, q_index, weights)
 
