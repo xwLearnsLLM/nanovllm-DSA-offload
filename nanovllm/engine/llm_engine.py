@@ -242,7 +242,7 @@ class LLMEngine:
             if (
                 is_prefill
                 or last_is_prefill
-                or i_step % 64 == 0
+                or i_step % 1 == 0
                 or self.is_finished()
             ):
                 latency_name = "TTFT" if is_prefill else "TPOT"
@@ -274,6 +274,11 @@ class LLMEngine:
             if total_decode_time > 0
             else 0.0
         )
+        decode_mean_tpot = (
+            total_decode_time / decode_steps
+            if decode_steps > 0
+            else 0.0
+        )
         e2e_input_tps = total_input_tokens / elapsed if elapsed > 0 else 0.0
         e2e_output_tps = total_output_tokens / elapsed if elapsed > 0 else 0.0
         print(
@@ -286,6 +291,7 @@ class LLMEngine:
             f"    decode steps = {decode_steps}, "
             f"decode tokens = {total_decode_tokens}, "
             f"total decode time = {total_decode_time:.4f} sec, "
+            f"decode mean TPOT = {decode_mean_tpot:.4f} sec, "
             f"decode TPS = {decode_tps:.2f} tok/s\n"
             f"    e2e input TPS = {e2e_input_tps:.2f} tok/s, "
             f"e2e output TPS = {e2e_output_tps:.2f} tok/s\n"

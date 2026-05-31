@@ -31,7 +31,7 @@ class Config:
     def __post_init__(self):
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 16 == 0
-        assert 1 <= self.tensor_parallel_size <= 8
+        assert 1 <= self.tensor_parallel_size
         self.dsa_offload_fixed_tx = self._env_int(
             "NANOVLLM_DSA_OFFLOAD_FIXED_TX",
             self.dsa_offload_fixed_tx,
