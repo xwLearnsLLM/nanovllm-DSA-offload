@@ -45,6 +45,7 @@ export NANOVLLM_MAX_MODEL_LEN=65536
 export NANOVLLM_MAX_PREFILL_SEQS_PER_STEP=1                     # prefill最大batch-size设为1，避免爆显存
 export NANOVLLM_MAX_DECODE_SEQS_PER_STEP=256                    # decode最大batch-size设为256
 export NANOVLLM_IGNORE_EOS=1
+export NANOVLLM_DSA_OFFLOAD_FIXED_TX=128   # 每请求每个decode step 每层换入的token数量
 ```
 
 然后进入目录，不需要 `pip install -e .` ，直接推：
@@ -91,6 +92,7 @@ export NANOVLLM_MAX_MODEL_LEN=65536
 export NANOVLLM_MAX_PREFILL_SEQS_PER_STEP=1                     # prefill最大batch-size设为1，避免爆显存
 export NANOVLLM_MAX_DECODE_SEQS_PER_STEP=256                    # decode最大batch-size设为256
 export NANOVLLM_IGNORE_EOS=1
+export NANOVLLM_DSA_OFFLOAD_FIXED_TX=128   # 每请求每个decode step 每层换入的token数量
 ```
 
 然后进入目录，不需要 `pip install -e .` ，直接推：

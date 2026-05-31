@@ -451,6 +451,7 @@ class ModelRunner:
         decode_lens = []
         sparse_kv_lens = []
         req_pool_entries = []
+        needs_dsa_update = False
         for seq in seqs:
             input_ids.append(seq.last_token)
             position = len(seq) - 1
@@ -469,6 +470,7 @@ class ModelRunner:
             candidate_len = seq.num_prefill_full_blocks * self.block_size
             sparse_selected_len = seq.num_sparse_tokens
             sparse_kv_len = sparse_selected_len + seq.prefill_tail_len + decode_len
+            needs_dsa_update = needs_dsa_update or (candidate_len > sparse_selected_len > 0)
 
             context_lens.append(sparse_kv_len)
             candidate_lens.append(candidate_len)
@@ -523,6 +525,7 @@ class ModelRunner:
                     prefill_tail_lens=prefill_tail_lens,
                     decode_lens=decode_lens,
                     sparse_kv_lens=sparse_kv_lens_tensor,
+                    needs_dsa_update=needs_dsa_update,
                     is_enforce_eager=True,
                     real_bs=len(seqs),
                     block_size=self.config.kvcache_block_size)

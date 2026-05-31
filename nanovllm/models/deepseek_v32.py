@@ -1298,6 +1298,14 @@ class DeepseekV32DSAAttention(nn.Module):
         sparse_tokens = int(seq.num_sparse_tokens)
         pool = self.hbm_cached_tokens_pool[self.layer_id, entry]
 
+        if num_sparse_blocks >= num_full_blocks:
+            # This request keeps every full prefill block in HBM. Do not rebuild KV
+            # through DRAM here; the path must be identical to baseline dense MLA.
+            if sparse_tokens > 0:
+                pool.fill_(-1)
+                pool[:sparse_tokens] = torch.arange(sparse_tokens, dtype=torch.int32, device=pool.device)
+            return
+
         # Full prefill attention already used HBM full blocks. After model.forward,
         # persist those full blocks to DRAM first, then rebuild HBM sparse budget
         # from the token ids selected during this layer's prefill forward.
@@ -1766,6 +1774,8 @@ class DeepseekV32DSAAttention(nn.Module):
         batch_size: int,
     ) -> None:
         context = get_context()
+        if not context.needs_dsa_update:
+            return
         required_context = {
             "candidate_lens": context.candidate_lens,
             "sparse_selected_lens": context.sparse_selected_lens,
