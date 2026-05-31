@@ -257,9 +257,61 @@ def dsa_indexer_project(
     )
 
 
+def dsa_indexer_project_query_only(
+    hidden_states: torch.Tensor,
+    q_c: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    wq_b_weight: torch.Tensor,
+    weights_proj_weight: torch.Tensor,
+    q_index_out: torch.Tensor,
+    index_weights_out: torch.Tensor,
+    *,
+    n_head: int,
+    head_dim: int,
+    rope_dim: int,
+    score_scale: float,
+    wq_b_bmm_t: torch.Tensor | None = None,
+    enable_q_bmm: bool = False,
+    detail: dict[str, float] | None = None,
+    sync_detail: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Decode-only indexer projection.
+
+    Decode DSA update scores only need the current token's query index and
+    per-head weights. The current decode token's index key is not part of the
+    prefill-candidate IndexCache, so this path skips wk/k_norm/k-rope entirely.
+    """
+    if q_index_out.shape != (hidden_states.shape[0], n_head, head_dim):
+        raise ValueError(f"q_index_out shape must be {(hidden_states.shape[0], n_head, head_dim)}, got {tuple(q_index_out.shape)}")
+    if index_weights_out.shape != (hidden_states.shape[0], n_head):
+        raise ValueError(f"index_weights_out shape must be {(hidden_states.shape[0], n_head)}, got {tuple(index_weights_out.shape)}")
+
+    start = _timer_start(detail, sync_detail, q_c.device)
+    q = _q_project(q_c, wq_b_weight, wq_b_bmm_t, int(n_head), int(head_dim), bool(enable_q_bmm))
+    _timer_end(detail, "q_proj", start, sync_detail, q_c.device)
+
+    start = _timer_start(detail, sync_detail, hidden_states.device)
+    weights = F.linear(hidden_states.float(), weights_proj_weight.float()).contiguous()
+    index_weights_out.copy_((weights * float(score_scale)).to(hidden_states.dtype))
+    _timer_end(detail, "weights_proj", start, sync_detail, hidden_states.device)
+
+    start = _timer_start(detail, sync_detail, q.device)
+    q_pe, q_nope = torch.split(q, [int(rope_dim), int(head_dim) - int(rope_dim)], dim=-1)
+    if q.device.type == "npu" and torch_npu is not None and q.dtype in (torch.float16, torch.bfloat16):
+        q_pe = torch_npu.npu_rotary_mul(q_pe.unsqueeze(2), cos, sin).squeeze(2)
+    else:
+        q_pe = _apply_rope_neox_reference(q_pe, cos, sin, int(rope_dim))
+    q_index_out[..., : int(rope_dim)].copy_(q_pe)
+    q_index_out[..., int(rope_dim) :].copy_(q_nope)
+    _timer_end(detail, "rope", start, sync_detail, q.device)
+    return q_index_out, index_weights_out
+
+
 __all__ = [
     "dsa_indexer_project",
     "dsa_indexer_project_post_available",
     "dsa_indexer_project_q_path",
+    "dsa_indexer_project_query_only",
     "dsa_indexer_project_torch",
 ]

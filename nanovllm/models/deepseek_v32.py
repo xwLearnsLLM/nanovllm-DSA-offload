@@ -19,7 +19,7 @@ from nanovllm.models.dsa_offload_ops import (
     dsa_indexer_score,
     dsa_scatter_h2d,
 )
-from nanovllm.models.dsa_indexer_project import dsa_indexer_project, dsa_indexer_project_post_available
+from nanovllm.models.dsa_indexer_project import dsa_indexer_project, dsa_indexer_project_post_available, dsa_indexer_project_query_only
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
 from nanovllm.layers.layernorm import RMSNorm
@@ -789,9 +789,32 @@ class DeepseekV32Indexer(nn.Module):
         rotary_emb: DeepseekScalingRotaryEmbedding,
         detail: dict[str, float] | None = None,
         sync_detail: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        query_only: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
         cos, sin = self._rope_cos_sin(positions, rotary_emb, hidden_states.dtype)
         q_index, index_k, index_weights = self._get_output_buffers(hidden_states)
+        if query_only:
+            self.last_q_project_path = "query_only"
+            # Decode DSA only scores prefill candidates. The decode token key is
+            # already in the MLA tail budget, so skip index_k projection/cache.
+            dsa_indexer_project_query_only(
+                hidden_states,
+                q_c,
+                cos,
+                sin,
+                self.wq_b.weight,
+                self.weights_proj.weight,
+                q_index,
+                index_weights,
+                n_head=self.n_head,
+                head_dim=self.head_dim,
+                rope_dim=self.rope_dim,
+                score_scale=self.softmax_scale * (self.n_head ** -0.5),
+                detail=detail,
+                sync_detail=sync_detail,
+            )
+            return q_index, None, index_weights
+
         self.last_q_project_path = "linear+ascendc_post" if hidden_states.device.type == "npu" and dsa_indexer_project_post_available() else "linear"
         # Final dsa_indexer_project interface writes these outputs explicitly; B-stage internals still use framework GEMMs plus AscendC post.
         dsa_indexer_project(
@@ -1446,7 +1469,8 @@ class DeepseekV32DSAAttention(nn.Module):
         q_c: torch.Tensor,
         positions: torch.Tensor,
         profile_decode: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        query_only: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
         start = self._decode_timer_start(profile_decode, hidden_states.device)
         indexer_detail = (
             {key: 0.0 for key in self.last_decode_indexer_detail}
@@ -1460,6 +1484,7 @@ class DeepseekV32DSAAttention(nn.Module):
             self.indexer_rotary_emb,
             indexer_detail,
             self.decode_timing_sync,
+            query_only=query_only,
         )
         if indexer_detail is not None:
             self.last_decode_indexer_detail = indexer_detail
@@ -1971,15 +1996,12 @@ class DeepseekV32DSAAttention(nn.Module):
                 q_c,
                 positions,
                 profile_decode,
+                query_only=True,
             )
-            start = self._decode_timer_start(profile_decode, index_k.device)
-            self._store_index_cache(index_k)
-            self._decode_timer_end(
-                profile_decode,
-                "index_cache",
-                start,
-                index_k.device,
-            )
+            if index_k is not None:
+                start = self._decode_timer_start(profile_decode, index_k.device)
+                self._store_index_cache(index_k)
+                self._decode_timer_end(profile_decode, "index_cache", start, index_k.device)
 
             attn_output = self._decode_forward(ql_nope, q_pe, q_index, weights)
             return self._o_proj_forward(attn_output, profile_decode)
@@ -2045,20 +2067,17 @@ class DeepseekV32DSAAttention(nn.Module):
             q_c,
             positions,
             profile_decode,
+            query_only=not context.is_prefill,
         )
 
         start = self._decode_timer_start(profile_decode, ckv.device)
         self._store_mla_cache(ckv, k_pe)
         self._decode_timer_end(profile_decode, "cache", start, ckv.device)
 
-        start = self._decode_timer_start(profile_decode, index_k.device)
-        self._store_index_cache(index_k)
-        self._decode_timer_end(
-            profile_decode,
-            "index_cache",
-            start,
-            index_k.device,
-        )
+        if index_k is not None:
+            start = self._decode_timer_start(profile_decode, index_k.device)
+            self._store_index_cache(index_k)
+            self._decode_timer_end(profile_decode, "index_cache", start, index_k.device)
 
         start = self._decode_timer_start(profile_decode, q_nope.device)
         ql_nope = self._q_nope_up_proj(q_nope)
