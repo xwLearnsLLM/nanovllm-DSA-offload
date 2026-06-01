@@ -955,6 +955,13 @@ class DeepseekV32DSAAttention(nn.Module):
         self.debug_decode_mlapo_compare_rank = _env_int("NANOVLLM_DEBUG_DECODE_MLAPO_COMPARE_RANK", 0)
         self.debug_decode_mlapo_compare_limit = _env_int("NANOVLLM_DEBUG_DECODE_MLAPO_COMPARE_LIMIT", 2)
         self._debug_decode_mlapo_compare_count = 0
+        self.prefill_budget_mode = os.environ.get("NANOVLLM_DSA_PREFILL_BUDGET_MODE", "score").strip().lower()
+        if self.prefill_budget_mode not in ("score", "suffix"):
+            logger.warning("Unknown NANOVLLM_DSA_PREFILL_BUDGET_MODE=%s, fallback to score.", self.prefill_budget_mode)
+            self.prefill_budget_mode = "score"
+        self.debug_prefill_budget = _env_flag("NANOVLLM_DSA_DEBUG_PREFILL_BUDGET", False)
+        self.debug_prefill_budget_rank = _env_int("NANOVLLM_DSA_DEBUG_PREFILL_BUDGET_RANK", 0)
+        self.debug_prefill_budget_sample = max(1, _env_int("NANOVLLM_DSA_DEBUG_PREFILL_BUDGET_SAMPLE", 8))
         self.log_decode_layer_timing = _env_flag(
             "NANOVLLM_LOG_DECODE_LAYER_TIMING",
             False,
@@ -1398,6 +1405,99 @@ class DeepseekV32DSAAttention(nn.Module):
             return context.flat_index_slot_mapping
         return self._flat_slots()
 
+    def _debug_prefill_budget_enabled(self) -> bool:
+        if not self.debug_prefill_budget:
+            return False
+        rank = _rank_id()
+        if self.debug_prefill_budget_rank >= 0 and rank != self.debug_prefill_budget_rank:
+            return False
+        return _profile_layer_selected(self.layer_id, self.num_layers)
+
+    def _debug_log_prefill_selection(
+        self,
+        *,
+        entry: int,
+        candidate_len: int,
+        selected_len: int,
+        selected_tokens: torch.Tensor,
+        mode: str,
+    ) -> None:
+        if not self._debug_prefill_budget_enabled():
+            return
+        selected_cpu = selected_tokens.detach().to("cpu", dtype=torch.long)
+        valid = selected_cpu[(selected_cpu >= 0) & (selected_cpu < candidate_len)]
+        sample = min(self.debug_prefill_budget_sample, int(valid.numel()))
+        tail512 = int((valid >= max(0, candidate_len - 512)).sum().item()) if valid.numel() else 0
+        tail1024 = int((valid >= max(0, candidate_len - 1024)).sum().item()) if valid.numel() else 0
+        tail2048 = int((valid >= max(0, candidate_len - 2048)).sum().item()) if valid.numel() else 0
+        first = valid[:sample].tolist() if sample > 0 else []
+        last = valid[-sample:].tolist() if sample > 0 else []
+        min_token = int(valid.min().item()) if valid.numel() else -1
+        max_token = int(valid.max().item()) if valid.numel() else -1
+        logger.info(
+            "DSA prefill budget select: rank=%d layer=%d entry=%d mode=%s candidate_len=%d "
+            "selected_len=%d valid=%d min=%d max=%d tail512=%d tail1024=%d tail2048=%d first=%s last=%s",
+            _rank_id(),
+            self.layer_id,
+            entry,
+            mode,
+            candidate_len,
+            selected_len,
+            int(valid.numel()),
+            min_token,
+            max_token,
+            tail512,
+            tail1024,
+            tail2048,
+            first,
+            last,
+        )
+
+    def _debug_log_prefill_materialize(
+        self,
+        *,
+        seq,
+        sparse_tokens: int,
+        selected_tokens: torch.Tensor,
+        src_flat_cpu: torch.Tensor,
+        dst_flat: torch.Tensor,
+    ) -> None:
+        if not self._debug_prefill_budget_enabled() or sparse_tokens <= 0:
+            return
+        device = self.ckv_cache.device
+        _profile_sync(device)
+        sample = min(self.debug_prefill_budget_sample, int(sparse_tokens))
+        probe_cpu = torch.unique(torch.cat((
+            torch.arange(sample, dtype=torch.long),
+            torch.arange(max(0, sparse_tokens - sample), sparse_tokens, dtype=torch.long),
+        )))
+        probe_dev = probe_cpu.to(device)
+        dst_probe = dst_flat.index_select(0, probe_dev)
+        src_probe_cpu = src_flat_cpu.index_select(0, probe_cpu)
+        selected_probe = selected_tokens.detach().to("cpu", dtype=torch.long).index_select(0, probe_cpu)
+
+        ckv_src = self.dram_ckv_cache.view(-1, self.kv_lora_rank).index_select(0, src_probe_cpu.to(self.dram_ckv_cache.device)).to(device=device, non_blocking=True)
+        kpe_src = self.dram_kpe_cache.view(-1, self.qk_rope_head_dim).index_select(0, src_probe_cpu.to(self.dram_kpe_cache.device)).to(device=device, non_blocking=True)
+        ckv_dst = self.ckv_cache.view(-1, self.kv_lora_rank).index_select(0, dst_probe)
+        kpe_dst = self.kpe_cache.view(-1, self.qk_rope_head_dim).index_select(0, dst_probe)
+        _profile_sync(device)
+        ckv_max = float((ckv_dst.float() - ckv_src.float()).abs().max().item()) if ckv_dst.numel() else 0.0
+        kpe_max = float((kpe_dst.float() - kpe_src.float()).abs().max().item()) if kpe_dst.numel() else 0.0
+        logger.info(
+            "DSA prefill budget materialize: rank=%d layer=%d entry=%d sparse_tokens=%d "
+            "num_sparse_blocks=%d ckv_max_abs=%.6g kpe_max_abs=%.6g selected_probe=%s src_flat=%s dst_flat=%s",
+            _rank_id(),
+            self.layer_id,
+            int(seq.hbm_cached_tokens_pool_entry),
+            int(sparse_tokens),
+            int(seq.num_sparse_blocks),
+            ckv_max,
+            kpe_max,
+            selected_probe.tolist(),
+            src_probe_cpu.tolist(),
+            dst_probe.detach().to("cpu", dtype=torch.long).tolist(),
+        )
+
     def finalize_prefill_offload(
         self,
         seq,
@@ -1475,6 +1575,7 @@ class DeepseekV32DSAAttention(nn.Module):
         kpe_values = self.dram_kpe_cache.view(-1, self.qk_rope_head_dim).index_select(0, kpe_src_index).to(device=device, non_blocking=True)
         self.ckv_cache.view(-1, self.kv_lora_rank).index_copy_(0, dst_flat, ckv_values)
         self.kpe_cache.view(-1, self.qk_rope_head_dim).index_copy_(0, dst_flat, kpe_values)
+        self._debug_log_prefill_materialize(seq=seq, sparse_tokens=sparse_tokens, selected_tokens=selected_tokens, src_flat_cpu=src_flat_cpu, dst_flat=dst_flat)
 
     def _prefill_select_sparse_budget(
         self,
@@ -1509,7 +1610,9 @@ class DeepseekV32DSAAttention(nn.Module):
             selected_len = min(selected_len, candidate_len, int(pool.shape[0]))
             if selected_len <= 0:
                 continue
-            if selected_len == candidate_len:
+            if self.prefill_budget_mode == "suffix":
+                selected_tokens = torch.arange(candidate_len - selected_len, candidate_len, dtype=torch.int32, device=pool.device)
+            elif selected_len == candidate_len:
                 selected_tokens = torch.arange(candidate_len, dtype=torch.int32, device=pool.device)
             else:
                 query_pos = end - 1
@@ -1520,6 +1623,7 @@ class DeepseekV32DSAAttention(nn.Module):
                 selected_tokens = torch.topk(scores.sum(dim=-1), k=selected_len, largest=True).indices.to(torch.int32)
                 selected_tokens = torch.sort(selected_tokens).values
             pool[:selected_len] = selected_tokens
+            self._debug_log_prefill_selection(entry=entry, candidate_len=candidate_len, selected_len=selected_len, selected_tokens=selected_tokens, mode=self.prefill_budget_mode)
 
         # Old suffix-block initialization used to live in finalize_prefill_offload.
         # Selection now happens here; finalize only materializes the chosen ids.

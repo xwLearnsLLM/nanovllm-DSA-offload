@@ -78,3 +78,23 @@ PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_ENABLE_DECODE_ML
 ```bash
 PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_ENABLE_DECODE_MLAPO=1 NANOVLLM_PROMPT_LENGTHS=12288 python3 example/long_prompts.py
 ```
+
+## 2026-06-01 22:33:41：prefill sparse budget 诊断切分与 MLA KV 顺序单测
+
+下一次请在昇腾上先跑 MLA KV 顺序交换单测：
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/probe_mla_kv_permutation.py --device npu:0 --backend v2 --kv-len 4096 --block-size 128 --heads 8 --kv-lora-rank 512 --rope-dim 64 --warmup 5 --iters 20 --fail-on-diff
+```
+
+再跑 score 选 token 的 prefill sparse budget 诊断：
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_ENABLE_DECODE_MLAPO=0 NANOVLLM_DSA_OFFLOAD_FIXED_TX=0 NANOVLLM_DSA_PREFILL_BUDGET_MODE=score NANOVLLM_DSA_DEBUG_PREFILL_BUDGET=1 NANOVLLM_PROFILE_LAYER_IDS=0,mid,last NANOVLLM_PROMPT_LENGTHS=8064,8192 python3 example/test.py
+```
+
+最后跑 suffix budget 对照。如果 suffix 正常而 score 异常，说明主要是 token 选择策略问题；如果 suffix 也异常，说明重点查 materialize / block_table / context_lens：
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_ENABLE_DECODE_MLAPO=0 NANOVLLM_DSA_OFFLOAD_FIXED_TX=0 NANOVLLM_DSA_PREFILL_BUDGET_MODE=suffix NANOVLLM_DSA_DEBUG_PREFILL_BUDGET=1 NANOVLLM_PROFILE_LAYER_IDS=0,mid,last NANOVLLM_PROMPT_LENGTHS=8064,8192 python3 example/test.py
+```
