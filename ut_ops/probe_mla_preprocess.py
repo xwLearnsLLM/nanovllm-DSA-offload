@@ -96,32 +96,43 @@ def to_mlapo_nz_weight(
 def make_cos_sin(
     tokens: int,
     rope_dim: int,
+    position_offset: int,
     device: torch.device,
     dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     inv_freq = 1.0 / (
         10000.0 ** (torch.arange(0, rope_dim, 2, device=device, dtype=torch.float32) / rope_dim)
     )
-    positions = torch.arange(tokens, device=device, dtype=torch.float32)
+    positions = torch.arange(position_offset, position_offset + tokens, device=device, dtype=torch.float32)
     freqs = torch.einsum("i,j->ij", positions, inv_freq)
     cos = torch.cat((freqs.cos(), freqs.cos()), dim=-1).to(dtype).contiguous()
     sin = torch.cat((freqs.sin(), freqs.sin()), dim=-1).to(dtype).contiguous()
     return cos, sin
 
 
-def diff(name: str, actual: torch.Tensor, expected: torch.Tensor) -> None:
+def diff(name: str, actual: torch.Tensor, expected: torch.Tensor, atol: float, rtol: float) -> bool:
     a = actual.float()
     e = expected.float()
     d = (a - e).abs()
     value_range = float(e.max().item() - e.min().item())
     denom = value_range if value_range > 0 else 1.0
+    allowed = atol + rtol * e.abs()
+    bad = d > allowed
+    flat_idx = int(d.reshape(-1).argmax().item()) if d.numel() else 0
+    got_value = float(a.reshape(-1)[flat_idx].item()) if d.numel() else 0.0
+    exp_value = float(e.reshape(-1)[flat_idx].item()) if d.numel() else 0.0
+    max_allowed = float(allowed.reshape(-1)[flat_idx].item()) if d.numel() else 0.0
+    bad_count = int(bad.sum().item()) if bad.numel() else 0
     print(
         f"MLAPO_DIFF {name} max_abs={d.max().item():.6g} "
         f"mean_abs={d.mean().item():.6g} "
         f"relative_max_error={d.max().item() / denom:.6g} "
         f"relative_mean_abs_error={d.mean().item() / denom:.6g} "
-        f"expected_range={value_range:.6g}"
+        f"expected_range={value_range:.6g} bad_count={bad_count} "
+        f"max_index={flat_idx} actual={got_value:.6g} expected={exp_value:.6g} "
+        f"max_allowed={max_allowed:.6g}"
     )
+    return bad_count == 0
 
 
 def build_inputs(args: argparse.Namespace, device: torch.device, dtype: torch.dtype) -> dict[str, torch.Tensor]:
@@ -159,8 +170,8 @@ def build_inputs(args: argparse.Namespace, device: torch.device, dtype: torch.dt
     gamma1 = (torch.randn(args.q_lora_rank, device=device, dtype=dtype) * 0.01 + 1.0).contiguous()
     beta1 = torch.zeros(args.q_lora_rank, device=device, dtype=dtype).contiguous()
     gamma2 = (torch.randn(args.kv_lora_rank, device=device, dtype=dtype) * 0.01 + 1.0).contiguous()
-    cos, sin = make_cos_sin(args.tokens, args.rope_dim, device, dtype)
-    blocks = max(args.blocks, math.ceil(args.tokens / args.block_size))
+    cos, sin = make_cos_sin(args.tokens, args.rope_dim, args.position_offset, device, dtype)
+    blocks = max(args.blocks, math.ceil((args.slot_offset + args.tokens) / args.block_size))
     ckv_cache = torch.zeros(
         blocks,
         args.block_size,
@@ -177,7 +188,7 @@ def build_inputs(args: argparse.Namespace, device: torch.device, dtype: torch.dt
         device=device,
         dtype=dtype,
     )
-    slotmapping = torch.arange(args.tokens, device=device, dtype=torch.int32).contiguous()
+    slotmapping = torch.arange(args.slot_offset, args.slot_offset + args.tokens, device=device, dtype=torch.int32).contiguous()
     return {
         "hidden": hidden.contiguous(),
         "wdqkv": wdqkv,
@@ -199,7 +210,7 @@ def build_inputs(args: argparse.Namespace, device: torch.device, dtype: torch.dt
 def reference(
     tensors: dict[str, torch.Tensor],
     args: argparse.Namespace,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     qkv = F.linear(tensors["hidden"], tensors["wdqkv_ref"])
     kv, q_c = torch.split(
         qkv,
@@ -227,13 +238,13 @@ def reference(
     slots = tensors["slotmapping"].to(torch.long)
     ckv_cache.view(-1, args.kv_lora_rank).index_copy_(0, slots, ckv)
     kpe_cache.view(-1, args.rope_dim).index_copy_(0, slots, k_pe)
-    return ql_nope, q_pe, ckv_cache, kpe_cache
+    return ql_nope, q_pe, ckv_cache, kpe_cache, q_c
 
 
 def run_mlapo(
     tensors: dict[str, torch.Tensor],
     args: argparse.Namespace,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     ql_nope = torch.empty(
         args.tokens,
         args.heads,
@@ -250,7 +261,10 @@ def run_mlapo(
     )
     ckv_cache = torch.zeros_like(tensors["ckv_cache"])
     kpe_cache = torch.zeros_like(tensors["kpe_cache"])
-    inner_out = torch.empty(0, device=tensors["hidden"].device, dtype=tensors["hidden"].dtype)
+    if args.enable_inner_out:
+        inner_out = torch.empty(args.tokens, args.q_lora_rank, device=tensors["hidden"].device, dtype=tensors["hidden"].dtype)
+    else:
+        inner_out = torch.empty(0, device=tensors["hidden"].device, dtype=tensors["hidden"].dtype)
     ascend_ops.mla_preprocess(
         tensors["hidden"],
         tensors["wdqkv"],
@@ -273,9 +287,9 @@ def run_mlapo(
         inner_out=inner_out,
         cache_mode=args.cache_mode,
         quant_mode=args.quant_mode,
-        enable_inner_out=False,
+        enable_inner_out=args.enable_inner_out,
     )
-    return ql_nope, q_pe, ckv_cache, kpe_cache
+    return ql_nope, q_pe, ckv_cache, kpe_cache, inner_out
 
 
 def main() -> None:
@@ -290,6 +304,8 @@ def main() -> None:
     parser.add_argument("--rope-dim", type=int, default=64)
     parser.add_argument("--block-size", type=int, default=128)
     parser.add_argument("--blocks", type=int, default=1)
+    parser.add_argument("--position-offset", type=int, default=0)
+    parser.add_argument("--slot-offset", type=int, default=0)
     parser.add_argument("--rms-eps", type=float, default=1e-6)
     parser.add_argument("--init-scale", type=float, default=0.02)
     parser.add_argument("--seed", type=int, default=0)
@@ -313,6 +329,10 @@ def main() -> None:
     )
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iters", type=int, default=10)
+    parser.add_argument("--enable-inner-out", action="store_true")
+    parser.add_argument("--atol", type=float, default=0.03125)
+    parser.add_argument("--rtol", type=float, default=0.01)
+    parser.add_argument("--fail-on-diff", action="store_true")
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -328,7 +348,9 @@ def main() -> None:
         f"q_lora={args.q_lora_rank} kv_lora={args.kv_lora_rank} "
         f"nope={args.nope_dim} rope={args.rope_dim} cache_mode={args.cache_mode} "
         f"quant_mode={args.quant_mode} format_cast={not args.no_format_cast} "
-        f"weight_block_cols={args.weight_block_cols}"
+        f"position_offset={args.position_offset} slot_offset={args.slot_offset} "
+        f"weight_block_cols={args.weight_block_cols} enable_inner_out={args.enable_inner_out} "
+        f"atol={args.atol} rtol={args.rtol}"
     )
     for name in (
         "hidden",
@@ -351,21 +373,33 @@ def main() -> None:
     sync(device)
     actual = run_mlapo(tensors, args)
     sync(device)
-    for name, out in zip(("ql_nope", "q_pe", "ckv_cache", "kpe_cache"), actual):
+    names = ["ql_nope", "q_pe", "ckv_cache", "kpe_cache"]
+    if args.enable_inner_out:
+        names.append("inner_out")
+
+    for name, out in zip(names, actual):
         print("MLAPO_PROBE after_mlapo " + desc(name, out))
-    for name, got, exp in zip(("ql_nope", "q_pe", "ckv_cache", "kpe_cache"), actual, expected):
-        diff(name, got, exp)
+
+    ok = True
+    for name, got, exp in zip(names, actual, expected):
+        ok = diff(name, got, exp, args.atol, args.rtol) and ok
     slots = tensors["slotmapping"].to(torch.long)
-    diff(
+    ok = diff(
         "ckv_cache_valid",
         actual[2].view(-1, args.kv_lora_rank).index_select(0, slots),
         expected[2].view(-1, args.kv_lora_rank).index_select(0, slots),
-    )
-    diff(
+        args.atol,
+        args.rtol,
+    ) and ok
+    ok = diff(
         "kpe_cache_valid",
         actual[3].view(-1, args.rope_dim).index_select(0, slots),
         expected[3].view(-1, args.rope_dim).index_select(0, slots),
-    )
+        args.atol,
+        args.rtol,
+    ) and ok
+    if args.fail_on_diff and not ok:
+        raise AssertionError("mla_preprocess output differs from torch reference")
 
     for _ in range(args.warmup):
         run_mlapo(tensors, args)
