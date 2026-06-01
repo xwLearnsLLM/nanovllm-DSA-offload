@@ -20,6 +20,20 @@ PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/probe_mla
 PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_ENABLE_DECODE_MLAPO=1 python3 example/long_prompts.py
 ```
 
+## 2026-06-01 21:11:14：验证首个 decode fallback 后的长短混合 DSA 路径
+
+下一次请在昇腾上先跑这个：
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_ENABLE_DECODE_MLAPO=1 NANOVLLM_PROMPT_LENGTHS=256,12288,14000,18000 python3 example/test.py
+```
+
+如果长序列输出仍然异常，再跑一个 MLAPO 关闭对照，用来区分是 MLAPO 问题还是 DSA/offload budget 问题：
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_ENABLE_DECODE_MLAPO=0 NANOVLLM_PROMPT_LENGTHS=256,12288,14000,18000 python3 example/test.py
+```
+
 再跑一个会触发 DSA decode update 的长序列：
 
 ```bash
