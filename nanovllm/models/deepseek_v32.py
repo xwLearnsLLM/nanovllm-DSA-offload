@@ -1177,7 +1177,6 @@ class DeepseekV32DSAAttention(nn.Module):
         num_tokens: int,
         dtype: torch.dtype,
         device: torch.device,
-        need_inner_out: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         ql_shape = (num_tokens, self.num_local_heads, self.kv_lora_rank)
         qpe_shape = (num_tokens, self.num_local_heads, self.qk_rope_head_dim)
@@ -1205,24 +1204,25 @@ class DeepseekV32DSAAttention(nn.Module):
             )
         if (
             self._decode_mlapo_inner_out is None
-            or tuple(self._decode_mlapo_inner_out.shape) != ((num_tokens, self.q_lora_rank) if need_inner_out else (0,))
+            or tuple(self._decode_mlapo_inner_out.shape) != (0,)
             or self._decode_mlapo_inner_out.dtype != dtype
             or self._decode_mlapo_inner_out.device != device
         ):
-            # enable_inner_out changes the MLAPO kernel path. Keep it off for
-            # dense/no-offload decode to match baseline accuracy; request q_c
-            # only when DSA update needs the query-only indexer.
-            q_c_shape = (num_tokens, self.q_lora_rank) if need_inner_out else (0,)
-            self._decode_mlapo_inner_out = torch.empty(
-                q_c_shape,
-                dtype=dtype,
-                device=device,
-            )
-        return (
-            self._decode_mlapo_ql_nope,
-            self._decode_mlapo_q_pe,
-            self._decode_mlapo_inner_out,
-        )
+            # The CANN enable_inner_out branch is not numerically aligned yet
+            # (probe_mla_preprocess sees NaNs / wrong cache writes). Keep MLAPO
+            # on the stable non-inner branch and recompute q_c separately when
+            # DSA needs it.
+            self._decode_mlapo_inner_out = torch.empty(0, dtype=dtype, device=device)
+        return self._decode_mlapo_ql_nope, self._decode_mlapo_q_pe, self._decode_mlapo_inner_out
+
+    # Temporary q_c fallback for DSA decode. Remove this once mla_preprocess
+    # enable_inner_out=True is fixed and matches the torch reference.
+    def _decode_mlapo_q_c_fallback(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.fuse_qkv_a:
+            q_c = F.linear(hidden_states, self.wd_qkv[: self.q_lora_rank])
+        else:
+            q_c = self.q_a_proj(hidden_states)
+        return self.q_a_layernorm(q_c)
 
     def _decode_mlapo_preprocess(
         self,
@@ -1241,7 +1241,6 @@ class DeepseekV32DSAAttention(nn.Module):
             num_tokens,
             dtype=hidden_states.dtype,
             device=hidden_states.device,
-            need_inner_out=need_inner_out,
         )
         cos, sin = self._mlapo_cos_sin(positions, hidden_states.dtype)
         slotmapping = self._flat_slots_i32()
@@ -1269,8 +1268,10 @@ class DeepseekV32DSAAttention(nn.Module):
             inner_out=inner_out,
             cache_mode="krope_ctkv",
             quant_mode="no_quant",
-            enable_inner_out=need_inner_out,
+            enable_inner_out=False,
         )
+        if need_inner_out:
+            inner_out = self._decode_mlapo_q_c_fallback(hidden_states)
         if not self.mla_rope_neox_cache:
             # mla_preprocess produces RoPE vectors in neox order. The normal
             # cache convention is interleaved, so only the current slots need a
