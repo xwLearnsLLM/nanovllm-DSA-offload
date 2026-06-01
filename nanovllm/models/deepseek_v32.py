@@ -951,6 +951,10 @@ class DeepseekV32DSAAttention(nn.Module):
             "NANOVLLM_DECODE_LAYER_TIMING_SYNC",
             True,
         )
+        self.debug_decode_mlapo_compare = _env_flag("NANOVLLM_DEBUG_DECODE_MLAPO_COMPARE", False)
+        self.debug_decode_mlapo_compare_rank = _env_int("NANOVLLM_DEBUG_DECODE_MLAPO_COMPARE_RANK", 0)
+        self.debug_decode_mlapo_compare_limit = _env_int("NANOVLLM_DEBUG_DECODE_MLAPO_COMPARE_LIMIT", 2)
+        self._debug_decode_mlapo_compare_count = 0
         self.log_decode_layer_timing = _env_flag(
             "NANOVLLM_LOG_DECODE_LAYER_TIMING",
             False,
@@ -1224,6 +1228,78 @@ class DeepseekV32DSAAttention(nn.Module):
             q_c = self.q_a_proj(hidden_states)
         return self.q_a_layernorm(q_c)
 
+    def _debug_tensor_diff(self, name: str, actual: torch.Tensor, expected: torch.Tensor) -> None:
+        diff = (actual.float() - expected.float()).abs()
+        max_abs = float(diff.max().item()) if diff.numel() else 0.0
+        mean_abs = float(diff.mean().item()) if diff.numel() else 0.0
+        bad_count = int((diff > 0.03125 + 0.01 * expected.float().abs()).sum().item()) if diff.numel() else 0
+        logger.info(
+            "MLAPO live diff: rank=%d layer=%d %s shape=%s max_abs=%.6g mean_abs=%.6g bad_count=%d",
+            _rank_id(),
+            self.layer_id,
+            name,
+            tuple(actual.shape),
+            max_abs,
+            mean_abs,
+            bad_count,
+        )
+
+    # Debug-only exact compare against the torch decode path using real model
+    # hidden states. This catches MLAPO mismatches that random standalone probes
+    # may miss.
+    def _debug_compare_decode_mlapo(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        ql_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+    ) -> None:
+        if not self.debug_decode_mlapo_compare:
+            return
+        rank = _rank_id()
+        if self.debug_decode_mlapo_compare_rank >= 0 and rank != self.debug_decode_mlapo_compare_rank:
+            return
+        if self._debug_decode_mlapo_compare_count >= self.debug_decode_mlapo_compare_limit:
+            return
+        if not _profile_layer_selected(self.layer_id, self.num_layers):
+            return
+
+        with torch.inference_mode():
+            if self.fuse_qkv_a:
+                qkv_a = F.linear(hidden_states, self.wd_qkv)
+                q_c, kv = torch.split(qkv_a, [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1)
+            else:
+                q_c = self.q_a_proj(hidden_states)
+                kv = self.kv_a_proj_with_mqa(hidden_states)
+            q_c = self.q_a_layernorm(q_c)
+            q = self.q_b_proj(q_c).view(-1, self.num_local_heads, self.qk_head_dim)
+            q_nope, q_pe_ref = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+            ckv_ref, k_pe_ref = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+            ckv_ref = self.kv_a_layernorm(ckv_ref)
+            q_pe_ref, k_pe_ref = self.rotary_emb(positions, q_pe_ref, k_pe_ref.unsqueeze(1))
+            k_pe_ref = k_pe_ref.squeeze(1)
+            if self.mla_rope_neox_cache:
+                q_pe_ref = _rope_interleaved_to_neox(q_pe_ref)
+                k_pe_ref = _rope_interleaved_to_neox(k_pe_ref)
+            ql_nope_ref = self._q_nope_up_proj(q_nope)
+            slots = self._flat_slots()
+            ckv_actual = self.ckv_cache.view(-1, self.kv_lora_rank).index_select(0, slots)
+            kpe_actual = self.kpe_cache.view(-1, self.qk_rope_head_dim).index_select(0, slots)
+
+            logger.info(
+                "MLAPO live compare: rank=%d layer=%d positions=%s slots=%s needs_dsa_update=%s",
+                rank,
+                self.layer_id,
+                positions.detach().cpu().tolist(),
+                slots.detach().cpu().tolist(),
+                get_context().needs_dsa_update,
+            )
+            self._debug_tensor_diff("ql_nope", ql_nope, ql_nope_ref)
+            self._debug_tensor_diff("q_pe", q_pe, q_pe_ref)
+            self._debug_tensor_diff("ckv_current_slots", ckv_actual, ckv_ref)
+            self._debug_tensor_diff("kpe_current_slots", kpe_actual, k_pe_ref)
+            self._debug_decode_mlapo_compare_count += 1
+
     def _decode_mlapo_preprocess(
         self,
         positions: torch.Tensor,
@@ -1283,6 +1359,7 @@ class DeepseekV32DSAAttention(nn.Module):
             k_pe = kpe_flat.index_select(0, slots)
             kpe_flat.index_copy_(0, slots, _rope_neox_to_interleaved(k_pe))
         self._decode_timer_end(profile_decode, "mlapo", start, ql_nope.device)
+        self._debug_compare_decode_mlapo(positions, hidden_states, ql_nope, q_pe)
         return ql_nope, q_pe, inner_out
 
     @property
