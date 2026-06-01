@@ -455,11 +455,13 @@ class ModelRunner:
         sparse_kv_lens = []
         req_pool_entries = []
         needs_dsa_update = False
+        has_first_decode = False
         for seq in seqs:
             input_ids.append(seq.last_token)
             position = len(seq) - 1
             positions.append(position)
             decode_len = len(seq) - seq.num_prompt_tokens
+            has_first_decode = has_first_decode or decode_len <= 1
             tail_decode_offset = position - seq.num_prefill_full_blocks * self.block_size
             hbm_logical_block = seq.num_sparse_blocks + tail_decode_offset // self.block_size
             hbm_offset = tail_decode_offset % self.block_size
@@ -529,6 +531,7 @@ class ModelRunner:
                     decode_lens=decode_lens,
                     sparse_kv_lens=sparse_kv_lens_tensor,
                     needs_dsa_update=needs_dsa_update,
+                    has_first_decode=has_first_decode,
                     is_enforce_eager=True,
                     real_bs=len(seqs),
                     block_size=self.config.kvcache_block_size)

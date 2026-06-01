@@ -1229,12 +1229,17 @@ class DeepseekV32DSAAttention(nn.Module):
         return self.q_a_layernorm(q_c)
 
     def _debug_tensor_diff(self, name: str, actual: torch.Tensor, expected: torch.Tensor) -> None:
-        diff = (actual.float() - expected.float()).abs()
-        max_abs = float(diff.max().item()) if diff.numel() else 0.0
-        mean_abs = float(diff.mean().item()) if diff.numel() else 0.0
-        bad_count = int((diff > 0.03125 + 0.01 * expected.float().abs()).sum().item()) if diff.numel() else 0
+        actual_f = actual.float()
+        expected_f = expected.float()
+        diff = (actual_f - expected_f).abs()
+        finite = torch.isfinite(diff) & torch.isfinite(actual_f) & torch.isfinite(expected_f)
+        nonfinite_count = int((~finite).sum().item()) if diff.numel() else 0
+        finite_diff = diff[finite]
+        max_abs = float(finite_diff.max().item()) if finite_diff.numel() else float("nan")
+        mean_abs = float(finite_diff.mean().item()) if finite_diff.numel() else float("nan")
+        bad_count = int(((diff > 0.03125 + 0.01 * expected_f.abs()) | (~finite)).sum().item()) if diff.numel() else 0
         logger.info(
-            "MLAPO live diff: rank=%d layer=%d %s shape=%s max_abs=%.6g mean_abs=%.6g bad_count=%d",
+            "MLAPO live diff: rank=%d layer=%d %s shape=%s max_abs=%.6g mean_abs=%.6g bad_count=%d nonfinite_count=%d",
             _rank_id(),
             self.layer_id,
             name,
@@ -1242,6 +1247,7 @@ class DeepseekV32DSAAttention(nn.Module):
             max_abs,
             mean_abs,
             bad_count,
+            nonfinite_count,
         )
 
     # Debug-only exact compare against the torch decode path using real model
@@ -2069,6 +2075,7 @@ class DeepseekV32DSAAttention(nn.Module):
         use_decode_mlapo = (
             self.enable_decode_mlapo
             and not context.is_prefill
+            and not context.has_first_decode
         )
         if use_decode_mlapo:
             ql_nope, q_pe, q_c = self._decode_mlapo_preprocess(

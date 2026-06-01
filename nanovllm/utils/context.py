@@ -31,6 +31,7 @@ class Context:
     decode_lens: torch.Tensor | None = None
     sparse_kv_lens: torch.Tensor | None = None
     needs_dsa_update: bool = False
+    has_first_decode: bool = False
     is_enforce_eager: bool = True
     real_bs: int = -1
     block_size: int = 256
@@ -51,7 +52,7 @@ def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0
                 index_slot_mapping=None, flat_index_slot_mapping=None, req_pool_entries=None, candidate_lens=None,
                 candidate_query_lens=None, max_candidate_len=None, sparse_selected_lens=None, prefill_tail_lens=None,
                 decode_lens=None, sparse_kv_lens=None,
-                needs_dsa_update=None, is_enforce_eager=None, real_bs=None, block_size=None, flat_slot_mapping_i32=None):
+                needs_dsa_update=None, has_first_decode=None, is_enforce_eager=None, real_bs=None, block_size=None, flat_slot_mapping_i32=None):
     global _CONTEXT
     if is_enforce_eager is None:
         is_enforce_eager = True
@@ -63,6 +64,8 @@ def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0
         max_candidate_len = 0
     if needs_dsa_update is None:
         needs_dsa_update = False
+    if has_first_decode is None:
+        has_first_decode = False
     _CONTEXT = Context(
         is_prefill=is_prefill,
         cu_seqlens_q=cu_seqlens_q,
@@ -89,6 +92,7 @@ def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0
         decode_lens=decode_lens,
         sparse_kv_lens=sparse_kv_lens,
         needs_dsa_update=needs_dsa_update,
+        has_first_decode=has_first_decode,
         is_enforce_eager=is_enforce_eager,
         real_bs=real_bs,
         block_size=block_size,
