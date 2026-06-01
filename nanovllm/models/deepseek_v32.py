@@ -1177,12 +1177,10 @@ class DeepseekV32DSAAttention(nn.Module):
         num_tokens: int,
         dtype: torch.dtype,
         device: torch.device,
+        need_inner_out: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         ql_shape = (num_tokens, self.num_local_heads, self.kv_lora_rank)
         qpe_shape = (num_tokens, self.num_local_heads, self.qk_rope_head_dim)
-        # MLAPO can expose the post-q_a_layernorm latent q_c. Reusing it keeps
-        # DSA decode from recomputing the same q_a projection path.
-        q_c_shape = (num_tokens, self.q_lora_rank)
         if (
             self._decode_mlapo_ql_nope is None
             or tuple(self._decode_mlapo_ql_nope.shape) != ql_shape
@@ -1207,10 +1205,14 @@ class DeepseekV32DSAAttention(nn.Module):
             )
         if (
             self._decode_mlapo_inner_out is None
-            or tuple(self._decode_mlapo_inner_out.shape) != q_c_shape
+            or tuple(self._decode_mlapo_inner_out.shape) != ((num_tokens, self.q_lora_rank) if need_inner_out else (0,))
             or self._decode_mlapo_inner_out.dtype != dtype
             or self._decode_mlapo_inner_out.device != device
         ):
+            # enable_inner_out changes the MLAPO kernel path. Keep it off for
+            # dense/no-offload decode to match baseline accuracy; request q_c
+            # only when DSA update needs the query-only indexer.
+            q_c_shape = (num_tokens, self.q_lora_rank) if need_inner_out else (0,)
             self._decode_mlapo_inner_out = torch.empty(
                 q_c_shape,
                 dtype=dtype,
@@ -1227,6 +1229,7 @@ class DeepseekV32DSAAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         profile_decode: bool,
+        need_inner_out: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.mlapo_wd_qkv is None or self.mlapo_wu_q is None:
             self._prepare_decode_mlapo()
@@ -1238,6 +1241,7 @@ class DeepseekV32DSAAttention(nn.Module):
             num_tokens,
             dtype=hidden_states.dtype,
             device=hidden_states.device,
+            need_inner_out=need_inner_out,
         )
         cos, sin = self._mlapo_cos_sin(positions, hidden_states.dtype)
         slotmapping = self._flat_slots_i32()
@@ -1265,7 +1269,7 @@ class DeepseekV32DSAAttention(nn.Module):
             inner_out=inner_out,
             cache_mode="krope_ctkv",
             quant_mode="no_quant",
-            enable_inner_out=True,
+            enable_inner_out=need_inner_out,
         )
         if not self.mla_rope_neox_cache:
             # mla_preprocess produces RoPE vectors in neox order. The normal
@@ -1993,6 +1997,7 @@ class DeepseekV32DSAAttention(nn.Module):
                 positions,
                 hidden_states,
                 profile_decode,
+                need_inner_out=context.needs_dsa_update,
             )
             q_index = index_k = weights = None
             if context.needs_dsa_update:
