@@ -370,6 +370,7 @@ class ModelRunner:
         candidate_lens = []
         sparse_selected_lens = []
         req_pool_entries = []
+        needs_dsa_update = False
 
         for seq in seqs:
             actual_tokens = seq[:]
@@ -396,6 +397,7 @@ class ModelRunner:
                 )
             candidate_lens.append(seq.num_prefill_full_blocks * self.block_size)
             sparse_selected_lens.append(seq.num_sparse_tokens)
+            needs_dsa_update = needs_dsa_update or (candidate_lens[-1] > sparse_selected_lens[-1] > 0)
             req_pool_entries.append(seq.hbm_cached_tokens_pool_entry)
 
         hbm_block_tables = self.prepare_block_tables(seqs, "hbm_block_table")
@@ -434,6 +436,7 @@ class ModelRunner:
                     req_pool_entries=req_pool_entries,
                     candidate_lens=candidate_lens,
                     sparse_selected_lens=sparse_selected_lens,
+                    needs_dsa_update=needs_dsa_update,
                     real_bs=len(seqs),
                     block_size=self.config.kvcache_block_size)
 

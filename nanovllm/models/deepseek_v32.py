@@ -1898,6 +1898,8 @@ class DeepseekV32DSAAttention(nn.Module):
         weights: torch.Tensor | None,
     ) -> torch.Tensor:
         self.last_decode_attention_op_time = 0.0
+        if not get_context().needs_dsa_update:
+            return self._decode_forward_mla(ql_nope, q_pe, q_index, weights)
         if q_index is None or weights is None:
             raise RuntimeError("DSA offload decode requires indexer outputs.")
         return self._decode_forward_mla(ql_nope, q_pe, q_index, weights)
@@ -1917,7 +1919,8 @@ class DeepseekV32DSAAttention(nn.Module):
         assert actual_seq_lengths_key is not None
         block_table = context.block_tables[:batch_size]
         profile_decode = self.log_decode_layer_timing
-        self._dsa_offload_update(q_index, weights, batch_size)
+        if context.needs_dsa_update:
+            self._dsa_offload_update(q_index, weights, batch_size)
         start = self._decode_timer_start(profile_decode, ql_nope.device)
         if self.decode_mla_fia_v2:
             latent = self._decode_forward_mla_v2(
@@ -1991,13 +1994,15 @@ class DeepseekV32DSAAttention(nn.Module):
                 hidden_states,
                 profile_decode,
             )
-            q_index, index_k, weights = self._run_indexer(
-                hidden_states,
-                q_c,
-                positions,
-                profile_decode,
-                query_only=True,
-            )
+            q_index = index_k = weights = None
+            if context.needs_dsa_update:
+                q_index, index_k, weights = self._run_indexer(
+                    hidden_states,
+                    q_c,
+                    positions,
+                    profile_decode,
+                    query_only=True,
+                )
             if index_k is not None:
                 start = self._decode_timer_start(profile_decode, index_k.device)
                 self._store_index_cache(index_k)
@@ -2062,13 +2067,15 @@ class DeepseekV32DSAAttention(nn.Module):
             q_pe = _rope_interleaved_to_neox(q_pe)
             k_pe = _rope_interleaved_to_neox(k_pe)
 
-        q_index, index_k, weights = self._run_indexer(
-            hidden_states,
-            q_c,
-            positions,
-            profile_decode,
-            query_only=not context.is_prefill,
-        )
+        q_index = index_k = weights = None
+        if context.needs_dsa_update:
+            q_index, index_k, weights = self._run_indexer(
+                hidden_states,
+                q_c,
+                positions,
+                profile_decode,
+                query_only=not context.is_prefill,
+            )
 
         start = self._decode_timer_start(profile_decode, ckv.device)
         self._store_mla_cache(ckv, k_pe)
@@ -2085,7 +2092,8 @@ class DeepseekV32DSAAttention(nn.Module):
 
         if context.is_prefill:
             attn_output = self._prefill_forward(ql_nope, q_pe)
-            self._prefill_select_sparse_budget(q_index, index_k, weights)
+            if q_index is not None and index_k is not None and weights is not None:
+                self._prefill_select_sparse_budget(q_index, index_k, weights)
         else:
             attn_output = self._decode_forward(ql_nope, q_pe, q_index, weights)
 
