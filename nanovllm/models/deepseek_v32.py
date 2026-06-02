@@ -2037,7 +2037,7 @@ class DeepseekV32DSAAttention(nn.Module):
         batch_size: int,
     ) -> None:
         context = get_context()
-        if not context.needs_dsa_update:
+        if not context.needs_dsa_update or self.dsa_offload_fixed_tx <= 0:
             return
         required_context = {
             "candidate_lens": context.candidate_lens,
@@ -2136,7 +2136,7 @@ class DeepseekV32DSAAttention(nn.Module):
         weights: torch.Tensor | None,
     ) -> torch.Tensor:
         self.last_decode_attention_op_time = 0.0
-        if not get_context().needs_dsa_update:
+        if not get_context().needs_dsa_update or self.dsa_offload_fixed_tx <= 0:
             return self._decode_forward_mla(ql_nope, q_pe, q_index, weights)
         if q_index is None or weights is None:
             raise RuntimeError("DSA offload decode requires indexer outputs.")
@@ -2227,15 +2227,16 @@ class DeepseekV32DSAAttention(nn.Module):
             and not context.is_prefill
             and not context.has_first_decode
         )
+        needs_decode_dsa_update = bool(context.needs_dsa_update and self.dsa_offload_fixed_tx > 0)
         if use_decode_mlapo:
             ql_nope, q_pe, q_c = self._decode_mlapo_preprocess(
                 positions,
                 hidden_states,
                 profile_decode,
-                need_inner_out=context.needs_dsa_update,
+                need_inner_out=needs_decode_dsa_update,
             )
             q_index = index_k = weights = None
-            if context.needs_dsa_update:
+            if needs_decode_dsa_update:
                 q_index, index_k, weights = self._run_indexer(
                     hidden_states,
                     q_c,
@@ -2308,7 +2309,7 @@ class DeepseekV32DSAAttention(nn.Module):
             k_pe = _rope_interleaved_to_neox(k_pe)
 
         q_index = index_k = weights = None
-        if context.needs_dsa_update:
+        if context.needs_dsa_update and (context.is_prefill or self.dsa_offload_fixed_tx > 0):
             q_index, index_k, weights = self._run_indexer(
                 hidden_states,
                 q_c,
