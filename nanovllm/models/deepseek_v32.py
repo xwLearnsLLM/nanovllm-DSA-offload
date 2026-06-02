@@ -71,6 +71,18 @@ def _rank_id() -> int:
         return 0
 
 
+def _ranked_debug_dump_path(path: str, rank: int) -> str:
+    path = path.strip()
+    if not path:
+        return ""
+    root, ext = os.path.splitext(path)
+    actual_path = f"{root}_rank{rank}{ext}" if ext else f"{path}_rank{rank}.txt"
+    parent = os.path.dirname(actual_path)
+    if parent and not os.path.isdir(parent):
+        return ""
+    return actual_path
+
+
 def _profile_sync(device: torch.device) -> None:
     if device.type == "npu":
         torch.npu.synchronize()
@@ -962,6 +974,11 @@ class DeepseekV32DSAAttention(nn.Module):
         self.debug_decode_metadata = _env_flag("NANOVLLM_DSA_DEBUG_DECODE_METADATA", False)
         self.debug_decode_metadata_rank = _env_int("NANOVLLM_DSA_DEBUG_DECODE_METADATA_RANK", 0)
         self.debug_decode_metadata_sample = max(1, _env_int("NANOVLLM_DSA_DEBUG_DECODE_METADATA_SAMPLE", 8))
+        self.debug_index_update_dump_file = _ranked_debug_dump_path(
+            os.environ.get("NANOVLLM_DSA_DEBUG_INDEX_UPDATE_DUMP_PATH", ""),
+            _rank_id(),
+        )
+        self._debug_index_update_dump_count = 0
         self.log_decode_layer_timing = _env_flag(
             "NANOVLLM_LOG_DECODE_LAYER_TIMING",
             False,
@@ -1496,6 +1513,194 @@ class DeepseekV32DSAAttention(nn.Module):
                 selected_last,
             )
 
+    def _debug_index_update_enabled(self) -> bool:
+        return bool(self.debug_index_update_dump_file) and _profile_layer_selected(self.layer_id, self.num_layers)
+
+    def _debug_write_index_update_record(self, record: dict) -> None:
+        if not self.debug_index_update_dump_file:
+            return
+        try:
+            with open(self.debug_index_update_dump_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except OSError as exc:
+            logger.warning(
+                "Disable NANOVLLM_DSA_DEBUG_INDEX_UPDATE_DUMP_PATH for rank=%d layer=%d because write failed: %s",
+                _rank_id(),
+                self.layer_id,
+                exc,
+            )
+            self.debug_index_update_dump_file = ""
+
+    def _debug_index_update_pool_snapshot(
+        self,
+        pool_slice: torch.Tensor,
+        selected_lens: torch.Tensor,
+        req_pool_entries: torch.Tensor,
+        batch_size: int,
+    ) -> list[dict] | None:
+        if not self._debug_index_update_enabled():
+            return None
+        selected_cpu = selected_lens[:batch_size].detach().to("cpu", dtype=torch.long).tolist()
+        entries_cpu = req_pool_entries[:batch_size].detach().to("cpu", dtype=torch.long).tolist()
+        snapshots: list[dict] = []
+        for b in range(batch_size):
+            selected_len = max(0, int(selected_cpu[b]))
+            entry = int(entries_cpu[b])
+            active_pool: list[int] = []
+            if 0 <= entry < int(pool_slice.shape[0]) and selected_len > 0:
+                active_pool = pool_slice[entry, :selected_len].detach().to("cpu", dtype=torch.long).tolist()
+            snapshots.append({"batch": b, "entry": entry, "selected_len": selected_len, "pool_active": active_pool})
+        return snapshots
+
+    def _debug_dump_index_update(
+        self,
+        *,
+        update_id: int,
+        pool_before: list[dict] | None,
+        pool_slice: torch.Tensor,
+        promote_idx: torch.Tensor,
+        demote_idx: torch.Tensor,
+        copy_counts: torch.Tensor,
+        candidate_lens: torch.Tensor,
+        selected_lens: torch.Tensor,
+        req_pool_entries: torch.Tensor,
+        batch_size: int,
+    ) -> None:
+        if pool_before is None or not self._debug_index_update_enabled():
+            return
+        candidate_cpu = candidate_lens[:batch_size].detach().to("cpu", dtype=torch.long).tolist()
+        selected_cpu = selected_lens[:batch_size].detach().to("cpu", dtype=torch.long).tolist()
+        entries_cpu = req_pool_entries[:batch_size].detach().to("cpu", dtype=torch.long).tolist()
+        copy_counts_cpu = copy_counts[:batch_size].detach().to("cpu", dtype=torch.long).tolist()
+        promote_cpu = promote_idx[:batch_size].detach().to("cpu", dtype=torch.long).tolist()
+        demote_cpu = demote_idx[:batch_size].detach().to("cpu", dtype=torch.long).tolist()
+        pool_after = self._debug_index_update_pool_snapshot(pool_slice, selected_lens, req_pool_entries, batch_size) or []
+        for b in range(batch_size):
+            copy_count = max(0, int(copy_counts_cpu[b]))
+            record = {
+                "event": "dsa_index_update",
+                "rank": _rank_id(),
+                "layer": self.layer_id,
+                "update_id": update_id,
+                "batch": b,
+                "entry": int(entries_cpu[b]),
+                "candidate_len": int(candidate_cpu[b]),
+                "selected_len": int(selected_cpu[b]),
+                "copy_count": copy_count,
+                "promote_idx_full": promote_cpu[b],
+                "demote_idx_full": demote_cpu[b],
+                "promote_idx_valid": promote_cpu[b][:copy_count],
+                "demote_idx_valid": demote_cpu[b][:copy_count],
+                "pool_before_active": pool_before[b]["pool_active"] if b < len(pool_before) else [],
+                "pool_after_active": pool_after[b]["pool_active"] if b < len(pool_after) else [],
+            }
+            self._debug_write_index_update_record(record)
+
+    def _debug_validate_scatter_h2d(
+        self,
+        *,
+        update_id: int,
+        pool_slice: torch.Tensor,
+        copy_counts: torch.Tensor,
+        candidate_lens: torch.Tensor,
+        selected_lens: torch.Tensor,
+        req_pool_entries: torch.Tensor,
+        hbm_block_tables: torch.Tensor,
+        dram_block_tables: torch.Tensor,
+        batch_size: int,
+    ) -> None:
+        if not self._debug_index_update_enabled():
+            return
+        _profile_sync(self.ckv_cache.device)
+        candidate_cpu = candidate_lens[:batch_size].detach().to("cpu", dtype=torch.long).tolist()
+        selected_cpu = selected_lens[:batch_size].detach().to("cpu", dtype=torch.long).tolist()
+        entries_cpu = req_pool_entries[:batch_size].detach().to("cpu", dtype=torch.long).tolist()
+        copy_counts_cpu = copy_counts[:batch_size].detach().to("cpu", dtype=torch.long).tolist()
+        block_size = self.block_size
+        for b in range(batch_size):
+            candidate_len = int(candidate_cpu[b])
+            selected_len = int(selected_cpu[b])
+            entry = int(entries_cpu[b])
+            base_record = {
+                "event": "dsa_scatter_h2d_validate",
+                "rank": _rank_id(),
+                "layer": self.layer_id,
+                "update_id": update_id,
+                "batch": b,
+                "entry": entry,
+                "candidate_len": candidate_len,
+                "selected_len": selected_len,
+                "copy_count": int(copy_counts_cpu[b]),
+            }
+            if candidate_len <= selected_len:
+                base_record["status"] = "skipped_dense_request_no_dram_copy"
+                self._debug_write_index_update_record(base_record)
+                continue
+            if selected_len <= 0 or not (0 <= entry < int(pool_slice.shape[0])):
+                base_record["status"] = "skipped_invalid_pool_entry_or_selected_len"
+                self._debug_write_index_update_record(base_record)
+                continue
+
+            token_ids = pool_slice[entry, :selected_len].to(torch.long)
+            valid_mask = (token_ids >= 0) & (token_ids < candidate_len)
+            valid_count = int(valid_mask.sum().item())
+            token_ids_cpu = token_ids.detach().to("cpu", dtype=torch.long).tolist()
+            if valid_count != selected_len:
+                base_record.update({
+                    "status": "invalid_selected_token_id",
+                    "valid_count": valid_count,
+                    "selected_tokens": token_ids_cpu,
+                })
+                self._debug_write_index_update_record(base_record)
+                continue
+
+            logical_slots = torch.arange(selected_len, dtype=torch.long, device=token_ids.device)
+            hbm_logical_blocks = logical_slots // block_size
+            hbm_offsets = logical_slots % block_size
+            dram_logical_blocks = token_ids // block_size
+            dram_offsets = token_ids % block_size
+            hbm_table = hbm_block_tables[b].to(torch.long)
+            dram_table = dram_block_tables[b].to(torch.long)
+            if int(hbm_logical_blocks.max().item()) >= int(hbm_table.shape[0]) or int(dram_logical_blocks.max().item()) >= int(dram_table.shape[0]):
+                base_record.update({
+                    "status": "block_table_too_short",
+                    "max_hbm_logical_block": int(hbm_logical_blocks.max().item()),
+                    "hbm_table_len": int(hbm_table.shape[0]),
+                    "max_dram_logical_block": int(dram_logical_blocks.max().item()),
+                    "dram_table_len": int(dram_table.shape[0]),
+                    "selected_tokens": token_ids_cpu,
+                })
+                self._debug_write_index_update_record(base_record)
+                continue
+
+            hbm_blocks = hbm_table.index_select(0, hbm_logical_blocks)
+            dram_blocks = dram_table.index_select(0, dram_logical_blocks)
+            hbm_ckv = self.ckv_cache[hbm_blocks, hbm_offsets]
+            hbm_kpe = self.kpe_cache[hbm_blocks, hbm_offsets]
+            dram_ckv = self.dram_ckv_cache[dram_blocks, dram_offsets]
+            dram_kpe = self.dram_kpe_cache[dram_blocks, dram_offsets]
+            ckv_bad_slots = (hbm_ckv != dram_ckv).reshape(selected_len, -1).any(dim=1)
+            kpe_bad_slots = (hbm_kpe != dram_kpe).reshape(selected_len, -1).any(dim=1)
+            bad_slots = ckv_bad_slots | kpe_bad_slots
+            bad_slot_ids = torch.nonzero(bad_slots, as_tuple=False).flatten()
+            first_bad_slot = int(bad_slot_ids[0].item()) if bad_slot_ids.numel() else -1
+            ckv_diff = (hbm_ckv.float() - dram_ckv.float()).abs()
+            kpe_diff = (hbm_kpe.float() - dram_kpe.float()).abs()
+            base_record.update({
+                "status": "ok" if first_bad_slot < 0 else "mismatch",
+                "selected_tokens": token_ids_cpu,
+                "selected_first": token_ids_cpu[: self.debug_decode_metadata_sample],
+                "selected_last": token_ids_cpu[-self.debug_decode_metadata_sample :],
+                "mismatch_slots": int(bad_slots.sum().item()),
+                "first_bad_slot": first_bad_slot,
+                "first_bad_token": int(token_ids[first_bad_slot].item()) if first_bad_slot >= 0 else -1,
+                "ckv_max_abs": float(ckv_diff.max().item()) if ckv_diff.numel() else 0.0,
+                "kpe_max_abs": float(kpe_diff.max().item()) if kpe_diff.numel() else 0.0,
+                "ckv_nan_count": int(torch.isnan(hbm_ckv.float()).sum().item() + torch.isnan(dram_ckv.float()).sum().item()),
+                "kpe_nan_count": int(torch.isnan(hbm_kpe.float()).sum().item() + torch.isnan(dram_kpe.float()).sum().item()),
+            })
+            self._debug_write_index_update_record(base_record)
+
     def _init_prefill_sparse_token_pool(self, seq) -> None:
         entry = int(seq.hbm_cached_tokens_pool_entry)
         num_full_blocks = int(seq.num_prefill_full_blocks)
@@ -1973,6 +2178,14 @@ class DeepseekV32DSAAttention(nn.Module):
         )
 
         pool_slice = self.hbm_cached_tokens_pool[self.layer_id]
+        update_id = self._debug_index_update_dump_count
+        self._debug_index_update_dump_count += 1
+        pool_before = self._debug_index_update_pool_snapshot(
+            pool_slice,
+            selected_lens,
+            req_pool_entries,
+            batch_size,
+        )
         start = self._decode_timer_start(profile_decode, score_out.device)
         dsa_index_update(
             score_out,
@@ -1990,6 +2203,18 @@ class DeepseekV32DSAAttention(nn.Module):
             "dsa_index_update",
             start,
             score_out.device,
+        )
+        self._debug_dump_index_update(
+            update_id=update_id,
+            pool_before=pool_before,
+            pool_slice=pool_slice,
+            promote_idx=promote_idx,
+            demote_idx=demote_idx,
+            copy_counts=copy_counts,
+            candidate_lens=candidate_lens,
+            selected_lens=selected_lens,
+            req_pool_entries=req_pool_entries,
+            batch_size=batch_size,
         )
 
         start = self._decode_timer_start(profile_decode, self.ckv_cache.device)
@@ -2009,6 +2234,17 @@ class DeepseekV32DSAAttention(nn.Module):
             "dsa_scatter_h2d",
             start,
             self.ckv_cache.device,
+        )
+        self._debug_validate_scatter_h2d(
+            update_id=update_id,
+            pool_slice=pool_slice,
+            copy_counts=copy_counts,
+            candidate_lens=candidate_lens,
+            selected_lens=selected_lens,
+            req_pool_entries=req_pool_entries,
+            hbm_block_tables=context.hbm_block_tables[:batch_size],
+            dram_block_tables=context.dram_block_tables[:batch_size],
+            batch_size=batch_size,
         )
 
     def _decode_forward(

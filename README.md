@@ -9,7 +9,7 @@
 在昇腾机器的仓库根目录执行：
 
 ```bash
-SOC_VERSION=ascend910_9391 PYTHONPATH=$PWD:$PYTHONPATH bash scripts/build_nanovllm_ops.sh
+NANOVLLM_CANN_BUILD_JOBS=64 SOC_VERSION=ascend910_9391 PYTHONPATH=$PWD:$PYTHONPATH bash scripts/build_nanovllm_ops.sh
 ls -lh nanovllm/_C*.so nanovllm/libnanovllm_ascend_kernels.so
 ```
 
