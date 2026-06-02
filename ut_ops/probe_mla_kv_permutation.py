@@ -79,41 +79,44 @@ def run_mla_v2(
     kv_len: int,
     scale: float,
 ) -> torch.Tensor:
-    ckv_cache_v2 = ckv_cache.transpose(1, 2)
-    kpe_cache_v2 = kpe_cache.transpose(1, 2)
-    out = torch.empty_like(q_nope)
-    lse = torch.empty((int(q_nope.shape[0]), int(q_nope.shape[1]), 1), dtype=torch.float32, device=q_nope.device)
+    batch_size = int(q_nope.shape[0])
+    num_heads = int(q_nope.shape[1])
+    q_dim = int(q_nope.shape[2])
+    query = q_nope.view(batch_size, num_heads, 1, q_dim).contiguous()
+    query_rope = q_pe.view(batch_size, num_heads, 1, int(q_pe.shape[2])).contiguous()
+    key_cache = ckv_cache.view(-1, 1, int(ckv_cache.shape[1]), int(ckv_cache.shape[3]))
+    key_rope_cache = kpe_cache.view(-1, 1, int(kpe_cache.shape[1]), int(kpe_cache.shape[3]))
+    out = torch.empty((num_heads, batch_size, 1, q_dim), dtype=q_nope.dtype, device=q_nope.device)
+    lse = torch.empty((batch_size,), dtype=torch.float32, device=q_nope.device)
     info = dict(
-        head_num=int(q_nope.shape[1]),
-        input_layout="TND",
+        num_query_heads=num_heads,
+        num_key_value_heads=1,
+        input_layout="BNSD_NBSD",
         atten_mask=None,
-        scale_value=float(scale),
-        pre_tokens=2147483647,
-        next_tokens=2147483647,
         sparse_mode=0,
+        softmax_scale=float(scale),
         block_size=int(ckv_cache.shape[1]),
         block_table=block_table,
-        actual_seq_qlen=[int(q_nope.shape[0])],
-        actual_seq_kvlen=[int(kv_len)],
+        actual_seq_qlen=None,
+        actual_seq_kvlen=[int(kv_len)] * batch_size,
     )
     workspace = torch_npu._npu_fused_infer_attention_score_v2_get_max_workspace(
-        q_nope,
-        ckv_cache_v2,
-        ckv_cache_v2,
-        query_rope=q_pe,
-        key_rope=kpe_cache_v2,
+        query,
+        key_cache,
+        key_cache,
+        query_rope=query_rope,
+        key_rope=key_rope_cache,
         **info,
     )
     torch_npu.npu_fused_infer_attention_score_v2.out(
-        q_nope,
-        ckv_cache_v2,
-        ckv_cache_v2,
-        query_rope=q_pe,
-        key_rope=kpe_cache_v2,
-        attention_out=out,
-        softmax_lse=lse,
-        workspace=workspace,
+        query,
+        key_cache,
+        key_cache,
+        query_rope=query_rope,
+        key_rope=key_rope_cache,
         **info,
+        workspace=workspace,
+        out=[out, lse],
     )
     return out
 
@@ -172,7 +175,7 @@ def main() -> None:
         torch.npu.set_device(device)
 
     blocks = (args.kv_len + args.block_size - 1) // args.block_size
-    block_table = torch.arange(blocks, dtype=torch.int32, device=device).view(1, blocks)
+    block_table = torch.arange(blocks, dtype=torch.int32, device=device).view(1, blocks).repeat(args.query_len, 1)
     scale = float(args.kv_lora_rank) ** -0.5
 
     q_nope = torch.randn((args.query_len, args.heads, args.kv_lora_rank), dtype=torch.float32, device=device).to(dtype)

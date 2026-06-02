@@ -956,9 +956,10 @@ class DeepseekV32DSAAttention(nn.Module):
         self.debug_decode_mlapo_compare_limit = _env_int("NANOVLLM_DEBUG_DECODE_MLAPO_COMPARE_LIMIT", 2)
         self._debug_decode_mlapo_compare_count = 0
         self.prefill_budget_mode = os.environ.get("NANOVLLM_DSA_PREFILL_BUDGET_MODE", "score").strip().lower()
-        if self.prefill_budget_mode not in ("score", "suffix"):
+        if self.prefill_budget_mode not in ("score", "suffix", "prefix_suffix"):
             logger.warning("Unknown NANOVLLM_DSA_PREFILL_BUDGET_MODE=%s, fallback to score.", self.prefill_budget_mode)
             self.prefill_budget_mode = "score"
+        self.prefill_budget_prefix_tokens = max(0, _env_int("NANOVLLM_DSA_PREFILL_PREFIX_TOKENS", 128))
         self.debug_prefill_budget = _env_flag("NANOVLLM_DSA_DEBUG_PREFILL_BUDGET", False)
         self.debug_prefill_budget_rank = _env_int("NANOVLLM_DSA_DEBUG_PREFILL_BUDGET_RANK", 0)
         self.debug_prefill_budget_sample = max(1, _env_int("NANOVLLM_DSA_DEBUG_PREFILL_BUDGET_SAMPLE", 8))
@@ -1612,6 +1613,14 @@ class DeepseekV32DSAAttention(nn.Module):
                 continue
             if self.prefill_budget_mode == "suffix":
                 selected_tokens = torch.arange(candidate_len - selected_len, candidate_len, dtype=torch.int32, device=pool.device)
+            elif self.prefill_budget_mode == "prefix_suffix":
+                # Keep attention-sink tokens at the beginning, then spend the
+                # remaining sparse budget on the latest prefill tokens.
+                prefix_len = min(self.prefill_budget_prefix_tokens, selected_len, candidate_len)
+                suffix_len = selected_len - prefix_len
+                prefix_tokens = torch.arange(0, prefix_len, dtype=torch.int32, device=pool.device)
+                suffix_tokens = torch.arange(candidate_len - suffix_len, candidate_len, dtype=torch.int32, device=pool.device) if suffix_len > 0 else prefix_tokens[:0]
+                selected_tokens = torch.cat((prefix_tokens, suffix_tokens), dim=0)
             elif selected_len == candidate_len:
                 selected_tokens = torch.arange(candidate_len, dtype=torch.int32, device=pool.device)
             else:
