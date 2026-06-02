@@ -13,14 +13,7 @@ def divide(numerator, denominator):
 
 class LinearBase(nn.Module):
 
-    def __init__(
-        self,
-        input_size: int,
-        output_size: int,
-        bias: bool = False,
-        tp_dim: int | None = None,
-        disable_tp: bool = False,
-    ):
+    def __init__(self, input_size: int, output_size: int, bias: bool = False, tp_dim: int | None = None, disable_tp: bool = False):
         super().__init__()
         self.tp_dim = tp_dim
         self.tp_rank = dist.get_rank()
@@ -39,15 +32,6 @@ class LinearBase(nn.Module):
 
 
 class ReplicatedLinear(LinearBase):
-
-    def __init__(
-        self,
-        input_size: int,
-        output_size: int,
-        bias: bool = False,
-    ):
-        super().__init__(input_size, output_size, bias)
-
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param.data.copy_(loaded_weight)
 
@@ -57,22 +41,10 @@ class ReplicatedLinear(LinearBase):
 
 class ColumnParallelLinear(LinearBase):
 
-    def __init__(
-        self,
-        input_size: int,
-        output_size: int,
-        bias: bool = False,
-        disable_tp: bool = False,
-    ):
+    def __init__(self, input_size: int, output_size: int, bias: bool = False, disable_tp: bool = False):
         tp_size = dist.get_world_size()
         local_output_size = output_size if disable_tp else divide(output_size, tp_size)
-        super().__init__(
-            input_size,
-            local_output_size,
-            bias,
-            0,
-            disable_tp=disable_tp,
-        )
+        super().__init__(input_size, local_output_size, bias, 0, disable_tp=disable_tp)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
@@ -90,20 +62,9 @@ class ColumnParallelLinear(LinearBase):
 
 class MergedColumnParallelLinear(ColumnParallelLinear):
 
-    def __init__(
-        self,
-        input_size: int,
-        output_sizes: list[int],
-        bias: bool = False,
-        disable_tp: bool = False,
-    ):
+    def __init__(self, input_size: int, output_sizes: list[int], bias: bool = False, disable_tp: bool = False):
         self.output_sizes = output_sizes
-        super().__init__(
-            input_size,
-            sum(output_sizes),
-            bias,
-            disable_tp=disable_tp,
-        )
+        super().__init__(input_size, sum(output_sizes), bias, disable_tp=disable_tp)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: int):
         if self.disable_tp:
@@ -121,31 +82,15 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
 class RowParallelLinear(LinearBase):
 
-    def __init__(
-        self,
-        input_size: int,
-        output_size: int,
-        bias: bool = False,
-        disable_tp: bool = False,
-        reduce_results: bool = True,
-    ):
+    def __init__(self, input_size: int, output_size: int, bias: bool = False, disable_tp: bool = False, reduce_results: bool = True):
         tp_size = dist.get_world_size()
         local_input_size = input_size if disable_tp else divide(input_size, tp_size)
-        super().__init__(
-            local_input_size,
-            output_size,
-            bias,
-            1,
-            disable_tp=disable_tp,
-        )
+        super().__init__(local_input_size, output_size, bias, 1, disable_tp=disable_tp)
         self.reduce_results = reduce_results
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
-        if param_data.dim() == 1:
-            param_data.copy_(loaded_weight)
-            return
-        if self.disable_tp:
+        if param_data.dim() == 1 or self.disable_tp:
             param_data.copy_(loaded_weight)
             return
         shard_size = param_data.size(self.tp_dim)

@@ -8,11 +8,7 @@ from nanovllm.utils.context import get_context
 
 class VocabParallelEmbedding(nn.Module):
 
-    def __init__(
-        self,
-        num_embeddings: int,
-        embedding_dim: int,
-    ):
+    def __init__(self, num_embeddings: int, embedding_dim: int):
         super().__init__()
         self.tp_rank = dist.get_rank()
         self.tp_size = dist.get_world_size()
@@ -44,12 +40,7 @@ class VocabParallelEmbedding(nn.Module):
 
 class ParallelLMHead(VocabParallelEmbedding):
 
-    def __init__(
-        self,
-        num_embeddings: int,
-        embedding_dim: int,
-        bias: bool = False,
-    ):
+    def __init__(self, num_embeddings: int, embedding_dim: int, bias: bool = False):
         assert not bias
         super().__init__(num_embeddings, embedding_dim)
 
@@ -60,16 +51,7 @@ class ParallelLMHead(VocabParallelEmbedding):
             x = x[last_indices].contiguous()
         logits = F.linear(x, self.weight)
         if self.tp_size > 1:
-            gathered = torch.empty(
-                self.tp_size * logits.shape[0],
-                logits.shape[1],
-                dtype=logits.dtype,
-                device=logits.device,
-            )
+            gathered = torch.empty(self.tp_size * logits.shape[0], logits.shape[1], dtype=logits.dtype, device=logits.device)
             dist.all_gather_into_tensor(gathered, logits.contiguous())
-            logits = (
-                gathered.view(self.tp_size, logits.shape[0], logits.shape[1])
-                .transpose(0, 1)
-                .reshape(logits.shape[0], self.num_embeddings)
-            )
+            logits = gathered.view(self.tp_size, logits.shape[0], logits.shape[1]).transpose(0, 1).reshape(logits.shape[0], self.num_embeddings)
         return logits

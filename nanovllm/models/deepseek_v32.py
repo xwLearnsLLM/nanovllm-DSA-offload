@@ -38,6 +38,7 @@ ACL_FORMAT_FRACTAL_NZ = 29
 _NPU_MLA_ATTENTION_MASK_CACHE: dict[tuple[str, int], torch.Tensor] = {}
 _NPU_MLA_V2_WORKSPACE_CACHE: dict[tuple, torch.Tensor] = {}
 _DSA_OFFLOAD_BUFFER_CACHE = {}
+_NPU_MOE_SHARED_STREAM = None
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -75,6 +76,13 @@ def _profile_sync(device: torch.device) -> None:
         torch.npu.synchronize()
     elif device.type == "cuda":
         torch.cuda.synchronize(device)
+
+
+def _moe_shared_stream():
+    global _NPU_MOE_SHARED_STREAM
+    if _NPU_MOE_SHARED_STREAM is None:
+        _NPU_MOE_SHARED_STREAM = torch_npu.npu.Stream()
+    return _NPU_MOE_SHARED_STREAM
 
 
 def _profile_layer_selected(layer_idx: int, num_layers: int) -> bool:
@@ -145,11 +153,6 @@ def _transdata_nz(
 def _to_mlapo_bf16_nz_weight(weight: torch.Tensor) -> torch.Tensor:
     nz_weight = _transdata_nz(weight, block_size=(16, 16)).unsqueeze(0).contiguous()
     return torch_npu.npu_format_cast(nz_weight, ACL_FORMAT_FRACTAL_NZ)
-
-
-def _rope_neox_to_interleaved(x: torch.Tensor) -> torch.Tensor:
-    half = x.shape[-1] // 2
-    return torch.stack((x[..., :half], x[..., half:]), dim=-1).flatten(-2).contiguous()
 
 
 def _rope_interleaved_to_neox(x: torch.Tensor) -> torch.Tensor:
@@ -574,11 +577,10 @@ class DeepseekV32SparseMoeBlock(nn.Module):
         del cpu_w13_parts, cpu_w2_parts
         gc.collect()
 
-    def _grouped_topk(
-        self,
-        router_logits: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        router_logits = router_logits.float()
+    def _grouped_topk(self, router_logits: torch.Tensor, weight_dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+        # Decode router logits are already BF16. Keeping that dtype avoids one
+        # hot-path FP32 allocation before the fused NPU top-k op.
+        router_logits = router_logits.contiguous()
         bias = getattr(self.gate, "e_score_correction_bias", None)
         if bias is not None and bias.dtype != router_logits.dtype:
             bias = bias.to(router_logits.dtype)
@@ -599,14 +601,22 @@ class DeepseekV32SparseMoeBlock(nn.Module):
             eps=1e-20,
             bias_opt=bias,
         )
-        topk_weights = topk_weights.float()
+        topk_weights = topk_weights.to(weight_dtype)
         return topk_weights, topk_ids
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         sequence_length, hidden_dim = hidden_states.shape
-        shared_output = self.shared_experts(hidden_states)
+        overlap_shared = hidden_states.device.type == "npu"
+        if overlap_shared:
+            default_stream = torch.npu.current_stream()
+            shared_stream = _moe_shared_stream()
+            shared_stream.wait_stream(default_stream)
+            with torch.npu.stream(shared_stream):
+                shared_output = self.shared_experts(hidden_states)        # Keep shared expert as one overlapped unit; finer split regressed TPOT.
+        else:
+            shared_output = self.shared_experts(hidden_states)
         router_logits = self.gate(hidden_states)
-        routing_weights, selected_experts = self._grouped_topk(router_logits)
+        routing_weights, selected_experts = self._grouped_topk(router_logits, hidden_states.dtype)
         if (
             self.moe_backend == "grouped"
             and self.grouped_w13_weight is not None
@@ -624,6 +634,8 @@ class DeepseekV32SparseMoeBlock(nn.Module):
                 routing_weights,
             )
 
+        if overlap_shared:
+            torch.npu.current_stream().wait_stream(shared_stream)          # shared_output must be ready before routed + shared accumulation.
         final_hidden_states = routed_hidden_states + shared_output
         if self.enable_expert_parallel and self.ep_size > 1:
             dist.all_reduce(final_hidden_states)
@@ -933,14 +945,6 @@ class DeepseekV32DSAAttention(nn.Module):
         self.free_kv_b_proj = _env_flag("NANOVLLM_FREE_KV_B_PROJ", True)
         self.enable_decode_mlapo = _env_flag(
             "NANOVLLM_ENABLE_DECODE_MLAPO",
-            True,
-        )
-        self.mla_rope_neox_cache = _env_flag(
-            "NANOVLLM_MLA_ROPE_NEOX_CACHE",
-            True,
-        )
-        self.decode_mla_fia_v2 = _env_flag(
-            "NANOVLLM_DECODE_MLA_FIA_V2",
             True,
         )
         self.q_up_bmm_trans_max_tokens = _env_int(
@@ -1287,9 +1291,8 @@ class DeepseekV32DSAAttention(nn.Module):
             ckv_ref = self.kv_a_layernorm(ckv_ref)
             q_pe_ref, k_pe_ref = self.rotary_emb(positions, q_pe_ref, k_pe_ref.unsqueeze(1))
             k_pe_ref = k_pe_ref.squeeze(1)
-            if self.mla_rope_neox_cache:
-                q_pe_ref = _rope_interleaved_to_neox(q_pe_ref)
-                k_pe_ref = _rope_interleaved_to_neox(k_pe_ref)
+            q_pe_ref = _rope_interleaved_to_neox(q_pe_ref)
+            k_pe_ref = _rope_interleaved_to_neox(k_pe_ref)
             ql_nope_ref = self._q_nope_up_proj(q_nope)
             slots = self._flat_slots()
             ckv_actual = self.ckv_cache.view(-1, self.kv_lora_rank).index_select(0, slots)
@@ -1357,16 +1360,6 @@ class DeepseekV32DSAAttention(nn.Module):
         )
         if need_inner_out:
             inner_out = self._decode_mlapo_q_c_fallback(hidden_states)
-        if not self.mla_rope_neox_cache:
-            # mla_preprocess produces RoPE vectors in neox order. The normal
-            # cache convention is interleaved, so only the current slots need a
-            # cheap rewrite. With NANOVLLM_MLA_ROPE_NEOX_CACHE=1 every path uses
-            # neox cache order and this per-token rewrite is intentionally gone.
-            q_pe = _rope_neox_to_interleaved(q_pe)
-            kpe_flat = self.kpe_cache.view(-1, self.qk_rope_head_dim)
-            slots = self._flat_slots()
-            k_pe = kpe_flat.index_select(0, slots)
-            kpe_flat.index_copy_(0, slots, _rope_neox_to_interleaved(k_pe))
         self._decode_timer_end(profile_decode, "mlapo", start, ql_nope.device)
         self._debug_compare_decode_mlapo(positions, hidden_states, ql_nope, q_pe)
         return ql_nope, q_pe, inner_out
@@ -2041,9 +2034,7 @@ class DeepseekV32DSAAttention(nn.Module):
     ) -> torch.Tensor:
         context = get_context()
         batch_size = int(ql_nope.shape[0])
-        actual_seq_lengths_query = context.actual_seq_lengths_query
         actual_seq_lengths_key = context.actual_seq_lengths_kv
-        assert actual_seq_lengths_query is not None
         assert actual_seq_lengths_key is not None
         block_table = context.block_tables[:batch_size]
         profile_decode = self.log_decode_layer_timing
@@ -2053,35 +2044,12 @@ class DeepseekV32DSAAttention(nn.Module):
                 raise RuntimeError("DSA offload decode requires indexer outputs.")
             self._dsa_offload_update(q_index, weights, batch_size)
         start = self._decode_timer_start(profile_decode, ql_nope.device)
-        if self.decode_mla_fia_v2:
-            latent = self._decode_forward_mla_v2(
-                ql_nope,
-                q_pe,
-                block_table,
-                actual_seq_lengths_key,
-            )
-        else:
-            mla_result = torch_npu.npu_fused_infer_attention_score(
-                ql_nope,
-                self.ckv_cache,
-                self.ckv_cache,
-                query_rope=q_pe,
-                key_rope=self.kpe_cache,
-                num_heads=self.num_local_heads,
-                num_key_value_heads=1,
-                input_layout="TND",
-                atten_mask=None,
-                sparse_mode=0,
-                scale=float(self.scale),
-                antiquant_mode=0,
-                antiquant_scale=None,
-                block_table=block_table,
-                block_size=self.block_size,
-                softmax_lse_flag=False,
-                actual_seq_lengths=actual_seq_lengths_query,
-                actual_seq_lengths_kv=actual_seq_lengths_key,
-            )
-            latent = _first_tensor(mla_result)
+        latent = self._decode_forward_mla_v2(
+            ql_nope,
+            q_pe,
+            block_table,
+            actual_seq_lengths_key,
+        )
         self._decode_timer_end(
             profile_decode,
             "decode_attention_op",
@@ -2092,10 +2060,7 @@ class DeepseekV32DSAAttention(nn.Module):
             "decode_attention_op"
         ]
         start = self._decode_timer_start(profile_decode, latent.device)
-        if self.decode_mla_fia_v2:
-            output = self._v_up_proj_head_major(latent, batch_size)
-        else:
-            output = self._v_up_proj(latent)
+        output = self._v_up_proj_head_major(latent, batch_size)
         self._decode_timer_end(profile_decode, "v_up", start, output.device)
         return output
 
@@ -2193,13 +2158,11 @@ class DeepseekV32DSAAttention(nn.Module):
         k_pe = k_pe.squeeze(1)
         self._decode_timer_end(profile_decode, "k_squeeze", start, k_pe.device)
 
-        if self.mla_rope_neox_cache:
-            # RoPE dot products are unchanged if both q/k use the same basis.
-            # This experimental path keeps the whole MLA RoPE cache in neox
-            # order so MLAPO decode can skip converting every new token back to
-            # interleaved order.
-            q_pe = _rope_interleaved_to_neox(q_pe)
-            k_pe = _rope_interleaved_to_neox(k_pe)
+        # RoPE dot products are unchanged if both q/k use the same basis.
+        # Keep MLA RoPE cache in neox order so MLAPO decode can use
+        # mla_preprocess output directly.
+        q_pe = _rope_interleaved_to_neox(q_pe)
+        k_pe = _rope_interleaved_to_neox(k_pe)
 
         q_index = index_k = weights = None
         if context.needs_dsa_update and (context.is_prefill or self.dsa_offload_fixed_tx > 0):
