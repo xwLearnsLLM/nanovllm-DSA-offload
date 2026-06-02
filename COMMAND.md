@@ -46,3 +46,16 @@ PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=4 NANOVLLM_ENABLE_DECODE_MLA
 
 ls ${DSA_DUMP}_rank*.txt
 ```
+
+## 2026-06-02 21:52:45：补充 score 摘要和 prefill DRAM materialize 校验
+
+下一次请在昇腾上先跑这个：
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH python3 -m py_compile nanovllm/models/deepseek_v32.py
+
+export DSA_DUMP=runlog/dsa_index_update_debug_$(date +%Y%m%d_%H%M%S)
+PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=4 NANOVLLM_ENABLE_DECODE_MLAPO=0 NANOVLLM_DSA_OFFLOAD_FIXED_TX=128 NANOVLLM_DSA_DEBUG_INDEX_UPDATE_DUMP_PATH=$DSA_DUMP NANOVLLM_PROFILE_LAYER_IDS=mid NANOVLLM_PROMPT_LENGTHS=8192 python3 example/test.py
+
+ls ${DSA_DUMP}_rank*.txt
+```

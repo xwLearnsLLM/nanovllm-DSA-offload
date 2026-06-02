@@ -1552,10 +1552,54 @@ class DeepseekV32DSAAttention(nn.Module):
             snapshots.append({"batch": b, "entry": entry, "selected_len": selected_len, "pool_active": active_pool})
         return snapshots
 
+    def _debug_score_summary(
+        self,
+        score: torch.Tensor,
+        candidate_len: int,
+        pool_before_active: list[int],
+        promote_valid: list[int],
+        demote_valid: list[int],
+    ) -> dict:
+        if candidate_len <= 0:
+            return {}
+        score_cpu = score[:candidate_len].detach().to("cpu", dtype=torch.float32)
+        finite_mask = torch.isfinite(score_cpu)
+        finite_scores = score_cpu[finite_mask]
+        window = min(256, candidate_len)
+        demote_tokens = [
+            int(pool_before_active[slot])
+            for slot in demote_valid
+            if 0 <= int(slot) < len(pool_before_active)
+        ]
+        def _scores_for_tokens(tokens: list[int]) -> list[float]:
+            if not tokens:
+                return []
+            ids = torch.tensor(
+                [max(0, min(candidate_len - 1, int(token))) for token in tokens],
+                dtype=torch.long,
+            )
+            return score_cpu.index_select(0, ids).tolist()
+
+        return {
+            "score_finite_count": int(finite_mask.sum().item()),
+            "score_nan_count": int(torch.isnan(score_cpu).sum().item()),
+            "score_posinf_count": int(torch.isposinf(score_cpu).sum().item()),
+            "score_neginf_count": int(torch.isneginf(score_cpu).sum().item()),
+            "score_min": float(finite_scores.min().item()) if finite_scores.numel() else None,
+            "score_max": float(finite_scores.max().item()) if finite_scores.numel() else None,
+            "score_mean": float(finite_scores.mean().item()) if finite_scores.numel() else None,
+            "score_first_256": score_cpu[:window].tolist(),
+            "score_last_256": score_cpu[-window:].tolist(),
+            "promote_score_valid": _scores_for_tokens(promote_valid),
+            "demote_token_valid": demote_tokens,
+            "demote_score_valid": _scores_for_tokens(demote_tokens),
+        }
+
     def _debug_dump_index_update(
         self,
         *,
         update_id: int,
+        score: torch.Tensor,
         pool_before: list[dict] | None,
         pool_slice: torch.Tensor,
         promote_idx: torch.Tensor,
@@ -1577,6 +1621,9 @@ class DeepseekV32DSAAttention(nn.Module):
         pool_after = self._debug_index_update_pool_snapshot(pool_slice, selected_lens, req_pool_entries, batch_size) or []
         for b in range(batch_size):
             copy_count = max(0, int(copy_counts_cpu[b]))
+            promote_valid = promote_cpu[b][:copy_count]
+            demote_valid = demote_cpu[b][:copy_count]
+            pool_before_active = pool_before[b]["pool_active"] if b < len(pool_before) else []
             record = {
                 "event": "dsa_index_update",
                 "rank": _rank_id(),
@@ -1589,11 +1636,12 @@ class DeepseekV32DSAAttention(nn.Module):
                 "copy_count": copy_count,
                 "promote_idx_full": promote_cpu[b],
                 "demote_idx_full": demote_cpu[b],
-                "promote_idx_valid": promote_cpu[b][:copy_count],
-                "demote_idx_valid": demote_cpu[b][:copy_count],
-                "pool_before_active": pool_before[b]["pool_active"] if b < len(pool_before) else [],
+                "promote_idx_valid": promote_valid,
+                "demote_idx_valid": demote_valid,
+                "pool_before_active": pool_before_active,
                 "pool_after_active": pool_after[b]["pool_active"] if b < len(pool_after) else [],
             }
+            record.update(self._debug_score_summary(score[b], int(candidate_cpu[b]), pool_before_active, promote_valid, demote_valid))
             self._debug_write_index_update_record(record)
 
     def _debug_validate_scatter_h2d(
@@ -1703,12 +1751,81 @@ class DeepseekV32DSAAttention(nn.Module):
                 "mismatch_slots": int(bad_slots.sum().item()),
                 "first_bad_slot": first_bad_slot,
                 "first_bad_token": int(token_ids[first_bad_slot].item()) if first_bad_slot >= 0 else -1,
+                "first_bad_hbm_block": int(hbm_blocks[first_bad_slot].detach().to("cpu").item()) if first_bad_slot >= 0 else -1,
+                "first_bad_hbm_offset": int(hbm_offsets[first_bad_slot].detach().to("cpu").item()) if first_bad_slot >= 0 else -1,
+                "first_bad_dram_block": int(dram_blocks[first_bad_slot].detach().to("cpu").item()) if first_bad_slot >= 0 else -1,
+                "first_bad_dram_offset": int(dram_offsets[first_bad_slot].detach().to("cpu").item()) if first_bad_slot >= 0 else -1,
                 "ckv_max_abs": float(ckv_diff.max().item()) if ckv_diff.numel() else 0.0,
                 "kpe_max_abs": float(kpe_diff.max().item()) if kpe_diff.numel() else 0.0,
                 "ckv_nan_count": int(torch.isnan(hbm_ckv.float()).sum().item() + torch.isnan(dram_ckv.float()).sum().item()),
                 "kpe_nan_count": int(torch.isnan(hbm_kpe.float()).sum().item() + torch.isnan(dram_kpe.float()).sum().item()),
             })
             self._debug_write_index_update_record(base_record)
+
+    def _debug_validate_prefill_dram_copy(self, seq, old_hbm_block_table: list[int]) -> None:
+        if not self._debug_index_update_enabled():
+            return
+        num_full_blocks = int(seq.num_prefill_full_blocks)
+        num_sparse_blocks = int(seq.num_sparse_blocks)
+        if num_sparse_blocks >= num_full_blocks:
+            self._debug_write_index_update_record({
+                "event": "dsa_prefill_dram_validate",
+                "rank": _rank_id(),
+                "layer": self.layer_id,
+                "entry": int(seq.hbm_cached_tokens_pool_entry),
+                "status": "skipped_dense_request_no_dram_copy",
+                "num_full_blocks": num_full_blocks,
+                "num_sparse_blocks": num_sparse_blocks,
+            })
+            return
+        prefix_blocks = 1 if num_sparse_blocks > 0 else 0
+        suffix_blocks = max(0, num_sparse_blocks - prefix_blocks)
+        suffix_start = num_full_blocks - suffix_blocks
+        logical_blocks = list(range(prefix_blocks)) + list(range(suffix_start, num_full_blocks))
+        _profile_sync(self.ckv_cache.device)
+        bad_logical_blocks: list[int] = []
+        first_bad: dict | None = None
+        max_ckv = 0.0
+        max_kpe = 0.0
+        for logical_block in logical_blocks:
+            hbm_block = int(old_hbm_block_table[logical_block])
+            dram_block = int(seq.dram_block_table[logical_block])
+            hbm_ckv = self.ckv_cache[hbm_block].detach().to("cpu")
+            hbm_kpe = self.kpe_cache[hbm_block].detach().to("cpu")
+            dram_ckv = self.dram_ckv_cache[dram_block].detach().to("cpu")
+            dram_kpe = self.dram_kpe_cache[dram_block].detach().to("cpu")
+            ckv_diff = (hbm_ckv.float() - dram_ckv.float()).abs()
+            kpe_diff = (hbm_kpe.float() - dram_kpe.float()).abs()
+            block_ckv = float(ckv_diff.max().item()) if ckv_diff.numel() else 0.0
+            block_kpe = float(kpe_diff.max().item()) if kpe_diff.numel() else 0.0
+            max_ckv = max(max_ckv, block_ckv)
+            max_kpe = max(max_kpe, block_kpe)
+            if block_ckv != 0.0 or block_kpe != 0.0:
+                bad_logical_blocks.append(logical_block)
+                if first_bad is None:
+                    first_bad = {
+                        "logical_block": logical_block,
+                        "hbm_block": hbm_block,
+                        "dram_block": dram_block,
+                        "ckv_max_abs": block_ckv,
+                        "kpe_max_abs": block_kpe,
+                    }
+        self._debug_write_index_update_record({
+            "event": "dsa_prefill_dram_validate",
+            "rank": _rank_id(),
+            "layer": self.layer_id,
+            "entry": int(seq.hbm_cached_tokens_pool_entry),
+            "status": "ok" if not bad_logical_blocks else "mismatch",
+            "num_full_blocks": num_full_blocks,
+            "num_sparse_blocks": num_sparse_blocks,
+            "checked_logical_blocks": logical_blocks,
+            "checked_hbm_blocks": [int(old_hbm_block_table[i]) for i in logical_blocks],
+            "checked_dram_blocks": [int(seq.dram_block_table[i]) for i in logical_blocks],
+            "mismatch_blocks": len(bad_logical_blocks),
+            "first_bad": first_bad,
+            "ckv_max_abs": max_ckv,
+            "kpe_max_abs": max_kpe,
+        })
 
     def _init_prefill_sparse_token_pool(self, seq) -> None:
         entry = int(seq.hbm_cached_tokens_pool_entry)
@@ -1770,6 +1887,7 @@ class DeepseekV32DSAAttention(nn.Module):
                     non_blocking=True,
                 ),
             )
+        self._debug_validate_prefill_dram_copy(seq, old_hbm_block_table)
 
     def _store_mla_cache(
         self,
@@ -2215,6 +2333,7 @@ class DeepseekV32DSAAttention(nn.Module):
         )
         self._debug_dump_index_update(
             update_id=update_id,
+            score=score_out,
             pool_before=pool_before,
             pool_slice=pool_slice,
             promote_idx=promote_idx,
