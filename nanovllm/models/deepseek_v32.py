@@ -963,6 +963,7 @@ class DeepseekV32DSAAttention(nn.Module):
         self.debug_prefill_budget = _env_flag("NANOVLLM_DSA_DEBUG_PREFILL_BUDGET", False)
         self.debug_prefill_budget_rank = _env_int("NANOVLLM_DSA_DEBUG_PREFILL_BUDGET_RANK", 0)
         self.debug_prefill_budget_sample = max(1, _env_int("NANOVLLM_DSA_DEBUG_PREFILL_BUDGET_SAMPLE", 8))
+        self.debug_prefill_budget_verify_all = _env_flag("NANOVLLM_DSA_DEBUG_PREFILL_VERIFY_ALL", False)
         self.log_decode_layer_timing = _env_flag(
             "NANOVLLM_LOG_DECODE_LAYER_TIMING",
             False,
@@ -1467,36 +1468,72 @@ class DeepseekV32DSAAttention(nn.Module):
             return
         device = self.ckv_cache.device
         _profile_sync(device)
-        sample = min(self.debug_prefill_budget_sample, int(sparse_tokens))
-        probe_cpu = torch.unique(torch.cat((
-            torch.arange(sample, dtype=torch.long),
-            torch.arange(max(0, sparse_tokens - sample), sparse_tokens, dtype=torch.long),
-        )))
+        sparse_tokens = int(sparse_tokens)
+        sample = min(self.debug_prefill_budget_sample, sparse_tokens)
+        if self.debug_prefill_budget_verify_all:
+            probe_cpu = torch.arange(sparse_tokens, dtype=torch.long)
+            compare_mode = "all"
+        else:
+            probe_cpu = torch.unique(torch.cat((
+                torch.arange(sample, dtype=torch.long),
+                torch.arange(max(0, sparse_tokens - sample), sparse_tokens, dtype=torch.long),
+            )))
+            compare_mode = "sample"
         probe_dev = probe_cpu.to(device)
         dst_probe = dst_flat.index_select(0, probe_dev)
         src_probe_cpu = src_flat_cpu.index_select(0, probe_cpu)
-        selected_probe = selected_tokens.detach().to("cpu", dtype=torch.long).index_select(0, probe_cpu)
+        selected_cpu = selected_tokens.detach().to("cpu", dtype=torch.long)
+        selected_probe = selected_cpu.index_select(0, probe_cpu)
 
         ckv_src = self.dram_ckv_cache.view(-1, self.kv_lora_rank).index_select(0, src_probe_cpu.to(self.dram_ckv_cache.device)).to(device=device, non_blocking=True)
         kpe_src = self.dram_kpe_cache.view(-1, self.qk_rope_head_dim).index_select(0, src_probe_cpu.to(self.dram_kpe_cache.device)).to(device=device, non_blocking=True)
         ckv_dst = self.ckv_cache.view(-1, self.kv_lora_rank).index_select(0, dst_probe)
         kpe_dst = self.kpe_cache.view(-1, self.qk_rope_head_dim).index_select(0, dst_probe)
         _profile_sync(device)
-        ckv_max = float((ckv_dst.float() - ckv_src.float()).abs().max().item()) if ckv_dst.numel() else 0.0
-        kpe_max = float((kpe_dst.float() - kpe_src.float()).abs().max().item()) if kpe_dst.numel() else 0.0
+        ckv_src_f = ckv_src.float()
+        ckv_dst_f = ckv_dst.float()
+        kpe_src_f = kpe_src.float()
+        kpe_dst_f = kpe_dst.float()
+        ckv_hbm_nan = int(torch.isnan(ckv_dst_f).sum().item()) if ckv_dst_f.numel() else 0
+        ckv_dram_nan = int(torch.isnan(ckv_src_f).sum().item()) if ckv_src_f.numel() else 0
+        kpe_hbm_nan = int(torch.isnan(kpe_dst_f).sum().item()) if kpe_dst_f.numel() else 0
+        kpe_dram_nan = int(torch.isnan(kpe_src_f).sum().item()) if kpe_src_f.numel() else 0
+        ckv_max = float((ckv_dst_f - ckv_src_f).abs().max().item()) if ckv_dst_f.numel() else 0.0
+        kpe_max = float((kpe_dst_f - kpe_src_f).abs().max().item()) if kpe_dst_f.numel() else 0.0
+        selected_first = selected_cpu[:sample].tolist()
+        selected_last = selected_cpu[-sample:].tolist()
+        src_first = src_flat_cpu[:sample].tolist()
+        src_last = src_flat_cpu[-sample:].tolist()
+        dst_cpu = dst_flat.detach().to("cpu", dtype=torch.long)
+        dst_first = dst_cpu[:sample].tolist()
+        dst_last = dst_cpu[-sample:].tolist()
         logger.info(
             "DSA prefill budget materialize: rank=%d layer=%d entry=%d sparse_tokens=%d "
-            "num_sparse_blocks=%d ckv_max_abs=%.6g kpe_max_abs=%.6g selected_probe=%s src_flat=%s dst_flat=%s",
+            "num_sparse_blocks=%d compare=%s compared_tokens=%d ckv_max_abs=%.6g kpe_max_abs=%.6g "
+            "ckv_hbm_nan=%d ckv_dram_nan=%d kpe_hbm_nan=%d kpe_dram_nan=%d "
+            "selected_first=%s selected_last=%s src_first=%s src_last=%s dst_first=%s dst_last=%s selected_probe=%s src_probe=%s dst_probe=%s",
             _rank_id(),
             self.layer_id,
             int(seq.hbm_cached_tokens_pool_entry),
-            int(sparse_tokens),
+            sparse_tokens,
             int(seq.num_sparse_blocks),
+            compare_mode,
+            int(probe_cpu.numel()),
             ckv_max,
             kpe_max,
-            selected_probe.tolist(),
-            src_probe_cpu.tolist(),
-            dst_probe.detach().to("cpu", dtype=torch.long).tolist(),
+            ckv_hbm_nan,
+            ckv_dram_nan,
+            kpe_hbm_nan,
+            kpe_dram_nan,
+            selected_first,
+            selected_last,
+            src_first,
+            src_last,
+            dst_first,
+            dst_last,
+            selected_probe.tolist() if not self.debug_prefill_budget_verify_all else [],
+            src_probe_cpu.tolist() if not self.debug_prefill_budget_verify_all else [],
+            dst_probe.detach().to("cpu", dtype=torch.long).tolist() if not self.debug_prefill_budget_verify_all else [],
         )
 
     def finalize_prefill_offload(
