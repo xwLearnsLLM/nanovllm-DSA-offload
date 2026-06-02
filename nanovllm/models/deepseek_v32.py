@@ -1595,6 +1595,61 @@ class DeepseekV32DSAAttention(nn.Module):
             "demote_score_valid": _scores_for_tokens(demote_tokens),
         }
 
+    def _debug_tensor_stats(self, tensor: torch.Tensor, prefix: str) -> dict:
+        data = tensor.detach().float()
+        finite_mask = torch.isfinite(data)
+        finite = data[finite_mask]
+        return {
+            f"{prefix}_shape": list(tensor.shape),
+            f"{prefix}_dtype": str(tensor.dtype),
+            f"{prefix}_device": str(tensor.device),
+            f"{prefix}_finite_count": int(finite_mask.sum().item()),
+            f"{prefix}_nan_count": int(torch.isnan(data).sum().item()),
+            f"{prefix}_posinf_count": int(torch.isposinf(data).sum().item()),
+            f"{prefix}_neginf_count": int(torch.isneginf(data).sum().item()),
+            f"{prefix}_min": float(finite.min().item()) if finite.numel() else None,
+            f"{prefix}_max": float(finite.max().item()) if finite.numel() else None,
+            f"{prefix}_mean": float(finite.mean().item()) if finite.numel() else None,
+        }
+
+    def _debug_dump_indexer_score_inputs(
+        self,
+        *,
+        update_id: int,
+        q_index: torch.Tensor,
+        weights: torch.Tensor,
+        candidate_lens: torch.Tensor,
+        index_block_tables: torch.Tensor,
+        batch_size: int,
+    ) -> None:
+        if not self._debug_index_update_enabled():
+            return
+        candidate_cpu = candidate_lens[:batch_size].detach().to("cpu", dtype=torch.long).tolist()
+        block_size = self.block_size
+        for b in range(batch_size):
+            candidate_len = max(0, int(candidate_cpu[b]))
+            block_count = (candidate_len + block_size - 1) // block_size if candidate_len > 0 else 0
+            blocks = index_block_tables[b, :block_count].to(torch.long)
+            index_values = torch.tensor([], dtype=self.index_cache.dtype, device=self.index_cache.device)
+            if block_count > 0:
+                index_values = self.index_cache.index_select(0, blocks.to(self.index_cache.device))
+            block_ids = blocks.detach().to("cpu", dtype=torch.long).tolist()
+            record = {
+                "event": "dsa_indexer_score_inputs",
+                "rank": _rank_id(),
+                "layer": self.layer_id,
+                "update_id": update_id,
+                "batch": b,
+                "candidate_len": candidate_len,
+                "block_count": block_count,
+                "index_block_table_first": block_ids[: self.debug_decode_metadata_sample],
+                "index_block_table_last": block_ids[-self.debug_decode_metadata_sample :],
+            }
+            record.update(self._debug_tensor_stats(q_index[b], "q_index"))
+            record.update(self._debug_tensor_stats(weights[b], "index_weights"))
+            record.update(self._debug_tensor_stats(index_values, "index_cache_candidate"))
+            self._debug_write_index_update_record(record)
+
     def _debug_dump_index_update(
         self,
         *,
@@ -1878,13 +1933,13 @@ class DeepseekV32DSAAttention(nn.Module):
             self.dram_ckv_cache[dram_block].copy_(
                 self.ckv_cache[hbm_block].to(
                     device=self.dram_ckv_cache.device,
-                    non_blocking=True,
+                    non_blocking=False,
                 ),
             )
             self.dram_kpe_cache[dram_block].copy_(
                 self.kpe_cache[hbm_block].to(
                     device=self.dram_kpe_cache.device,
-                    non_blocking=True,
+                    non_blocking=False,
                 ),
             )
         self._debug_validate_prefill_dram_copy(seq, old_hbm_block_table)
@@ -2287,6 +2342,16 @@ class DeepseekV32DSAAttention(nn.Module):
         )
 
         profile_decode = self.log_decode_layer_timing
+        update_id = self._debug_index_update_dump_count
+        self._debug_index_update_dump_count += 1
+        self._debug_dump_indexer_score_inputs(
+            update_id=update_id,
+            q_index=q_index[:batch_size],
+            weights=weights[:batch_size],
+            candidate_lens=candidate_lens,
+            index_block_tables=context.index_block_tables[:batch_size],
+            batch_size=batch_size,
+        )
         start = self._decode_timer_start(profile_decode, q_index.device)
         dsa_indexer_score(
             q_index[:batch_size],
@@ -2305,8 +2370,6 @@ class DeepseekV32DSAAttention(nn.Module):
         )
 
         pool_slice = self.hbm_cached_tokens_pool[self.layer_id]
-        update_id = self._debug_index_update_dump_count
-        self._debug_index_update_dump_count += 1
         pool_before = self._debug_index_update_pool_snapshot(
             pool_slice,
             selected_lens,
