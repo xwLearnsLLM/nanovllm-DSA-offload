@@ -566,13 +566,21 @@ class ModelRunner:
                 if finalize is not None and hasattr(module, "layer_id"):
                     finalize(seq, old_hbm_block_table)
 
-            keep_sparse = old_hbm_block_table[: seq.num_sparse_blocks]
-            keep_tail = old_hbm_block_table[
-                seq.num_prefill_full_blocks : seq.num_prefill_blocks
-            ]
-            release_blocks = old_hbm_block_table[
-                seq.num_sparse_blocks : seq.num_prefill_full_blocks
-            ]
+            # Sparse decode is logically packed, but HBM KV stays in its original
+            # physical blocks: first prefix block, suffix blocks, then tail/decode.
+            if seq.num_sparse_blocks >= seq.num_prefill_full_blocks:
+                keep_sparse = old_hbm_block_table[: seq.num_prefill_full_blocks]
+                release_blocks = []
+            else:
+                prefix_blocks = 1 if seq.num_sparse_blocks > 0 else 0
+                suffix_blocks = seq.num_sparse_blocks - prefix_blocks
+                suffix_start = seq.num_prefill_full_blocks - suffix_blocks
+                keep_sparse = (
+                    old_hbm_block_table[:prefix_blocks]
+                    + old_hbm_block_table[suffix_start : seq.num_prefill_full_blocks]
+                )
+                release_blocks = old_hbm_block_table[prefix_blocks:suffix_start]
+            keep_tail = old_hbm_block_table[seq.num_prefill_full_blocks : seq.num_prefill_blocks]
             seq.hbm_block_table = keep_sparse + keep_tail
             seq.block_table = seq.hbm_block_table
             seq.hbm_blocks_to_release = release_blocks
