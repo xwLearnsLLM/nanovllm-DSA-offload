@@ -964,6 +964,9 @@ class DeepseekV32DSAAttention(nn.Module):
         self.debug_prefill_budget_rank = _env_int("NANOVLLM_DSA_DEBUG_PREFILL_BUDGET_RANK", 0)
         self.debug_prefill_budget_sample = max(1, _env_int("NANOVLLM_DSA_DEBUG_PREFILL_BUDGET_SAMPLE", 8))
         self.debug_prefill_budget_verify_all = _env_flag("NANOVLLM_DSA_DEBUG_PREFILL_VERIFY_ALL", False)
+        self.debug_decode_metadata = _env_flag("NANOVLLM_DSA_DEBUG_DECODE_METADATA", False)
+        self.debug_decode_metadata_rank = _env_int("NANOVLLM_DSA_DEBUG_DECODE_METADATA_RANK", 0)
+        self.debug_decode_metadata_sample = max(1, _env_int("NANOVLLM_DSA_DEBUG_DECODE_METADATA_SAMPLE", 8))
         self.log_decode_layer_timing = _env_flag(
             "NANOVLLM_LOG_DECODE_LAYER_TIMING",
             False,
@@ -1414,6 +1417,108 @@ class DeepseekV32DSAAttention(nn.Module):
         if self.debug_prefill_budget_rank >= 0 and rank != self.debug_prefill_budget_rank:
             return False
         return _profile_layer_selected(self.layer_id, self.num_layers)
+
+    def _debug_decode_metadata_enabled(self) -> bool:
+        if not self.debug_decode_metadata:
+            return False
+        rank = _rank_id()
+        if self.debug_decode_metadata_rank >= 0 and rank != self.debug_decode_metadata_rank:
+            return False
+        context = get_context()
+        return bool(context.has_first_decode) and _profile_layer_selected(self.layer_id, self.num_layers)
+
+    # Debug-only: verify the sparse decode metadata seen by MLA after prefill
+    # materialization. This is intentionally D2H-heavy and must stay behind the
+    # NANOVLLM_DSA_DEBUG_DECODE_METADATA gate.
+    def _debug_log_decode_metadata(
+        self,
+        *,
+        batch_size: int,
+        block_table: torch.Tensor,
+        actual_seq_lengths_key: list[int],
+    ) -> None:
+        if not self._debug_decode_metadata_enabled():
+            return
+        context = get_context()
+        required = {
+            "slot_mapping": context.slot_mapping,
+            "flat_slot_mapping": context.flat_slot_mapping,
+            "candidate_lens": context.candidate_lens,
+            "sparse_selected_lens": context.sparse_selected_lens,
+            "prefill_tail_lens": context.prefill_tail_lens,
+            "decode_lens": context.decode_lens,
+            "req_pool_entries": context.req_pool_entries,
+            "hbm_block_tables": context.hbm_block_tables,
+        }
+        missing = [name for name, value in required.items() if value is None]
+        if missing:
+            logger.info("DSA decode metadata: rank=%d layer=%d missing=%s", _rank_id(), self.layer_id, missing)
+            return
+
+        sample = self.debug_decode_metadata_sample
+        slot_cpu = context.slot_mapping[:batch_size].detach().to("cpu", dtype=torch.long)
+        flat_slot_cpu = context.flat_slot_mapping[:batch_size].detach().to("cpu", dtype=torch.long)
+        candidate_cpu = context.candidate_lens[:batch_size].detach().to("cpu", dtype=torch.long).tolist()
+        selected_cpu = context.sparse_selected_lens[:batch_size].detach().to("cpu", dtype=torch.long).tolist()
+        tail_cpu = context.prefill_tail_lens[:batch_size].detach().to("cpu", dtype=torch.long).tolist()
+        decode_cpu = context.decode_lens[:batch_size].detach().to("cpu", dtype=torch.long).tolist()
+        entries_cpu = context.req_pool_entries[:batch_size].detach().to("cpu", dtype=torch.long).tolist()
+        tables_cpu = block_table[:batch_size].detach().to("cpu", dtype=torch.long)
+
+        for b in range(batch_size):
+            candidate_len = int(candidate_cpu[b])
+            selected_len = int(selected_cpu[b])
+            tail_len = int(tail_cpu[b])
+            decode_len = int(decode_cpu[b])
+            actual_len = int(actual_seq_lengths_key[b]) if b < len(actual_seq_lengths_key) else -1
+            used_blocks = max(1, (max(actual_len, 0) + self.block_size - 1) // self.block_size)
+            selected_blocks = (selected_len + self.block_size - 1) // self.block_size if selected_len > 0 else 0
+            tail_decode_offset = tail_len + max(decode_len, 1) - 1              # logical offset inside tail+decode region
+            expected_logical = selected_blocks + tail_decode_offset // self.block_size
+            expected_offset = tail_decode_offset % self.block_size
+            inspect_blocks = max(used_blocks, expected_logical + 1, 1)
+            hbm_table = [int(v) for v in tables_cpu[b, :inspect_blocks].tolist()]
+            expected_block = hbm_table[expected_logical] if 0 <= expected_logical < len(hbm_table) else -1
+            expected_flat = expected_block * self.block_size + expected_offset if expected_block >= 0 else -1
+            slot_block = int(slot_cpu[b, 0].item())
+            slot_offset = int(slot_cpu[b, 1].item())
+            flat_slot = int(flat_slot_cpu[b].item())
+            entry = int(entries_cpu[b])
+            selected_first: list[int] = []
+            selected_last: list[int] = []
+            if selected_len > 0 and self.hbm_cached_tokens_pool.numel() and 0 <= entry < self.hbm_cached_tokens_pool.shape[1]:
+                pool_cpu = self.hbm_cached_tokens_pool[self.layer_id, entry, :selected_len].detach().to("cpu", dtype=torch.long)
+                selected_first = pool_cpu[:sample].tolist()
+                selected_last = pool_cpu[-sample:].tolist()
+            logger.info(
+                "DSA decode metadata: rank=%d layer=%d batch=%d entry=%d candidate_len=%d selected_len=%d "
+                "tail_len=%d decode_len=%d actual_kv_len=%d selected_blocks=%d used_blocks=%d "
+                "slot=(%d,%d) flat_slot=%d expected_logical=%d expected_slot=(%d,%d) expected_flat=%d "
+                "slot_match=%s hbm_table_first=%s hbm_table_last=%s selected_first=%s selected_last=%s",
+                _rank_id(),
+                self.layer_id,
+                b,
+                entry,
+                candidate_len,
+                selected_len,
+                tail_len,
+                decode_len,
+                actual_len,
+                selected_blocks,
+                used_blocks,
+                slot_block,
+                slot_offset,
+                flat_slot,
+                expected_logical,
+                expected_block,
+                expected_offset,
+                expected_flat,
+                str(flat_slot == expected_flat),
+                hbm_table[:sample],
+                hbm_table[-sample:],
+                selected_first,
+                selected_last,
+            )
 
     def _debug_log_prefill_selection(
         self,
@@ -2157,6 +2262,7 @@ class DeepseekV32DSAAttention(nn.Module):
         assert actual_seq_lengths_key is not None
         block_table = context.block_tables[:batch_size]
         profile_decode = self.log_decode_layer_timing
+        self._debug_log_decode_metadata(batch_size=batch_size, block_table=block_table, actual_seq_lengths_key=actual_seq_lengths_key)
         if context.needs_dsa_update:
             self._dsa_offload_update(q_index, weights, batch_size)
         start = self._decode_timer_start(profile_decode, ql_nope.device)
