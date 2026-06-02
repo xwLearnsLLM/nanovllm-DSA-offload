@@ -1675,10 +1675,19 @@ class DeepseekV32DSAAttention(nn.Module):
 
             hbm_blocks = hbm_table.index_select(0, hbm_logical_blocks)
             dram_blocks = dram_table.index_select(0, dram_logical_blocks)
-            hbm_ckv = self.ckv_cache[hbm_blocks, hbm_offsets]
-            hbm_kpe = self.kpe_cache[hbm_blocks, hbm_offsets]
-            dram_ckv = self.dram_ckv_cache[dram_blocks, dram_offsets]
-            dram_kpe = self.dram_kpe_cache[dram_blocks, dram_offsets]
+            # Debug validation may compare NPU HBM cache against host-side DRAM
+            # cache, so each advanced-index tensor must live with the cache it
+            # indexes. Move gathered KV back to CPU before the exact comparison.
+            hbm_index_device = self.ckv_cache.device
+            dram_index_device = self.dram_ckv_cache.device
+            hbm_blocks = hbm_blocks.to(hbm_index_device)
+            hbm_offsets = hbm_offsets.to(hbm_index_device)
+            dram_blocks = dram_blocks.to(dram_index_device)
+            dram_offsets = dram_offsets.to(dram_index_device)
+            hbm_ckv = self.ckv_cache[hbm_blocks, hbm_offsets].detach().to("cpu")
+            hbm_kpe = self.kpe_cache[hbm_blocks, hbm_offsets].detach().to("cpu")
+            dram_ckv = self.dram_ckv_cache[dram_blocks, dram_offsets].detach().to("cpu")
+            dram_kpe = self.dram_kpe_cache[dram_blocks, dram_offsets].detach().to("cpu")
             ckv_bad_slots = (hbm_ckv != dram_ckv).reshape(selected_len, -1).any(dim=1)
             kpe_bad_slots = (hbm_kpe != dram_kpe).reshape(selected_len, -1).any(dim=1)
             bad_slots = ckv_bad_slots | kpe_bad_slots
