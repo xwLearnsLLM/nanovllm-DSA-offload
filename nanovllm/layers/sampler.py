@@ -11,6 +11,11 @@ class Sampler(nn.Module):
         if logits.shape[0] != real_bs:
             logits = logits[:real_bs, :]
         logits = logits.float()
+        # Temporary DSA-offload precision workaround: token 0 is BOS and should
+        # not be generated during decode. Remove this once the Tx/MLAPO accuracy
+        # issues are fixed at the attention/cache-update level.
+        if logits.shape[-1] > 0:
+            logits[:, 0] = -float("inf")
         greedy_mask = temperatures <= 1e-10
         sampled = torch.empty(real_bs, dtype=torch.long, device=logits.device)
         if greedy_mask.any():
