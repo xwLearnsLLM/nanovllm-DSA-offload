@@ -73,3 +73,16 @@ NANOVLLM_CANN_BUILD_JOBS=64 NANOVLLM_EXT_BUILD_JOBS=1 SOC_VERSION=ascend910_9391
 
 PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/probe_dsa_index_update.py --device npu:0 --batch 4 --candidate 8192 --selected 2560 --k 128 --warmup 5 --iters 20
 ```
+
+## 2026-06-03 13:18：补充导出 ascend_ops.dsa_update_index
+
+下一次请在昇腾上先跑这个：
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH python3 - <<'PY'
+import nanovllm.ops as ops
+print("has_dsa_update_index", hasattr(ops, "dsa_update_index"))
+print(ops.dsa_update_index)
+PY
+
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/probe_dsa_index_update.py --device npu:0 --batch 4 --candidate 8192 --selected 2560 --k 128 --warmup 5 --iters 20
+```

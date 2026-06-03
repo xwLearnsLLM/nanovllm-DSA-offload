@@ -48,6 +48,7 @@ paged_scatter_copy_h2d_alloc_host_mapped_empty = (
     _C.paged_scatter_copy_h2d_alloc_host_mapped_empty
 )
 batch_matmul_transpose = _C.batch_matmul_transpose
+dsa_update_index = _C.dsa_update_index
 
 
 def _missing_dsa_indexer_project(*args, **kwargs):
@@ -134,6 +135,7 @@ __all__ = [
     "dsa_indexer_project_binding_version",
     "dsa_indexer_project_post",
     "dsa_indexer_project_post_out",
+    "dsa_update_index",
     "mla_preprocess",
     "moe_gating_top_k",
     "npu_lightning_indexer",
