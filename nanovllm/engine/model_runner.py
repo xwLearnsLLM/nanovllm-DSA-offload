@@ -51,6 +51,12 @@ class ModelRunner:
         torch.npu.empty_cache()
         self.allocate_kv_cache()
 
+        # npu profiler state (lazy-init in run_model)
+        self._prof = None
+        self._prof_step_count = 0
+        self._prof_skip = 0
+        self._prof_max = 0
+
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
         logger.info(f"config: {config}")
@@ -553,6 +559,18 @@ class ModelRunner:
         return os.environ.get("NANOVLLM_NPU_PROFILE_DIR",
                               f"npu_trace_rank{self.rank}")
 
+    def _profiler_skip_first(self) -> int:
+        try:
+            return int(os.environ.get("NANOVLLM_NPU_PROFILE_SKIP_FIRST", "3"))
+        except ValueError:
+            return 2
+
+    def _profiler_max_steps(self) -> int:
+        try:
+            return int(os.environ.get("NANOVLLM_NPU_PROFILE_STEPS", "10"))
+        except ValueError:
+            return 3
+
     @torch.inference_mode()
     def run_model(self,
                   input_ids: torch.Tensor,
@@ -560,27 +578,45 @@ class ModelRunner:
                   is_prefill: bool,
                   ):
         use_prof = self._profiler_enabled() and not is_prefill
+        prof = None
         if use_prof:
-            self.model.log_decode_layer_timing = False
-            out_dir = self._profiler_dir()
-            os.makedirs(out_dir, exist_ok=True)
-            activities = [torch_npu.profiler.ProfilerActivity.CPU,
-                          torch_npu.profiler.ProfilerActivity.NPU]
-            prof = torch_npu.profiler.profile(
-                activities=activities,
-                record_shapes=True,
-                with_stack=True,
-                on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(out_dir),
-            )
-            prof.__enter__()
+            # Create profiler once, reuse across decode steps.
+            # Each per-token __enter__/__exit__ + trace export kills throughput;
+            # instead we step the profiler and export a single trace at the end.
+            if self._prof_step_count == 0:
+                self.model.log_decode_layer_timing = False
+                out_dir = self._profiler_dir()
+                os.makedirs(out_dir, exist_ok=True)
+                activities = [torch_npu.profiler.ProfilerActivity.CPU,
+                              torch_npu.profiler.ProfilerActivity.NPU]
+                self._prof = torch_npu.profiler.profile(
+                    activities=activities,
+                    record_shapes=True,
+                    with_stack=False,       # stack tracing is very expensive per-op
+                    on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(out_dir),
+                )
+                self._prof.__enter__()
+                self._prof_skip = self._profiler_skip_first()
+                self._prof_max = self._profiler_max_steps()
+
+            self._prof_step_count += 1
+
+            # Stop after collecting enough steps (skip warmup + N active steps).
+            if self._prof_step_count >= self._prof_skip + self._prof_max + 1:
+                self._prof.__exit__(None, None, None)
+                self.model.log_decode_layer_timing = os.environ.get(
+                    "NANOVLLM_LOG_DECODE_LAYER_TIMING", "").strip() in ("1", "true")
+                self._prof = None
+                self._prof_step_count = 0
+            elif self._prof_step_count > self._prof_skip:
+                prof = self._prof          # forward call is inside active profiling window
+
         try:
             hidden_states = self.model(input_ids, positions)
             logits = self.model.compute_logits(hidden_states)
         finally:
-            if use_prof:
-                prof.__exit__(None, None, None)
-                self.model.log_decode_layer_timing = os.environ.get(
-                    "NANOVLLM_LOG_DECODE_LAYER_TIMING", "").strip() in ("1", "true")
+            if prof is not None and hasattr(prof, "step"):
+                prof.step()
         return logits
 
     @torch.inference_mode()
