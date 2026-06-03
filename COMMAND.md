@@ -1,3 +1,5 @@
+# 准备工作
+
 ## 推128专家正常模型（16卡910C）的公共配置
 
 ```bash
@@ -34,20 +36,7 @@ export NANOVLLM_MAX_DECODE_SEQS_PER_STEP=256                    # decode最大ba
 export NANOVLLM_IGNORE_EOS=1
 ```
 
-## 2026-06-02 23:02：对齐 vllm-ascend BF16 indexer weights 输入
-
-下一次请在昇腾上先跑这个：
-
-```bash
-PYTHONPATH=$PWD:$PYTHONPATH python3 -m py_compile nanovllm/models/deepseek_v32.py nanovllm/models/dsa_indexer_project.py ut_ops/probe_indexer_project.py
-
-PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/probe_indexer_project.py --device npu:0 --tokens 4 --warmup 10 --iters 100
-
-export DSA_DUMP=runlog/dsa_index_update_debug_$(date +%Y%m%d_%H%M%S)
-PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=8 NANOVLLM_ENABLE_DECODE_MLAPO=0 NANOVLLM_DSA_OFFLOAD_FIXED_TX=128 NANOVLLM_DSA_DEBUG_INDEX_UPDATE_DUMP_PATH=$DSA_DUMP NANOVLLM_PROFILE_LAYER_IDS=mid NANOVLLM_PROMPT_LENGTHS=8192 python3 example/test.py
-
-ls ${DSA_DUMP}_rank*.txt
-```
+# 运行
 
 ## 2026-06-03 10:25：清理 DSA 临时日志，新增 NANOVLLM_DSA_CHECK，并精简 timing 字段
 
@@ -61,13 +50,17 @@ PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=8 NANOVLLM_ENABLE_DECODE_MLA
 PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_ENABLE_DECODE_MLAPO=0 NANOVLLM_DSA_OFFLOAD_FIXED_TX=128 NANOVLLM_DSA_CHECK=0 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=1 NANOVLLM_PROFILE_LAYER_IDS=mid NANOVLLM_PROMPT_LENGTHS=8192 python3 example/test.py
 ```
 
-## 2026-06-03 11:00：合并 dsa_indexer_project.py 和 dsa_indexer_project_real.py
+## 2026-06-03 12:53：合入 dsa_index_update CANN 真算子，默认启用，保留 torch 路径开关
 
 下一次请在昇腾上先跑这个：
 ```bash
-PYTHONPATH=$PWD:$PYTHONPATH python3 -m py_compile nanovllm/models/dsa_indexer_project.py ut_ops/probe_indexer_project.py ut_ops/probe_indexer_project_post.py
+PYTHONPATH=$PWD:$PYTHONPATH python3 -m py_compile nanovllm/models/dsa_offload_ops.py ut_ops/probe_dsa_index_update.py
 
-PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/probe_indexer_project_post.py --device npu:0 --tokens 4 --warmup 10 --iters 100
+SOC_VERSION=ascend910_9391 PYTHONPATH=$PWD:$PYTHONPATH bash scripts/build_nanovllm_ops.sh
 
-PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/probe_indexer_project.py --device npu:0 --tokens 4 --warmup 10 --iters 100
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/probe_dsa_index_update.py --device npu:0 --batch 4 --candidate 8192 --selected 2560 --k 128 --warmup 5 --iters 20
+
+PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=8 NANOVLLM_ENABLE_DECODE_MLAPO=0 NANOVLLM_DSA_OFFLOAD_FIXED_TX=128 NANOVLLM_DSA_INDEX_UPDATE_USE_CANN=1 NANOVLLM_DSA_CHECK=1 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=1 NANOVLLM_PROFILE_LAYER_IDS=mid NANOVLLM_PROMPT_LENGTHS=8192 python3 example/test.py
+
+PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=8 NANOVLLM_ENABLE_DECODE_MLAPO=0 NANOVLLM_DSA_OFFLOAD_FIXED_TX=128 NANOVLLM_DSA_INDEX_UPDATE_USE_CANN=0 NANOVLLM_DSA_CHECK=1 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=1 NANOVLLM_PROFILE_LAYER_IDS=mid NANOVLLM_PROMPT_LENGTHS=8192 python3 example/test.py
 ```

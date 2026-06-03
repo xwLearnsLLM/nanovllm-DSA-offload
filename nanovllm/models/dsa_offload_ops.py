@@ -1,8 +1,19 @@
 from __future__ import annotations
 
+import os
+
 import torch
 
 import nanovllm.ops as ascend_ops
+
+_DSA_INDEX_UPDATE_CANN_MAX_K = 128
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in ("0", "false", "off", "no", "")
 
 
 def dsa_indexer_score(
@@ -107,6 +118,90 @@ def dsa_index_update_torch(
         ] = promote_tokens
 
 
+def _dsa_index_update_cann(
+    score: torch.Tensor,
+    hbm_cached_tokens_pool: torch.Tensor,
+    promote_idx: torch.Tensor,
+    demote_idx: torch.Tensor,
+    copy_counts: torch.Tensor,
+    candidate_lens: torch.Tensor,
+    selected_lens: torch.Tensor,
+    req_pool_entries: torch.Tensor,
+    max_copy_tokens: int,
+) -> None:
+    """Run the CANN dsa_update_index op behind the framework-facing interface."""
+    promote_idx.zero_()
+    demote_idx.zero_()
+    copy_counts.zero_()
+
+    bs = int(score.shape[0])
+    k = int(max_copy_tokens)
+    if bs <= 0 or k <= 0:
+        return
+    if k > _DSA_INDEX_UPDATE_CANN_MAX_K:
+        raise RuntimeError(
+            "CANN dsa_update_index supports at most "
+            f"{_DSA_INDEX_UPDATE_CANN_MAX_K} copy tokens, got {k}. "
+            "Set NANOVLLM_DSA_INDEX_UPDATE_USE_CANN=0 to use the torch path, "
+            "or lower NANOVLLM_DSA_OFFLOAD_FIXED_TX."
+        )
+    if not hasattr(ascend_ops, "dsa_update_index"):
+        raise RuntimeError(
+            "ascend_ops.dsa_update_index is unavailable. Rebuild with "
+            "`SOC_VERSION=ascend910_9391 PYTHONPATH=$PWD:$PYTHONPATH bash scripts/build_nanovllm_ops.sh`."
+        )
+
+    pool_entries = req_pool_entries.to(torch.long)
+    selected_idx = hbm_cached_tokens_pool[pool_entries].contiguous()
+    score_contig = score.contiguous()
+    candidate_lens_contig = candidate_lens.contiguous()
+    selected_lens_contig = selected_lens.contiguous()
+    promote_k = promote_idx[:, :k].contiguous()
+    demote_k = demote_idx[:, :k].contiguous()
+
+    # copy_counts must keep the torch prototype semantics. This matters for
+    # mixed short/long batches: a short sequence may already cache all candidate
+    # tokens, in which case the CANN op may still emit padded pairs but scatter
+    # must copy zero tokens for that row.
+    max_selected = int(selected_idx.shape[1])
+    col_range = torch.arange(max_selected, device=score.device).unsqueeze(0)
+    within_len = col_range < selected_lens_contig.unsqueeze(1)
+    valid_id = (selected_idx >= 0) & (selected_idx < candidate_lens_contig.unsqueeze(1))
+    selected_valid = within_len & valid_id
+    actual_selected = selected_valid.sum(dim=1).to(candidate_lens_contig.dtype)
+    available = candidate_lens_contig - actual_selected
+    copy_count = torch.clamp(
+        torch.minimum(
+            torch.full_like(selected_lens_contig, k),
+            torch.minimum(selected_lens_contig, available),
+        ),
+        min=0,
+    )
+    copy_counts.copy_(copy_count)
+
+    ascend_ops.dsa_update_index(
+        score_contig,
+        selected_idx,
+        candidate_lens_contig,
+        selected_lens_contig,
+        k,
+        promote_k,
+        demote_k,
+    )
+
+    if not score.is_contiguous():
+        score.copy_(score_contig)
+    promote_idx[:, :k].copy_(promote_k)
+    demote_idx[:, :k].copy_(demote_k)
+
+    k_range = torch.arange(k, device=score.device).unsqueeze(0)
+    valid_k = k_range < copy_count.unsqueeze(1)
+    flat_pool_rows = pool_entries.unsqueeze(1).expand(-1, k)[valid_k]
+    flat_slots = demote_idx[:, :k][valid_k].to(torch.long)
+    flat_vals = promote_idx[:, :k][valid_k].to(torch.int32)
+    hbm_cached_tokens_pool[flat_pool_rows, flat_slots] = flat_vals
+
+
 def dsa_index_update(
     score: torch.Tensor,
     hbm_cached_tokens_pool: torch.Tensor,
@@ -118,11 +213,25 @@ def dsa_index_update(
     req_pool_entries: torch.Tensor,
     max_copy_tokens: int,
 ) -> None:
-    """Update sparse HBM budget with the PyTorch prototype.
+    """Update sparse HBM budget.
 
-    Keep this function as the stable framework-facing interface. The current
-    implementation is intentionally the PyTorch prototype.
+    By default this uses the CANN op. Set
+    NANOVLLM_DSA_INDEX_UPDATE_USE_CANN=0 to force the PyTorch prototype.
     """
+    if _env_flag("NANOVLLM_DSA_INDEX_UPDATE_USE_CANN", True):
+        _dsa_index_update_cann(
+            score,
+            hbm_cached_tokens_pool,
+            promote_idx,
+            demote_idx,
+            copy_counts,
+            candidate_lens,
+            selected_lens,
+            req_pool_entries,
+            int(max_copy_tokens),
+        )
+        return
+
     dsa_index_update_torch(
         score,
         hbm_cached_tokens_pool,

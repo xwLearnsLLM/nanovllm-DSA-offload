@@ -60,6 +60,7 @@ extern void mla_preprocess_impl(
 #include "cann_ops/moe_gating_top_k/moe_gating_top_k_torch_adpt.h"
 #include "cann_ops/paged_scatter_copy_h2d/paged_scatter_copy_h2d_torch_adpt.h"
 #include "cann_ops/qk_score/qk_score_torch_adpt.h"
+#include "cann_ops/dsa_update_index/dsa_update_index_torch_adpt.h"
 #include "cann_ops/sparse_flash_attention/sparse_flash_attention_torch_adpt.h"
 #include "dsa_indexer_project/dsa_indexer_project_torch_adpt.h"
 #include "mla_preprocess/mla_preprocess_torch_adpt.h"
@@ -220,6 +221,24 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_gating_top_k_py(
       routed_scaling_factor,
       eps,
       optional_tensor(bias_opt));
+}
+
+void dsa_update_index_py(
+    at::Tensor score,
+    at::Tensor selected_idx,
+    const at::Tensor& seq_len,
+    const at::Tensor& selected_len,
+    int64_t k,
+    at::Tensor promote_idx,
+    at::Tensor demote_idx) {
+  vllm_ascend::dsa_update_index(
+      score,
+      selected_idx,
+      seq_len,
+      selected_len,
+      k,
+      promote_idx,
+      demote_idx);
 }
 
 void batch_matmul_transpose_py(
@@ -391,6 +410,16 @@ PYBIND11_MODULE(_C, m) {
       py::arg("routed_scaling_factor"),
       py::arg("eps"),
       py::arg("bias_opt") = py::none());
+  m.def(
+      "dsa_update_index",
+      &dsa_update_index_py,
+      py::arg("score"),
+      py::arg("selected_idx"),
+      py::arg("seq_len"),
+      py::arg("selected_len"),
+      py::arg("k"),
+      py::arg("promote_idx"),
+      py::arg("demote_idx"));
   m.def(
       "batch_matmul_transpose",
       &batch_matmul_transpose_py,
