@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from time import perf_counter
+from typing import Callable
 
 import torch
 import torch.nn.functional as F
@@ -17,6 +18,11 @@ except Exception as exc:  # pragma: no cover - nanovllm Ascend ops are built on 
     ascend_ops_import_error = exc
 else:
     ascend_ops_import_error = None
+
+try:
+    import torchair  # type: ignore
+except Exception:  # pragma: no cover - TorchAir is optional.
+    torchair = None
 
 _POST_OPS = None
 _POST_IMPORT_ERROR: Exception | None = None
@@ -78,6 +84,240 @@ def _apply_rope_neox_reference(x: torch.Tensor, cos: torch.Tensor, sin: torch.Te
     cos = cos.view(view_shape)
     sin = sin.view(view_shape)
     return (x * cos) + (_rotate_half_neox(x) * sin)
+
+
+def _rms_norm_reference(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    orig_dtype = x.dtype
+    x_float = x.float()
+    var = x_float.pow(2).mean(dim=-1, keepdim=True)
+    return (x_float * torch.rsqrt(var + float(eps))).to(orig_dtype) * weight
+
+
+def _dsa_indexer_project_query_only_out_functional(
+    hidden_states: torch.Tensor,
+    q_c: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    wq_b_weight: torch.Tensor,
+    weights_proj_weight: torch.Tensor,
+    q_index_out: torch.Tensor,
+    index_weights_out: torch.Tensor,
+    *,
+    n_head: int,
+    head_dim: int,
+    rope_dim: int,
+    score_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    q = F.linear(q_c, wq_b_weight).view(-1, int(n_head), int(head_dim))
+    weights = F.linear(hidden_states.float(), weights_proj_weight.float()).contiguous()
+    index_weights_out.copy_((weights * float(score_scale)).to(hidden_states.dtype))
+    q_pe, q_nope = torch.split(q, [int(rope_dim), int(head_dim) - int(rope_dim)], dim=-1)
+    q_pe = _apply_rope_neox_reference(q_pe, cos, sin, int(rope_dim))
+    q_index_out[..., : int(rope_dim)].copy_(q_pe)
+    q_index_out[..., int(rope_dim) :].copy_(q_nope)
+    return q_index_out, index_weights_out
+
+
+def _dsa_indexer_project_query_only_with_qc_out_functional(
+    hidden_states: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    q_a_weight: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    wq_b_weight: torch.Tensor,
+    weights_proj_weight: torch.Tensor,
+    q_index_out: torch.Tensor,
+    index_weights_out: torch.Tensor,
+    *,
+    q_norm_eps: float,
+    n_head: int,
+    head_dim: int,
+    rope_dim: int,
+    score_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    q_c = F.linear(hidden_states, q_a_weight)
+    q_c = _rms_norm_reference(q_c, q_norm_weight, float(q_norm_eps))
+    return _dsa_indexer_project_query_only_out_functional(
+        hidden_states,
+        q_c,
+        cos,
+        sin,
+        wq_b_weight,
+        weights_proj_weight,
+        q_index_out,
+        index_weights_out,
+        n_head=int(n_head),
+        head_dim=int(head_dim),
+        rope_dim=int(rope_dim),
+        score_scale=float(score_scale),
+    )
+
+
+class DsaQueryOnlyTorchAirCache:
+    def __init__(self) -> None:
+        self._compiled: dict[tuple, Callable[..., tuple[torch.Tensor, torch.Tensor]]] = {}
+        self._disabled: dict[tuple, str] = {}
+
+    @staticmethod
+    def _key(
+        mode: str,
+        hidden_states: torch.Tensor,
+        *,
+        q_rank: int,
+        n_head: int,
+        head_dim: int,
+        rope_dim: int,
+        q_norm_eps: float | None = None,
+    ) -> tuple:
+        return (
+            str(mode),
+            int(hidden_states.shape[0]),
+            int(hidden_states.shape[1]),
+            int(q_rank),
+            str(hidden_states.dtype),
+            str(hidden_states.device),
+            int(n_head),
+            int(head_dim),
+            int(rope_dim),
+            None if q_norm_eps is None else float(q_norm_eps),
+        )
+
+    def _compile(
+        self,
+        key: tuple,
+        fn,
+        warmup_args: tuple,
+        device: torch.device,
+    ) -> tuple[Callable[..., tuple[torch.Tensor, torch.Tensor]] | None, str]:
+        if key in self._compiled:
+            return self._compiled[key], "cached"
+        if key in self._disabled:
+            return None, self._disabled[key]
+        if torchair is None:
+            reason = "torchair_unavailable"
+            self._disabled[key] = reason
+            return None, reason
+        if device.type != "npu":
+            reason = "non_npu_device"
+            self._disabled[key] = reason
+            return None, reason
+        try:
+            config = torchair.CompilerConfig()
+            backend = torchair.get_npu_backend(compiler_config=config)
+            compiled = torch.compile(fn, backend=backend, dynamic=False)
+            with torch.inference_mode():
+                _ = compiled(*warmup_args)
+                _profile_sync(device)
+            self._compiled[key] = compiled
+            return compiled, "compiled"
+        except Exception as exc:  # pragma: no cover - depends on Ascend/TorchAir runtime.
+            reason = f"compile_failed:{type(exc).__name__}"
+            self._disabled[key] = reason
+            return None, reason
+
+    def get(self, key: tuple) -> tuple[Callable[..., tuple[torch.Tensor, torch.Tensor]] | None, str]:
+        if key in self._compiled:
+            return self._compiled[key], "cached"
+        return None, self._disabled.get(key, "missing")
+
+    def disable(self, key: tuple, reason: str) -> None:
+        self._disabled[key] = reason
+        self._compiled.pop(key, None)
+
+    def compile_query_only(
+        self,
+        hidden_states: torch.Tensor,
+        q_c: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        wq_b_weight: torch.Tensor,
+        weights_proj_weight: torch.Tensor,
+        *,
+        n_head: int,
+        head_dim: int,
+        rope_dim: int,
+        score_scale: float,
+    ) -> tuple[Callable[..., tuple[torch.Tensor, torch.Tensor]] | None, str, tuple]:
+        key = self._key("query_only", hidden_states, q_rank=int(q_c.shape[1]), n_head=int(n_head), head_dim=int(head_dim), rope_dim=int(rope_dim))
+
+        def fn(hidden_states_arg, q_c_arg, cos_arg, sin_arg, wq_b_weight_arg, weights_proj_weight_arg, q_index_out_arg, index_weights_out_arg):
+            return _dsa_indexer_project_query_only_out_functional(
+                hidden_states_arg,
+                q_c_arg,
+                cos_arg,
+                sin_arg,
+                wq_b_weight_arg,
+                weights_proj_weight_arg,
+                q_index_out_arg,
+                index_weights_out_arg,
+                n_head=int(n_head),
+                head_dim=int(head_dim),
+                rope_dim=int(rope_dim),
+                score_scale=float(score_scale),
+            )
+
+        q_index_out = torch.empty((hidden_states.shape[0], int(n_head), int(head_dim)), dtype=hidden_states.dtype, device=hidden_states.device)
+        index_weights_out = torch.empty((hidden_states.shape[0], int(n_head)), dtype=hidden_states.dtype, device=hidden_states.device)
+        args = (hidden_states, q_c, cos, sin, wq_b_weight, weights_proj_weight, q_index_out, index_weights_out)
+        compiled, reason = self._compile(key, fn, args, hidden_states.device)
+        return compiled, reason, key
+
+    def compile_query_only_with_qc(
+        self,
+        hidden_states: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        q_a_weight: torch.Tensor,
+        q_norm_weight: torch.Tensor,
+        wq_b_weight: torch.Tensor,
+        weights_proj_weight: torch.Tensor,
+        *,
+        q_norm_eps: float,
+        n_head: int,
+        head_dim: int,
+        rope_dim: int,
+        score_scale: float,
+    ) -> tuple[Callable[..., tuple[torch.Tensor, torch.Tensor]] | None, str, tuple]:
+        key = self._key("query_only_with_qc", hidden_states, q_rank=int(q_a_weight.shape[0]), n_head=int(n_head), head_dim=int(head_dim), rope_dim=int(rope_dim), q_norm_eps=float(q_norm_eps))
+
+        def fn(hidden_states_arg, cos_arg, sin_arg, q_a_weight_arg, q_norm_weight_arg, wq_b_weight_arg, weights_proj_weight_arg, q_index_out_arg, index_weights_out_arg):
+            return _dsa_indexer_project_query_only_with_qc_out_functional(
+                hidden_states_arg,
+                cos_arg,
+                sin_arg,
+                q_a_weight_arg,
+                q_norm_weight_arg,
+                wq_b_weight_arg,
+                weights_proj_weight_arg,
+                q_index_out_arg,
+                index_weights_out_arg,
+                q_norm_eps=float(q_norm_eps),
+                n_head=int(n_head),
+                head_dim=int(head_dim),
+                rope_dim=int(rope_dim),
+                score_scale=float(score_scale),
+            )
+
+        q_index_out = torch.empty((hidden_states.shape[0], int(n_head), int(head_dim)), dtype=hidden_states.dtype, device=hidden_states.device)
+        index_weights_out = torch.empty((hidden_states.shape[0], int(n_head)), dtype=hidden_states.dtype, device=hidden_states.device)
+        args = (hidden_states, cos, sin, q_a_weight, q_norm_weight, wq_b_weight, weights_proj_weight, q_index_out, index_weights_out)
+        compiled, reason = self._compile(key, fn, args, hidden_states.device)
+        return compiled, reason, key
+
+
+_QUERY_ONLY_TORCHAIR_CACHE = DsaQueryOnlyTorchAirCache()
+
+
+def _ensure_dynamo_recompile_limit(num_shapes: int) -> None:
+    try:
+        import torch._dynamo as torch_dynamo  # type: ignore
+
+        current = int(getattr(torch_dynamo.config, "recompile_limit"))
+        target = max(current, int(num_shapes) + 4)
+        if target > current:
+            torch_dynamo.config.recompile_limit = target
+    except Exception:
+        return
 
 
 def _can_use_q_bmm(q_c: torch.Tensor, wq_b_bmm_t: torch.Tensor | None, enable_q_bmm: bool) -> bool:
@@ -362,6 +602,220 @@ def dsa_indexer_project_query_only(
     return q_index_out, index_weights_out
 
 
+def dsa_indexer_project_query_only_torchair(
+    hidden_states: torch.Tensor,
+    q_c: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    wq_b_weight: torch.Tensor,
+    weights_proj_weight: torch.Tensor,
+    q_index_out: torch.Tensor,
+    index_weights_out: torch.Tensor,
+    *,
+    n_head: int,
+    head_dim: int,
+    rope_dim: int,
+    score_scale: float,
+    allow_compile: bool,
+    detail: dict[str, float] | None = None,
+    sync_detail: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, bool, str]:
+    if q_index_out.shape != (hidden_states.shape[0], n_head, head_dim):
+        raise ValueError(f"q_index_out shape must be {(hidden_states.shape[0], n_head, head_dim)}, got {tuple(q_index_out.shape)}")
+    if index_weights_out.shape != (hidden_states.shape[0], n_head):
+        raise ValueError(f"index_weights_out shape must be {(hidden_states.shape[0], n_head)}, got {tuple(index_weights_out.shape)}")
+
+    start = _timer_start(detail, sync_detail, hidden_states.device)
+    if allow_compile:
+        compiled, reason, key = _QUERY_ONLY_TORCHAIR_CACHE.compile_query_only(
+            hidden_states,
+            q_c,
+            cos,
+            sin,
+            wq_b_weight,
+            weights_proj_weight,
+            n_head=int(n_head),
+            head_dim=int(head_dim),
+            rope_dim=int(rope_dim),
+            score_scale=float(score_scale),
+        )
+    else:
+        key = _QUERY_ONLY_TORCHAIR_CACHE._key("query_only", hidden_states, q_rank=int(q_c.shape[1]), n_head=int(n_head), head_dim=int(head_dim), rope_dim=int(rope_dim))
+        compiled, reason = _QUERY_ONLY_TORCHAIR_CACHE.get(key)
+    if compiled is None:
+        _timer_end(detail, "torchair", start, sync_detail, hidden_states.device)
+        return q_index_out, index_weights_out, False, reason
+
+    try:
+        with torch.inference_mode():
+            _ = compiled(hidden_states, q_c, cos, sin, wq_b_weight, weights_proj_weight, q_index_out, index_weights_out)
+        _timer_end(detail, "torchair", start, sync_detail, hidden_states.device)
+        return q_index_out, index_weights_out, True, "torchair"
+    except Exception as exc:  # pragma: no cover - depends on Ascend/TorchAir runtime.
+        reason = f"run_failed:{type(exc).__name__}"
+        _QUERY_ONLY_TORCHAIR_CACHE.disable(key, reason)
+        _timer_end(detail, "torchair", start, sync_detail, hidden_states.device)
+        return q_index_out, index_weights_out, False, reason
+
+
+def dsa_indexer_project_query_only_with_qc_torchair(
+    hidden_states: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    q_a_weight: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    wq_b_weight: torch.Tensor,
+    weights_proj_weight: torch.Tensor,
+    q_index_out: torch.Tensor,
+    index_weights_out: torch.Tensor,
+    *,
+    q_norm_eps: float,
+    n_head: int,
+    head_dim: int,
+    rope_dim: int,
+    score_scale: float,
+    allow_compile: bool,
+    detail: dict[str, float] | None = None,
+    sync_detail: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, bool, str]:
+    if q_index_out.shape != (hidden_states.shape[0], n_head, head_dim):
+        raise ValueError(f"q_index_out shape must be {(hidden_states.shape[0], n_head, head_dim)}, got {tuple(q_index_out.shape)}")
+    if index_weights_out.shape != (hidden_states.shape[0], n_head):
+        raise ValueError(f"index_weights_out shape must be {(hidden_states.shape[0], n_head)}, got {tuple(index_weights_out.shape)}")
+
+    start = _timer_start(detail, sync_detail, hidden_states.device)
+    if allow_compile:
+        compiled, reason, key = _QUERY_ONLY_TORCHAIR_CACHE.compile_query_only_with_qc(
+            hidden_states,
+            cos,
+            sin,
+            q_a_weight,
+            q_norm_weight,
+            wq_b_weight,
+            weights_proj_weight,
+            q_norm_eps=float(q_norm_eps),
+            n_head=int(n_head),
+            head_dim=int(head_dim),
+            rope_dim=int(rope_dim),
+            score_scale=float(score_scale),
+        )
+    else:
+        key = _QUERY_ONLY_TORCHAIR_CACHE._key("query_only_with_qc", hidden_states, q_rank=int(q_a_weight.shape[0]), n_head=int(n_head), head_dim=int(head_dim), rope_dim=int(rope_dim), q_norm_eps=float(q_norm_eps))
+        compiled, reason = _QUERY_ONLY_TORCHAIR_CACHE.get(key)
+    if compiled is None:
+        _timer_end(detail, "torchair_with_qc", start, sync_detail, hidden_states.device)
+        return q_index_out, index_weights_out, False, reason
+
+    try:
+        with torch.inference_mode():
+            _ = compiled(hidden_states, cos, sin, q_a_weight, q_norm_weight, wq_b_weight, weights_proj_weight, q_index_out, index_weights_out)
+        _timer_end(detail, "torchair_with_qc", start, sync_detail, hidden_states.device)
+        return q_index_out, index_weights_out, True, "torchair_with_qc"
+    except Exception as exc:  # pragma: no cover - depends on Ascend/TorchAir runtime.
+        reason = f"run_failed:{type(exc).__name__}"
+        _QUERY_ONLY_TORCHAIR_CACHE.disable(key, reason)
+        _timer_end(detail, "torchair_with_qc", start, sync_detail, hidden_states.device)
+        return q_index_out, index_weights_out, False, reason
+
+
+def warmup_dsa_query_only_torchair(
+    *,
+    tokens_list: list[int],
+    hidden_size: int,
+    q_lora_rank: int,
+    n_head: int,
+    head_dim: int,
+    rope_dim: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    wq_b_weight: torch.Tensor,
+    weights_proj_weight: torch.Tensor,
+    score_scale: float,
+) -> dict[int, str]:
+    results: dict[int, str] = {}
+    if torchair is None:
+        return {int(tokens): "torchair_unavailable" for tokens in tokens_list}
+    if device.type != "npu":
+        return {int(tokens): "non_npu_device" for tokens in tokens_list}
+    _ensure_dynamo_recompile_limit(len([tokens for tokens in tokens_list if int(tokens) > 0]))
+    for tokens in tokens_list:
+        tokens = int(tokens)
+        if tokens <= 0:
+            continue
+        try:
+            hidden_states = torch.zeros((tokens, int(hidden_size)), dtype=dtype, device=device)
+            q_c = torch.zeros((tokens, int(q_lora_rank)), dtype=dtype, device=device)
+            cos = torch.ones((tokens, 1, 1, int(rope_dim)), dtype=dtype, device=device).contiguous()
+            sin = torch.zeros((tokens, 1, 1, int(rope_dim)), dtype=dtype, device=device).contiguous()
+            compiled, reason, _ = _QUERY_ONLY_TORCHAIR_CACHE.compile_query_only(
+                hidden_states,
+                q_c,
+                cos,
+                sin,
+                wq_b_weight,
+                weights_proj_weight,
+                n_head=int(n_head),
+                head_dim=int(head_dim),
+                rope_dim=int(rope_dim),
+                score_scale=float(score_scale),
+            )
+            results[tokens] = "ok" if compiled is not None else reason
+        except Exception as exc:  # pragma: no cover - depends on Ascend/TorchAir runtime.
+            results[tokens] = f"warmup_failed:{type(exc).__name__}"
+    return results
+
+
+def warmup_dsa_query_only_with_qc_torchair(
+    *,
+    tokens_list: list[int],
+    hidden_size: int,
+    q_lora_rank: int,
+    n_head: int,
+    head_dim: int,
+    rope_dim: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    q_a_weight: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    wq_b_weight: torch.Tensor,
+    weights_proj_weight: torch.Tensor,
+    q_norm_eps: float,
+    score_scale: float,
+) -> dict[int, str]:
+    results: dict[int, str] = {}
+    if torchair is None:
+        return {int(tokens): "torchair_unavailable" for tokens in tokens_list}
+    if device.type != "npu":
+        return {int(tokens): "non_npu_device" for tokens in tokens_list}
+    _ensure_dynamo_recompile_limit(len([tokens for tokens in tokens_list if int(tokens) > 0]))
+    for tokens in tokens_list:
+        tokens = int(tokens)
+        if tokens <= 0:
+            continue
+        try:
+            hidden_states = torch.zeros((tokens, int(hidden_size)), dtype=dtype, device=device)
+            cos = torch.ones((tokens, 1, 1, int(rope_dim)), dtype=dtype, device=device).contiguous()
+            sin = torch.zeros((tokens, 1, 1, int(rope_dim)), dtype=dtype, device=device).contiguous()
+            compiled, reason, _ = _QUERY_ONLY_TORCHAIR_CACHE.compile_query_only_with_qc(
+                hidden_states,
+                cos,
+                sin,
+                q_a_weight,
+                q_norm_weight,
+                wq_b_weight,
+                weights_proj_weight,
+                q_norm_eps=float(q_norm_eps),
+                n_head=int(n_head),
+                head_dim=int(head_dim),
+                rope_dim=int(rope_dim),
+                score_scale=float(score_scale),
+            )
+            results[tokens] = "ok" if compiled is not None else reason
+        except Exception as exc:  # pragma: no cover - depends on Ascend/TorchAir runtime.
+            results[tokens] = f"warmup_failed:{type(exc).__name__}"
+    return results
+
+
 __all__ = [
     "dsa_indexer_project",
     "dsa_indexer_project_post_availability_error",
@@ -372,5 +826,9 @@ __all__ = [
     "dsa_indexer_project_post_real_out",
     "dsa_indexer_project_q_path",
     "dsa_indexer_project_query_only",
+    "dsa_indexer_project_query_only_torchair",
+    "dsa_indexer_project_query_only_with_qc_torchair",
     "dsa_indexer_project_torch",
+    "warmup_dsa_query_only_torchair",
+    "warmup_dsa_query_only_with_qc_torchair",
 ]

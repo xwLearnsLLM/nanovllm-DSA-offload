@@ -19,7 +19,15 @@ from nanovllm.models.dsa_offload_ops import (
     dsa_indexer_score,
     dsa_scatter_h2d,
 )
-from nanovllm.models.dsa_indexer_project import dsa_indexer_project, dsa_indexer_project_post_available, dsa_indexer_project_query_only
+from nanovllm.models.dsa_indexer_project import (
+    dsa_indexer_project,
+    dsa_indexer_project_post_available,
+    dsa_indexer_project_query_only,
+    dsa_indexer_project_query_only_torchair,
+    dsa_indexer_project_query_only_with_qc_torchair,
+    warmup_dsa_query_only_torchair,
+    warmup_dsa_query_only_with_qc_torchair,
+)
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
 from nanovllm.layers.layernorm import RMSNorm
@@ -57,6 +65,22 @@ def _env_int(name: str, default: int) -> int:
         return int(value)
     except ValueError:
         return default
+
+
+def _env_csv_ints(name: str, default: str) -> list[int]:
+    value = os.environ.get(name, default)
+    result: list[int] = []
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            parsed = int(item)
+        except ValueError:
+            continue
+        if parsed > 0:
+            result.append(parsed)
+    return result
 
 
 def _first_tensor(value):
@@ -749,6 +773,11 @@ class DeepseekV32Indexer(nn.Module):
         self.last_q_project_path = "linear"
         self._output_buffer_key = None
         self._output_buffers = None
+        self.query_only_backend = os.environ.get("NANOVLLM_DSA_QUERY_ONLY_BACKEND", "current").strip().lower()
+        if self.query_only_backend not in ("current", "torchair", "auto"):
+            self.query_only_backend = "current"
+        self.query_only_warmup_tokens = _env_csv_ints("NANOVLLM_DSA_QUERY_ONLY_WARMUP_TOKENS", "1,2,4,8,16,32,64,128")
+        self.query_only_torchair_warmup_status: dict[int, str] = {}
 
     # Output tensors are owned by this layer and reused only in decode. Prefill may have
     # thousands of tokens, so caching those temporary outputs would pin huge per-layer tensors.
@@ -809,6 +838,28 @@ class DeepseekV32Indexer(nn.Module):
             self.last_q_project_path = "query_only"
             # Decode DSA only scores prefill candidates. The decode token key is
             # already in the MLA tail budget, so skip index_k projection/cache.
+            if self.query_only_backend in ("torchair", "auto"):
+                _, _, used_torchair, reason = dsa_indexer_project_query_only_torchair(
+                    hidden_states,
+                    q_c,
+                    cos,
+                    sin,
+                    self.wq_b.weight,
+                    self.weights_proj.weight,
+                    q_index,
+                    index_weights,
+                    n_head=self.n_head,
+                    head_dim=self.head_dim,
+                    rope_dim=self.rope_dim,
+                    score_scale=1.0,  # vllm-ascend BF16 lightning_indexer consumes raw weights_proj(x).
+                    allow_compile=self.query_only_backend == "torchair",
+                    detail=detail,
+                    sync_detail=sync_detail,
+                )
+                if used_torchair:
+                    self.last_q_project_path = "query_only_torchair"
+                    return q_index, None, index_weights
+                self.last_q_project_path = f"query_only_torchair_fallback:{reason}"
             dsa_indexer_project_query_only(
                 hidden_states,
                 q_c,
@@ -1003,6 +1054,8 @@ class DeepseekV32DSAAttention(nn.Module):
             "k_norm": 0.0,
             "rope": 0.0,
             "weights_proj": 0.0,
+            "torchair": 0.0,
+            "torchair_with_qc": 0.0,
         }
 
     def _decode_timer_start(self, profile_decode: bool, device) -> float | None:
@@ -1122,6 +1175,97 @@ class DeepseekV32DSAAttention(nn.Module):
 
         if self.enable_decode_mlapo:
             self._prepare_decode_mlapo()
+        self._warmup_query_only_with_qc_torchair()
+
+    def _query_only_q_a_weight(self) -> torch.Tensor | None:
+        if self.fuse_qkv_a:
+            if self.wd_qkv is None:
+                return None
+            return self.wd_qkv[: self.q_lora_rank]
+        return self.q_a_proj.weight
+
+    def _warmup_query_only_with_qc_torchair(self) -> None:
+        if self.indexer.query_only_backend not in ("torchair", "auto"):
+            return
+        if self.layer_id != 0:                                  # Graph is shape-based; one layer warms the rank cache.
+            return
+        q_a_weight = self._query_only_q_a_weight()
+        q_only_status = warmup_dsa_query_only_torchair(
+            tokens_list=self.indexer.query_only_warmup_tokens,
+            hidden_size=self.hidden_size,
+            q_lora_rank=self.q_lora_rank,
+            n_head=self.indexer.n_head,
+            head_dim=self.indexer.head_dim,
+            rope_dim=self.indexer.rope_dim,
+            dtype=self.indexer.wq_b.weight.dtype,
+            device=self.indexer.wq_b.weight.device,
+            wq_b_weight=self.indexer.wq_b.weight,
+            weights_proj_weight=self.indexer.weights_proj.weight,
+            score_scale=1.0,
+        )
+        if q_a_weight is None:
+            self.indexer.query_only_torchair_warmup_status = {int(tokens): f"q_only={q_only_status.get(int(tokens), 'skipped')};with_qc=q_a_weight_unavailable" for tokens in self.indexer.query_only_warmup_tokens}
+            return
+        with_qc_status = warmup_dsa_query_only_with_qc_torchair(
+            tokens_list=self.indexer.query_only_warmup_tokens,
+            hidden_size=self.hidden_size,
+            q_lora_rank=self.q_lora_rank,
+            n_head=self.indexer.n_head,
+            head_dim=self.indexer.head_dim,
+            rope_dim=self.indexer.rope_dim,
+            dtype=q_a_weight.dtype,
+            device=q_a_weight.device,
+            q_a_weight=q_a_weight,
+            q_norm_weight=self.q_a_layernorm.weight,
+            wq_b_weight=self.indexer.wq_b.weight,
+            weights_proj_weight=self.indexer.weights_proj.weight,
+            q_norm_eps=float(self.q_a_layernorm.eps),
+            score_scale=1.0,
+        )
+        self.indexer.query_only_torchair_warmup_status = {int(tokens): f"q_only={q_only_status.get(int(tokens), 'skipped')};with_qc={with_qc_status.get(int(tokens), 'skipped')}" for tokens in self.indexer.query_only_warmup_tokens}
+
+    def _run_indexer_with_qc_torchair(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        profile_decode: bool,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, bool]:
+        if self.indexer.query_only_backend not in ("torchair", "auto"):
+            return None, None, None, False
+        q_a_weight = self._query_only_q_a_weight()
+        if q_a_weight is None:
+            return None, None, None, False
+
+        start = self._decode_timer_start(profile_decode, hidden_states.device)
+        indexer_detail = {key: 0.0 for key in self.last_decode_indexer_detail} if profile_decode else None
+        cos, sin = self.indexer._rope_cos_sin(positions, self.indexer_rotary_emb, hidden_states.dtype)
+        q_index, _, index_weights = self.indexer._get_output_buffers(hidden_states)
+        q_index, index_weights, used_torchair, reason = dsa_indexer_project_query_only_with_qc_torchair(
+            hidden_states,
+            cos,
+            sin,
+            q_a_weight,
+            self.q_a_layernorm.weight,
+            self.indexer.wq_b.weight,
+            self.indexer.weights_proj.weight,
+            q_index,
+            index_weights,
+            q_norm_eps=float(self.q_a_layernorm.eps),
+            n_head=self.indexer.n_head,
+            head_dim=self.indexer.head_dim,
+            rope_dim=self.indexer.rope_dim,
+            score_scale=1.0,                                   # Keep qk_score inputs aligned with vllm-ascend BF16 SFA.
+            allow_compile=self.indexer.query_only_backend == "torchair",
+            detail=indexer_detail,
+            sync_detail=self.decode_timing_sync,
+        )
+        if indexer_detail is not None:
+            self.last_decode_indexer_detail = indexer_detail
+            self.last_decode_indexer_q_path = "query_only_torchair_with_qc" if used_torchair else f"query_only_torchair_with_qc_fallback:{reason}"
+        self._decode_timer_end(profile_decode, "indexer_project", start, hidden_states.device)
+        if not used_torchair:
+            return None, None, None, False
+        return q_index, None, index_weights, True
 
     def _prepare_decode_mlapo(self) -> None:
         if self.mlapo_wd_qkv is not None and self.mlapo_wu_q is not None:
@@ -2144,21 +2288,22 @@ class DeepseekV32DSAAttention(nn.Module):
         )
         needs_decode_dsa_update = bool(context.needs_dsa_update and self.dsa_offload_fixed_tx > 0)
         if use_decode_mlapo:
+            try_torchair_with_qc = needs_decode_dsa_update and self.indexer.query_only_backend in ("torchair", "auto")
             ql_nope, q_pe, q_c = self._decode_mlapo_preprocess(
                 positions,
                 hidden_states,
                 profile_decode,
-                need_inner_out=needs_decode_dsa_update,
+                need_inner_out=needs_decode_dsa_update and not try_torchair_with_qc,
             )
             q_index = index_k = weights = None
             if needs_decode_dsa_update:
-                q_index, index_k, weights = self._run_indexer(
-                    hidden_states,
-                    q_c,
-                    positions,
-                    profile_decode,
-                    query_only=True,
-                )
+                used_torchair_with_qc = False
+                if try_torchair_with_qc:
+                    q_index, index_k, weights, used_torchair_with_qc = self._run_indexer_with_qc_torchair(hidden_states, positions, profile_decode)
+                if not used_torchair_with_qc:
+                    if try_torchair_with_qc or q_c is None or q_c.numel() == 0:
+                        q_c = self._decode_mlapo_q_c_fallback(hidden_states)  # TorchAir unavailable/fallback: compute q_c on the old path.
+                    q_index, index_k, weights = self._run_indexer(hidden_states, q_c, positions, profile_decode, query_only=True)
             if index_k is not None:
                 start = self._decode_timer_start(profile_decode, index_k.device)
                 self._store_index_cache(index_k)
