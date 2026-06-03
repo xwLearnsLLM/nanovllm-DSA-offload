@@ -38,51 +38,46 @@ export NANOVLLM_IGNORE_EOS=1
 
 # 运行
 
-## 2026-06-03 10:25：清理 DSA 临时日志，新增 NANOVLLM_DSA_CHECK，并精简 timing 字段
+## 2026-06-03 13:45：修复 dsa_update_index CANN kernel 对 selected_idx 有序性的错误假设
 
 下一次请在昇腾上先跑这个：
 
-```bash
-PYTHONPATH=$PWD:$PYTHONPATH python3 -m py_compile nanovllm/models/deepseek_v32.py
-
-PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=8 NANOVLLM_ENABLE_DECODE_MLAPO=0 NANOVLLM_DSA_OFFLOAD_FIXED_TX=128 NANOVLLM_DSA_CHECK=1 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=1 NANOVLLM_PROFILE_LAYER_IDS=mid NANOVLLM_PROMPT_LENGTHS=8192 python3 example/test.py
-
-PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_ENABLE_DECODE_MLAPO=0 NANOVLLM_DSA_OFFLOAD_FIXED_TX=128 NANOVLLM_DSA_CHECK=0 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=1 NANOVLLM_PROFILE_LAYER_IDS=mid NANOVLLM_PROMPT_LENGTHS=8192 python3 example/test.py
-```
-
-## 2026-06-03 12:53：合入 dsa_index_update CANN 真算子，默认启用，保留 torch 路径开关
-
-下一次请在昇腾上先跑这个：
-```bash
-PYTHONPATH=$PWD:$PYTHONPATH python3 -m py_compile nanovllm/models/dsa_offload_ops.py ut_ops/probe_dsa_index_update.py
-
-SOC_VERSION=ascend910_9391 PYTHONPATH=$PWD:$PYTHONPATH bash scripts/build_nanovllm_ops.sh
-
-PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/probe_dsa_index_update.py --device npu:0 --batch 4 --candidate 8192 --selected 2560 --k 128 --warmup 5 --iters 20
-
-PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=8 NANOVLLM_ENABLE_DECODE_MLAPO=0 NANOVLLM_DSA_OFFLOAD_FIXED_TX=128 NANOVLLM_DSA_INDEX_UPDATE_USE_CANN=1 NANOVLLM_DSA_CHECK=1 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=1 NANOVLLM_PROFILE_LAYER_IDS=mid NANOVLLM_PROMPT_LENGTHS=8192 python3 example/test.py
-
-PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=8 NANOVLLM_ENABLE_DECODE_MLAPO=0 NANOVLLM_DSA_OFFLOAD_FIXED_TX=128 NANOVLLM_DSA_INDEX_UPDATE_USE_CANN=0 NANOVLLM_DSA_CHECK=1 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=1 NANOVLLM_PROFILE_LAYER_IDS=mid NANOVLLM_PROMPT_LENGTHS=8192 python3 example/test.py
-```
-
-## 2026-06-03 13:10：修复 build_nanovllm_ops.sh 后半段高并发构建不稳定
-
-下一次请在昇腾上先跑这个：
 ```bash
 NANOVLLM_CANN_BUILD_JOBS=64 NANOVLLM_EXT_BUILD_JOBS=1 SOC_VERSION=ascend910_9391 PYTHONPATH=$PWD:$PYTHONPATH bash scripts/build_nanovllm_ops.sh
-
-PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/probe_dsa_index_update.py --device npu:0 --batch 4 --candidate 8192 --selected 2560 --k 128 --warmup 5 --iters 20
 ```
 
-## 2026-06-03 13:18：补充导出 ascend_ops.dsa_update_index
+然后跑单测确认 CANN `dsa_update_index` 和 torch 版本对齐：
 
-下一次请在昇腾上先跑这个：
 ```bash
-PYTHONPATH=$PWD:$PYTHONPATH python3 - <<'PY'
-import nanovllm.ops as ops
-print("has_dsa_update_index", hasattr(ops, "dsa_update_index"))
-print(ops.dsa_update_index)
-PY
-
-PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/probe_dsa_index_update.py --device npu:0 --batch 4 --candidate 8192 --selected 2560 --k 128 --warmup 5 --iters 20
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 NANOVLLM_DSA_INDEX_UPDATE_USE_CANN=1 python3 ut_ops/probe_dsa_index_update.py --device npu:0 --batch 4 --candidate 8192 --selected 2560 --k 128 --warmup 10 --iters 100
 ```
+
+最后跑一次带 `DSA_CHECK` 的推理，重点看是否还出现 `DSA_CHECK_FAIL pool_not_unique`：
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=8 NANOVLLM_ENABLE_DECODE_MLAPO=0 NANOVLLM_DSA_OFFLOAD_FIXED_TX=128 NANOVLLM_DSA_INDEX_UPDATE_USE_CANN=1 NANOVLLM_DSA_CHECK=1 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=1 NANOVLLM_PROFILE_LAYER_IDS=mid NANOVLLM_PROMPT_LENGTHS=8192 python3 example/test.py
+```
+
+## 2026-06-03 14:36：合入 query-only TorchAir，并把 MLAPO q_c fallback 纳入 with-qc 图
+
+下一次请在昇腾上先跑这个，确认 q_c-only 图和 with-qc 图都能和普通 query-only 路径对齐：
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/probe_query_only_torchair.py --device npu:0 --tokens 1,4,8 --warmup 10 --iters 100
+```
+
+然后跑一把带 timing 的推理，重点看日志里的 `indexer_project_detail` 中是否出现 `torchair_with_qc`，以及 `indexer_project` 是否下降：
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_DSA_QUERY_ONLY_BACKEND=auto NANOVLLM_DSA_QUERY_ONLY_WARMUP_TOKENS=1,2,4,8,16,32,64,128 NANOVLLM_MAX_GEN_TOKENS=8 NANOVLLM_ENABLE_DECODE_MLAPO=1 NANOVLLM_DSA_OFFLOAD_FIXED_TX=128 NANOVLLM_DSA_INDEX_UPDATE_USE_CANN=1 NANOVLLM_DSA_CHECK=0 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=1 NANOVLLM_PROFILE_LAYER_IDS=mid NANOVLLM_PROMPT_LENGTHS=8192 python3 example/test.py
+```
+
+## 2026-06-03 15:25：调整 dsa_index_update 单测，默认校验 hard invariant 而不是逐项对齐 torch
+
+下一次请在昇腾上先跑这个。默认会检查 promote/demote/pool unique、范围、pool 更新位置、非 demote slot 不变等硬约束，并打印和 torch 原型的 overlap 作为参考：
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 NANOVLLM_DSA_INDEX_UPDATE_USE_CANN=1 python3 ut_ops/probe_dsa_index_update.py --device npu:0 --batch 4 --candidate 8192 --selected 2560 --k 128 --warmup 10 --iters 100
+```
+
+如果后面临时想看逐项是否和 torch 完全一致，再额外加 `--strict-torch`，但这个不作为默认正确性标准。
