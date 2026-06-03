@@ -6,6 +6,7 @@ PYTHON_BIN="${PYTHON:-python}"
 RAW_SOC_VERSION="${SOC_VERSION:-ascend910_9391}"
 ASCEND_HOME_PATH="${ASCEND_HOME_PATH:-/usr/local/Ascend/ascend-toolkit/latest}"
 CUSTOM_OPS="lightning_indexer_vllm;sparse_flash_attention;moe_gating_top_k;qk_score;paged_scatter_copy_h2d;dsa_update_index"
+NANOVLLM_EXT_BUILD_JOBS="${NANOVLLM_EXT_BUILD_JOBS:-1}"
 
 case "${RAW_SOC_VERSION}" in
   ascend910_93*)
@@ -32,6 +33,7 @@ echo "[nanovllm ops] root: ${ROOT_DIR}"
 echo "[nanovllm ops] python: $(${PYTHON_BIN} -c 'import sys; print(sys.executable)')"
 echo "[nanovllm ops] soc: raw=${RAW_SOC_VERSION}, cann_opp=${CANN_OPP_SOC_VERSION}, ascendc=${ASCENDC_SOC_VERSION}"
 echo "[nanovllm ops] ascend: ${ASCEND_HOME_PATH}"
+echo "[nanovllm ops] extension build jobs: ${NANOVLLM_EXT_BUILD_JOBS}"
 
 echo "[nanovllm ops] normalize build script line endings"
 find "${ROOT_DIR}/csrc/nanovllm_ascend_ops" -type f \
@@ -56,6 +58,8 @@ print(os.path.dirname(torch_npu.__file__))
 PY
 )"
 
+rm -rf "${ROOT_DIR}/build/nanovllm_ascend_ops"
+
 cmake -S "${ROOT_DIR}/csrc/nanovllm_ascend_ops" \
   -B "${ROOT_DIR}/build/nanovllm_ascend_ops" \
   -DCMAKE_BUILD_TYPE=Release \
@@ -65,7 +69,7 @@ cmake -S "${ROOT_DIR}/csrc/nanovllm_ascend_ops" \
   -DASCEND_HOME_PATH="${ASCEND_HOME_PATH}" \
   -DSOC_VERSION="${ASCENDC_SOC_VERSION}"
 
-cmake --build "${ROOT_DIR}/build/nanovllm_ascend_ops" --target install -j"$(nproc)"
+cmake --build "${ROOT_DIR}/build/nanovllm_ascend_ops" --target install -j"${NANOVLLM_EXT_BUILD_JOBS}"
 
 NANOVLLM_EXT="$(
   find "${ROOT_DIR}/build/nanovllm_ascend_ops" -maxdepth 1 -name "_C*.so" -print -quit
