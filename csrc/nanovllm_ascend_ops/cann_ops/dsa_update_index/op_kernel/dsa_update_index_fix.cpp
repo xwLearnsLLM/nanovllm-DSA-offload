@@ -417,7 +417,6 @@ private:
         AscendC::LocalTensor<uint16_t> scoreRawLocal = scoreRawBuf_.Get<uint16_t>();
         AscendC::LocalTensor<bfloat16_t> scoreBf16Local = scoreRawLocal.template ReinterpretCast<bfloat16_t>();
 
-        int32_t selectedCursor = 0;
         int32_t accumCount = 0;
         for (int32_t base = globalStart; base < globalEnd; base += DSA_STAGE1_SORT_BLOCK) {
             const int32_t chunk = MinInt32(DSA_STAGE1_SORT_BLOCK, globalEnd - base);
@@ -427,20 +426,15 @@ private:
             AscendC::DataCopy(scoreRawLocal, scoreGm_[scoreBase + base], chunk);
             AscendC::PipeBarrier<PIPE_ALL>();
 
-            // Fast path assumes selected_idx is monotonic in token-id order. This is
-            // intentionally restored for performance comparison; dynamic DSA updates
-            // can make selected_idx unordered, so this path may select duplicate tokens.
-            while (selectedCursor < m) {
+            // selected_idx follows HBM sparse-slot order, not token-id order. Decode
+            // updates can insert arbitrary token ids, so the list is not monotonic.
+            // Scan all selected tokens for each chunk; this is conservative but keeps
+            // promote_idx from selecting a token already cached in HBM.
+            for (int32_t selectedCursor = 0; selectedCursor < m; ++selectedCursor) {
                 const int32_t globalIdx = selectedIdxGm_.GetValue(selectedBase + selectedCursor);
-                if (globalIdx < base) {
-                    ++selectedCursor;
-                    continue;
+                if (globalIdx >= base && globalIdx < base + chunk) {
+                    scoreRawLocal.SetValue(globalIdx - base, DSA_BF16_LOW_SENTINEL_RAW);
                 }
-                if (globalIdx >= base + chunk) {
-                    break;
-                }
-                scoreRawLocal.SetValue(globalIdx - base, DSA_BF16_LOW_SENTINEL_RAW);
-                ++selectedCursor;
             }
             AscendC::PipeBarrier<PIPE_ALL>();
 

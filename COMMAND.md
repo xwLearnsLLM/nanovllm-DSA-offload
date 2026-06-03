@@ -77,3 +77,25 @@ PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/bench_dsa
 ```bash
 PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_LOG_PREPARE_DECODE_TIMING=1 NANOVLLM_DSA_QK_SCORE_BF16_OUT=0 NANOVLLM_DSA_QUERY_ONLY_BACKEND=auto NANOVLLM_DSA_QUERY_ONLY_WARMUP_TOKENS=1,2,4,8,16,32,64,128 NANOVLLM_MAX_GEN_TOKENS=8 NANOVLLM_ENABLE_DECODE_MLAPO=1 NANOVLLM_DSA_OFFLOAD_FIXED_TX=128 NANOVLLM_DSA_INDEX_UPDATE_USE_CANN=1 NANOVLLM_DSA_CHECK=0 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=0 NANOVLLM_PROFILE_LAYER_IDS=mid NANOVLLM_PROMPT_LENGTHS=8200,9000,10000,11000,12000,13000,14000,15000,16000,17000 python3 example/test.py
 ```
+
+## 2026-06-03 22:47：临时退回 `dsa_index_update` 的旧快路径
+
+这版是为了测性能，已知旧快路径假设 `hbm_cached_tokens_pool` 按 token id 单调有序，动态 DSA 更新后可能破坏 unique 约束。
+
+下一次请在昇腾上先重新编译算子：
+
+```bash
+NANOVLLM_CANN_BUILD_JOBS=64 NANOVLLM_EXT_BUILD_JOBS=1 SOC_VERSION=ascend910_9391 PYTHONPATH=$PWD:$PYTHONPATH bash scripts/build_nanovllm_ops.sh
+```
+
+然后先跑 `dsa_index_update` sweep 看性能差距：
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/bench_dsa_index_update_sweep.py --device npu:0 --batch-sizes 1,2,4,8,10,16 --candidate-lens 8192,16384,32768,65536 --selected-lens 2560 --warmup 10 --iters 50
+```
+
+如果要看它是否重新触发 unique 风险，再跑 probe：
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/probe_dsa_index_update.py --device npu:0 --batch-size 10 --candidate-len 32768 --selected-len 2560 --k 128 --warmup 10 --iters 50
+```
