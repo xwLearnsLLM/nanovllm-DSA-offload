@@ -9,7 +9,7 @@
 在昇腾机器的仓库根目录执行：
 
 ```bash
-NANOVLLM_CANN_BUILD_JOBS=64 SOC_VERSION=ascend910_9391 PYTHONPATH=$PWD:$PYTHONPATH bash scripts/build_nanovllm_ops.sh
+NANOVLLM_CANN_BUILD_JOBS=64 NANOVLLM_EXT_BUILD_JOBS=1 SOC_VERSION=ascend910_9391 PYTHONPATH=$PWD:$PYTHONPATH bash scripts/build_nanovllm_ops.sh
 ls -lh nanovllm/_C*.so nanovllm/libnanovllm_ascend_kernels.so
 ```
 
@@ -29,7 +29,7 @@ ls -lh nanovllm/_C*.so nanovllm/libnanovllm_ascend_kernels.so
 
 　
 
-## 推128专家模型（16卡910C）
+## 推128专家模型（16卡910C）准备工作
 
 先进行一些公用配置：
 
@@ -50,35 +50,7 @@ export NANOVLLM_IGNORE_EOS=1
 export NANOVLLM_DSA_OFFLOAD_FIXED_TX=128   # 每请求每个decode step 每层换入的token数量
 ```
 
-然后进入目录，不需要 `pip install -e .` ，直接推：
-
-1. 混合长短序列（随机无意义tokens），并打印 decode 时延分解：
-
-```bash
-PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=5 NANOVLLM_PROMPT_LENGTHS=9000,9001,9002,9003,9004,9005,9006 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=0 NANOVLLM_PROFILE_LAYER_IDS=mid python3 example/test.py
-```
-
-2. 混合长短序列（随机无意义tokens），不打印时延分解：
-
-```bash
-PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=5 NANOVLLM_PROMPT_LENGTHS=9000,9001,9002,9003,9004,9005,9006 python3 example/test.py
-```
-
-3. 真实短序列：
-
-```bash
-PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=16 python3 example/short_prompts.py
-```
-
-4. 真实长序列：
-
-```bash
-PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=16 python3 example/long_prompts.py
-```
-
-　
-
-## 推32专家残障模型（8卡910C）
+## 推32专家残障模型（8卡910C）准备工作
 
 先进行一些公用配置：
 
@@ -99,31 +71,30 @@ export NANOVLLM_IGNORE_EOS=1
 export NANOVLLM_DSA_OFFLOAD_FIXED_TX=128   # 每请求每个decode step 每层换入的token数量
 ```
 
+## 运行推理
+
 然后进入目录，不需要 `pip install -e .` ，直接推：
 
-1. 混合长短序列（随机无意义tokens），并打印 decode 时延分解：
+1. 单个长序列，带检查，并打印 decode 时延分解：
 
 ```bash
-PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=5 NANOVLLM_PROMPT_LENGTHS=256,12288,14000,18000 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=0 NANOVLLM_PROFILE_LAYER_IDS=mid python3 example/test.py
+PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=8 NANOVLLM_ENABLE_DECODE_MLAPO=1 NANOVLLM_DSA_INDEX_UPDATE_USE_CANN=1 NANOVLLM_DSA_CHECK=1 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=1 NANOVLLM_PROFILE_LAYER_IDS=mid NANOVLLM_PROMPT_LENGTHS=8200 python3 example/test.py
 ```
 
-2. 混合长短序列（随机无意义tokens），不打印时延分解：
+2. 多个长序列，不检查，不打印时延分解：
 
 ```bash
-PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=5 NANOVLLM_PROMPT_LENGTHS=256,12288,14000,18000 python3 example/test.py
+PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=8 NANOVLLM_ENABLE_DECODE_MLAPO=1 NANOVLLM_DSA_INDEX_UPDATE_USE_CANN=1 NANOVLLM_DSA_CHECK=0 NANOVLLM_LOG_DECODE_LAYER_TIMING=0 NANOVLLM_PROMPT_LENGTHS=8200,8300,8400,8500,8600 python3 example/test.py
 ```
 
-3. 真实短序列：
-
-```bash
-PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=16 python3 example/short_prompts.py
-```
-
-4. 真实长序列：
+3. 真实长序列：
 
 ```bash
 PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=16 python3 example/long_prompts.py
 ```
+
+　
+
 
 　
 
