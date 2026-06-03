@@ -16,35 +16,6 @@ export NANOVLLM_MAX_DECODE_SEQS_PER_STEP=256                    # decode最大ba
 export NANOVLLM_IGNORE_EOS=1
 ```
 
-## 2026-06-02 23:02：对齐 vllm-ascend BF16 indexer weights 输入
-
-下一次请在昇腾上先跑这个：
-
-```bash
-PYTHONPATH=$PWD:$PYTHONPATH python3 -m py_compile nanovllm/models/deepseek_v32.py nanovllm/models/dsa_indexer_project.py ut_ops/probe_indexer_project.py
-
-PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/probe_indexer_project.py --device npu:0 --tokens 4 --warmup 10 --iters 100
-
-export DSA_DUMP=runlog/dsa_index_update_debug_$(date +%Y%m%d_%H%M%S)
-PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=8 NANOVLLM_ENABLE_DECODE_MLAPO=0 NANOVLLM_DSA_OFFLOAD_FIXED_TX=128 NANOVLLM_DSA_DEBUG_INDEX_UPDATE_DUMP_PATH=$DSA_DUMP NANOVLLM_PROFILE_LAYER_IDS=mid NANOVLLM_PROMPT_LENGTHS=8192 python3 example/test.py
-
-ls ${DSA_DUMP}_rank*.txt
-```
-
-## 2026-06-03 08:56：新增 lightning_indexer 与 dsa_indexer_score 的 topk 对齐单测
-
-下一次请在昇腾上先跑这个：
-
-```bash
-PYTHONPATH=$PWD:$PYTHONPATH python3 -m py_compile ut_ops/compare_lightning_indexer_qk_score.py
-
-PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/compare_lightning_indexer_qk_score.py --device npu:0 --batch-size 1 --seq-len 8192 --topk 2048 --score-dtype bf16
-
-PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/compare_lightning_indexer_qk_score.py --device npu:0 --batch-size 1 --seq-len 8192 --topk 2048 --score-dtype fp32
-
-PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/compare_lightning_indexer_qk_score.py --device npu:0 --batch-size 4 --candidate-lens 8192,10000,12000,16384 --topk 2048 --score-dtype bf16
-```
-
 ## 推32专家残障模型（8卡910C）的公共配置
 
 ```bash
@@ -63,41 +34,40 @@ export NANOVLLM_MAX_DECODE_SEQS_PER_STEP=256                    # decode最大ba
 export NANOVLLM_IGNORE_EOS=1
 ```
 
-## 2026-06-02 21:18:30：修复 debug 校验索引设备不一致问题
+## 2026-06-02 23:02：对齐 vllm-ascend BF16 indexer weights 输入
 
 下一次请在昇腾上先跑这个：
 
 ```bash
-PYTHONPATH=$PWD:$PYTHONPATH python3 -m py_compile nanovllm/models/deepseek_v32.py
+PYTHONPATH=$PWD:$PYTHONPATH python3 -m py_compile nanovllm/models/deepseek_v32.py nanovllm/models/dsa_indexer_project.py ut_ops/probe_indexer_project.py
+
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/probe_indexer_project.py --device npu:0 --tokens 4 --warmup 10 --iters 100
 
 export DSA_DUMP=runlog/dsa_index_update_debug_$(date +%Y%m%d_%H%M%S)
-PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=4 NANOVLLM_ENABLE_DECODE_MLAPO=0 NANOVLLM_DSA_OFFLOAD_FIXED_TX=128 NANOVLLM_DSA_DEBUG_INDEX_UPDATE_DUMP_PATH=$DSA_DUMP NANOVLLM_PROFILE_LAYER_IDS=mid NANOVLLM_PROMPT_LENGTHS=8192 python3 example/test.py
+PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=8 NANOVLLM_ENABLE_DECODE_MLAPO=0 NANOVLLM_DSA_OFFLOAD_FIXED_TX=128 NANOVLLM_DSA_DEBUG_INDEX_UPDATE_DUMP_PATH=$DSA_DUMP NANOVLLM_PROFILE_LAYER_IDS=mid NANOVLLM_PROMPT_LENGTHS=8192 python3 example/test.py
 
 ls ${DSA_DUMP}_rank*.txt
 ```
 
-## 2026-06-02 22:05:29：修复 prefill HBM 到 DRAM 阻塞拷贝，并补充 score 输入 NaN 诊断
+## 2026-06-03 10:25：清理 DSA 临时日志，新增 NANOVLLM_DSA_CHECK，并精简 timing 字段
 
 下一次请在昇腾上先跑这个：
 
 ```bash
 PYTHONPATH=$PWD:$PYTHONPATH python3 -m py_compile nanovllm/models/deepseek_v32.py
 
-export DSA_DUMP=runlog/dsa_index_update_debug_$(date +%Y%m%d_%H%M%S)
-PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=4 NANOVLLM_ENABLE_DECODE_MLAPO=0 NANOVLLM_DSA_OFFLOAD_FIXED_TX=128 NANOVLLM_DSA_DEBUG_INDEX_UPDATE_DUMP_PATH=$DSA_DUMP NANOVLLM_PROFILE_LAYER_IDS=mid NANOVLLM_PROMPT_LENGTHS=8192 python3 example/test.py
+PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=8 NANOVLLM_ENABLE_DECODE_MLAPO=0 NANOVLLM_DSA_OFFLOAD_FIXED_TX=128 NANOVLLM_DSA_CHECK=1 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=1 NANOVLLM_PROFILE_LAYER_IDS=mid NANOVLLM_PROMPT_LENGTHS=8192 python3 example/test.py
 
-ls ${DSA_DUMP}_rank*.txt
+PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_ENABLE_DECODE_MLAPO=0 NANOVLLM_DSA_OFFLOAD_FIXED_TX=128 NANOVLLM_DSA_CHECK=0 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=1 NANOVLLM_PROFILE_LAYER_IDS=mid NANOVLLM_PROMPT_LENGTHS=8192 python3 example/test.py
 ```
 
-## 2026-06-02 21:52:45：补充 score 摘要和 prefill DRAM materialize 校验
+## 2026-06-03 11:00：合并 dsa_indexer_project.py 和 dsa_indexer_project_real.py
 
 下一次请在昇腾上先跑这个：
-
 ```bash
-PYTHONPATH=$PWD:$PYTHONPATH python3 -m py_compile nanovllm/models/deepseek_v32.py
+PYTHONPATH=$PWD:$PYTHONPATH python3 -m py_compile nanovllm/models/dsa_indexer_project.py ut_ops/probe_indexer_project.py ut_ops/probe_indexer_project_post.py
 
-export DSA_DUMP=runlog/dsa_index_update_debug_$(date +%Y%m%d_%H%M%S)
-PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=4 NANOVLLM_ENABLE_DECODE_MLAPO=0 NANOVLLM_DSA_OFFLOAD_FIXED_TX=128 NANOVLLM_DSA_DEBUG_INDEX_UPDATE_DUMP_PATH=$DSA_DUMP NANOVLLM_PROFILE_LAYER_IDS=mid NANOVLLM_PROMPT_LENGTHS=8192 python3 example/test.py
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/probe_indexer_project_post.py --device npu:0 --tokens 4 --warmup 10 --iters 100
 
-ls ${DSA_DUMP}_rank*.txt
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/probe_indexer_project.py --device npu:0 --tokens 4 --warmup 10 --iters 100
 ```

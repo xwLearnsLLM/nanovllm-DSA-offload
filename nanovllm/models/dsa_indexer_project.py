@@ -12,13 +12,30 @@ except Exception:  # pragma: no cover - local non-Ascend syntax checks
 
 try:
     import nanovllm.ops as ascend_ops
-except Exception:  # pragma: no cover - nanovllm Ascend ops are built on board.
+except Exception as exc:  # pragma: no cover - nanovllm Ascend ops are built on board.
     ascend_ops = None
+    ascend_ops_import_error = exc
+else:
+    ascend_ops_import_error = None
 
-try:
-    from nanovllm.models import dsa_indexer_project_real
-except Exception:  # pragma: no cover - standalone AscendC op is built on board.
-    dsa_indexer_project_real = None
+_POST_OPS = None
+_POST_IMPORT_ERROR: Exception | None = None
+_EXPECTED_POST_BINDING_VERSION = "dsa_indexer_project_post_csrc_v1"
+if ascend_ops is None:
+    _POST_IMPORT_ERROR = ascend_ops_import_error
+else:
+    try:
+        actual_version = getattr(ascend_ops, "dsa_indexer_project_binding_version", lambda: "missing")()
+        if actual_version != _EXPECTED_POST_BINDING_VERSION:
+            raise RuntimeError(
+                "dsa_indexer_project binding version mismatch: "
+                f"expected {_EXPECTED_POST_BINDING_VERSION}, got {actual_version}. "
+                "Rebuild with `bash scripts/build_nanovllm_ops.sh`."
+            )
+        _POST_OPS = ascend_ops
+    except Exception as exc:  # pragma: no cover - depends on Ascend build env.
+        _POST_IMPORT_ERROR = exc
+        _POST_OPS = None
 
 
 def _profile_sync(device: torch.device) -> None:
@@ -80,7 +97,42 @@ def dsa_indexer_project_q_path(q_c: torch.Tensor, wq_b_bmm_t: torch.Tensor | Non
 
 
 def dsa_indexer_project_post_available() -> bool:
-    return dsa_indexer_project_real is not None and dsa_indexer_project_real.is_available()
+    return _POST_OPS is not None
+
+
+def dsa_indexer_project_post_availability_error() -> Exception | None:
+    return _POST_IMPORT_ERROR
+
+
+def dsa_indexer_project_post_binding_version() -> str | None:
+    if _POST_OPS is None:
+        return None
+    return _POST_OPS.dsa_indexer_project_binding_version()
+
+
+def dsa_indexer_project_post_extension_path() -> str | None:
+    if _POST_OPS is None:
+        return None
+    return getattr(_POST_OPS, "__file__", None)
+
+
+def dsa_indexer_project_post_real(q_in, k_in, weights_in, cos, sin, score_scale: float, rope_dim: int):
+    if _POST_OPS is None:
+        raise RuntimeError(
+            "dsa_indexer_project post op is not built into nanovllm.ops. Run "
+            "`bash scripts/build_nanovllm_ops.sh` on the Ascend machine first."
+        ) from _POST_IMPORT_ERROR
+    return _POST_OPS.dsa_indexer_project_post(q_in, k_in, weights_in, cos, sin, float(score_scale), int(rope_dim))
+
+
+def dsa_indexer_project_post_real_out(q_in, k_in, weights_in, cos, sin, q_out, k_out, weights_out, score_scale: float, rope_dim: int):
+    if _POST_OPS is None:
+        raise RuntimeError(
+            "dsa_indexer_project post op is not built into nanovllm.ops. Run "
+            "`bash scripts/build_nanovllm_ops.sh` on the Ascend machine first."
+        ) from _POST_IMPORT_ERROR
+    _POST_OPS.dsa_indexer_project_post_out(q_in, k_in, weights_in, cos, sin, q_out, k_out, weights_out, float(score_scale), int(rope_dim))
+    return q_out, k_out, weights_out
 
 
 def _can_use_post_op(q: torch.Tensor, k: torch.Tensor, weights: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> bool:
@@ -192,7 +244,7 @@ def dsa_indexer_project_torch(
         # B-stage true AscendC sub-op: q/k RoPE + weights cast, writing final outputs in-place.
         # DeepSeek-V3.2 BF16 SFA in vllm-ascend feeds raw weights_proj(x) to
         # lightning_indexer, so callers pass score_scale=1.0 here.
-        dsa_indexer_project_real.dsa_indexer_project_post_real_out(q, k, weights, cos, sin, q_index_out, index_k_out, index_weights_out, float(score_scale), int(rope_dim))
+        dsa_indexer_project_post_real_out(q, k, weights, cos, sin, q_index_out, index_k_out, index_weights_out, float(score_scale), int(rope_dim))
         _timer_end(detail, "rope", start, sync_detail, q.device)
         return q_index_out, index_k_out, index_weights_out
 
@@ -312,7 +364,12 @@ def dsa_indexer_project_query_only(
 
 __all__ = [
     "dsa_indexer_project",
+    "dsa_indexer_project_post_availability_error",
     "dsa_indexer_project_post_available",
+    "dsa_indexer_project_post_binding_version",
+    "dsa_indexer_project_post_extension_path",
+    "dsa_indexer_project_post_real",
+    "dsa_indexer_project_post_real_out",
     "dsa_indexer_project_q_path",
     "dsa_indexer_project_query_only",
     "dsa_indexer_project_torch",

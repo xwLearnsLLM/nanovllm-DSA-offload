@@ -10,8 +10,12 @@ try:
 except Exception:
     torch_npu = None
 
-from nanovllm.models import dsa_indexer_project_real
-from nanovllm.models.dsa_indexer_project import _apply_rope_neox_reference
+from nanovllm.models.dsa_indexer_project import (
+    _apply_rope_neox_reference,
+    dsa_indexer_project_post_available,
+    dsa_indexer_project_post_binding_version,
+    dsa_indexer_project_post_real_out,
+)
 
 
 def sync(device: torch.device) -> None:
@@ -84,7 +88,7 @@ def main() -> None:
     parser.add_argument("--rtol", type=float, default=0.01)
     args = parser.parse_args()
 
-    if not dsa_indexer_project_real.is_available():
+    if not dsa_indexer_project_post_available():
         raise RuntimeError("dsa_indexer_project_post is not available. Rebuild with: bash scripts/build_nanovllm_ops.sh")
 
     device = torch.device(args.device)
@@ -100,14 +104,14 @@ def main() -> None:
     op_q = torch.empty_like(q)
     op_k = torch.empty_like(k)
     op_w = torch.empty(weights.shape, dtype=q.dtype, device=device)
-    dsa_indexer_project_real.dsa_indexer_project_post_real_out(q, k, weights, cos, sin, op_q, op_k, op_w, score_scale, args.rope_dim)
+    dsa_indexer_project_post_real_out(q, k, weights, cos, sin, op_q, op_k, op_w, score_scale, args.rope_dim)
     sync(device)
 
     print(
         "INDEXER_POST_PROBE "
         f"device={args.device} tokens={args.tokens} heads={args.heads} "
         f"head_dim={args.head_dim} rope_dim={args.rope_dim} warmup={args.warmup} iters={args.iters} "
-        f"binding={dsa_indexer_project_real.binding_version()}"
+        f"binding={dsa_indexer_project_post_binding_version()}"
     )
     print("INDEXER_POST_DIFF " + diff_report("q", op_q, ref_q))
     print("INDEXER_POST_DIFF " + diff_report("k", op_k, ref_k))
@@ -121,7 +125,7 @@ def main() -> None:
         q_out = torch.empty_like(q)
         k_out = torch.empty_like(k)
         w_out = torch.empty(weights.shape, dtype=q.dtype, device=device)
-        return dsa_indexer_project_real.dsa_indexer_project_post_real_out(q, k, weights, cos, sin, q_out, k_out, w_out, score_scale, args.rope_dim)
+        return dsa_indexer_project_post_real_out(q, k, weights, cos, sin, q_out, k_out, w_out, score_scale, args.rope_dim)
 
     op_ms = bench(run_post_out, device, args.warmup, args.iters)
     print(f"INDEXER_POST_BENCH reference_avg_ms={ref_ms:.6f} ascendc_avg_ms={op_ms:.6f}")

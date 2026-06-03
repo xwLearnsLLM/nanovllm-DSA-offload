@@ -6,8 +6,12 @@ import time
 import torch
 import torch.nn.functional as F
 
-from nanovllm.models.dsa_indexer_project import dsa_indexer_project, dsa_indexer_project_post_available, dsa_indexer_project_q_path
-from nanovllm.models import dsa_indexer_project_real
+from nanovllm.models.dsa_indexer_project import (
+    dsa_indexer_project,
+    dsa_indexer_project_post_available,
+    dsa_indexer_project_post_binding_version,
+    dsa_indexer_project_q_path,
+)
 
 try:
     import torch_npu  # type: ignore
@@ -318,7 +322,7 @@ def main() -> None:
         f"batch_matmul_transpose_available={ascend_ops is not None and hasattr(ascend_ops, 'batch_matmul_transpose')} "
         f"ascend_ops_import_error={ascend_ops_import_error} "
         f"dsa_indexer_project_post_available={dsa_indexer_project_post_available()} "
-        f"dsa_indexer_project_post_binding={dsa_indexer_project_real.binding_version()}"
+        f"dsa_indexer_project_post_binding={dsa_indexer_project_post_binding_version()}"
     )
 
     common_kwargs = {
