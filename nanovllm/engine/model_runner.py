@@ -1,6 +1,7 @@
 ﻿# SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the Nano-vLLM project
 
+import os
 import pickle
 from multiprocessing.shared_memory import SharedMemory
 from multiprocessing.synchronize import Event
@@ -545,14 +546,41 @@ class ModelRunner:
                                                                                            non_blocking=True)
         return temperatures
 
+    def _profiler_enabled(self) -> bool:
+        return os.environ.get("NANOVLLM_NPU_PROFILE", "").strip() in ("1", "true", "on")
+
+    def _profiler_dir(self) -> str:
+        return os.environ.get("NANOVLLM_NPU_PROFILE_DIR",
+                              f"npu_trace_rank{self.rank}")
+
     @torch.inference_mode()
     def run_model(self,
                   input_ids: torch.Tensor,
                   positions: torch.Tensor,
                   is_prefill: bool,
                   ):
-        hidden_states = self.model(input_ids, positions)
-        logits = self.model.compute_logits(hidden_states)
+        use_prof = self._profiler_enabled() and not is_prefill
+        if use_prof:
+            self.model.log_decode_layer_timing = False
+            out_dir = self._profiler_dir()
+            os.makedirs(out_dir, exist_ok=True)
+            activities = [torch_npu.profiler.ProfilerActivity.CPU,
+                          torch_npu.profiler.ProfilerActivity.NPU]
+            prof = torch_npu.profiler.profile(
+                activities=activities,
+                record_shapes=True,
+                with_stack=True,
+                on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(out_dir),
+            )
+            prof.__enter__()
+        try:
+            hidden_states = self.model(input_ids, positions)
+            logits = self.model.compute_logits(hidden_states)
+        finally:
+            if use_prof:
+                prof.__exit__(None, None, None)
+                self.model.log_decode_layer_timing = os.environ.get(
+                    "NANOVLLM_LOG_DECODE_LAYER_TIMING", "").strip() in ("1", "true")
         return logits
 
     @torch.inference_mode()
