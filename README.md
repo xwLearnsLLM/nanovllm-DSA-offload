@@ -29,6 +29,12 @@ ls -lh nanovllm/_C*.so nanovllm/libnanovllm_ascend_kernels.so
 
 　
 
+## 添加prof
+```bash
+NANOVLLM_NPU_PROFILE = 1
+NANOVLLM_NPU_PROFILE_DIR = xx
+```
+
 ## 推128专家模型（16卡910C）准备工作
 
 先进行一些公用配置：
