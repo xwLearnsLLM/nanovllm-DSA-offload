@@ -150,7 +150,6 @@ def indexer_current(
     k = torch.cat((k_pe, k_nope), dim=-1)
 
     score_weights = F.linear(hidden_states.float(), weights["weights_proj"].float())
-    score_weights = score_weights * (head_dim**-0.5) * (n_head**-0.5)
     return q, k, score_weights.to(hidden_states.dtype)
 
 
@@ -178,7 +177,6 @@ def indexer_model_reference(
     k = torch.cat((k_pe, k_nope), dim=-1)
 
     score_weights = F.linear(hidden_states.float(), weights["weights_proj"].float())
-    score_weights = score_weights * (head_dim**-0.5) * (n_head**-0.5)
     return q, k, score_weights.to(hidden_states.dtype)
 
 
@@ -328,7 +326,7 @@ def main() -> None:
         "head_dim": args.head_dim,
         "rope_dim": args.rope_dim,
     }
-    score_scale = (args.head_dim ** -0.5) * (args.heads ** -0.5)
+    score_scale = 1.0
     enable_q_bmm = bool(args.use_bmm_transpose and not args.skip_bmm_transpose)
     cos_op = cos.view(args.tokens, 1, 1, args.rope_dim).contiguous()
     sin_op = sin.view(args.tokens, 1, 1, args.rope_dim).contiguous()

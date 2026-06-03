@@ -752,7 +752,6 @@ class DeepseekV32Indexer(nn.Module):
         self.rope_dim = int(config.qk_rope_head_dim)
         self.hidden_size = int(config.hidden_size)
         self.q_lora_rank = int(config.q_lora_rank)
-        self.softmax_scale = self.head_dim ** -0.5
 
         self.wq_b = ReplicatedLinear(self.q_lora_rank, self.n_head * self.head_dim, bias=False)
         self.wk = ReplicatedLinear(self.hidden_size, self.head_dim, bias=False)
@@ -833,7 +832,7 @@ class DeepseekV32Indexer(nn.Module):
                 n_head=self.n_head,
                 head_dim=self.head_dim,
                 rope_dim=self.rope_dim,
-                score_scale=self.softmax_scale * (self.n_head ** -0.5),
+                score_scale=1.0,  # vllm-ascend BF16 lightning_indexer consumes raw weights_proj(x).
                 detail=detail,
                 sync_detail=sync_detail,
             )
@@ -857,7 +856,7 @@ class DeepseekV32Indexer(nn.Module):
             n_head=self.n_head,
             head_dim=self.head_dim,
             rope_dim=self.rope_dim,
-            score_scale=self.softmax_scale * (self.n_head ** -0.5),
+            score_scale=1.0,  # Keep qk_score inputs aligned with vllm-ascend BF16 SFA.
             detail=detail,
             sync_detail=sync_detail,
         )

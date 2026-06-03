@@ -167,7 +167,7 @@ def dsa_indexer_project_torch(
 
     The public interface already takes final output tensors. Internally this
     stage still computes q/k/weights projection with mature framework kernels,
-    then uses the AscendC post op to write RoPE/scaled outputs directly into
+    then uses the AscendC post op to write RoPE/casted outputs directly into
     q_index_out/index_k_out/index_weights_out when available.
     """
     _check_project_outputs(q_index_out, index_k_out, index_weights_out, num_tokens=int(hidden_states.shape[0]), n_head=int(n_head), head_dim=int(head_dim), dtype=hidden_states.dtype, device=hidden_states.device)
@@ -189,7 +189,9 @@ def dsa_indexer_project_torch(
 
     start = _timer_start(detail, sync_detail, q.device)
     if _can_use_post_op(q, k, weights, cos, sin):
-        # B-stage true AscendC sub-op: q/k RoPE + weights scale/cast, writing final outputs in-place.
+        # B-stage true AscendC sub-op: q/k RoPE + weights cast, writing final outputs in-place.
+        # DeepSeek-V3.2 BF16 SFA in vllm-ascend feeds raw weights_proj(x) to
+        # lightning_indexer, so callers pass score_scale=1.0 here.
         dsa_indexer_project_real.dsa_indexer_project_post_real_out(q, k, weights, cos, sin, q_index_out, index_k_out, index_weights_out, float(score_scale), int(rope_dim))
         _timer_end(detail, "rope", start, sync_detail, q.device)
         return q_index_out, index_k_out, index_weights_out
