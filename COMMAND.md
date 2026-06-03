@@ -71,3 +71,13 @@ PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/probe_que
 ```bash
 PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_DSA_QUERY_ONLY_BACKEND=auto NANOVLLM_DSA_QUERY_ONLY_WARMUP_TOKENS=1,2,4,8,16,32,64,128 NANOVLLM_MAX_GEN_TOKENS=8 NANOVLLM_ENABLE_DECODE_MLAPO=1 NANOVLLM_DSA_OFFLOAD_FIXED_TX=128 NANOVLLM_DSA_INDEX_UPDATE_USE_CANN=1 NANOVLLM_DSA_CHECK=0 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=1 NANOVLLM_PROFILE_LAYER_IDS=mid NANOVLLM_PROMPT_LENGTHS=8192 python3 example/test.py
 ```
+
+## 2026-06-03 15:25：调整 dsa_index_update 单测，默认校验 hard invariant 而不是逐项对齐 torch
+
+下一次请在昇腾上先跑这个。默认会检查 promote/demote/pool unique、范围、pool 更新位置、非 demote slot 不变等硬约束，并打印和 torch 原型的 overlap 作为参考：
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 NANOVLLM_DSA_INDEX_UPDATE_USE_CANN=1 python3 ut_ops/probe_dsa_index_update.py --device npu:0 --batch 4 --candidate 8192 --selected 2560 --k 128 --warmup 10 --iters 100
+```
+
+如果后面临时想看逐项是否和 torch 完全一致，再额外加 `--strict-torch`，但这个不作为默认正确性标准。
