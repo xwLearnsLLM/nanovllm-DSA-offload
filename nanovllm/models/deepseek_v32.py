@@ -509,9 +509,7 @@ class DeepseekV32SparseMoeBlock(nn.Module):
 
         self.gate = ReplicatedLinear(self.hidden_size, self.num_experts, bias=False)
         if getattr(config, "topk_method", None) == "noaux_tc":
-            self.gate.e_score_correction_bias = nn.Parameter(
-                torch.empty(self.num_experts, dtype=torch.float32)
-            )
+            self.gate.e_score_correction_bias = nn.Parameter(torch.empty(self.num_experts, dtype=torch.float32))
         else:
             self.gate.register_parameter("e_score_correction_bias", None)
 

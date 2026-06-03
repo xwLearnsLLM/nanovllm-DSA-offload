@@ -3,6 +3,7 @@
 
 import os
 import pickle
+from time import perf_counter
 from multiprocessing.shared_memory import SharedMemory
 from multiprocessing.synchronize import Event
 
@@ -56,6 +57,7 @@ class ModelRunner:
         self._prof_step_count = 0
         self._prof_skip = 0
         self._prof_max = 0
+        self.log_prepare_decode_timing = os.environ.get("NANOVLLM_LOG_PREPARE_DECODE_TIMING", "").strip().lower() in ("1", "true", "on")
 
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
@@ -651,11 +653,15 @@ class ModelRunner:
             seq.offload_finalized = True
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        input_ids, positions = (
-            self.prepare_prefill(seqs)
-            if is_prefill
-            else self.prepare_decode(seqs)
-        )
+        if is_prefill:
+            input_ids, positions = self.prepare_prefill(seqs)
+        else:
+            prepare_start = perf_counter() if self.log_prepare_decode_timing else None
+            input_ids, positions = self.prepare_decode(seqs)
+            if prepare_start is not None:
+                torch.npu.synchronize()              # Include async H2D copies and small NPU metadata ops in this diagnostic timing.
+                if self.rank == 0:
+                    logger.info("prepare_decode timing: rank=%d batch=%d elapsed=%.6fs sync=1", self.rank, len(seqs), perf_counter() - prepare_start)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
         if is_prefill:
