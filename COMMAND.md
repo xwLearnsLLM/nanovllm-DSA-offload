@@ -58,6 +58,20 @@ PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/probe_qk_
 PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_LOG_PREPARE_DECODE_TIMING=1 NANOVLLM_DSA_QK_SCORE_BF16_OUT=1 NANOVLLM_DSA_QUERY_ONLY_BACKEND=auto NANOVLLM_DSA_QUERY_ONLY_WARMUP_TOKENS=1,2,4,8,16,32,64,128 NANOVLLM_MAX_GEN_TOKENS=8 NANOVLLM_ENABLE_DECODE_MLAPO=1 NANOVLLM_DSA_OFFLOAD_FIXED_TX=128 NANOVLLM_DSA_INDEX_UPDATE_USE_CANN=1 NANOVLLM_DSA_CHECK=0 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=0 NANOVLLM_PROFILE_LAYER_IDS=mid NANOVLLM_PROMPT_LENGTHS=8200,9000,10000,11000,12000,13000,14000,15000,16000,17000 python3 example/test.py
 ```
 
+## 2026-06-03 21:04：扫 `dsa_index_update` 在不同 batch/序列长度下的时延
+
+下一次请在昇腾上先跑这个。固定 `k=128`，默认只测 CANN 路径，计时循环内不重置输入，尽量贴近推理热路径：
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/bench_dsa_index_update_sweep.py --device npu:0 --batch-sizes 1,2,4,8,10,16 --candidate-lens 8192,16384,32768,65536 --selected-lens 2560 --warmup 10 --iters 50
+```
+
+如果还想和 torch 伪算子做小规模对照，跑这个，避免 torch 路径太慢：
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/bench_dsa_index_update_sweep.py --device npu:0 --batch-sizes 1,4,10 --candidate-lens 8192,32768 --selected-lens 2560 --warmup 3 --iters 10 --include-torch
+```
+
 旧路径用于对照：
 
 ```bash
