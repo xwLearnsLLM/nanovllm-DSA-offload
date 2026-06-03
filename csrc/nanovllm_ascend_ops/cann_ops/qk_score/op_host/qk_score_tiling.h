@@ -54,6 +54,7 @@ constexpr uint32_t QK_SCORE = 0;
 constexpr uint32_t ATTR_QUERY_LAYOUT_INDEX = 0;
 constexpr uint32_t ATTR_KEY_LAYOUT_INDEX = 1;
 constexpr uint32_t ATTR_SCORE_COUNT_INDEX = 2;
+constexpr uint32_t ATTR_OUTPUT_DTYPE_INDEX = 3;
 // Dim Index
 constexpr uint32_t DIM_IDX_ONE = 1;
 constexpr uint32_t DIM_IDX_TWO = 2;
@@ -72,6 +73,7 @@ TILING_DATA_FIELD_DEF(uint32_t, gSize)
 TILING_DATA_FIELD_DEF(uint32_t, s1Size)
 TILING_DATA_FIELD_DEF(uint32_t, s2Size)
 TILING_DATA_FIELD_DEF(uint32_t, scoreCount)
+TILING_DATA_FIELD_DEF(uint32_t, outputStride)
 TILING_DATA_FIELD_DEF(uint32_t, usedCoreNum)
 TILING_DATA_FIELD_DEF(uint32_t, blockSize)
 TILING_DATA_FIELD_DEF(uint32_t, maxBlockNumPerBatch)
@@ -92,6 +94,7 @@ struct QkScoreParaInfo {
     const char *layOut = nullptr;
     const char *layOutKey = nullptr;
     const int32_t *scoreCount = nullptr;
+    const char *outputDType = nullptr;
 };
 
 class QkScoreTilingInfo {
@@ -114,6 +117,7 @@ public:
     uint32_t maxBlockNumPerBatch = 0;
     // Others Flag
     uint32_t scoreCount = 0;
+    uint32_t outputStride = 0;
     // DType
     ge::DataType inputQType = ge::DT_FLOAT16;
     ge::DataType inputKType = ge::DT_FLOAT16;

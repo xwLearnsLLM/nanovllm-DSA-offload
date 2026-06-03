@@ -85,6 +85,7 @@ struct ConstInfo {
     uint64_t kHeadNum;
     uint64_t headDim;
     uint64_t scoreCount;
+    uint64_t outputStride;
     uint64_t kSeqSize = 0ULL;
     uint64_t qSeqSize = 1ULL;
     uint32_t kCacheBlockSize = 0;

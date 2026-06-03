@@ -92,7 +92,7 @@ protected:
     GlobalTensor<K_T> keyGm;
     GlobalTensor<K_T> weightsGm;
 
-    GlobalTensor<float> scoreOutGm;
+    GlobalTensor<OUT_T> scoreOutGm;
     GlobalTensor<int32_t> blockTableGm;
 
     GlobalTensor<uint32_t> actualSeqLengthsGmQ;
@@ -144,6 +144,7 @@ __aicore__ inline void QKPreload<QKT>::InitTilingData(const QkScoreTilingData *_
     constInfo.kCacheBlockSize = tilingData->blockSize;
     constInfo.maxBlockNumPerBatch = tilingData->maxBlockNumPerBatch;
     constInfo.scoreCount = tilingData->scoreCount;
+    constInfo.outputStride = tilingData->outputStride;
     constInfo.outputLayout = LAYOUT_T;
     if (LAYOUT_T == QK_LAYOUT::TND) {
         constInfo.isAccumSeqS1 = true;
@@ -333,16 +334,16 @@ __aicore__ inline void QKPreload<QKT>::DealActSeqLenIsZero(uint32_t bIdx, uint32
 
             for (uint32_t s1Idx = s1Start; s1Idx < s1Count; s1Idx++) {
                 uint64_t scoreOutOffset =
-                    (tBase + s1Idx) * constInfo.kHeadNum * constInfo.scoreCount +
-                    n2Idx * constInfo.scoreCount;
+                    (tBase + s1Idx) * constInfo.kHeadNum * constInfo.outputStride +
+                    n2Idx * constInfo.outputStride;
                 vectorService.CleanInvalidOutput(scoreOutOffset, constInfo.scoreCount);
             }
         } else if (constInfo.outputLayout == QK_LAYOUT::BSND) {
             for (uint32_t s1Idx = s1Start; s1Idx < constInfo.qSeqSize; s1Idx++) {
                 // B,S1,N2,K
-                uint64_t scoreOutOffset = bIdx * constInfo.qSeqSize * constInfo.kHeadNum * constInfo.scoreCount +
-                                           s1Idx * constInfo.kHeadNum * constInfo.scoreCount +
-                                           n2Idx * constInfo.scoreCount;
+                uint64_t scoreOutOffset = bIdx * constInfo.qSeqSize * constInfo.kHeadNum * constInfo.outputStride +
+                                           s1Idx * constInfo.kHeadNum * constInfo.outputStride +
+                                           n2Idx * constInfo.outputStride;
                 vectorService.CleanInvalidOutput(scoreOutOffset, constInfo.scoreCount);
             }
         }
@@ -377,7 +378,7 @@ __aicore__ inline void QKPreload<QKT>::Init(__gm__ uint8_t *query, __gm__ uint8_
 
     if ASCEND_IS_AIV {
         vectorService.InitParams(constInfo, tiling);
-        scoreOutGm.SetGlobalBuffer((__gm__ float *)scores);
+        scoreOutGm.SetGlobalBuffer((__gm__ OUT_T *)scores);
         weightsGm.SetGlobalBuffer((__gm__ K_T *)weights);
         vectorService.InitVec1GlobalTensor(mm1ResGm, weightsGm, scoreOutGm);
     } else {
@@ -487,8 +488,8 @@ __aicore__ inline void QKPreload<QKT>::CalcRunInfo(uint32_t loop, uint32_t s2Loo
         // B,S1,N1(N2,G)/T,N1(N2,G)
         weightsCoreOffset = actualSeqQPrefixSum * constInfo.qHeadNum + runInfo.n2Idx * constInfo.gSize;
         // B,S1,N2,k/T,N2,k
-        scoreOutCoreOffset = actualSeqQPrefixSum * constInfo.kHeadNum * constInfo.scoreCount +
-                             runInfo.n2Idx * constInfo.scoreCount;
+        scoreOutCoreOffset = actualSeqQPrefixSum * constInfo.kHeadNum * constInfo.outputStride +
+                             runInfo.n2Idx * constInfo.outputStride;
     }
     runInfo.tensorQueryOffset = queryCoreOffset;
     runInfo.tensorKeyOffset = keyCoreOffset + runInfo.s2Idx * constInfo.s2BaseSize * constInfo.kHeadNum
@@ -513,7 +514,7 @@ __aicore__ inline void QKPreload<QKT>::ProcessInvalid()
     if ASCEND_IS_AIV {
         uint32_t aivCoreNum = GetBlockNum() * 2; // 2 means c:v = 1:2
         uint64_t totalOutputSize =
-            constInfo.batchSize * constInfo.qSeqSize * constInfo.kHeadNum * constInfo.scoreCount;
+            constInfo.batchSize * constInfo.qSeqSize * constInfo.kHeadNum * constInfo.outputStride;
         uint64_t singleCoreSize =
             QKCommon::Align((totalOutputSize + aivCoreNum - 1) / aivCoreNum, GM_ALIGN_BYTES / sizeof(OUT_T));
         uint64_t baseSize = tmpBlockIdx * singleCoreSize;

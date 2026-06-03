@@ -77,6 +77,8 @@ at::Tensor npu_qk_score(
     // convert str
     char *query_layout_ptr = const_cast<char *>(query_layout_str.c_str());
     char *key_layout_ptr = const_cast<char *>(key_layout_str.c_str());
+    std::string output_dtype_str = "float";
+    char *output_dtype_ptr = const_cast<char *>(output_dtype_str.c_str());
     EXEC_NPU_CMD(
         aclnnQkScore,
         query,
@@ -88,8 +90,62 @@ at::Tensor npu_qk_score(
         query_layout_ptr,
         key_layout_ptr,
         score_count,
+        output_dtype_ptr,
         qk_score_output);
     return qk_score_output;
+}
+
+inline void npu_qk_score_bf16_out(
+    const at::Tensor &query, const at::Tensor &key, const at::Tensor &weights,
+    const c10::optional<at::Tensor> &actual_seq_lengths_query,
+    const c10::optional<at::Tensor> &actual_seq_lengths_key,
+    const c10::optional<at::Tensor> &block_table, int64_t block_count,
+    at::Tensor &score_out, c10::string_view layout_query, c10::string_view layout_key)
+{
+    constexpr int64_t DIM_0 = 0;
+    constexpr int64_t DIM_1 = 1;
+    TORCH_CHECK(query.numel() > 0, "Query is empty.");
+    TORCH_CHECK(key.numel() > 0, "Key is empty.");
+    TORCH_CHECK(weights.numel() > 0, "Weights is empty.");
+    TORCH_CHECK(score_out.scalar_type() == at::kBFloat16, "score_out must be bf16.");
+    TORCH_CHECK(score_out.dim() == 2, "score_out must be [tokens, score_stride].");
+    TORCH_CHECK(block_count > 0, "block_count must be positive.");
+
+    std::string query_layout_str = std::string(layout_query);
+    std::string key_layout_str = std::string(layout_key);
+    TORCH_CHECK(query_layout_str == "TND", "npu_qk_score_bf16_out currently expects layout_query='TND'.");
+    TORCH_CHECK(key_layout_str == "PA_BSND", "npu_qk_score_bf16_out currently expects layout_key='PA_BSND'.");
+    TORCH_CHECK(block_table.has_value(), "block_table must be provided when layout_key='PA_BSND'.");
+    TORCH_CHECK(key.dim() == 4, "key must be 4-D when layout_key='PA_BSND'.");
+    TORCH_CHECK(block_table.value().dim() == 2, "block_table must be 2-D.");
+    TORCH_CHECK(block_count <= block_table.value().size(DIM_1),
+                "block_count must be <= block_table.shape[1].");
+    TORCH_CHECK(score_out.size(DIM_0) == query.size(DIM_0),
+                "score_out first dim must match query T dim.");
+
+    int64_t block_size = key.size(DIM_1);
+    int64_t score_count = block_count * block_size;
+    TORCH_CHECK(score_out.size(DIM_1) >= score_count,
+                "score_out stride must be >= block_count * block_size.");
+
+    at::Tensor score_view = score_out.view({score_out.size(DIM_0), 1, score_out.size(DIM_1)});
+    char *query_layout_ptr = const_cast<char *>(query_layout_str.c_str());
+    char *key_layout_ptr = const_cast<char *>(key_layout_str.c_str());
+    std::string output_dtype_str = "bf16";
+    char *output_dtype_ptr = const_cast<char *>(output_dtype_str.c_str());
+    EXEC_NPU_CMD(
+        aclnnQkScore,
+        query,
+        key,
+        weights,
+        actual_seq_lengths_query,
+        actual_seq_lengths_key,
+        block_table,
+        query_layout_ptr,
+        key_layout_ptr,
+        score_count,
+        output_dtype_ptr,
+        score_view);
 }
 }
 #endif

@@ -50,10 +50,11 @@ public:
             .DataTypeList({ge::DT_INT32})
             .FormatList({ge::FORMAT_ND})
             .AutoContiguous();
-        this->Output("scores").ParamType(REQUIRED).DataTypeList({ge::DT_FLOAT}).FormatList({ge::FORMAT_ND});
+        this->Output("scores").ParamType(REQUIRED).DataTypeList({ge::DT_FLOAT, ge::DT_BF16}).FormatList({ge::FORMAT_ND});
         this->Attr("layout_query").AttrType(OPTIONAL).String("BSND");
         this->Attr("layout_key").AttrType(OPTIONAL).String("PA_BSND");
-        this->Attr("score_count").AttrType(OPTIONAL).Int(2048); // output score stride, set by torch adapter
+        this->Attr("score_count").AttrType(OPTIONAL).Int(2048); // logical score length, set by torch adapter
+        this->Attr("output_dtype").AttrType(OPTIONAL).String("float");
         OpAICoreConfig aicore_config;
         aicore_config.DynamicCompileStaticFlag(true)
             .DynamicFormatFlag(true)

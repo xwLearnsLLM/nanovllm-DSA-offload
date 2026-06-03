@@ -32,6 +32,7 @@ template <typename QKT>
 class QKVector {
 public:
     using K_T = typename QKT::keyType;
+    using OUT_T = typename QKT::outputType;
     static constexpr QK_LAYOUT LAYOUT_T = QKT::layout;
 
     using MM1_OUT_T = float;
@@ -42,13 +43,13 @@ public:
     __aicore__ inline void InitParams(const struct QKCommon::ConstInfo &constInfo,
                                       const QkScoreTilingData *__restrict);
     __aicore__ inline void InitVec1GlobalTensor(GlobalTensor<MM1_OUT_T> mm1ResGm, GlobalTensor<K_T> weightsGm,
-                                                GlobalTensor<float> scoreOutGm);
+                                                GlobalTensor<OUT_T> scoreOutGm);
     __aicore__ inline void CleanInvalidOutput(int64_t invalidS1offset, int64_t cleanCount);
 
 protected:
     GlobalTensor<MM1_OUT_T> mm1ResGm;
     GlobalTensor<K_T> weightsGm;
-    GlobalTensor<float> scoreOutGm;
+    GlobalTensor<OUT_T> scoreOutGm;
 
 private:
     TQue<QuePosition::VECIN, 1> inQueue_;
@@ -102,7 +103,7 @@ __aicore__ inline void QKVector<QKT>::InitParams(const struct QKCommon::ConstInf
 template <typename QKT>
 __aicore__ inline void
 QKVector<QKT>::InitVec1GlobalTensor(GlobalTensor<MM1_OUT_T> mm1ResGm, GlobalTensor<K_T> weightsGm,
-                                    GlobalTensor<float> scoreOutGm)
+                                    GlobalTensor<typename QKT::outputType> scoreOutGm)
 {
     this->mm1ResGm = mm1ResGm;
     this->weightsGm = weightsGm;
@@ -115,12 +116,16 @@ __aicore__ inline void QKVector<QKT>::CleanInvalidOutput(int64_t invalidS1offset
     if (cleanCount <= 0) {
         return;
     }
-    LocalTensor<float> invalidLocal = outQueue_.AllocTensor<float>();
+    LocalTensor<OUT_T> invalidLocal = outQueue_.AllocTensor<OUT_T>();
     int64_t invalidCopyBase = static_cast<int64_t>(groupInner_) * s2BaseSize_;
     invalidCopyBase = invalidCopyBase > cleanCount ? cleanCount : invalidCopyBase;
-    Duplicate(invalidLocal.template ReinterpretCast<int32_t>(), QKServiceVec::NEG_INF, invalidCopyBase);
-    outQueue_.EnQue<float>(invalidLocal);
-    invalidLocal = outQueue_.DeQue<float>();
+    if constexpr (IsSameType<OUT_T, float>::value) {
+        Duplicate(invalidLocal.template ReinterpretCast<int32_t>(), QKServiceVec::NEG_INF, invalidCopyBase);
+    } else {
+        Duplicate(invalidLocal.template ReinterpretCast<uint16_t>(), QKServiceVec::NEG_INF_BF16, invalidCopyBase);
+    }
+    outQueue_.EnQue<OUT_T>(invalidLocal);
+    invalidLocal = outQueue_.DeQue<OUT_T>();
 
     int64_t remaining = cleanCount;
     int64_t offset = invalidS1offset;
@@ -171,7 +176,7 @@ __aicore__ inline void QKVector<QKT>::ProcessVec(const QKCommon::RunInfo &info)
             cuRealAcSeq += 1;
         }
         int32_t cuS1Idx = cuS1BeginIdxPerAiv + innerS1Idx;
-        int64_t rowOutOffset = info.scoreOutOffset + static_cast<int64_t>(cuS1Idx) * constInfo_.scoreCount;
+        int64_t rowOutOffset = info.scoreOutOffset + static_cast<int64_t>(cuS1Idx) * constInfo_.outputStride;
 
         if (cuRealAcSeq <= 0) {
             if (!splitS2ForSingleRow || blockId_ % 2 == 0) {
@@ -237,8 +242,16 @@ __aicore__ inline void QKVector<QKT>::ProcessVec(const QKCommon::RunInfo &info)
         outQueue_.FreeTensor(reduceCacheBuf);
 
         SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
-        QKServiceVec::CopyOut(scoreOutGm[rowOutOffset + cuBaseS2Idx + s2SplitBase], reduceOutInner, processS2Len,
-                              rowOutOffset + cuBaseS2Idx + s2SplitBase);
+        if constexpr (IsSameType<OUT_T, float>::value) {
+            QKServiceVec::CopyOut(scoreOutGm[rowOutOffset + cuBaseS2Idx + s2SplitBase], reduceOutInner, processS2Len,
+                                  rowOutOffset + cuBaseS2Idx + s2SplitBase);
+        } else {
+            LocalTensor<OUT_T> reduceOutCast = reduceOutBuff.template ReinterpretCast<OUT_T>();
+            AscendC::Cast<OUT_T, float>(reduceOutCast, reduceOutInner, AscendC::RoundMode::CAST_RINT, processS2Len);
+            AscendC::PipeBarrier<PIPE_V>();
+            QKServiceVec::CopyOut(scoreOutGm[rowOutOffset + cuBaseS2Idx + s2SplitBase], reduceOutCast, processS2Len,
+                                  rowOutOffset + cuBaseS2Idx + s2SplitBase);
+        }
         SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
 
         bool isS2End = cuBaseS2Idx + s2BaseSize_ >= cuRealAcSeq;
@@ -256,7 +269,7 @@ __aicore__ inline void QKVector<QKT>::ProcessVec(const QKCommon::RunInfo &info)
             int32_t s1OffsetPerAiv = info.actS1Size + (blockId_ % 2) * CeilDiv(invalidS1Num, 2);
             for (int innerS1Idx = 0; innerS1Idx < s1NumPerAiv; innerS1Idx++) {
                 CleanInvalidOutput(info.scoreOutOffset +
-                                       static_cast<int64_t>(s1OffsetPerAiv + innerS1Idx) * constInfo_.scoreCount,
+                                       static_cast<int64_t>(s1OffsetPerAiv + innerS1Idx) * constInfo_.outputStride,
                                    constInfo_.scoreCount);
             }
         }
@@ -267,7 +280,7 @@ __aicore__ inline void QKVector<QKT>::ProcessVec(const QKCommon::RunInfo &info)
             int32_t s1OffsetPerAiv = (blockId_ % 2) * CeilDiv(invalidS1Num2, 2);
             for (int innerS1Idx = 0; innerS1Idx < s1NumPerAiv; innerS1Idx++) {
                 CleanInvalidOutput((info.bN2Idx * constInfo_.qSeqSize + s1OffsetPerAiv + innerS1Idx) *
-                                       constInfo_.scoreCount,
+                                       constInfo_.outputStride,
                                    constInfo_.scoreCount);
             }
         }

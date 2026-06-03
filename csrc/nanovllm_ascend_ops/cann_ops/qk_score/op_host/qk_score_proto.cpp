@@ -25,6 +25,7 @@ constexpr uint32_t KEY_INDEX = 1;
 constexpr uint32_t ATTR_QUERY_LAYOUT_INDEX = 0;
 constexpr uint32_t ATTR_KEY_LAYOUT_INDEX = 1;
 constexpr uint32_t ATTR_SCORE_COUNT_INDEX = 2;
+constexpr uint32_t ATTR_OUTPUT_DTYPE_INDEX = 3;
 
 static ge::graphStatus InferShapeQkScore(gert::InferShapeContext *context)
 {
@@ -82,6 +83,15 @@ static ge::graphStatus InferDataTypeQkScore(gert::InferDataTypeContext *context)
                return ge::GRAPH_FAILED);
     OPS_LOG_D(context->GetNodeName(), "Enter QkScore InferDataType impl.");
     ge::DataType outputType = ge::DT_FLOAT;
+    auto attrs = context->GetAttrs();
+    OPS_LOG_E_IF_NULL(context, attrs, return ge::GRAPH_FAILED);
+    const char *outputDTypePtr = attrs->GetAttrPointer<char>(ATTR_OUTPUT_DTYPE_INDEX);
+    if (outputDTypePtr != nullptr) {
+        std::string outputDType = std::string(outputDTypePtr);
+        if (outputDType == "bf16") {
+            outputType = ge::DT_BF16;
+        }
+    }
     context->SetOutputDataType(0, outputType);
     OPS_LOG_D(context->GetNodeName(), "QkScore InferDataType end.");
     return GRAPH_SUCCESS;

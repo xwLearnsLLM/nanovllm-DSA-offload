@@ -42,6 +42,7 @@ except ImportError as exc:
 moe_gating_top_k = _C.moe_gating_top_k
 npu_lightning_indexer = _C.npu_lightning_indexer
 npu_qk_score = _C.npu_qk_score
+npu_qk_score_bf16_out = _C.npu_qk_score_bf16_out
 npu_sparse_flash_attention = _C.npu_sparse_flash_attention
 paged_scatter_copy_h2d = _C.paged_scatter_copy_h2d
 paged_scatter_copy_h2d_alloc_host_mapped_empty = (
@@ -140,6 +141,7 @@ __all__ = [
     "moe_gating_top_k",
     "npu_lightning_indexer",
     "npu_qk_score",
+    "npu_qk_score_bf16_out",
     "npu_sparse_flash_attention",
     "paged_scatter_copy_h2d",
     "paged_scatter_copy_h2d_alloc_host_mapped_empty",

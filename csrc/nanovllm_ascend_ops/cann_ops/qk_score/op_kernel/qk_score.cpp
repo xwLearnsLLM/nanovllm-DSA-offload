@@ -50,8 +50,14 @@ __global__ __aicore__ void qk_score(__gm__ uint8_t *query, __gm__ uint8_t *key, 
     if constexpr (DT_Q == QK_TPL_FP16 && DT_K == QK_TPL_FP16 && DT_OUT == QK_TPL_FLOAT) {
         INVOKE_QK_NO_KFC_OP_IMPL(QKPreload, half, half, float, PAGE_ATTENTION,
                                  QK_LAYOUT(LAYOUT_T), QK_LAYOUT(K_LAYOUT_T), S2_BASE_T);
-    } else {
+    } else if constexpr (DT_Q == QK_TPL_FP16 && DT_K == QK_TPL_FP16 && DT_OUT == QK_TPL_BF16) {
+        INVOKE_QK_NO_KFC_OP_IMPL(QKPreload, half, half, bfloat16_t, PAGE_ATTENTION,
+                                 QK_LAYOUT(LAYOUT_T), QK_LAYOUT(K_LAYOUT_T), S2_BASE_T);
+    } else if constexpr (DT_Q == QK_TPL_BF16 && DT_K == QK_TPL_BF16 && DT_OUT == QK_TPL_FLOAT) {
         INVOKE_QK_NO_KFC_OP_IMPL(QKPreload, bfloat16_t, bfloat16_t, float, PAGE_ATTENTION,
+                                 QK_LAYOUT(LAYOUT_T), QK_LAYOUT(K_LAYOUT_T), S2_BASE_T);
+    } else {
+        INVOKE_QK_NO_KFC_OP_IMPL(QKPreload, bfloat16_t, bfloat16_t, bfloat16_t, PAGE_ATTENTION,
                                  QK_LAYOUT(LAYOUT_T), QK_LAYOUT(K_LAYOUT_T), S2_BASE_T);
     }
 #endif

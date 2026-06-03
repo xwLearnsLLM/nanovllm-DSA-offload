@@ -159,6 +159,7 @@ ge::graphStatus QkScoreInfoParser::GetAndCheckAttrParaInfo()
     opParamInfo_.layOut = attrs->GetStr(ATTR_QUERY_LAYOUT_INDEX);
     opParamInfo_.layOutKey = attrs->GetStr(ATTR_KEY_LAYOUT_INDEX);
     opParamInfo_.scoreCount = attrs->GetAttrPointer<int32_t>(ATTR_SCORE_COUNT_INDEX);
+    opParamInfo_.outputDType = attrs->GetStr(ATTR_OUTPUT_DTYPE_INDEX);
 
     if (opParamInfo_.layOut != nullptr) {
         OPS_LOG_I(context_->GetNodeName(), "layout_query is:%s", opParamInfo_.layOut);
@@ -168,6 +169,9 @@ ge::graphStatus QkScoreInfoParser::GetAndCheckAttrParaInfo()
     }
     if (opParamInfo_.scoreCount != nullptr) {
         OPS_LOG_I(context_->GetNodeName(), "score output length is:%d", *opParamInfo_.scoreCount);
+    }
+    if (opParamInfo_.outputDType != nullptr) {
+        OPS_LOG_I(context_->GetNodeName(), "output dtype is:%s", opParamInfo_.outputDType);
     }
     OPS_LOG_I(context_->GetNodeName(), "GetAndCheckAttrParaInfo end");
 
@@ -214,8 +218,8 @@ ge::graphStatus QkScoreInfoParser::GetAndCheckInOutDataType()
                OPS_LOG_E(opName_, "The data types of the input query, key, and weights must be float16 or bfloat16."),
                return ge::GRAPH_FAILED);
 
-    OPS_ERR_IF(outputType_ != ge::DT_FLOAT,
-               OPS_LOG_E(opName_, "The data type of the output scores must be float32."),
+    OPS_ERR_IF(((outputType_ != ge::DT_FLOAT) && (outputType_ != ge::DT_BF16)),
+               OPS_LOG_E(opName_, "The data type of the output scores must be float32 or bfloat16."),
                return ge::GRAPH_FAILED);
 
     return ge::GRAPH_SUCCESS;
@@ -438,7 +442,15 @@ ge::graphStatus QkScoreInfoParser::GetS2SizeForPageAttention()
         return ge::GRAPH_FAILED;
     }
     maxBlockNumPerBatch_ = opParamInfo_.blockTable.tensor->GetStorageShape().GetDim(1);
-    s2Size_ = maxBlockNumPerBatch_ * blockSize_;
+    OPS_ERR_IF((*opParamInfo_.scoreCount % blockSize_ != 0),
+               OPS_LOG_E(opName_, "score_count must be a multiple of block_size under PA_BSND, got score_count %d, block_size %d.",
+                         *opParamInfo_.scoreCount, blockSize_),
+               return ge::GRAPH_FAILED);
+    OPS_ERR_IF((*opParamInfo_.scoreCount > static_cast<int32_t>(maxBlockNumPerBatch_ * blockSize_)),
+               OPS_LOG_E(opName_, "score_count %d exceeds physical block_table capacity %u.",
+                         *opParamInfo_.scoreCount, maxBlockNumPerBatch_ * blockSize_),
+               return ge::GRAPH_FAILED);
+    s2Size_ = *opParamInfo_.scoreCount;
     OPS_LOG_I(context_->GetNodeName(), "maxBlockNumPerBatch_ is %d, blockSize_ is %d, s2Size_ is %d",
               maxBlockNumPerBatch_, blockSize_, s2Size_);
     return ge::GRAPH_SUCCESS;
@@ -557,8 +569,10 @@ ge::graphStatus QkScoreInfoParser::ValidateInputShapesMatch()
                OPS_LOG_E(opName_, "input query and output scores shape n2 dim must be same."),
                return ge::GRAPH_FAILED);
     // -----------------------check score output length-------------------
-    OPS_ERR_IF((opParamInfo_.attenOut.shape->GetStorageShape().GetDim(outN2Dim + 1) != *opParamInfo_.scoreCount),
-               OPS_LOG_E(opName_, "output scores shape last dim must be same as attr score_count."),
+    const int64_t outputStride = opParamInfo_.attenOut.shape->GetStorageShape().GetDim(outN2Dim + 1);
+    OPS_ERR_IF((outputStride < *opParamInfo_.scoreCount),
+               OPS_LOG_E(opName_, "output scores shape last dim must be >= attr score_count, got %ld and %d.",
+                         outputStride, *opParamInfo_.scoreCount),
                return ge::GRAPH_FAILED);
     OPS_ERR_IF((static_cast<int64_t>(*opParamInfo_.scoreCount) != s2Size_),
                OPS_LOG_E(opName_, "attr score_count must equal logical key length %ld, but got %d.",
@@ -592,6 +606,8 @@ void QkScoreInfoParser::GenerateInfo(QkScoreTilingInfo &qkInfo)
     std::string layOutKeyStr(opParamInfo_.layOutKey);
     qkInfo.pageAttentionFlag = layOutKeyStr == "PA_BSND" ? true : false;
     qkInfo.scoreCount = *opParamInfo_.scoreCount;
+    uint32_t outN2Dim = qLayout_ == DataLayout::TND ? DIM_IDX_ONE : DIM_IDX_TWO;
+    qkInfo.outputStride = opParamInfo_.attenOut.shape->GetStorageShape().GetDim(outN2Dim + 1);
 
     qkInfo.inputQLayout = qLayout_;
     qkInfo.inputKLayout = kLayout_;
@@ -657,6 +673,7 @@ ge::graphStatus QkScoreTiling::DoTiling(QkScoreTilingInfo *tilingInfo)
     tilingData_.set_s2Size(tilingInfo->s2Size);
     tilingData_.set_s1Size(tilingInfo->s1Size);
     tilingData_.set_scoreCount(tilingInfo->scoreCount);
+    tilingData_.set_outputStride(tilingInfo->outputStride);
     tilingData_.set_gSize(tilingInfo->gSize);
     tilingData_.set_blockSize(tilingInfo->blockSize);
     tilingData_.set_maxBlockNumPerBatch(tilingInfo->maxBlockNumPerBatch);

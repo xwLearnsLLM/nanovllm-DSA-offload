@@ -21,6 +21,7 @@ namespace QKServiceVec {
 using namespace AscendC;
 
 constexpr int32_t NEG_INF = 0xFF800000;
+constexpr uint16_t NEG_INF_BF16 = 0xFF80;
 constexpr uint8_t B32_BLOCK_ALIGN_NUM = 8;
 constexpr uint8_t B32_VEC_REPEAT_STRIDE = 8;
 constexpr uint64_t VEC_REPEAT_BYTES = 256;

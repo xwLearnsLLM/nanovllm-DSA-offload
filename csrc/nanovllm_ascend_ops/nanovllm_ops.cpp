@@ -133,6 +133,30 @@ at::Tensor npu_qk_score_py(
       c10::string_view(layout_key.data(), layout_key.size()));
 }
 
+void npu_qk_score_bf16_out_py(
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& weights,
+    py::object actual_seq_lengths_query,
+    py::object actual_seq_lengths_key,
+    py::object block_table,
+    int64_t block_count,
+    at::Tensor& score_out,
+    std::string layout_query,
+    std::string layout_key) {
+  vllm_ascend::npu_qk_score_bf16_out(
+      query,
+      key,
+      weights,
+      optional_tensor(actual_seq_lengths_query),
+      optional_tensor(actual_seq_lengths_key),
+      optional_tensor(block_table),
+      block_count,
+      score_out,
+      c10::string_view(layout_query.data(), layout_query.size()),
+      c10::string_view(layout_key.data(), layout_key.size()));
+}
+
 void paged_scatter_copy_h2d_py(
     at::Tensor npu_krope_cache,
     at::Tensor npu_knope_cache,
@@ -360,6 +384,19 @@ PYBIND11_MODULE(_C, m) {
       py::arg("actual_seq_lengths_key") = py::none(),
       py::arg("block_table") = py::none(),
       py::arg("layout_query") = "BSND",
+      py::arg("layout_key") = "PA_BSND");
+  m.def(
+      "npu_qk_score_bf16_out",
+      &npu_qk_score_bf16_out_py,
+      py::arg("query"),
+      py::arg("key"),
+      py::arg("weights"),
+      py::arg("actual_seq_lengths_query"),
+      py::arg("actual_seq_lengths_key"),
+      py::arg("block_table"),
+      py::arg("block_count"),
+      py::arg("score_out"),
+      py::arg("layout_query") = "TND",
       py::arg("layout_key") = "PA_BSND");
   m.def(
       "paged_scatter_copy_h2d",

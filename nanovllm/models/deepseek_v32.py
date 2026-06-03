@@ -2153,6 +2153,7 @@ class DeepseekV32DSAAttention(nn.Module):
             candidate_lens,
             score_out,
             actual_seq_lengths_query=candidate_query_lens,
+            block_count=(max_candidate + self.block_size - 1) // self.block_size,
         )
         self._decode_timer_end(
             profile_decode,

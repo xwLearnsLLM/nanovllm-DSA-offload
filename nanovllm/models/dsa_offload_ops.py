@@ -16,6 +16,10 @@ def _env_flag(name: str, default: bool) -> bool:
     return value.strip().lower() not in ("0", "false", "off", "no", "")
 
 
+_DSA_QK_SCORE_BF16_OUT = _env_flag("NANOVLLM_DSA_QK_SCORE_BF16_OUT", True)
+_DSA_INDEX_UPDATE_USE_CANN = _env_flag("NANOVLLM_DSA_INDEX_UPDATE_USE_CANN", True)
+
+
 def dsa_indexer_score(
     query_index: torch.Tensor,
     index_cache: torch.Tensor,
@@ -25,27 +29,45 @@ def dsa_indexer_score(
     score_out: torch.Tensor,
     *,
     actual_seq_lengths_query: torch.Tensor | None,
+    block_count: int | None = None,
 ) -> None:
     """Score DSA candidates with the Ascend qk_score op."""
-    score_out.fill_(-float("inf"))
     block_size = int(index_cache.shape[1])
     score_capacity = int(score_out.shape[1])
     if score_capacity <= 0:
         return
 
-    block_count = (score_capacity + block_size - 1) // block_size
-    scores = ascend_ops.npu_qk_score(
-        query_index.contiguous(),
-        index_cache,
-        index_weights.contiguous(),
-        actual_seq_lengths_query.contiguous(),
-        candidate_lens.contiguous(),
-        index_block_table[:, :block_count].contiguous(),
-        "TND",
-        "PA_BSND",
-    )
-    copy_len = min(score_capacity, int(scores.shape[-1]))
-    score_out[:, :copy_len].copy_(scores[:, 0, :copy_len].to(score_out.dtype))
+    block_count = int(block_count) if block_count is not None else (score_capacity + block_size - 1) // block_size
+    score_count = block_count * block_size
+    if score_count > score_capacity:
+        raise RuntimeError(f"score_out capacity {score_capacity} is smaller than qk_score logical length {score_count}.")
+    
+    if _DSA_QK_SCORE_BF16_OUT:
+        ascend_ops.npu_qk_score_bf16_out(
+            query_index,
+            index_cache,
+            index_weights,
+            actual_seq_lengths_query,
+            candidate_lens,
+            index_block_table,
+            block_count,
+            score_out,
+            "TND",
+            "PA_BSND",
+        )
+    else: 
+        scores = ascend_ops.npu_qk_score(
+            query_index,
+            index_cache,
+            index_weights,
+            actual_seq_lengths_query,
+            candidate_lens,
+            index_block_table[:, :block_count].contiguous(),
+            "TND",
+            "PA_BSND",
+        )
+        copy_len = min(score_count, int(scores.shape[-1]))
+        score_out[:, :copy_len].copy_(scores[:, 0, :copy_len])
 
 
 def dsa_index_update_torch(
@@ -218,7 +240,7 @@ def dsa_index_update(
     By default this uses the CANN op. Set
     NANOVLLM_DSA_INDEX_UPDATE_USE_CANN=0 to force the PyTorch prototype.
     """
-    if _env_flag("NANOVLLM_DSA_INDEX_UPDATE_USE_CANN", True):
+    if _DSA_INDEX_UPDATE_USE_CANN:
         _dsa_index_update_cann(
             score,
             hbm_cached_tokens_pool,
