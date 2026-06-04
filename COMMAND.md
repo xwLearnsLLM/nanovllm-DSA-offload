@@ -68,6 +68,26 @@ PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/probe_ind
 PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_DSA_QK_SCORE_BF16_OUT=1 NANOVLLM_MAX_GEN_TOKENS=8 NANOVLLM_ENABLE_DECODE_MLAPO=1 NANOVLLM_DSA_OFFLOAD_FIXED_TX=128 NANOVLLM_DSA_INDEX_UPDATE_USE_CANN=1 NANOVLLM_DSA_CHECK=0 NANOVLLM_PROMPT_LENGTHS=17000,17001,17002,17003,17004,17005,17006,17007,17008,17009 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=0 NANOVLLM_PROFILE_LAYER_IDS=mid python3 example/test.py
 ```
 
+## 2026-06-04 12:05：诊断 query-only TorchAir 组图精度
+
+这次新增 `ut_ops/probe_query_only_torchair_accuracy.py`，用于把 current 路径、functional eager 路径、TorchAir 组图路径放在同一组输入上对齐。先跑 batch=10 的主场景：
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/probe_query_only_torchair_accuracy.py --device npu:0 --tokens 10 --use-bmm-transpose --weights-dtype bf16 --repeats 3 --warmup 10 --iters 100 --score-proxy-candidates 512 --score-proxy-topk 128
+```
+
+然后跑几个 shape，确认问题是否只在特定 batch 触发：
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/probe_query_only_torchair_accuracy.py --device npu:0 --tokens 1,2,4,8,10,16,32,64 --use-bmm-transpose --weights-dtype bf16 --repeats 3 --warmup 5 --iters 20 --score-proxy-candidates 512 --score-proxy-topk 128
+```
+
+如果上面显示 `current_vs_functional q` 已经有明显差异，再额外跑一把不走 q BMM 的版本，用来判断差异是否来自 q BMM 还是 RoPE：
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/probe_query_only_torchair_accuracy.py --device npu:0 --tokens 10 --weights-dtype bf16 --repeats 3 --warmup 10 --iters 100 --score-proxy-candidates 512 --score-proxy-topk 128
+```
+
 ## 2026-06-04 11:35：把 decode query-only q BMM 路径真正接入推理
 
 这次会为每层额外缓存一份 head-major `wq_b_bmm_t`，用于 `tokens<=64` 的 query-only q projection。请先跑同步 timing，重点看是否 OOM、`indexer_project` 是否下降、输出是否和上一轮一致：
