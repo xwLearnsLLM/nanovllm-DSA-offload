@@ -86,6 +86,13 @@ def _apply_rope_neox_reference(x: torch.Tensor, cos: torch.Tensor, sin: torch.Te
     return (x * cos) + (_rotate_half_neox(x) * sin)
 
 
+def _apply_query_rope_like_runtime(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, rope_dim: int) -> torch.Tensor:
+    # Query-only TorchAir must match the runtime path bit-for-bit; otherwise q_index differs before qk_score.
+    if x.device.type == "npu" and torch_npu is not None and x.dtype in (torch.float16, torch.bfloat16):
+        return torch_npu.npu_rotary_mul(x.unsqueeze(2), cos, sin).squeeze(2)
+    return _apply_rope_neox_reference(x, cos, sin, int(rope_dim))
+
+
 def _rms_norm_reference(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     orig_dtype = x.dtype
     x_float = x.float()
@@ -130,7 +137,7 @@ def _dsa_indexer_project_query_only_out_functional(
     q = F.linear(q_c, wq_b_weight).view(-1, int(n_head), int(head_dim))
     _query_only_weights_proj(hidden_states, weights_proj_weight, index_weights_out, float(score_scale))
     q_pe, q_nope = torch.split(q, [int(rope_dim), int(head_dim) - int(rope_dim)], dim=-1)
-    q_pe = _apply_rope_neox_reference(q_pe, cos, sin, int(rope_dim))
+    q_pe = _apply_query_rope_like_runtime(q_pe, cos, sin, int(rope_dim))
     q_index_out[..., : int(rope_dim)].copy_(q_pe)
     q_index_out[..., int(rope_dim) :].copy_(q_nope)
     return q_index_out, index_weights_out
@@ -608,10 +615,7 @@ def dsa_indexer_project_query_only(
 
     start = _timer_start(detail, sync_detail, q.device)
     q_pe, q_nope = torch.split(q, [int(rope_dim), int(head_dim) - int(rope_dim)], dim=-1)
-    if q.device.type == "npu" and torch_npu is not None and q.dtype in (torch.float16, torch.bfloat16):
-        q_pe = torch_npu.npu_rotary_mul(q_pe.unsqueeze(2), cos, sin).squeeze(2)
-    else:
-        q_pe = _apply_rope_neox_reference(q_pe, cos, sin, int(rope_dim))
+    q_pe = _apply_query_rope_like_runtime(q_pe, cos, sin, int(rope_dim))
     q_index_out[..., : int(rope_dim)].copy_(q_pe)
     q_index_out[..., int(rope_dim) :].copy_(q_nope)
     _timer_end(detail, "rope", start, sync_detail, q.device)

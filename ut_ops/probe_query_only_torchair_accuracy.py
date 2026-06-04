@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 from time import perf_counter
 
 import torch
@@ -77,7 +78,12 @@ def assert_close(name: str, actual: torch.Tensor, expected: torch.Tensor, atol: 
 
 
 def sentinel_report(name: str, tensor: torch.Tensor, sentinel: float) -> None:
-    count = int((tensor == tensor.new_tensor(float(sentinel))).sum().item()) if tensor.numel() else 0
+    if not tensor.numel():
+        count = 0
+    elif math.isnan(float(sentinel)):
+        count = int(torch.isnan(tensor).sum().item())
+    else:
+        count = int((tensor == tensor.new_tensor(float(sentinel))).sum().item())
     print(f"QOTA_SENTINEL {name}: remaining={count} numel={tensor.numel()}")
 
 
@@ -329,7 +335,7 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--sentinel", type=float, default=-123.0)
+    parser.add_argument("--sentinel", type=float, default=float("nan"))
     parser.add_argument("--atol", type=float, default=1.0)
     parser.add_argument("--rtol", type=float, default=0.01)
     args = parser.parse_args()
