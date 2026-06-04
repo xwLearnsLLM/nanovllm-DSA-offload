@@ -22,6 +22,7 @@ from nanovllm.models.dsa_offload_ops import (
 from nanovllm.models.dsa_indexer_project import (
     dsa_indexer_project,
     dsa_indexer_project_post_available,
+    dsa_indexer_project_q_path,
     dsa_indexer_project_query_only,
     dsa_indexer_project_query_only_torchair,
     dsa_indexer_project_query_only_with_qc_torchair,
@@ -773,6 +774,8 @@ class DeepseekV32Indexer(nn.Module):
         self._output_buffers = None
         self._weights_proj_bf16_key = None
         self._weights_proj_bf16 = None
+        self._wq_b_bmm_t_key = None
+        self._wq_b_bmm_t = None
         self.query_only_backend = os.environ.get("NANOVLLM_DSA_QUERY_ONLY_BACKEND", "current").strip().lower()
         if self.query_only_backend not in ("current", "torchair", "auto"):
             self.query_only_backend = "current"
@@ -810,6 +813,23 @@ class DeepseekV32Indexer(nn.Module):
         self._weights_proj_bf16 = weight.detach().to(device=device, dtype=dtype).contiguous()
         self._weights_proj_bf16_key = key
         return self._weights_proj_bf16
+
+    # query-only q projection can use the same head-major BMM-transpose path as
+    # MLAPO. The transformed weight is large, so keep one cached copy per layer.
+    def _query_only_wq_b_bmm_t(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor | None:
+        if device.type != "npu" or dtype not in (torch.float16, torch.bfloat16):
+            return None
+        if ascend_ops is None or not hasattr(ascend_ops, "batch_matmul_transpose"):
+            return None
+        key = (dtype, device)
+        if self._wq_b_bmm_t_key == key and self._wq_b_bmm_t is not None:
+            return self._wq_b_bmm_t
+        weight = self.wq_b.weight
+        if weight.dtype != dtype or weight.device != device:
+            return None
+        self._wq_b_bmm_t = weight.view(self.n_head, self.head_dim, self.q_lora_rank).transpose(1, 2).contiguous()
+        self._wq_b_bmm_t_key = key
+        return self._wq_b_bmm_t
 
     # Cache per-forward cos/sin tensors in context.scratch. All layers share the
     # same positions, so this removes repeated tiny H2D/index_select overhead.
@@ -874,6 +894,9 @@ class DeepseekV32Indexer(nn.Module):
                     self.last_q_project_path = "query_only_torchair"
                     return q_index, None, index_weights
                 self.last_q_project_path = f"query_only_torchair_fallback:{reason}"
+            wq_b_bmm_t = self._query_only_wq_b_bmm_t(q_c.dtype, q_c.device)
+            q_path = dsa_indexer_project_q_path(q_c, wq_b_bmm_t, wq_b_bmm_t is not None)
+            self.last_q_project_path = f"{self.last_q_project_path}->{q_path}" if self.last_q_project_path.startswith("query_only_torchair_fallback:") else q_path
             dsa_indexer_project_query_only(
                 hidden_states,
                 q_c,
@@ -887,6 +910,8 @@ class DeepseekV32Indexer(nn.Module):
                 head_dim=self.head_dim,
                 rope_dim=self.rope_dim,
                 score_scale=1.0,  # vllm-ascend BF16 lightning_indexer consumes raw weights_proj(x).
+                wq_b_bmm_t=wq_b_bmm_t,
+                enable_q_bmm=wq_b_bmm_t is not None,
                 detail=detail,
                 sync_detail=sync_detail,
             )
