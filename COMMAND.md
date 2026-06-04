@@ -89,3 +89,17 @@ PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/probe_ind
 ```bash
 for t in 10 16 32 64 128; do PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/probe_indexer_project.py --device npu:0 --tokens $t --warmup 10 --iters 100 --use-bmm-transpose --reuse-output-buffers --weights-topk $t; done
 ```
+
+## 2026-06-04 10:05：固定启用 decode query-only BF16 `weights_proj`，并把 q BMM 上限收敛到 64
+
+这次没有新增运行时开关；decode query-only 直接使用 cached BF16 `weights_proj`，prefill/full indexer_project 仍走原 FP32 路径。下一次请先跑 probe，确认 q BMM 路径和 BF16 weights_proj 仍然对齐：
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/probe_indexer_project.py --device npu:0 --tokens 10 --warmup 10 --iters 100 --use-bmm-transpose --reuse-output-buffers --profile-detail --weights-topk 10
+```
+
+然后跑不组图的纯长 batch=10 decode timing，观察 `indexer_project` 和最终输出是否正常：
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_DSA_QK_SCORE_BF16_OUT=1 NANOVLLM_MAX_GEN_TOKENS=8 NANOVLLM_ENABLE_DECODE_MLAPO=1 NANOVLLM_DSA_OFFLOAD_FIXED_TX=128 NANOVLLM_DSA_INDEX_UPDATE_USE_CANN=1 NANOVLLM_DSA_CHECK=0 NANOVLLM_PROMPT_LENGTHS=17000,17001,17002,17003,17004,17005,17006,17007,17008,17009 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=0 NANOVLLM_PROFILE_LAYER_IDS=mid python3 example/test.py
+```

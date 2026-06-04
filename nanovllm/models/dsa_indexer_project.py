@@ -93,6 +93,25 @@ def _rms_norm_reference(x: torch.Tensor, weight: torch.Tensor, eps: float) -> to
     return (x_float * torch.rsqrt(var + float(eps))).to(orig_dtype) * weight
 
 
+def _query_only_weights_proj(
+    hidden_states: torch.Tensor,
+    weights_proj_weight: torch.Tensor,
+    index_weights_out: torch.Tensor,
+    score_scale: float,
+) -> torch.Tensor:
+    if weights_proj_weight.dtype == hidden_states.dtype:
+        weights = F.linear(hidden_states, weights_proj_weight)
+        if float(score_scale) != 1.0:
+            weights = weights * float(score_scale)
+        index_weights_out.copy_(weights)
+        return index_weights_out
+    weights = F.linear(hidden_states.float(), weights_proj_weight.float()).contiguous()
+    if float(score_scale) != 1.0:
+        weights = weights * float(score_scale)
+    index_weights_out.copy_(weights.to(hidden_states.dtype))
+    return index_weights_out
+
+
 def _dsa_indexer_project_query_only_out_functional(
     hidden_states: torch.Tensor,
     q_c: torch.Tensor,
@@ -109,8 +128,7 @@ def _dsa_indexer_project_query_only_out_functional(
     score_scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     q = F.linear(q_c, wq_b_weight).view(-1, int(n_head), int(head_dim))
-    weights = F.linear(hidden_states.float(), weights_proj_weight.float()).contiguous()
-    index_weights_out.copy_((weights * float(score_scale)).to(hidden_states.dtype))
+    _query_only_weights_proj(hidden_states, weights_proj_weight, index_weights_out, float(score_scale))
     q_pe, q_nope = torch.split(q, [int(rope_dim), int(head_dim) - int(rope_dim)], dim=-1)
     q_pe = _apply_rope_neox_reference(q_pe, cos, sin, int(rope_dim))
     q_index_out[..., : int(rope_dim)].copy_(q_pe)
@@ -306,7 +324,7 @@ class DsaQueryOnlyTorchAirCache:
 
 
 _QUERY_ONLY_TORCHAIR_CACHE = DsaQueryOnlyTorchAirCache()
-_Q_BMM_MAX_TOKENS = 128  # Keep larger decode batches on the q BMM path; benchmark decides if this remains profitable.
+_Q_BMM_MAX_TOKENS = 64  # Keep larger decode batches on the q BMM path; tokens=128 was slower in probe.
 
 
 def _ensure_dynamo_recompile_limit(num_shapes: int) -> None:
@@ -585,8 +603,7 @@ def dsa_indexer_project_query_only(
     _timer_end(detail, "q_proj", start, sync_detail, q_c.device)
 
     start = _timer_start(detail, sync_detail, hidden_states.device)
-    weights = F.linear(hidden_states.float(), weights_proj_weight.float()).contiguous()
-    index_weights_out.copy_((weights * float(score_scale)).to(hidden_states.dtype))
+    _query_only_weights_proj(hidden_states, weights_proj_weight, index_weights_out, float(score_scale))
     _timer_end(detail, "weights_proj", start, sync_detail, hidden_states.device)
 
     start = _timer_start(detail, sync_detail, q.device)

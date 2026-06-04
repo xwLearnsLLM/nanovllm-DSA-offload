@@ -771,6 +771,8 @@ class DeepseekV32Indexer(nn.Module):
         self.last_q_project_path = "linear"
         self._output_buffer_key = None
         self._output_buffers = None
+        self._weights_proj_bf16_key = None
+        self._weights_proj_bf16 = None
         self.query_only_backend = os.environ.get("NANOVLLM_DSA_QUERY_ONLY_BACKEND", "current").strip().lower()
         if self.query_only_backend not in ("current", "torchair", "auto"):
             self.query_only_backend = "current"
@@ -795,6 +797,19 @@ class DeepseekV32Indexer(nn.Module):
         self._output_buffer_key = key
         self._output_buffers = (q_index, index_k, index_weights)
         return self._output_buffers
+
+    # Decode query-only uses a cached low-precision copy of weights_proj. Full
+    # indexer and prefill keep the FP32 weight path to stay aligned with the original code.
+    def _query_only_weights_proj_weight(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        weight = self.weights_proj.weight
+        if dtype not in (torch.float16, torch.bfloat16):
+            return weight
+        key = (dtype, device)
+        if self._weights_proj_bf16_key == key and self._weights_proj_bf16 is not None:
+            return self._weights_proj_bf16
+        self._weights_proj_bf16 = weight.detach().to(device=device, dtype=dtype).contiguous()
+        self._weights_proj_bf16_key = key
+        return self._weights_proj_bf16
 
     # Cache per-forward cos/sin tensors in context.scratch. All layers share the
     # same positions, so this removes repeated tiny H2D/index_select overhead.
@@ -836,6 +851,7 @@ class DeepseekV32Indexer(nn.Module):
             self.last_q_project_path = "query_only"
             # Decode DSA only scores prefill candidates. The decode token key is
             # already in the MLA tail budget, so skip index_k projection/cache.
+            weights_proj_weight = self._query_only_weights_proj_weight(hidden_states.dtype, hidden_states.device)
             if self.query_only_backend in ("torchair", "auto"):
                 _, _, used_torchair, reason = dsa_indexer_project_query_only_torchair(
                     hidden_states,
@@ -843,7 +859,7 @@ class DeepseekV32Indexer(nn.Module):
                     cos,
                     sin,
                     self.wq_b.weight,
-                    self.weights_proj.weight,
+                    weights_proj_weight,
                     q_index,
                     index_weights,
                     n_head=self.n_head,
@@ -864,7 +880,7 @@ class DeepseekV32Indexer(nn.Module):
                 cos,
                 sin,
                 self.wq_b.weight,
-                self.weights_proj.weight,
+                weights_proj_weight,
                 q_index,
                 index_weights,
                 n_head=self.n_head,
@@ -1188,6 +1204,7 @@ class DeepseekV32DSAAttention(nn.Module):
         if self.layer_id != 0:                                  # Graph is shape-based; one layer warms the rank cache.
             return
         q_a_weight = self._query_only_q_a_weight()
+        weights_proj_weight = self.indexer._query_only_weights_proj_weight(self.indexer.wq_b.weight.dtype, self.indexer.wq_b.weight.device)
         q_only_status = warmup_dsa_query_only_torchair(
             tokens_list=self.indexer.query_only_warmup_tokens,
             hidden_size=self.hidden_size,
@@ -1198,7 +1215,7 @@ class DeepseekV32DSAAttention(nn.Module):
             dtype=self.indexer.wq_b.weight.dtype,
             device=self.indexer.wq_b.weight.device,
             wq_b_weight=self.indexer.wq_b.weight,
-            weights_proj_weight=self.indexer.weights_proj.weight,
+            weights_proj_weight=weights_proj_weight,
             score_scale=1.0,
         )
         if q_a_weight is None:
@@ -1216,7 +1233,7 @@ class DeepseekV32DSAAttention(nn.Module):
             q_a_weight=q_a_weight,
             q_norm_weight=self.q_a_layernorm.weight,
             wq_b_weight=self.indexer.wq_b.weight,
-            weights_proj_weight=self.indexer.weights_proj.weight,
+            weights_proj_weight=weights_proj_weight,
             q_norm_eps=float(self.q_a_layernorm.eps),
             score_scale=1.0,
         )
@@ -1238,6 +1255,7 @@ class DeepseekV32DSAAttention(nn.Module):
         indexer_detail = {key: 0.0 for key in self.last_decode_indexer_detail} if profile_decode else None
         cos, sin = self.indexer._rope_cos_sin(positions, self.indexer_rotary_emb, hidden_states.dtype)
         q_index, _, index_weights = self.indexer._get_output_buffers(hidden_states)
+        weights_proj_weight = self.indexer._query_only_weights_proj_weight(hidden_states.dtype, hidden_states.device)
         q_index, index_weights, used_torchair, reason = dsa_indexer_project_query_only_with_qc_torchair(
             hidden_states,
             cos,
@@ -1245,7 +1263,7 @@ class DeepseekV32DSAAttention(nn.Module):
             q_a_weight,
             self.q_a_layernorm.weight,
             self.indexer.wq_b.weight,
-            self.indexer.weights_proj.weight,
+            weights_proj_weight,
             q_index,
             index_weights,
             q_norm_eps=float(self.q_a_layernorm.eps),
