@@ -2238,7 +2238,7 @@ class DeepseekV32DSAAttention(nn.Module):
             self.dram_ckv_cache,
             self.dram_kpe_cache,
         )
-        _profile_sync(self.ckv_cache.device)                    # Scatter updates HBM KV consumed immediately by MLA.
+        # _profile_sync(self.ckv_cache.device)                    # Scatter updates HBM KV consumed immediately by MLA.
         self._decode_timer_end(
             profile_decode,
             "dsa_scatter_h2d",
