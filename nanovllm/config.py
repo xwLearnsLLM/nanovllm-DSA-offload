@@ -21,7 +21,7 @@ class Config:
     num_index_cache_blocks: int = -1
     num_hbm_kvcache_blocks: int = -1
     num_dram_kvcache_blocks: int = -1
-    dsa_offload_fixed_tx: int = 64
+    dsa_offload_fixed_tx: int = 128
     dsa_offload_max_copy_tokens: int = 2048
     dsa_offload_max_sparse_tokens: int = -1
     hccl_port: int = 28000

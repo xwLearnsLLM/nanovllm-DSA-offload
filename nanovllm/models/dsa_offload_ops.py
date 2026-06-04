@@ -16,7 +16,6 @@ def _env_flag(name: str, default: bool) -> bool:
     return value.strip().lower() not in ("0", "false", "off", "no", "")
 
 
-_DSA_QK_SCORE_BF16_OUT = _env_flag("NANOVLLM_DSA_QK_SCORE_BF16_OUT", True)
 _DSA_INDEX_UPDATE_USE_CANN = _env_flag("NANOVLLM_DSA_INDEX_UPDATE_USE_CANN", True)
 
 
@@ -41,33 +40,19 @@ def dsa_indexer_score(
     score_count = block_count * block_size
     if score_count > score_capacity:
         raise RuntimeError(f"score_out capacity {score_capacity} is smaller than qk_score logical length {score_count}.")
-    
-    if _DSA_QK_SCORE_BF16_OUT:
-        ascend_ops.npu_qk_score_bf16_out(
-            query_index,
-            index_cache,
-            index_weights,
-            actual_seq_lengths_query,
-            candidate_lens,
-            index_block_table,
-            block_count,
-            score_out,
-            "TND",
-            "PA_BSND",
-        )
-    else: 
-        scores = ascend_ops.npu_qk_score(
-            query_index,
-            index_cache,
-            index_weights,
-            actual_seq_lengths_query,
-            candidate_lens,
-            index_block_table[:, :block_count].contiguous(),
-            "TND",
-            "PA_BSND",
-        )
-        copy_len = min(score_count, int(scores.shape[-1]))
-        score_out[:, :copy_len].copy_(scores[:, 0, :copy_len])
+
+    ascend_ops.npu_qk_score_bf16_out(
+        query_index,
+        index_cache,
+        index_weights,
+        actual_seq_lengths_query,
+        candidate_lens,
+        index_block_table,
+        block_count,
+        score_out,
+        "TND",
+        "PA_BSND",
+    )
 
 
 def dsa_index_update_torch(

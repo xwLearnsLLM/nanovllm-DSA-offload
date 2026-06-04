@@ -1031,8 +1031,6 @@ class DeepseekV32DSAAttention(nn.Module):
         self.mlapo_wd_qkv = None
         self.mlapo_wu_q = None
         self.mlapo_beta1 = None
-        self.fuse_qkv_a = _env_flag("NANOVLLM_FUSE_QKV_A", True)
-        self.free_kv_b_proj = _env_flag("NANOVLLM_FREE_KV_B_PROJ", True)
         self.enable_decode_mlapo = _env_flag(
             "NANOVLLM_ENABLE_DECODE_MLAPO",
             True,
@@ -1045,10 +1043,6 @@ class DeepseekV32DSAAttention(nn.Module):
             "NANOVLLM_DECODE_LAYER_TIMING_SYNC",
             True,
         )
-        self.debug_decode_mlapo_compare = _env_flag("NANOVLLM_DEBUG_DECODE_MLAPO_COMPARE", False)
-        self.debug_decode_mlapo_compare_rank = _env_int("NANOVLLM_DEBUG_DECODE_MLAPO_COMPARE_RANK", 0)
-        self.debug_decode_mlapo_compare_limit = _env_int("NANOVLLM_DEBUG_DECODE_MLAPO_COMPARE_LIMIT", 2)
-        self._debug_decode_mlapo_compare_count = 0
         self.dsa_check = _env_flag("NANOVLLM_DSA_CHECK", False)
         self.log_decode_layer_timing = _env_flag(
             "NANOVLLM_LOG_DECODE_LAYER_TIMING",
@@ -1169,7 +1163,7 @@ class DeepseekV32DSAAttention(nn.Module):
         self.dsa_offload_fixed_tx = int(dsa_offload_fixed_tx)
 
     def post_load_prepare(self) -> None:
-        if self.fuse_qkv_a and self.wd_qkv is None:
+        if self.wd_qkv is None:
             q_weight = self.q_a_proj.weight.detach().cpu()
             kv_weight = self.kv_a_proj_with_mqa.weight.detach().cpu()
             dtype = self.q_a_proj.weight.dtype
@@ -1206,22 +1200,19 @@ class DeepseekV32DSAAttention(nn.Module):
                 .transpose(1, 2)
                 .contiguous()
             )
-            if self.free_kv_b_proj:
-                self.kv_b_proj._parameters.pop("weight", None)
-                gc.collect()
-                if self.w_uk_t.device.type == "npu":
-                    torch.npu.empty_cache()
+            self.kv_b_proj._parameters.pop("weight", None)
+            gc.collect()
+            if self.w_uk_t.device.type == "npu":
+                torch.npu.empty_cache()
 
         if self.enable_decode_mlapo:
             self._prepare_decode_mlapo()
         self._warmup_query_only_with_qc_torchair()
 
     def _query_only_q_a_weight(self) -> torch.Tensor | None:
-        if self.fuse_qkv_a:
-            if self.wd_qkv is None:
-                return None
-            return self.wd_qkv[: self.q_lora_rank]
-        return self.q_a_proj.weight
+        if self.wd_qkv is None:
+            return None
+        return self.wd_qkv[: self.q_lora_rank]
 
     def _warmup_query_only_with_qc_torchair(self) -> None:
         if self.indexer.query_only_backend not in ("torchair", "auto"):
@@ -1312,14 +1303,10 @@ class DeepseekV32DSAAttention(nn.Module):
         if self.mlapo_wd_qkv is not None and self.mlapo_wu_q is not None:
             return
 
-        if self.fuse_qkv_a:
-            if self.wd_qkv is None:
-                return
-            q_weight = self.wd_qkv[: self.q_lora_rank].detach()
-            kv_weight = self.wd_qkv[self.q_lora_rank :].detach()
-        else:
-            q_weight = self.q_a_proj.weight.detach()
-            kv_weight = self.kv_a_proj_with_mqa.weight.detach()
+        if self.wd_qkv is None:
+            return
+        q_weight = self.wd_qkv[: self.q_lora_rank].detach()
+        kv_weight = self.wd_qkv[self.q_lora_rank :].detach()
 
         kv_weight = _trans_rope_weight(kv_weight, self.qk_rope_head_dim)
         wd_qkv = torch.cat((kv_weight, q_weight), dim=0).contiguous()
@@ -1412,88 +1399,10 @@ class DeepseekV32DSAAttention(nn.Module):
     # Temporary q_c fallback for DSA decode. Remove this once mla_preprocess
     # enable_inner_out=True is fixed and matches the torch reference.
     def _decode_mlapo_q_c_fallback(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.fuse_qkv_a:
-            q_c = F.linear(hidden_states, self.wd_qkv[: self.q_lora_rank])
-        else:
-            q_c = self.q_a_proj(hidden_states)
+        if self.wd_qkv is None:
+            raise RuntimeError("Fused qkv_a weight is not prepared.")
+        q_c = F.linear(hidden_states, self.wd_qkv[: self.q_lora_rank])
         return self.q_a_layernorm(q_c)
-
-    def _debug_tensor_diff(self, name: str, actual: torch.Tensor, expected: torch.Tensor) -> None:
-        actual_f = actual.float()
-        expected_f = expected.float()
-        diff = (actual_f - expected_f).abs()
-        finite = torch.isfinite(diff) & torch.isfinite(actual_f) & torch.isfinite(expected_f)
-        nonfinite_count = int((~finite).sum().item()) if diff.numel() else 0
-        finite_diff = diff[finite]
-        max_abs = float(finite_diff.max().item()) if finite_diff.numel() else float("nan")
-        mean_abs = float(finite_diff.mean().item()) if finite_diff.numel() else float("nan")
-        bad_count = int(((diff > 0.03125 + 0.01 * expected_f.abs()) | (~finite)).sum().item()) if diff.numel() else 0
-        logger.info(
-            "MLAPO live diff: rank=%d layer=%d %s shape=%s max_abs=%.6g mean_abs=%.6g bad_count=%d nonfinite_count=%d",
-            _rank_id(),
-            self.layer_id,
-            name,
-            tuple(actual.shape),
-            max_abs,
-            mean_abs,
-            bad_count,
-            nonfinite_count,
-        )
-
-    # Debug-only exact compare against the torch decode path using real model
-    # hidden states. This catches MLAPO mismatches that random standalone probes
-    # may miss.
-    def _debug_compare_decode_mlapo(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        ql_nope: torch.Tensor,
-        q_pe: torch.Tensor,
-    ) -> None:
-        if not self.debug_decode_mlapo_compare:
-            return
-        rank = _rank_id()
-        if self.debug_decode_mlapo_compare_rank >= 0 and rank != self.debug_decode_mlapo_compare_rank:
-            return
-        if self._debug_decode_mlapo_compare_count >= self.debug_decode_mlapo_compare_limit:
-            return
-        if not _profile_layer_selected(self.layer_id, self.num_layers):
-            return
-
-        with torch.inference_mode():
-            if self.fuse_qkv_a:
-                qkv_a = F.linear(hidden_states, self.wd_qkv)
-                q_c, kv = torch.split(qkv_a, [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1)
-            else:
-                q_c = self.q_a_proj(hidden_states)
-                kv = self.kv_a_proj_with_mqa(hidden_states)
-            q_c = self.q_a_layernorm(q_c)
-            q = self.q_b_proj(q_c).view(-1, self.num_local_heads, self.qk_head_dim)
-            q_nope, q_pe_ref = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-            ckv_ref, k_pe_ref = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-            ckv_ref = self.kv_a_layernorm(ckv_ref)
-            q_pe_ref, k_pe_ref = self.rotary_emb(positions, q_pe_ref, k_pe_ref.unsqueeze(1))
-            k_pe_ref = k_pe_ref.squeeze(1)
-            q_pe_ref = _rope_interleaved_to_neox(q_pe_ref)
-            k_pe_ref = _rope_interleaved_to_neox(k_pe_ref)
-            ql_nope_ref = self._q_nope_up_proj(q_nope)
-            slots = self._flat_slots()
-            ckv_actual = self.ckv_cache.view(-1, self.kv_lora_rank).index_select(0, slots)
-            kpe_actual = self.kpe_cache.view(-1, self.qk_rope_head_dim).index_select(0, slots)
-
-            logger.info(
-                "MLAPO live compare: rank=%d layer=%d positions=%s slots=%s needs_dsa_update=%s",
-                rank,
-                self.layer_id,
-                positions.detach().cpu().tolist(),
-                slots.detach().cpu().tolist(),
-                get_context().needs_dsa_update,
-            )
-            self._debug_tensor_diff("ql_nope", ql_nope, ql_nope_ref)
-            self._debug_tensor_diff("q_pe", q_pe, q_pe_ref)
-            self._debug_tensor_diff("ckv_current_slots", ckv_actual, ckv_ref)
-            self._debug_tensor_diff("kpe_current_slots", kpe_actual, k_pe_ref)
-            self._debug_decode_mlapo_compare_count += 1
 
     def _decode_mlapo_preprocess(
         self,
@@ -1544,7 +1453,6 @@ class DeepseekV32DSAAttention(nn.Module):
         if need_inner_out:
             inner_out = self._decode_mlapo_q_c_fallback(hidden_states)
         self._decode_timer_end(profile_decode, "mlapo", start, ql_nope.device)
-        self._debug_compare_decode_mlapo(positions, hidden_states, ql_nope, q_pe)
         return ql_nope, q_pe, inner_out
 
     @property
@@ -2323,8 +2231,10 @@ class DeepseekV32DSAAttention(nn.Module):
         if self.w_uk_t is None or self.w_uv is None:
             self.post_load_prepare()
 
-        if self.fuse_qkv_a and self.wd_qkv is None:
+        if self.wd_qkv is None:
             self.post_load_prepare()
+        if self.wd_qkv is None:
+            raise RuntimeError("Fused qkv_a weight is not prepared.")
 
         use_decode_mlapo = (
             self.enable_decode_mlapo
@@ -2358,16 +2268,12 @@ class DeepseekV32DSAAttention(nn.Module):
             return self._o_proj_forward(attn_output, profile_decode)
 
         start = self._decode_timer_start(profile_decode, hidden_states.device)
-        if self.fuse_qkv_a:
-            qkv_a = F.linear(hidden_states, self.wd_qkv)
-            q_c, kv = torch.split(
-                qkv_a,
-                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
-                dim=-1,
-            )
-        else:
-            q_c = self.q_a_proj(hidden_states)
-            kv = self.kv_a_proj_with_mqa(hidden_states)
+        qkv_a = F.linear(hidden_states, self.wd_qkv)
+        q_c, kv = torch.split(
+            qkv_a,
+            [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+            dim=-1,
+        )
         self._decode_timer_end(profile_decode, "qkv_a", start, hidden_states.device)
 
         start = self._decode_timer_start(profile_decode, q_c.device)

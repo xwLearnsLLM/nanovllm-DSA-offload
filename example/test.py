@@ -243,10 +243,7 @@ def main() -> None:
     prompt_lengths = parse_prompt_lengths()
     max_prompt_len = max(prompt_lengths)
     max_gen_tokens = env_int("NANOVLLM_MAX_GEN_TOKENS", 1)
-    max_model_len = env_int(
-        "NANOVLLM_MAX_MODEL_LEN",
-        max_prompt_len + max_gen_tokens,
-    )
+    max_model_len = env_int("NANOVLLM_MAX_MODEL_LEN", 65536)
     if max_model_len < max_prompt_len + max_gen_tokens:
         raise ValueError(
             "NANOVLLM_MAX_MODEL_LEN must cover prompt length plus generation "
