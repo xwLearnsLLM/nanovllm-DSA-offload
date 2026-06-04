@@ -2046,7 +2046,7 @@ class DeepseekV32DSAAttention(nn.Module):
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         global _DSA_OFFLOAD_BUFFER_CACHE
-        copy_capacity = int(self.dsa_offload_max_copy_tokens)
+        copy_capacity = max(1, min(int(self.dsa_offload_fixed_tx), int(self.dsa_offload_max_copy_tokens)))  # Hot path only needs fixed Tx slots.
         key = (str(device), dtype)
         cached = _DSA_OFFLOAD_BUFFER_CACHE.get(key)
         if cached is None:
@@ -2079,8 +2079,9 @@ class DeepseekV32DSAAttention(nn.Module):
                 dtype=torch.int32,
                 device=device,
             )
-            copy_counts = torch.empty(
+            copy_counts = torch.full(
                 (cached_batch,),
+                copy_capacity,
                 dtype=torch.int32,
                 device=device,
             )
@@ -2172,6 +2173,8 @@ class DeepseekV32DSAAttention(nn.Module):
             selected_lens,
             req_pool_entries,
             min(self.dsa_offload_fixed_tx, self.dsa_offload_max_copy_tokens),
+            all_copy_count_k=bool(context.dsa_all_copy_count_k),
+            pool_entries_start=int(context.dsa_pool_entries_start),
         )
         self._decode_timer_end(
             profile_decode,

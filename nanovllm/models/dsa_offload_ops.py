@@ -150,12 +150,11 @@ def _dsa_index_update_cann(
     selected_lens: torch.Tensor,
     req_pool_entries: torch.Tensor,
     max_copy_tokens: int,
+    *,
+    all_copy_count_k: bool = False,
+    pool_entries_start: int = -1,
 ) -> None:
     """Run the CANN dsa_update_index op behind the framework-facing interface."""
-    promote_idx.zero_()
-    demote_idx.zero_()
-    copy_counts.zero_()
-
     bs = int(score.shape[0])
     k = int(max_copy_tokens)
     if bs <= 0 or k <= 0:
@@ -167,61 +166,66 @@ def _dsa_index_update_cann(
             "Set NANOVLLM_DSA_INDEX_UPDATE_USE_CANN=0 to use the torch path, "
             "or lower NANOVLLM_DSA_OFFLOAD_FIXED_TX."
         )
+    
     if not hasattr(ascend_ops, "dsa_update_index"):
-        raise RuntimeError(
-            "ascend_ops.dsa_update_index is unavailable. Rebuild with "
-            "`SOC_VERSION=ascend910_9391 PYTHONPATH=$PWD:$PYTHONPATH bash scripts/build_nanovllm_ops.sh`."
+        raise RuntimeError("ascend_ops.dsa_update_index is unavailable. Rebuild with `SOC_VERSION=ascend910_9391 PYTHONPATH=$PWD:$PYTHONPATH bash scripts/build_nanovllm_ops.sh`.")
+
+    # Pure long-sequence decode: every row copies exactly fixed Tx tokens, and pool entries are consecutive. Pass the HBM pool view directly; the CANN op updates selected_idx in-place, so no Python-side pool scatter is needed.
+    if all_copy_count_k and pool_entries_start >= 0:
+        pool_start = int(pool_entries_start)
+        selected_idx = hbm_cached_tokens_pool[pool_start:pool_start + bs]
+        ascend_ops.dsa_update_index(score, selected_idx, candidate_lens, selected_lens, k, promote_idx, demote_idx)
+        
+    else :
+        score_arg = score if score.is_contiguous() else score.contiguous()
+        candidate_lens_arg = candidate_lens if candidate_lens.is_contiguous() else candidate_lens.contiguous()
+        selected_lens_arg = selected_lens if selected_lens.is_contiguous() else selected_lens.contiguous()
+        promote_arg = promote_idx if int(promote_idx.shape[1]) == k and promote_idx.is_contiguous() else promote_idx[:, :k].contiguous()
+        demote_arg = demote_idx if int(demote_idx.shape[1]) == k and demote_idx.is_contiguous() else demote_idx[:, :k].contiguous()
+
+        pool_entries = req_pool_entries.to(torch.long)
+        selected_idx = hbm_cached_tokens_pool[pool_entries].contiguous()
+
+        # Fallback keeps mixed short/long batch semantics. Rows that already cache all candidate tokens must report copy_count=0 even though the CANN op emits k pairs.
+        max_selected = int(selected_idx.shape[1])
+        col_range = torch.arange(max_selected, device=score.device).unsqueeze(0)
+        within_len = col_range < selected_lens_arg.unsqueeze(1)
+        valid_id = (selected_idx >= 0) & (selected_idx < candidate_lens_arg.unsqueeze(1))
+        selected_valid = within_len & valid_id
+        actual_selected = selected_valid.sum(dim=1).to(candidate_lens_arg.dtype)
+        available = candidate_lens_arg - actual_selected
+        copy_count = torch.clamp(
+            torch.minimum(
+                torch.full_like(selected_lens_arg, k),
+                torch.minimum(selected_lens_arg, available),
+            ),
+            min=0,
+        )
+        copy_counts.copy_(copy_count)
+
+        ascend_ops.dsa_update_index(
+            score_arg,
+            selected_idx,
+            candidate_lens_arg,
+            selected_lens_arg,
+            k,
+            promote_arg,
+            demote_arg,
         )
 
-    pool_entries = req_pool_entries.to(torch.long)
-    selected_idx = hbm_cached_tokens_pool[pool_entries].contiguous()
-    score_contig = score.contiguous()
-    candidate_lens_contig = candidate_lens.contiguous()
-    selected_lens_contig = selected_lens.contiguous()
-    promote_k = promote_idx[:, :k].contiguous()
-    demote_k = demote_idx[:, :k].contiguous()
+        if score_arg is not score:
+            score.copy_(score_arg)
+        if promote_arg is not promote_idx:
+            promote_idx[:, :k].copy_(promote_arg)
+        if demote_arg is not demote_idx:
+            demote_idx[:, :k].copy_(demote_arg)
 
-    # copy_counts must keep the torch prototype semantics. This matters for
-    # mixed short/long batches: a short sequence may already cache all candidate
-    # tokens, in which case the CANN op may still emit padded pairs but scatter
-    # must copy zero tokens for that row.
-    max_selected = int(selected_idx.shape[1])
-    col_range = torch.arange(max_selected, device=score.device).unsqueeze(0)
-    within_len = col_range < selected_lens_contig.unsqueeze(1)
-    valid_id = (selected_idx >= 0) & (selected_idx < candidate_lens_contig.unsqueeze(1))
-    selected_valid = within_len & valid_id
-    actual_selected = selected_valid.sum(dim=1).to(candidate_lens_contig.dtype)
-    available = candidate_lens_contig - actual_selected
-    copy_count = torch.clamp(
-        torch.minimum(
-            torch.full_like(selected_lens_contig, k),
-            torch.minimum(selected_lens_contig, available),
-        ),
-        min=0,
-    )
-    copy_counts.copy_(copy_count)
-
-    ascend_ops.dsa_update_index(
-        score_contig,
-        selected_idx,
-        candidate_lens_contig,
-        selected_lens_contig,
-        k,
-        promote_k,
-        demote_k,
-    )
-
-    if not score.is_contiguous():
-        score.copy_(score_contig)
-    promote_idx[:, :k].copy_(promote_k)
-    demote_idx[:, :k].copy_(demote_k)
-
-    k_range = torch.arange(k, device=score.device).unsqueeze(0)
-    valid_k = k_range < copy_count.unsqueeze(1)
-    flat_pool_rows = pool_entries.unsqueeze(1).expand(-1, k)[valid_k]
-    flat_slots = demote_idx[:, :k][valid_k].to(torch.long)
-    flat_vals = promote_idx[:, :k][valid_k].to(torch.int32)
-    hbm_cached_tokens_pool[flat_pool_rows, flat_slots] = flat_vals
+        k_range = torch.arange(k, device=score.device).unsqueeze(0)
+        valid_k = k_range < copy_count.unsqueeze(1)
+        flat_pool_rows = pool_entries.unsqueeze(1).expand(-1, k)[valid_k]
+        flat_slots = demote_idx[:, :k][valid_k].to(torch.long)
+        flat_vals = promote_idx[:, :k][valid_k].to(torch.int32)
+        hbm_cached_tokens_pool[flat_pool_rows, flat_slots] = flat_vals
 
 
 def dsa_index_update(
@@ -234,6 +238,9 @@ def dsa_index_update(
     selected_lens: torch.Tensor,
     req_pool_entries: torch.Tensor,
     max_copy_tokens: int,
+    *,
+    all_copy_count_k: bool = False,
+    pool_entries_start: int = -1,
 ) -> None:
     """Update sparse HBM budget.
 
@@ -251,6 +258,8 @@ def dsa_index_update(
             selected_lens,
             req_pool_entries,
             int(max_copy_tokens),
+            all_copy_count_k=all_copy_count_k,
+            pool_entries_start=pool_entries_start,
         )
         return
 

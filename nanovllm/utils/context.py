@@ -31,6 +31,8 @@ class Context:
     decode_lens: torch.Tensor | None = None
     sparse_kv_lens: torch.Tensor | None = None
     needs_dsa_update: bool = False
+    dsa_all_copy_count_k: bool = False
+    dsa_pool_entries_start: int = -1
     has_first_decode: bool = False
     is_enforce_eager: bool = True
     real_bs: int = -1
@@ -52,7 +54,8 @@ def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0
                 index_slot_mapping=None, flat_index_slot_mapping=None, req_pool_entries=None, candidate_lens=None,
                 candidate_query_lens=None, max_candidate_len=None, sparse_selected_lens=None, prefill_tail_lens=None,
                 decode_lens=None, sparse_kv_lens=None,
-                needs_dsa_update=None, has_first_decode=None, is_enforce_eager=None, real_bs=None, block_size=None, flat_slot_mapping_i32=None):
+                needs_dsa_update=None, dsa_all_copy_count_k=None, dsa_pool_entries_start=None,
+                has_first_decode=None, is_enforce_eager=None, real_bs=None, block_size=None, flat_slot_mapping_i32=None):
     global _CONTEXT
     if is_enforce_eager is None:
         is_enforce_eager = True
@@ -64,6 +67,10 @@ def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0
         max_candidate_len = 0
     if needs_dsa_update is None:
         needs_dsa_update = False
+    if dsa_all_copy_count_k is None:
+        dsa_all_copy_count_k = False
+    if dsa_pool_entries_start is None:
+        dsa_pool_entries_start = -1
     if has_first_decode is None:
         has_first_decode = False
     _CONTEXT = Context(
@@ -92,6 +99,8 @@ def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0
         decode_lens=decode_lens,
         sparse_kv_lens=sparse_kv_lens,
         needs_dsa_update=needs_dsa_update,
+        dsa_all_copy_count_k=dsa_all_copy_count_k,
+        dsa_pool_entries_start=int(dsa_pool_entries_start),
         has_first_decode=has_first_decode,
         is_enforce_eager=is_enforce_eager,
         real_bs=real_bs,

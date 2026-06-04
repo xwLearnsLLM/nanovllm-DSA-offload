@@ -494,6 +494,17 @@ class ModelRunner:
             sparse_kv_lens.append(sparse_kv_len)
             req_pool_entries.append(seq.hbm_cached_tokens_pool_entry)
         max_candidate_len = max(max(candidate_lens), 1) if candidate_lens else 1
+        dsa_update_k = min(int(self.config.dsa_offload_fixed_tx), int(self.config.dsa_offload_max_copy_tokens))
+        dsa_all_copy_count_k = bool(
+            dsa_update_k > 0
+            and candidate_lens
+            and all(candidate_len > selected_len > 0 and selected_len >= dsa_update_k and candidate_len - selected_len >= dsa_update_k for candidate_len, selected_len in zip(candidate_lens, sparse_selected_lens))
+        )
+        if req_pool_entries:
+            pool_entries_start = int(req_pool_entries[0])
+            dsa_pool_entries_start = pool_entries_start if all(int(entry) == pool_entries_start + i for i, entry in enumerate(req_pool_entries)) else -1
+        else:
+            dsa_pool_entries_start = -1
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).to(self.device, non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).to(self.device, non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
@@ -540,6 +551,8 @@ class ModelRunner:
                     decode_lens=decode_lens,
                     sparse_kv_lens=sparse_kv_lens_tensor,
                     needs_dsa_update=needs_dsa_update,
+                    dsa_all_copy_count_k=dsa_all_copy_count_k,
+                    dsa_pool_entries_start=dsa_pool_entries_start,
                     has_first_decode=has_first_decode,
                     is_enforce_eager=True,
                     real_bs=len(seqs),

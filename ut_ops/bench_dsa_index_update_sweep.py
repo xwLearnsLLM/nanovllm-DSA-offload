@@ -47,7 +47,7 @@ def make_case_tensors(
     pool = selected_ids.unsqueeze(0).expand(batch_size, selected_len).contiguous()
     promote = torch.empty((batch_size, k), dtype=torch.int32, device=device)
     demote = torch.empty((batch_size, k), dtype=torch.int32, device=device)
-    copy_counts = torch.empty((batch_size,), dtype=torch.int32, device=device)
+    copy_counts = torch.full((batch_size,), k, dtype=torch.int32, device=device)
     candidate_lens = torch.full((batch_size,), candidate_len, dtype=torch.int32, device=device)
     selected_lens = torch.full((batch_size,), selected_len, dtype=torch.int32, device=device)
     req_pool_entries = torch.arange(batch_size, dtype=torch.int32, device=device)
@@ -61,11 +61,12 @@ def reset_outputs(
     promote: torch.Tensor,
     demote: torch.Tensor,
     copy_counts: torch.Tensor,
+    k: int,
 ) -> None:
     pool.copy_(base_pool)
     promote.zero_()
     demote.zero_()
-    copy_counts.zero_()
+    copy_counts.fill_(k)
 
 
 def run_update(
@@ -81,7 +82,7 @@ def run_update(
     k: int,
 ) -> None:
     if backend == "cann":
-        _dsa_index_update_cann(score, pool, promote, demote, copy_counts, candidate_lens, selected_lens, req_pool_entries, k)
+        _dsa_index_update_cann(score, pool, promote, demote, copy_counts, candidate_lens, selected_lens, req_pool_entries, k, all_copy_count_k=True, pool_entries_start=0)
     elif backend == "torch":
         dsa_index_update_torch(score, pool, promote, demote, copy_counts, candidate_lens, selected_lens, req_pool_entries, k)
     else:
@@ -113,14 +114,14 @@ def bench_case(
 
     for _ in range(warmup):
         if reset_each_iter:
-            reset_outputs(pool=pool, base_pool=base_pool, promote=promote, demote=demote, copy_counts=copy_counts)
+            reset_outputs(pool=pool, base_pool=base_pool, promote=promote, demote=demote, copy_counts=copy_counts, k=k)
         run_update(backend, score, pool, promote, demote, copy_counts, candidate_lens, selected_lens, req_pool_entries, k)
     sync(device)
 
     start = perf_counter()
     for _ in range(iters):
         if reset_each_iter:
-            reset_outputs(pool=pool, base_pool=base_pool, promote=promote, demote=demote, copy_counts=copy_counts)
+            reset_outputs(pool=pool, base_pool=base_pool, promote=promote, demote=demote, copy_counts=copy_counts, k=k)
         run_update(backend, score, pool, promote, demote, copy_counts, candidate_lens, selected_lens, req_pool_entries, k)
     sync(device)
     avg_ms = (perf_counter() - start) * 1000.0 / max(iters, 1)
