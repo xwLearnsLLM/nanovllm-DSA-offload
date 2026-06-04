@@ -53,6 +53,21 @@ def diff_report(name: str, actual: torch.Tensor, expected: torch.Tensor) -> str:
     )
 
 
+def topk_overlap_report(
+    name: str,
+    actual_score: torch.Tensor,
+    expected_score: torch.Tensor,
+    k: int,
+) -> str:
+    k = max(1, min(int(k), int(actual_score.numel()), int(expected_score.numel())))
+    actual_topk = torch.topk(actual_score.float(), k=k).indices
+    expected_topk = torch.topk(expected_score.float(), k=k).indices
+    actual_set = set(int(x) for x in actual_topk.detach().cpu().tolist())
+    expected_set = set(int(x) for x in expected_topk.detach().cpu().tolist())
+    overlap = len(actual_set & expected_set)
+    return f"{name}: topk={k} overlap={overlap}/{k} ratio={overlap / max(k, 1):.6f}"
+
+
 def assert_close(
     name: str,
     actual: torch.Tensor,
@@ -227,6 +242,18 @@ def q_project_bmm_transpose_cached(
     return out
 
 
+def weights_proj_fp32_ref(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return F.linear(hidden_states.float(), weight.float()).to(hidden_states.dtype)
+
+
+def weights_proj_bf16_cached(hidden_states: torch.Tensor, weight_bf16: torch.Tensor) -> torch.Tensor:
+    return F.linear(hidden_states, weight_bf16)
+
+
+def weights_proj_bf16_cast_each_time(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return F.linear(hidden_states, weight.to(hidden_states.dtype))
+
+
 def bench(fn, warmup: int, iters: int, device: torch.device) -> tuple[object, float]:
     result = None
     for _ in range(warmup):
@@ -267,6 +294,7 @@ def main() -> None:
     parser.add_argument("--reuse-output-buffers", action="store_true")
     parser.add_argument("--profile-detail", action="store_true")
     parser.add_argument("--detail-iters", type=int, default=20)
+    parser.add_argument("--weights-topk", type=int, default=16)
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -429,6 +457,43 @@ def main() -> None:
         f"INDEXER_BENCH manual_ref_avg_ms={ref_ms:.6f} "
         f"model_ref_avg_ms={model_ref_ms:.6f} "
         f"dsa_indexer_project_avg_ms={op_ms:.6f}"
+    )
+
+    weights_proj_bf16 = weights["weights_proj"].to(dtype).contiguous()
+    weights_fp32_out, weights_fp32_ms = bench(
+        lambda: weights_proj_fp32_ref(hidden_states, weights["weights_proj"]),
+        args.warmup,
+        args.iters,
+        device,
+    )
+    weights_bf16_cached_out, weights_bf16_cached_ms = bench(
+        lambda: weights_proj_bf16_cached(hidden_states, weights_proj_bf16),
+        args.warmup,
+        args.iters,
+        device,
+    )
+    weights_bf16_cast_out, weights_bf16_cast_ms = bench(
+        lambda: weights_proj_bf16_cast_each_time(hidden_states, weights["weights_proj"]),
+        args.warmup,
+        args.iters,
+        device,
+    )
+    assert isinstance(weights_fp32_out, torch.Tensor)
+    assert isinstance(weights_bf16_cached_out, torch.Tensor)
+    assert isinstance(weights_bf16_cast_out, torch.Tensor)
+    qk_basis = torch.randn(args.tokens, args.heads, dtype=dtype, device=device)
+    score_fp32 = (weights_fp32_out.float() * qk_basis.float()).sum(dim=-1)
+    score_bf16_cached = (weights_bf16_cached_out.float() * qk_basis.float()).sum(dim=-1)
+    score_bf16_cast = (weights_bf16_cast_out.float() * qk_basis.float()).sum(dim=-1)
+    print("INDEXER_DIFF weights_proj_bf16_cached_vs_fp32 " + diff_report("weights", weights_bf16_cached_out, weights_fp32_out))
+    print("INDEXER_DIFF weights_proj_bf16_cast_each_vs_fp32 " + diff_report("weights", weights_bf16_cast_out, weights_fp32_out))
+    print("INDEXER_TOPK weights_proj_bf16_cached_vs_fp32 " + topk_overlap_report("score", score_bf16_cached, score_fp32, args.weights_topk))
+    print("INDEXER_TOPK weights_proj_bf16_cast_each_vs_fp32 " + topk_overlap_report("score", score_bf16_cast, score_fp32, args.weights_topk))
+    print(
+        "INDEXER_BENCH "
+        f"weights_proj_fp32_avg_ms={weights_fp32_ms:.6f} "
+        f"weights_proj_bf16_cached_avg_ms={weights_bf16_cached_ms:.6f} "
+        f"weights_proj_bf16_cast_each_avg_ms={weights_bf16_cast_ms:.6f}"
     )
 
     if args.profile_detail:

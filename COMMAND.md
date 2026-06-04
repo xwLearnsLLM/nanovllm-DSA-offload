@@ -38,68 +38,6 @@ export NANOVLLM_IGNORE_EOS=1
 
 # 运行
 
-## 2026-06-03 20:38：新增 `npu_qk_score_bf16_out`，用于对比 DSA score 新旧路径
-
-下一次请在昇腾上先跑这个：
-
-```bash
-NANOVLLM_CANN_BUILD_JOBS=64 NANOVLLM_EXT_BUILD_JOBS=1 SOC_VERSION=ascend910_9391 PYTHONPATH=$PWD:$PYTHONPATH bash scripts/build_nanovllm_ops.sh
-```
-
-然后跑新的 qk_score out 算子单测：
-
-```bash
-PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/probe_qk_score_bf16_out.py --device npu:0 --batch-size 10 --block-count 64 --extra-block-cols 4 --extra-output-cols 128 --warmup 10 --iters 100
-```
-
-如果单测通过，再对比推理里新旧 DSA score 路径。新路径默认开启：
-
-```bash
-PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_LOG_PREPARE_DECODE_TIMING=1 NANOVLLM_DSA_QK_SCORE_BF16_OUT=1 NANOVLLM_DSA_QUERY_ONLY_BACKEND=auto NANOVLLM_DSA_QUERY_ONLY_WARMUP_TOKENS=1,2,4,8,16,32,64,128 NANOVLLM_MAX_GEN_TOKENS=8 NANOVLLM_ENABLE_DECODE_MLAPO=1 NANOVLLM_DSA_OFFLOAD_FIXED_TX=128 NANOVLLM_DSA_INDEX_UPDATE_USE_CANN=1 NANOVLLM_DSA_CHECK=0 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=0 NANOVLLM_PROFILE_LAYER_IDS=mid NANOVLLM_PROMPT_LENGTHS=8200,9000,10000,11000,12000,13000,14000,15000,16000,17000 python3 example/test.py
-```
-
-## 2026-06-03 21:04：扫 `dsa_index_update` 在不同 batch/序列长度下的时延
-
-下一次请在昇腾上先跑这个。固定 `k=128`，默认只测 CANN 路径，计时循环内不重置输入，尽量贴近推理热路径：
-
-```bash
-PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/bench_dsa_index_update_sweep.py --device npu:0 --batch-sizes 1,2,4,8,10,16 --candidate-lens 8192,16384,32768,65536 --selected-lens 2560 --warmup 10 --iters 50
-```
-
-如果还想和 torch 伪算子做小规模对照，跑这个，避免 torch 路径太慢：
-
-```bash
-PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/bench_dsa_index_update_sweep.py --device npu:0 --batch-sizes 1,4,10 --candidate-lens 8192,32768 --selected-lens 2560 --warmup 3 --iters 10 --include-torch
-```
-
-旧路径用于对照：
-
-```bash
-PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_LOG_PREPARE_DECODE_TIMING=1 NANOVLLM_DSA_QK_SCORE_BF16_OUT=0 NANOVLLM_DSA_QUERY_ONLY_BACKEND=auto NANOVLLM_DSA_QUERY_ONLY_WARMUP_TOKENS=1,2,4,8,16,32,64,128 NANOVLLM_MAX_GEN_TOKENS=8 NANOVLLM_ENABLE_DECODE_MLAPO=1 NANOVLLM_DSA_OFFLOAD_FIXED_TX=128 NANOVLLM_DSA_INDEX_UPDATE_USE_CANN=1 NANOVLLM_DSA_CHECK=0 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=0 NANOVLLM_PROFILE_LAYER_IDS=mid NANOVLLM_PROMPT_LENGTHS=8200,9000,10000,11000,12000,13000,14000,15000,16000,17000 python3 example/test.py
-```
-
-## 2026-06-03 22:47：临时退回 `dsa_index_update` 的旧快路径
-
-这版是为了测性能，已知旧快路径假设 `hbm_cached_tokens_pool` 按 token id 单调有序，动态 DSA 更新后可能破坏 unique 约束。
-
-下一次请在昇腾上先重新编译算子：
-
-```bash
-NANOVLLM_CANN_BUILD_JOBS=64 NANOVLLM_EXT_BUILD_JOBS=1 SOC_VERSION=ascend910_9391 PYTHONPATH=$PWD:$PYTHONPATH bash scripts/build_nanovllm_ops.sh
-```
-
-然后先跑 `dsa_index_update` sweep 看性能差距：
-
-```bash
-PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/bench_dsa_index_update_sweep.py --device npu:0 --batch-sizes 1,2,4,8,10,16 --candidate-lens 8192,16384,32768,65536 --selected-lens 2560 --warmup 10 --iters 50
-```
-
-如果要看它是否重新触发 unique 风险，再跑 probe：
-
-```bash
-PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/probe_dsa_index_update.py --device npu:0 --batch-size 10 --candidate-len 32768 --selected-len 2560 --k 128 --warmup 10 --iters 50
-```
-
 ## 2026-06-03 23:09：优化纯长序列固定 Tx=128 的 `dsa_index_update` Python 热路径
 
 这次只改 Python 封装和调度元数据，没有改 CANN kernel，理论上不需要重新编译算子。目标场景是所有 batch 都是长序列、都会卸载，并且 `NANOVLLM_DSA_OFFLOAD_FIXED_TX=128`。
@@ -114,4 +52,40 @@ PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/bench_dsa
 
 ```bash
 PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_DSA_QK_SCORE_BF16_OUT=1 NANOVLLM_DSA_QUERY_ONLY_BACKEND=auto NANOVLLM_DSA_QUERY_ONLY_WARMUP_TOKENS=1,2,4,8,16,32,64,128 NANOVLLM_MAX_GEN_TOKENS=8 NANOVLLM_ENABLE_DECODE_MLAPO=1 NANOVLLM_DSA_OFFLOAD_FIXED_TX=128 NANOVLLM_DSA_INDEX_UPDATE_USE_CANN=1 NANOVLLM_DSA_CHECK=0 NANOVLLM_PROMPT_LENGTHS=17000,17001,17002,17003,17004,17005,17006,17007,17008,17009 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=0 NANOVLLM_PROFILE_LAYER_IDS=mid python3 example/test.py
+```
+
+## 2026-06-04 09:16：放宽 `dsa_indexer_project` 的 q BMM 路径到 batch=16
+
+这次只改 Python 判断逻辑，不需要重新编译 CANN 算子。下一次请在昇腾上先跑 query-only / full indexer_project 单测，确认 batch=10 已经走 `dsa_indexer_project_bmm_transpose` 路径：
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/probe_indexer_project.py --device npu:0 --tokens 10 --warmup 10 --iters 100 --use-bmm-transpose --reuse-output-buffers --profile-detail
+```
+
+然后跑纯长 batch=10 的 decode timing，对比 `indexer_project` 是否下降：
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_DSA_QK_SCORE_BF16_OUT=1 NANOVLLM_DSA_QUERY_ONLY_BACKEND=auto NANOVLLM_DSA_QUERY_ONLY_WARMUP_TOKENS=1,2,4,8,10,16,32,64,128 NANOVLLM_MAX_GEN_TOKENS=8 NANOVLLM_ENABLE_DECODE_MLAPO=1 NANOVLLM_DSA_OFFLOAD_FIXED_TX=128 NANOVLLM_DSA_INDEX_UPDATE_USE_CANN=1 NANOVLLM_DSA_CHECK=0 NANOVLLM_PROMPT_LENGTHS=17000,17001,17002,17003,17004,17005,17006,17007,17008,17009 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=0 NANOVLLM_PROFILE_LAYER_IDS=mid python3 example/test.py
+```
+
+## 2026-06-04 09:20：继续把 q BMM 路径上限放宽到 128
+
+这次仍然只改 Python 判断逻辑，不需要重新编译 CANN 算子。下一次请在昇腾上跑这个 sweep，重点看 `dsa_indexer_project_q_path` 是否为 `dsa_indexer_project_bmm_transpose`，以及不同 tokens 下 BMM 路径是否比 linear 路径更快：
+
+```bash
+for t in 10 16 32 64 128; do PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/probe_indexer_project.py --device npu:0 --tokens $t --warmup 10 --iters 100 --use-bmm-transpose --reuse-output-buffers --profile-detail; done
+```
+
+## 2026-06-04 09:56：验证 `weights_proj` 从 FP32 改成 BF16 的精度和性能风险
+
+这次只改了 `ut_ops/probe_indexer_project.py`，没有改模型热路径。下一次请在昇腾上跑这个，重点看 `INDEXER_DIFF weights_proj_bf16_*`、`INDEXER_TOPK weights_proj_bf16_*` 和 `INDEXER_BENCH weights_proj_*`：
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/probe_indexer_project.py --device npu:0 --tokens 10 --warmup 10 --iters 100 --use-bmm-transpose --reuse-output-buffers --profile-detail --weights-topk 10
+```
+
+如果想看更大 batch/token 数下 BF16 weights_proj 是否仍然稳定，再跑这个 sweep：
+
+```bash
+for t in 10 16 32 64 128; do PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/probe_indexer_project.py --device npu:0 --tokens $t --warmup 10 --iters 100 --use-bmm-transpose --reuse-output-buffers --weights-topk $t; done
 ```

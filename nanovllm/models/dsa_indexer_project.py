@@ -306,6 +306,7 @@ class DsaQueryOnlyTorchAirCache:
 
 
 _QUERY_ONLY_TORCHAIR_CACHE = DsaQueryOnlyTorchAirCache()
+_Q_BMM_MAX_TOKENS = 128  # Keep larger decode batches on the q BMM path; benchmark decides if this remains profitable.
 
 
 def _ensure_dynamo_recompile_limit(num_shapes: int) -> None:
@@ -328,7 +329,7 @@ def _can_use_q_bmm(q_c: torch.Tensor, wq_b_bmm_t: torch.Tensor | None, enable_q_
         and hasattr(ascend_ops, "batch_matmul_transpose")
         and q_c.device.type == "npu"
         and q_c.dtype in (torch.float16, torch.bfloat16)
-        and 0 < q_c.shape[0] <= 8
+        and 0 < q_c.shape[0] <= _Q_BMM_MAX_TOKENS
     )
 
 
@@ -571,11 +572,9 @@ def dsa_indexer_project_query_only(
     sync_detail: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Decode-only indexer projection.
-
-    Decode DSA update scores only need the current token's query index and
-    per-head weights. The current decode token's index key is not part of the
-    prefill-candidate IndexCache, so this path skips wk/k_norm/k-rope entirely.
+    Decode DSA update scores only need the current token's query index and per-head weights. The current decode token's index key is not part of the prefill-candidate IndexCache, so this path skips wk/k_norm/k-rope entirely.
     """
+
     if q_index_out.shape != (hidden_states.shape[0], n_head, head_dim):
         raise ValueError(f"q_index_out shape must be {(hidden_states.shape[0], n_head, head_dim)}, got {tuple(q_index_out.shape)}")
     if index_weights_out.shape != (hidden_states.shape[0], n_head):

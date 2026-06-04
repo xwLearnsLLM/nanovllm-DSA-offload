@@ -243,10 +243,9 @@ def dsa_index_update(
     pool_entries_start: int = -1,
 ) -> None:
     """Update sparse HBM budget.
-
-    By default this uses the CANN op. Set
-    NANOVLLM_DSA_INDEX_UPDATE_USE_CANN=0 to force the PyTorch prototype.
+    By default this uses the CANN op. Set NANOVLLM_DSA_INDEX_UPDATE_USE_CANN=0 to force the PyTorch prototype.
     """
+
     if _DSA_INDEX_UPDATE_USE_CANN:
         _dsa_index_update_cann(
             score,
