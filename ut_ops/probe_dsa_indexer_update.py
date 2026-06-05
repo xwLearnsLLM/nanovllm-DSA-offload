@@ -220,9 +220,9 @@ def bench(fn, device: torch.device, warmup: int, iters: int) -> float:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", default="npu:0")
-    parser.add_argument("--batch", type=int, default=4)
-    parser.add_argument("--candidate", type=int, default=8192)
-    parser.add_argument("--selected", type=int, default=2560)
+    parser.add_argument("--batch", "--batch-size", dest="batch", type=int, default=4)
+    parser.add_argument("--candidate", "--candidate-len", dest="candidate", type=int, default=8192)
+    parser.add_argument("--selected", "--selected-len", dest="selected", type=int, default=2560)
     parser.add_argument("--pool-capacity", type=int, default=16)
     parser.add_argument("--k", type=int, default=128)
     parser.add_argument("--warmup", type=int, default=5)
