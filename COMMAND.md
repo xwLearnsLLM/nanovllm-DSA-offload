@@ -58,11 +58,21 @@ PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_DSA_QUERY_ONLY_BACKEND=torchair NANOVLLM_DS
 NANOVLLM_CANN_BUILD_JOBS=64 SOC_VERSION=ascend910_9391 PYTHONPATH=$PWD:$PYTHONPATH bash scripts/build_nanovllm_ops.sh
 ```
 
+## 2026-06-05 15:19：整理 ut_ops 单测目录
+
+这次删除了历史 SFA/prefill/老 indexer 探针，把仍在使用的单测整理到 `ut_ops/dsa/`、`ut_ops/indexer_project/`、`ut_ops/mla/`、`ut_ops/moe/`，并抽出 `ut_ops/common/` 公共工具。下一次请在昇腾上先跑这个：
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/dsa/probe_indexer_score_bf16_out.py --device npu:0 --batch-size 10 --block-count 64 --warmup 10 --iters 100
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 NANOVLLM_DSA_INDEXER_UPDATE_USE_CANN=1 python3 ut_ops/dsa/probe_indexer_update.py --device npu:0 --batch-size 10 --candidate-len 17000 --selected-len 2560 --k 128 --warmup 10 --iters 100
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/indexer_project/probe_query_only_torchair_accuracy.py --device npu:0 --tokens 10 --warmup 10 --iters 100
+```
+
 然后跑两个 renamed op 的最小 probe：
 
 ```bash
-PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/probe_dsa_indexer_score_bf16_out.py --device npu:0 --batch-size 10 --block-count 64 --warmup 10 --iters 100
-PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 NANOVLLM_DSA_INDEXER_UPDATE_USE_CANN=1 python3 ut_ops/probe_dsa_indexer_update.py --device npu:0 --batch-size 10 --candidate-len 17000 --selected-len 2560 --k 128 --warmup 10 --iters 100
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/dsa/probe_indexer_score_bf16_out.py --device npu:0 --batch-size 10 --block-count 64 --warmup 10 --iters 100
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 NANOVLLM_DSA_INDEXER_UPDATE_USE_CANN=1 python3 ut_ops/dsa/probe_indexer_update.py --device npu:0 --batch-size 10 --candidate-len 17000 --selected-len 2560 --k 128 --warmup 10 --iters 100
 ```
 
 ## 2026-06-05 14:22：修复 csrc 扁平化后的 kernel include 路径

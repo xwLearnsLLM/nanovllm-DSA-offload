@@ -5,26 +5,9 @@ import time
 
 import torch
 
-try:
-    import torch_npu  # type: ignore  # noqa: F401
-except Exception:  # pragma: no cover - local non-Ascend syntax checks
-    torch_npu = None
-
 import nanovllm.ops as ascend_ops
-
-
-def sync(device: torch.device) -> None:
-    if device.type == "npu" and torch_npu is not None:
-        torch.npu.synchronize()
-    elif device.type == "cuda":
-        torch.cuda.synchronize(device)
-
-
-def desc(name: str, tensor: torch.Tensor) -> str:
-    return (
-        f"{name}=shape={tuple(tensor.shape)} dtype={tensor.dtype} "
-        f"device={tensor.device} contiguous={tensor.is_contiguous()} stride={tuple(tensor.stride())}"
-    )
+from ut_ops.common.device import set_device, sync_device
+from ut_ops.common.format import tensor_desc
 
 
 def make_block_table(batch_size: int, table_cols: int, num_blocks: int, device: torch.device) -> torch.Tensor:
@@ -66,7 +49,7 @@ def main() -> None:
     parser.add_argument("--rtol", type=float, default=0.0)
     args = parser.parse_args()
 
-    device = torch.device(args.device)
+    device = set_device(args.device)
     torch.manual_seed(args.seed)
     batch_size = int(args.batch_size)
     heads = int(args.heads)
@@ -92,10 +75,10 @@ def main() -> None:
         f"block_size={block_size} block_count={block_count} table_cols={table_cols} "
         f"score_count={score_count} output_stride={output_stride} warmup={args.warmup} iters={args.iters}"
     )
-    print(desc("query", query))
-    print(desc("key", key))
-    print(desc("weights", weights))
-    print(desc("full_block_table", full_block_table))
+    print(tensor_desc("query", query))
+    print(tensor_desc("key", key))
+    print(tensor_desc("weights", weights))
+    print(tensor_desc("full_block_table", full_block_table))
 
     ref = ascend_ops.npu_dsa_indexer_score(
         query,
@@ -122,7 +105,7 @@ def main() -> None:
         "TND",
         "PA_BSND",
     )
-    sync(device)
+    sync_device(device)
 
     expected = ref[:, 0, :score_count].to(torch.bfloat16)
     assert_close("new_vs_old_bf16", out[:, :score_count], expected, args.atol, args.rtol)
@@ -141,7 +124,7 @@ def main() -> None:
             "TND",
             "PA_BSND",
         )
-    sync(device)
+    sync_device(device)
     t0 = time.perf_counter()
     for _ in range(args.iters):
         _ = ascend_ops.npu_dsa_indexer_score(
@@ -154,7 +137,7 @@ def main() -> None:
             "TND",
             "PA_BSND",
         )
-    sync(device)
+    sync_device(device)
     old_ms = (time.perf_counter() - t0) * 1000.0 / max(args.iters, 1)
 
     for _ in range(args.warmup):
@@ -170,7 +153,7 @@ def main() -> None:
             "TND",
             "PA_BSND",
         )
-    sync(device)
+    sync_device(device)
     t0 = time.perf_counter()
     for _ in range(args.iters):
         ascend_ops.npu_dsa_indexer_score_bf16_out(
@@ -185,7 +168,7 @@ def main() -> None:
             "TND",
             "PA_BSND",
         )
-    sync(device)
+    sync_device(device)
     new_ms = (time.perf_counter() - t0) * 1000.0 / max(args.iters, 1)
     print(f"QK_BF16_OUT_BENCH old_float_return_avg_ms={old_ms:.6f} new_bf16_out_avg_ms={new_ms:.6f}")
 

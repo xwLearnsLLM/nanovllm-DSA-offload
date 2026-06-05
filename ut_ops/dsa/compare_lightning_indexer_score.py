@@ -7,11 +7,8 @@ import time
 import torch
 
 from nanovllm.models.dsa_offload_ops import dsa_indexer_score
-
-try:
-    import torch_npu  # type: ignore  # noqa: F401
-except Exception:  # pragma: no cover - local non-Ascend syntax checks
-    torch_npu = None
+from ut_ops.common.device import set_device, seed_everything, sync_device
+from ut_ops.common.format import tensor_desc
 
 try:
     import nanovllm.ops as ascend_ops
@@ -30,20 +27,6 @@ def parse_int_list(value: str | None, batch_size: int, default_value: int) -> li
     if len(items) != batch_size:
         raise ValueError(f"candidate-lens expects 1 or batch-size values, got {len(items)} for batch_size={batch_size}")
     return items
-
-
-def sync(device: torch.device) -> None:
-    if device.type == "npu" and torch_npu is not None:
-        torch.npu.synchronize()
-    elif device.type == "cuda":
-        torch.cuda.synchronize(device)
-
-
-def tensor_desc(name: str, tensor: torch.Tensor) -> str:
-    return (
-        f"{name}=shape={tuple(tensor.shape)} dtype={tensor.dtype} "
-        f"device={tensor.device} contiguous={tensor.is_contiguous()} stride={tuple(tensor.stride())}"
-    )
 
 
 def make_block_tables(
@@ -143,7 +126,7 @@ def run_once(args: argparse.Namespace) -> None:
     if ascend_ops is None:
         raise RuntimeError(f"nanovllm.ops import failed: {ascend_ops_import_error}")
 
-    device = torch.device(args.device)
+    device = set_device(args.device)
     data_dtype = dtype_from_name(args.dtype)
     score_dtype = dtype_from_name(args.score_dtype)
     candidate_lens_list = parse_int_list(args.candidate_lens, args.batch_size, args.seq_len)
@@ -153,9 +136,7 @@ def run_once(args: argparse.Namespace) -> None:
     if topk <= 0:
         raise ValueError(f"topk must be positive after clipping, got {topk}")
 
-    torch.manual_seed(args.seed)
-    if device.type == "npu" and torch_npu is not None:
-        torch.npu.manual_seed(args.seed)
+    seed_everything(args.seed, device)
 
     block_tables, physical_blocks = make_block_tables(
         candidate_lens_list,
@@ -197,7 +178,7 @@ def run_once(args: argparse.Namespace) -> None:
         sparse_count=topk,
         sparse_mode=args.sparse_mode,
     )
-    sync(device)
+    sync_device(device)
 
     dsa_indexer_score(
         query.contiguous(),
@@ -208,7 +189,7 @@ def run_once(args: argparse.Namespace) -> None:
         score_out,
         actual_seq_lengths_query=actual_seq_lengths_query,
     )
-    sync(device)
+    sync_device(device)
 
     if lightning_topk.dim() != 3 or lightning_topk.shape[0] != args.batch_size:
         raise RuntimeError(f"unexpected lightning_topk shape: {tuple(lightning_topk.shape)}")
@@ -251,7 +232,7 @@ def run_once(args: argparse.Namespace) -> None:
             score_out,
             actual_seq_lengths_query=actual_seq_lengths_query,
         )
-    sync(device)
+    sync_device(device)
 
     t0 = time.perf_counter()
     for _ in range(args.iters):
@@ -267,7 +248,7 @@ def run_once(args: argparse.Namespace) -> None:
             topk,
             args.sparse_mode,
         )
-    sync(device)
+    sync_device(device)
     lightning_ms = (time.perf_counter() - t0) * 1000.0 / args.iters
 
     t0 = time.perf_counter()
@@ -281,7 +262,7 @@ def run_once(args: argparse.Namespace) -> None:
             score_out,
             actual_seq_lengths_query=actual_seq_lengths_query,
         )
-    sync(device)
+    sync_device(device)
     dsa_indexer_score_ms = (time.perf_counter() - t0) * 1000.0 / args.iters
     print(
         "INDEXER_SCORE_BENCH "

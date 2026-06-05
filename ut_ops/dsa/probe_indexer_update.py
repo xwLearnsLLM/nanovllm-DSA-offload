@@ -1,23 +1,12 @@
 from __future__ import annotations
 
 import argparse
-from time import perf_counter
 
 import torch
 
-try:
-    import torch_npu  # type: ignore
-except Exception:
-    torch_npu = None
-
 from nanovllm.models.dsa_offload_ops import _dsa_indexer_update_cann, dsa_indexer_update_torch
-
-
-def sync(device: torch.device) -> None:
-    if device.type == "npu" and torch_npu is not None:
-        torch.npu.synchronize()
-    elif device.type == "cuda":
-        torch.cuda.synchronize(device)
+from ut_ops.common.bench import benchmark_ms
+from ut_ops.common.device import set_device, sync_device
 
 
 def make_inputs(
@@ -206,17 +195,6 @@ def print_overlap_report(
     )
 
 
-def bench(fn, device: torch.device, warmup: int, iters: int) -> float:
-    for _ in range(warmup):
-        fn()
-    sync(device)
-    start = perf_counter()
-    for _ in range(iters):
-        fn()
-    sync(device)
-    return (perf_counter() - start) * 1000.0 / max(iters, 1)
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", default="npu:0")
@@ -231,11 +209,7 @@ def main() -> None:
     parser.add_argument("--strict-torch", action="store_true", help="Also require CANN outputs to exactly match the torch prototype.")
     args = parser.parse_args()
 
-    device = torch.device(args.device)
-    if device.type == "npu":
-        if torch_npu is None:
-            raise RuntimeError("torch_npu is required for NPU runs")
-        torch.npu.set_device(device)
+    device = set_device(args.device)
 
     base = make_inputs(
         device=device,
@@ -259,7 +233,7 @@ def main() -> None:
     cann_demote = torch.empty_like(demote)
     cann_counts = torch.empty_like(counts)
     _dsa_indexer_update_cann(score.clone(), cann_pool, cann_promote, cann_demote, cann_counts, candidate_lens, selected_lens, req_pool_entries, args.k)
-    sync(device)
+    sync_device(device)
 
     validate_hard_invariants(
         before_pool=pool,
@@ -300,8 +274,8 @@ def main() -> None:
     def run_cann():
         _dsa_indexer_update_cann(score.clone(), pool.clone(), torch.empty_like(promote), torch.empty_like(demote), torch.empty_like(counts), candidate_lens, selected_lens, req_pool_entries, args.k)
 
-    torch_ms = bench(run_torch, device, args.warmup, args.iters)
-    cann_ms = bench(run_cann, device, args.warmup, args.iters)
+    torch_ms = benchmark_ms(run_torch, device, args.warmup, args.iters)
+    cann_ms = benchmark_ms(run_cann, device, args.warmup, args.iters)
     print(
         "DSA_INDEXER_UPDATE_PROBE "
         f"device={args.device} batch={args.batch} candidate={args.candidate} "

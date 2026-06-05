@@ -5,31 +5,9 @@ from time import perf_counter
 
 import torch
 
-try:
-    import torch_npu  # type: ignore
-except Exception:  # pragma: no cover - local non-Ascend syntax checks
-    torch_npu = None
-
 from nanovllm.models.dsa_offload_ops import _dsa_indexer_update_cann, dsa_indexer_update_torch
-
-
-def parse_int_list(value: str) -> list[int]:
-    result: list[int] = []
-    for item in value.split(","):
-        item = item.strip()
-        if not item:
-            continue
-        result.append(int(item))
-    if not result:
-        raise ValueError(f"empty int list: {value!r}")
-    return result
-
-
-def sync(device: torch.device) -> None:
-    if device.type == "npu" and torch_npu is not None:
-        torch.npu.synchronize()
-    elif device.type == "cuda":
-        torch.cuda.synchronize(device)
+from ut_ops.common.device import set_device, sync_device
+from ut_ops.common.format import parse_int_list
 
 
 def make_case_tensors(
@@ -116,14 +94,14 @@ def bench_case(
         if reset_each_iter:
             reset_outputs(pool=pool, base_pool=base_pool, promote=promote, demote=demote, copy_counts=copy_counts, k=k)
         run_update(backend, score, pool, promote, demote, copy_counts, candidate_lens, selected_lens, req_pool_entries, k)
-    sync(device)
+    sync_device(device)
 
     start = perf_counter()
     for _ in range(iters):
         if reset_each_iter:
             reset_outputs(pool=pool, base_pool=base_pool, promote=promote, demote=demote, copy_counts=copy_counts, k=k)
         run_update(backend, score, pool, promote, demote, copy_counts, candidate_lens, selected_lens, req_pool_entries, k)
-    sync(device)
+    sync_device(device)
     avg_ms = (perf_counter() - start) * 1000.0 / max(iters, 1)
     counts = [int(x) for x in copy_counts.detach().cpu().tolist()]
     return avg_ms, counts
@@ -155,11 +133,7 @@ def main() -> None:
 
     if int(args.k) != 128:
         raise ValueError("This benchmark is intended for fixed Tx/k=128.")
-    device = torch.device(args.device)
-    if device.type == "npu":
-        if torch_npu is None:
-            raise RuntimeError("torch_npu is required for NPU runs")
-        torch.npu.set_device(device)
+    device = set_device(args.device)
 
     batch_sizes = parse_int_list(args.batch_sizes)
     candidate_lens = parse_int_list(args.candidate_lens)
