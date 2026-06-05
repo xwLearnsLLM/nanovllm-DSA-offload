@@ -1,5 +1,5 @@
 #include "kernel_operator.h"
-#include "../../kernels/types.h"
+#include "../../../common/kernels/types.h"
 
 namespace {
 

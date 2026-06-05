@@ -8,7 +8,7 @@
 #include <torch/extension.h>
 
 #include "common/torch_adapter/op_api_common.h"
-#include "kernels/types.h"
+#include "common/kernels/types.h"
 
 namespace vllm_ascend {
 

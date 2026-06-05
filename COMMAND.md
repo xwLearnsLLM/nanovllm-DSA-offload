@@ -64,3 +64,11 @@ NANOVLLM_CANN_BUILD_JOBS=64 SOC_VERSION=ascend910_9391 PYTHONPATH=$PWD:$PYTHONPA
 PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/probe_dsa_indexer_score_bf16_out.py --device npu:0 --batch-size 10 --block-count 64 --warmup 10 --iters 100
 PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 NANOVLLM_DSA_INDEXER_UPDATE_USE_CANN=1 python3 ut_ops/probe_dsa_indexer_update.py --device npu:0 --batch-size 10 --candidate-len 17000 --selected-len 2560 --k 128 --warmup 10 --iters 100
 ```
+
+## 2026-06-05 14:22：修复 csrc 扁平化后的 kernel include 路径
+
+这次修复 `common/kernels` 移动后残留的旧 include 路径。下一次请在昇腾上重新跑编译：
+
+```bash
+NANOVLLM_CANN_BUILD_JOBS=64 SOC_VERSION=ascend910_9391 PYTHONPATH=$PWD:$PYTHONPATH bash scripts/build_nanovllm_ops.sh
+```

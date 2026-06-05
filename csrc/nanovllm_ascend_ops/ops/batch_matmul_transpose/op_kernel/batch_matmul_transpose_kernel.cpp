@@ -18,7 +18,7 @@
 #include "../../mla_preprocess/op_kernel/kernel/mma.h"
 #include "../../mla_preprocess/op_kernel/kernel/utils.h"
 #include "../../mla_preprocess/op_kernel/kernel/iterator.h"
-#include "../../kernels/math_utils.h"
+#include "../../../common/kernels/math_utils.h"
 
 constexpr uint32_t L0_PINGPONG_BUFFER_LEN = 16384;
 constexpr uint32_t L1_PINGPONG_BUFFER_LEN = 131072;
