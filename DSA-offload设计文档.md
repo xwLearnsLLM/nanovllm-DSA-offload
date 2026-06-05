@@ -179,7 +179,7 @@ sequenceDiagram
 
 这里的 prefix 是 first block，而不是固定 128 token；如果 `B=256`，则保留 prefix 256 token。
 
-当前 prefix first block 只作为初始化保留，不永久 pin 住。后续 DSA 更新可以淘汰 prefix slot；如果未来要永久保护 attention sink token，只需要在 `dsa_index_update` 算子内部禁止 demote 对应 slot，外层接口不需要变化。
+当前 prefix first block 只作为初始化保留，不永久 pin 住。后续 DSA 更新可以淘汰 prefix slot；如果未来要永久保护 attention sink token，只需要在 `dsa_indexer_update` 算子内部禁止 demote 对应 slot，外层接口不需要变化。
 
 ## 5. Decode 阶段流程
 
@@ -187,7 +187,7 @@ sequenceDiagram
 flowchart TD
     A["prepare_decode<br/>生成 tensor 化元数据"] --> B["Indexer Project<br/>生成 query_index / index_weights"]
     B --> C["dsa_indexer_score<br/>计算候选 token 分数"]
-    C --> D["dsa_index_update<br/>更新 hbm_cached_tokens_pool"]
+    C --> D["dsa_indexer_update<br/>更新 hbm_cached_tokens_pool"]
     D --> E["dsa_scatter_h2d<br/>按 promote/demote 拷贝 DRAM KV 到 HBM"]
     E --> F["MLA decode<br/>读取 HBM sparse KV"]
     F --> G["输出投影 / MoE / logits"]
@@ -210,11 +210,11 @@ flowchart TD
 
 1. `indexer_project` 计算当前 decode query 对应的 DSA query 表征。
 2. `dsa_indexer_score` 使用 query 表征、IndexCache 和 `index_block_table` 计算候选 token score。
-3. `dsa_index_update` 根据 score 选择 promote token 和 demote slot，并更新 `hbm_cached_tokens_pool`。
+3. `dsa_indexer_update` 根据 score 选择 promote token 和 demote slot，并更新 `hbm_cached_tokens_pool`。
 4. `dsa_scatter_h2d` 根据 promote/demote 结果，把 DRAM 中的 CKV/KPE 搬到 HBM sparse slot。
 5. MLA 使用更新后的 HBM sparse KV 计算 decode attention。
 
-若 `Tx == 0`，则跳过 `dsa_indexer_score`、`dsa_index_update` 和 `dsa_scatter_h2d`，只使用 prefill 结束时初始化好的 prefix first block + suffix sparse KV。
+若 `Tx == 0`，则跳过 `dsa_indexer_score`、`dsa_indexer_update` 和 `dsa_scatter_h2d`，只使用 prefill 结束时初始化好的 prefix first block + suffix sparse KV。
 
 ## 6. 算子接口
 
@@ -231,9 +231,9 @@ flowchart TD
 - `candidate_lens`: 每个请求的候选 token 数。
 - `score_out`: 输出分数，当前固定 bf16。
 
-当前实现固定走 bf16-out 新路径，避免旧路径中额外的 fp32 输出和 copy。score tensor 只需要覆盖有效候选区域，后续 `dsa_index_update` 按 `candidate_lens` 读取。
+当前实现固定走 bf16-out 新路径，避免旧路径中额外的 fp32 输出和 copy。score tensor 只需要覆盖有效候选区域，后续 `dsa_indexer_update` 按 `candidate_lens` 读取。
 
-### 6.2 dsa_index_update
+### 6.2 dsa_indexer_update
 
 功能：只更新 sparse 索引，不做实际 KV 搬移。
 
@@ -332,7 +332,7 @@ decode 后续 step 主要走 query-only 路径：历史 token 的 IndexCache 已
 当前 decode TPOT 的主要优化目标集中在：
 
 1. `dsa_indexer_score`
-2. `dsa_index_update`
+2. `dsa_indexer_update`
 3. `dsa_scatter_h2d`
 4. query-only `indexer_project`
 
@@ -347,7 +347,7 @@ decode 后续 step 主要走 query-only 路径：历史 token 的 IndexCache 已
 
 后续可继续优化：
 
-- `dsa_index_update` 算子内部 topk 和唯一性维护。
+- `dsa_indexer_update` 算子内部 topk 和唯一性维护。
 - query-only indexer_project 的组图或融合算子版本。
 - `dsa_scatter_h2d` 的 AIV 并行搬运效率。
 - 大 batch 下 q_up/v_up 相关 BMM 路径。
@@ -357,12 +357,12 @@ decode 后续 step 主要走 query-only 路径：历史 token 的 IndexCache 已
 
 ### 11.1 动态 Tx / 无损策略
 
-当前接口已经有 `copy_counts`，因此未来可以在不改变外层框架接口的情况下，把 `dsa_index_update` 改成动态 `Tx`：
+当前接口已经有 `copy_counts`，因此未来可以在不改变外层框架接口的情况下，把 `dsa_indexer_update` 改成动态 `Tx`：
 
 - 若 `GT2048` 已全部在 HBM sparse budget 中，则 `copy_counts[b]=0`。
 - 若有缺失，则 promote 缺失部分，并 demote 同等数量低分 token。
 
-这主要改变 `dsa_index_update` 内部策略和 `dsa_scatter_h2d` 的实际 copy 数量，不需要重写调度元数据。
+这主要改变 `dsa_indexer_update` 内部策略和 `dsa_scatter_h2d` 的实际 copy 数量，不需要重写调度元数据。
 
 ### 11.2 前缀复用
 
@@ -376,7 +376,7 @@ HBM sparse budget 本身不直接表达前缀命中。命中前缀块可在 pref
 
 ### 11.3 prefix 保护
 
-当前 prefix first block 只作为初始化保留，不永久 pin 住。若未来希望永久保护 attention sink token，可在 `dsa_index_update` 内部禁止 demote prefix slot，外层 block table、pool 和 scatter 接口不需要变化。
+当前 prefix first block 只作为初始化保留，不永久 pin 住。若未来希望永久保护 attention sink token，可在 `dsa_indexer_update` 内部禁止 demote prefix slot，外层 block table、pool 和 scatter 接口不需要变化。
 
 ## 附录：设计文档提纲（提示词）
 
