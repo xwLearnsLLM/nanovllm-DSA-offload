@@ -43,7 +43,9 @@ function(op_add_subdirectory OP_LIST OP_DIR_LIST)
     set(_OP_LIST)
     set(_OP_DIR_LIST)
 
-    file(GLOB OP_HOST_CMAKE_FILES "${CMAKE_CURRENT_SOURCE_DIR}/**/op_host/CMakeLists.txt")
+    file(GLOB OP_HOST_CMAKE_FILES
+        "${CMAKE_CURRENT_SOURCE_DIR}/**/op_host/CMakeLists.txt"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../ops/**/op_host/CMakeLists.txt")
 
     foreach(OP_CMAKE_FILE ${OP_HOST_CMAKE_FILES})
         get_filename_component(OP_HOST_DIR "${OP_CMAKE_FILE}" DIRECTORY)
@@ -315,6 +317,11 @@ function(add_bin_compile_target)
     foreach(_op_info ${BINARY_OP_INFO})
         get_filename_component(_op_name "${_op_info}" NAME)
         set(${_op_name}_dir ${_op_info})
+        if (DEFINED ${_op_name}_kernel_aliases)
+            foreach(_alias_name ${${_op_name}_kernel_aliases})
+                set(${_alias_name}_dir ${_op_info})
+            endforeach()
+        endif()
     endforeach()
 
     set(_ops_target_list)

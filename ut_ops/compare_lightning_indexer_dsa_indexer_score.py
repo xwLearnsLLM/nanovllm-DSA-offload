@@ -136,7 +136,7 @@ def summarize_batch(
         f"score_min={score_min:.6g} score_max={score_max:.6g} score_mean={score_mean:.6g}"
     )
     print(f"  lightning_top{preview}={as_list(lightning_topk, min(preview, topk))}")
-    print(f"  qk_score_top{preview}={as_list(score_topk, min(preview, topk))}")
+    print(f"  dsa_indexer_score_top{preview}={as_list(score_topk, min(preview, topk))}")
 
 
 def run_once(args: argparse.Namespace) -> None:
@@ -282,11 +282,11 @@ def run_once(args: argparse.Namespace) -> None:
             actual_seq_lengths_query=actual_seq_lengths_query,
         )
     sync(device)
-    qk_score_ms = (time.perf_counter() - t0) * 1000.0 / args.iters
+    dsa_indexer_score_ms = (time.perf_counter() - t0) * 1000.0 / args.iters
     print(
         "INDEXER_SCORE_BENCH "
         f"iters={args.iters} lightning_indexer_avg_ms={lightning_ms:.6f} "
-        f"dsa_indexer_score_avg_ms={qk_score_ms:.6f}"
+        f"dsa_indexer_score_avg_ms={dsa_indexer_score_ms:.6f}"
     )
 
 

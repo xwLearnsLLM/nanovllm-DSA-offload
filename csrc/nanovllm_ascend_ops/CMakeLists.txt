@@ -78,17 +78,17 @@ endif()
 include(${ASCENDC_CMAKE_DIR}/ascendc.cmake)
 
 set(NANOVLLM_KERNEL_SRC
-  ${CMAKE_CURRENT_SOURCE_DIR}/mla_preprocess/op_kernel/mla_preprocess_kernel.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/batch_matmul_transpose/op_kernel/batch_matmul_transpose_kernel.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/dsa_indexer_project/op_kernel/dsa_indexer_project_kernel.cpp)
+  ${CMAKE_CURRENT_SOURCE_DIR}/ops/mla_preprocess/op_kernel/mla_preprocess_kernel.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/ops/batch_matmul_transpose/op_kernel/batch_matmul_transpose_kernel.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/ops/dsa_indexer_project/op_kernel/dsa_indexer_project_kernel.cpp)
 
 ascendc_library(nanovllm_ascend_kernels SHARED ${NANOVLLM_KERNEL_SRC})
 
 set(NANOVLLM_EXT_SRC
-  ${CMAKE_CURRENT_SOURCE_DIR}/nanovllm_ops.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/aclnn_torch_adapter/NPUBridge.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/aclnn_torch_adapter/NPUStorageImpl.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/batch_matmul_transpose/op_host/tiling/tiling_data.cpp)
+  ${CMAKE_CURRENT_SOURCE_DIR}/bindings/nanovllm_ops.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/common/torch_adapter/NPUBridge.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/common/torch_adapter/NPUStorageImpl.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/ops/batch_matmul_transpose/op_host/tiling/tiling_data.cpp)
 
 pybind11_add_module(_C ${NANOVLLM_EXT_SRC})
 
@@ -97,18 +97,19 @@ target_include_directories(_C BEFORE PRIVATE
   ${TORCH_INCLUDE_DIRS}
   ${TORCH_NPU_PATH}/include
   ${CMAKE_CURRENT_SOURCE_DIR}
-  ${CMAKE_CURRENT_SOURCE_DIR}/aclnn_torch_adapter
-  ${CMAKE_CURRENT_SOURCE_DIR}/batch_matmul_transpose
-  ${CMAKE_CURRENT_SOURCE_DIR}/batch_matmul_transpose/op_host
-  ${CMAKE_CURRENT_SOURCE_DIR}/dsa_indexer_project
-  ${CMAKE_CURRENT_SOURCE_DIR}/mla_preprocess
-  ${CMAKE_CURRENT_SOURCE_DIR}/mla_preprocess/op_host
+  ${CMAKE_CURRENT_SOURCE_DIR}/common/torch_adapter
+  ${CMAKE_CURRENT_SOURCE_DIR}/ops/batch_matmul_transpose
+  ${CMAKE_CURRENT_SOURCE_DIR}/ops/batch_matmul_transpose/op_host
+  ${CMAKE_CURRENT_SOURCE_DIR}/ops/dsa_indexer_project
+  ${CMAKE_CURRENT_SOURCE_DIR}/ops/mla_preprocess
+  ${CMAKE_CURRENT_SOURCE_DIR}/ops/mla_preprocess/op_host
   ${CMAKE_CURRENT_SOURCE_DIR}/cann_ops
-  ${CMAKE_CURRENT_SOURCE_DIR}/cann_ops/lightning_indexer_vllm
-  ${CMAKE_CURRENT_SOURCE_DIR}/cann_ops/paged_scatter_copy_h2d
-  ${CMAKE_CURRENT_SOURCE_DIR}/cann_ops/qk_score
-  ${CMAKE_CURRENT_SOURCE_DIR}/cann_ops/sparse_flash_attention
-  ${CMAKE_CURRENT_SOURCE_DIR}/cann_ops/moe_gating_top_k)
+  ${CMAKE_CURRENT_SOURCE_DIR}/ops/lightning_indexer
+  ${CMAKE_CURRENT_SOURCE_DIR}/ops/dsa_scatter_h2d
+  ${CMAKE_CURRENT_SOURCE_DIR}/ops/dsa_indexer_score
+  ${CMAKE_CURRENT_SOURCE_DIR}/ops/dsa_indexer_update
+  ${CMAKE_CURRENT_SOURCE_DIR}/ops/sparse_flash_attention
+  ${CMAKE_CURRENT_SOURCE_DIR}/ops/moe_gating_top_k)
 
 target_link_directories(_C PRIVATE
   ${TORCH_LIBRARY_DIRS}

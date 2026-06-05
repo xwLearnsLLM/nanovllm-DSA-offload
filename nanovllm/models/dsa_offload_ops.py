@@ -6,7 +6,7 @@ import torch
 
 import nanovllm.ops as ascend_ops
 
-_DSA_INDEX_UPDATE_CANN_MAX_K = 128
+_DSA_INDEXER_UPDATE_CANN_MAX_K = 128
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -16,7 +16,7 @@ def _env_flag(name: str, default: bool) -> bool:
     return value.strip().lower() not in ("0", "false", "off", "no", "")
 
 
-_DSA_INDEX_UPDATE_USE_CANN = _env_flag("NANOVLLM_DSA_INDEX_UPDATE_USE_CANN", True)
+_DSA_INDEXER_UPDATE_USE_CANN = _env_flag("NANOVLLM_DSA_INDEXER_UPDATE_USE_CANN", True)
 
 
 def dsa_indexer_score(
@@ -30,7 +30,7 @@ def dsa_indexer_score(
     actual_seq_lengths_query: torch.Tensor | None,
     block_count: int | None = None,
 ) -> None:
-    """Score DSA candidates with the Ascend qk_score op."""
+    """Score DSA candidates with the Ascend dsa_indexer_score op."""
     block_size = int(index_cache.shape[1])
     score_capacity = int(score_out.shape[1])
     if score_capacity <= 0:
@@ -39,9 +39,9 @@ def dsa_indexer_score(
     block_count = int(block_count) if block_count is not None else (score_capacity + block_size - 1) // block_size
     score_count = block_count * block_size
     if score_count > score_capacity:
-        raise RuntimeError(f"score_out capacity {score_capacity} is smaller than qk_score logical length {score_count}.")
+        raise RuntimeError(f"score_out capacity {score_capacity} is smaller than dsa_indexer_score logical length {score_count}.")
 
-    ascend_ops.npu_qk_score_bf16_out(
+    ascend_ops.npu_dsa_indexer_score_bf16_out(
         query_index,
         index_cache,
         index_weights,
@@ -55,7 +55,7 @@ def dsa_indexer_score(
     )
 
 
-def dsa_index_update_torch(
+def dsa_indexer_update_torch(
     score: torch.Tensor,
     hbm_cached_tokens_pool: torch.Tensor,
     promote_idx: torch.Tensor,
@@ -125,7 +125,7 @@ def dsa_index_update_torch(
         ] = promote_tokens
 
 
-def _dsa_index_update_cann(
+def _dsa_indexer_update_cann(
     score: torch.Tensor,
     hbm_cached_tokens_pool: torch.Tensor,
     promote_idx: torch.Tensor,
@@ -139,27 +139,27 @@ def _dsa_index_update_cann(
     all_copy_count_k: bool = False,
     pool_entries_start: int = -1,
 ) -> None:
-    """Run the CANN dsa_update_index op behind the framework-facing interface."""
+    """Run the CANN dsa_indexer_update op behind the framework-facing interface."""
     bs = int(score.shape[0])
     k = int(max_copy_tokens)
     if bs <= 0 or k <= 0:
         return
-    if k > _DSA_INDEX_UPDATE_CANN_MAX_K:
+    if k > _DSA_INDEXER_UPDATE_CANN_MAX_K:
         raise RuntimeError(
-            "CANN dsa_update_index supports at most "
-            f"{_DSA_INDEX_UPDATE_CANN_MAX_K} copy tokens, got {k}. "
-            "Set NANOVLLM_DSA_INDEX_UPDATE_USE_CANN=0 to use the torch path, "
+            "CANN dsa_indexer_update supports at most "
+            f"{_DSA_INDEXER_UPDATE_CANN_MAX_K} copy tokens, got {k}. "
+            "Set NANOVLLM_DSA_INDEXER_UPDATE_USE_CANN=0 to use the torch path, "
             "or lower NANOVLLM_DSA_OFFLOAD_FIXED_TX."
         )
     
-    if not hasattr(ascend_ops, "dsa_update_index"):
-        raise RuntimeError("ascend_ops.dsa_update_index is unavailable. Rebuild with `SOC_VERSION=ascend910_9391 PYTHONPATH=$PWD:$PYTHONPATH bash scripts/build_nanovllm_ops.sh`.")
+    if not hasattr(ascend_ops, "dsa_indexer_update"):
+        raise RuntimeError("ascend_ops.dsa_indexer_update is unavailable. Rebuild with `SOC_VERSION=ascend910_9391 PYTHONPATH=$PWD:$PYTHONPATH bash scripts/build_nanovllm_ops.sh`.")
 
     # Pure long-sequence decode: every row copies exactly fixed Tx tokens, and pool entries are consecutive. Pass the HBM pool view directly; the CANN op updates selected_idx in-place, so no Python-side pool scatter is needed.
     if all_copy_count_k and pool_entries_start >= 0:
         pool_start = int(pool_entries_start)
         selected_idx = hbm_cached_tokens_pool[pool_start:pool_start + bs]
-        ascend_ops.dsa_update_index(score, selected_idx, candidate_lens, selected_lens, k, promote_idx, demote_idx)
+        ascend_ops.dsa_indexer_update(score, selected_idx, candidate_lens, selected_lens, k, promote_idx, demote_idx)
         
     else :
         score_arg = score if score.is_contiguous() else score.contiguous()
@@ -188,7 +188,7 @@ def _dsa_index_update_cann(
         )
         copy_counts.copy_(copy_count)
 
-        ascend_ops.dsa_update_index(
+        ascend_ops.dsa_indexer_update(
             score_arg,
             selected_idx,
             candidate_lens_arg,
@@ -213,7 +213,7 @@ def _dsa_index_update_cann(
         hbm_cached_tokens_pool[flat_pool_rows, flat_slots] = flat_vals
 
 
-def dsa_index_update(
+def dsa_indexer_update(
     score: torch.Tensor,
     hbm_cached_tokens_pool: torch.Tensor,
     promote_idx: torch.Tensor,
@@ -228,11 +228,11 @@ def dsa_index_update(
     pool_entries_start: int = -1,
 ) -> None:
     """Update sparse HBM budget.
-    By default this uses the CANN op. Set NANOVLLM_DSA_INDEX_UPDATE_USE_CANN=0 to force the PyTorch prototype.
+    By default this uses the CANN op. Set NANOVLLM_DSA_INDEXER_UPDATE_USE_CANN=0 to force the PyTorch prototype.
     """
 
-    if _DSA_INDEX_UPDATE_USE_CANN:
-        _dsa_index_update_cann(
+    if _DSA_INDEXER_UPDATE_USE_CANN:
+        _dsa_indexer_update_cann(
             score,
             hbm_cached_tokens_pool,
             promote_idx,
@@ -247,7 +247,7 @@ def dsa_index_update(
         )
         return
 
-    dsa_index_update_torch(
+    dsa_indexer_update_torch(
         score,
         hbm_cached_tokens_pool,
         promote_idx,

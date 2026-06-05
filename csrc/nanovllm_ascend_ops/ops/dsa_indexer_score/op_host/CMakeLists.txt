@@ -8,7 +8,7 @@
 # ======================================================================================================================
 
 add_ops_compile_options(
-        OP_NAME LightningIndexerVllm
+        OP_NAME QkScore
         OPTIONS --cce-auto-sync=off
                 -Wno-deprecated-declarations
                 -Werror
@@ -16,19 +16,19 @@ add_ops_compile_options(
                 --op_relocatable_kernel_binary=true
 )
 
-set(lightning_indexer_vllm_depends transformer/attention/lightning_indexer_vllm PARENT_SCOPE)
+set(dsa_indexer_score_depends transformer/attention/qk_score PARENT_SCOPE)
 
 target_sources(op_host_aclnn PRIVATE
-        lightning_indexer_vllm_def.cpp
+        qk_score_def.cpp
 )
 
 target_sources(optiling PRIVATE
-        lightning_indexer_vllm_tiling.cpp
+        qk_score_tiling.cpp
 )
 
 if (NOT BUILD_OPEN_PROJECT)
     target_sources(opmaster_ct PRIVATE
-        lightning_indexer_vllm_tiling.cpp
+        qk_score_tiling.cpp
     )
 endif ()
 
@@ -37,6 +37,5 @@ target_include_directories(optiling PRIVATE
 )
 
 target_sources(opsproto PRIVATE
-        lightning_indexer_vllm_proto.cpp
+        qk_score_proto.cpp
 )
-

@@ -7,7 +7,7 @@ add_ops_compile_options(
                 --op_relocatable_kernel_binary=true
 )
 
-set(dsa_update_index_depends PARENT_SCOPE)
+set(dsa_indexer_update_depends PARENT_SCOPE)
 
 target_sources(op_host_aclnn PRIVATE
         dsa_update_index_def.cpp

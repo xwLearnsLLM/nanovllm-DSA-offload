@@ -21,6 +21,8 @@ include(cmake/config.cmake)
 include(cmake/func.cmake)
 include(cmake/intf.cmake)
 
+get_filename_component(NANOVLLM_ASCEND_OPS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../ops" ABSOLUTE)
+
 if (BUILD_OPEN_PROJECT)
     set(_op_host_aclnn_link
             $<BUILD_INTERFACE:intf_pub>
@@ -233,8 +235,16 @@ set(OP_LIST)
 set(OP_DIR_LIST)
 op_add_subdirectory(OP_LIST OP_DIR_LIST)
 
+# Directory names are framework-facing and use DSA vocabulary. A few CANN
+# kernels keep their original registered op names to avoid changing aclnn ABI.
+set(dsa_indexer_score_kernel_aliases qk_score)
+set(dsa_indexer_update_kernel_aliases dsa_update_index)
+set(dsa_scatter_h2d_kernel_aliases paged_scatter_copy_h2d)
+set(lightning_indexer_kernel_aliases lightning_indexer_vllm)
+
 foreach (OP_DIR ${OP_DIR_LIST})
-    add_subdirectory(${OP_DIR}/op_host)
+    get_filename_component(_op_name "${OP_DIR}" NAME)
+    add_subdirectory(${OP_DIR}/op_host ${CMAKE_CURRENT_BINARY_DIR}/ops/${_op_name}/op_host)
 endforeach ()
 
 set(OP_DEPEND_DIR_LIST)
@@ -243,7 +253,8 @@ op_add_depend_directory(
         OP_DIR_LIST OP_DEPEND_DIR_LIST
 )
 foreach (OP_DEPEND_DIR ${OP_DEPEND_DIR_LIST})
-    add_subdirectory(${OP_DEPEND_DIR}/op_host)
+    get_filename_component(_depend_op_name "${OP_DEPEND_DIR}" NAME)
+    add_subdirectory(${OP_DEPEND_DIR}/op_host ${CMAKE_CURRENT_BINARY_DIR}/ops_dep/${_depend_op_name}/op_host)
 endforeach ()
 
 # ------------------------------------------------ aclnn ------------------------------------------------
@@ -267,7 +278,11 @@ set(generate_proto_headers)
 
 if (base_aclnn_srcs)
     foreach (_src ${base_aclnn_srcs})
-        string(REGEX MATCH "^${CMAKE_CURRENT_SOURCE_DIR}" is_match "${_src}")
+        if (_src MATCHES "^${CMAKE_CURRENT_SOURCE_DIR}" OR _src MATCHES "^${NANOVLLM_ASCEND_OPS_DIR}")
+            set(is_match TRUE)
+        else()
+            set(is_match FALSE)
+        endif()
         if (is_match)
             get_filename_component(name_without_ext ${_src} NAME_WE)
 
@@ -290,7 +305,11 @@ endif ()
 
 if (base_aclnn_inner_srcs)
     foreach (_src ${base_aclnn_inner_srcs})
-        string(REGEX MATCH "^${CMAKE_CURRENT_SOURCE_DIR}" is_match "${_src}")
+        if (_src MATCHES "^${CMAKE_CURRENT_SOURCE_DIR}" OR _src MATCHES "^${NANOVLLM_ASCEND_OPS_DIR}")
+            set(is_match TRUE)
+        else()
+            set(is_match FALSE)
+        endif()
         if (is_match)
             get_filename_component(name_without_ext ${_src} NAME_WE)
             string(REGEX REPLACE "_def$" "" _op_name ${name_without_ext})
@@ -311,7 +330,11 @@ endif ()
 
 if (base_aclnn_exclude_srcs)
     foreach (_src ${base_aclnn_exclude_srcs})
-        string(REGEX MATCH "^${CMAKE_CURRENT_SOURCE_DIR}" is_match "${_src}")
+        if (_src MATCHES "^${CMAKE_CURRENT_SOURCE_DIR}" OR _src MATCHES "^${NANOVLLM_ASCEND_OPS_DIR}")
+            set(is_match TRUE)
+        else()
+            set(is_match FALSE)
+        endif()
         if (is_match)
             get_filename_component(name_without_ext ${_src} NAME_WE)
             string(REGEX REPLACE "_def$" "" _op_name ${name_without_ext})
@@ -537,10 +560,16 @@ add_custom_target(generate_adapt_py
 add_dependencies(generate_adapt_py opbuild_gen_default opbuild_gen_inner opbuild_gen_exc)
 
 foreach (_op_name ${OP_LIST})
-    install(FILES ${ASCEND_IMPL_OUT_DIR}/dynamic/${_op_name}.py
-            DESTINATION ${IMPL_DYNAMIC_INSTALL_DIR}
-            OPTIONAL
-    )
+    set(_dynamic_py_names ${_op_name})
+    if (DEFINED ${_op_name}_kernel_aliases)
+        list(APPEND _dynamic_py_names ${${_op_name}_kernel_aliases})
+    endif()
+    foreach (_dynamic_py_name ${_dynamic_py_names})
+        install(FILES ${ASCEND_IMPL_OUT_DIR}/dynamic/${_dynamic_py_name}.py
+                DESTINATION ${IMPL_DYNAMIC_INSTALL_DIR}
+                OPTIONAL
+        )
+    endforeach()
 endforeach ()
 
 install(DIRECTORY ${OPS_ADV_UTILS_KERNEL_INC}/

@@ -87,7 +87,7 @@ def _apply_rope_neox_reference(x: torch.Tensor, cos: torch.Tensor, sin: torch.Te
 
 
 def _apply_query_rope_like_runtime(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, rope_dim: int) -> torch.Tensor:
-    # Query-only TorchAir must match the runtime path bit-for-bit; otherwise q_index differs before qk_score.
+    # Query-only TorchAir must match the runtime path bit-for-bit; otherwise q_index differs before dsa_indexer_score.
     if x.device.type == "npu" and torch_npu is not None and x.dtype in (torch.float16, torch.bfloat16):
         return torch_npu.npu_rotary_mul(x.unsqueeze(2), cos, sin).squeeze(2)
     return _apply_rope_neox_reference(x, cos, sin, int(rope_dim))

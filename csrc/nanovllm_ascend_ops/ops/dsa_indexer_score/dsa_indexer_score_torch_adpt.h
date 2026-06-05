@@ -17,7 +17,7 @@
 #define QK_SCORE_TORCH_ADPT_H
 namespace vllm_ascend {
 
-inline int64_t get_qk_score_s2_size(
+inline int64_t get_dsa_indexer_score_s2_size(
     const at::Tensor &key,
     const c10::optional<at::Tensor> &block_table,
     const std::string &key_layout_str)
@@ -36,14 +36,14 @@ inline int64_t get_qk_score_s2_size(
     return key.size(DIM_1);
 }
 
-inline int64_t get_qk_score_kv_heads(const at::Tensor &key, const std::string &key_layout_str)
+inline int64_t get_dsa_indexer_score_kv_heads(const at::Tensor &key, const std::string &key_layout_str)
 {
     constexpr int64_t DIM_1 = 1;
     constexpr int64_t DIM_2 = 2;
     return key_layout_str == "TND" ? key.size(DIM_1) : key.size(DIM_2);
 }
 
-at::Tensor npu_qk_score(
+at::Tensor npu_dsa_indexer_score(
     const at::Tensor &query, const at::Tensor &key, const at::Tensor &weights,
     const c10::optional<at::Tensor> &actual_seq_lengths_query,
     const c10::optional<at::Tensor> &actual_seq_lengths_key,
@@ -65,15 +65,15 @@ at::Tensor npu_qk_score(
     at::SmallVector<int64_t, SIZE> output_size;
     std::string query_layout_str = std::string(layout_query);
     std::string key_layout_str = std::string(layout_key);
-    int64_t score_count = get_qk_score_s2_size(key, block_table, key_layout_str);
-    int64_t kv_heads = get_qk_score_kv_heads(key, key_layout_str);
+    int64_t score_count = get_dsa_indexer_score_s2_size(key, block_table, key_layout_str);
+    int64_t kv_heads = get_dsa_indexer_score_kv_heads(key, key_layout_str);
     TORCH_CHECK(score_count > 0, "qk score output length should be greater than 0, but now is ", score_count);
     if (query_layout_str == "BSND") {
         output_size = {query.size(DIM_0), query.size(DIM_1), kv_heads, score_count};
     } else {
         output_size = {query.size(DIM_0), kv_heads, score_count};
     }
-    at::Tensor qk_score_output = at::empty(output_size, query.options().dtype(at::kFloat));
+    at::Tensor score_output = at::empty(output_size, query.options().dtype(at::kFloat));
     // convert str
     char *query_layout_ptr = const_cast<char *>(query_layout_str.c_str());
     char *key_layout_ptr = const_cast<char *>(key_layout_str.c_str());
@@ -91,11 +91,11 @@ at::Tensor npu_qk_score(
         key_layout_ptr,
         score_count,
         output_dtype_ptr,
-        qk_score_output);
-    return qk_score_output;
+        score_output);
+    return score_output;
 }
 
-inline void npu_qk_score_bf16_out(
+inline void npu_dsa_indexer_score_bf16_out(
     const at::Tensor &query, const at::Tensor &key, const at::Tensor &weights,
     const c10::optional<at::Tensor> &actual_seq_lengths_query,
     const c10::optional<at::Tensor> &actual_seq_lengths_key,
@@ -113,8 +113,8 @@ inline void npu_qk_score_bf16_out(
 
     std::string query_layout_str = std::string(layout_query);
     std::string key_layout_str = std::string(layout_key);
-    TORCH_CHECK(query_layout_str == "TND", "npu_qk_score_bf16_out currently expects layout_query='TND'.");
-    TORCH_CHECK(key_layout_str == "PA_BSND", "npu_qk_score_bf16_out currently expects layout_key='PA_BSND'.");
+    TORCH_CHECK(query_layout_str == "TND", "npu_dsa_indexer_score_bf16_out currently expects layout_query='TND'.");
+    TORCH_CHECK(key_layout_str == "PA_BSND", "npu_dsa_indexer_score_bf16_out currently expects layout_key='PA_BSND'.");
     TORCH_CHECK(block_table.has_value(), "block_table must be provided when layout_key='PA_BSND'.");
     TORCH_CHECK(key.dim() == 4, "key must be 4-D when layout_key='PA_BSND'.");
     TORCH_CHECK(block_table.value().dim() == 2, "block_table must be 2-D.");

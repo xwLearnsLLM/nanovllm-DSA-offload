@@ -10,7 +10,7 @@ try:
 except Exception:  # pragma: no cover - local non-Ascend syntax checks
     torch_npu = None
 
-from nanovllm.models.dsa_offload_ops import _dsa_index_update_cann, dsa_index_update_torch
+from nanovllm.models.dsa_offload_ops import _dsa_indexer_update_cann, dsa_indexer_update_torch
 
 
 def parse_int_list(value: str) -> list[int]:
@@ -82,9 +82,9 @@ def run_update(
     k: int,
 ) -> None:
     if backend == "cann":
-        _dsa_index_update_cann(score, pool, promote, demote, copy_counts, candidate_lens, selected_lens, req_pool_entries, k, all_copy_count_k=True, pool_entries_start=0)
+        _dsa_indexer_update_cann(score, pool, promote, demote, copy_counts, candidate_lens, selected_lens, req_pool_entries, k, all_copy_count_k=True, pool_entries_start=0)
     elif backend == "torch":
-        dsa_index_update_torch(score, pool, promote, demote, copy_counts, candidate_lens, selected_lens, req_pool_entries, k)
+        dsa_indexer_update_torch(score, pool, promote, demote, copy_counts, candidate_lens, selected_lens, req_pool_entries, k)
     else:
         raise ValueError(f"unsupported backend: {backend}")
 
@@ -140,7 +140,7 @@ def selected_len_for_case(candidate_idx: int, candidate_len: int, candidate_lens
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Benchmark dsa_index_update across batch sizes and sequence lengths.")
+    parser = argparse.ArgumentParser(description="Benchmark dsa_indexer_update across batch sizes and sequence lengths.")
     parser.add_argument("--device", default="npu:0")
     parser.add_argument("--batch-sizes", default="1,2,4,8,10,16")
     parser.add_argument("--candidate-lens", default="8192,16384,32768,65536")
@@ -167,7 +167,7 @@ def main() -> None:
     backends = ["cann"] + (["torch"] if args.include_torch else [])
 
     print(
-        "DSA_INDEX_UPDATE_SWEEP_CONFIG "
+        "DSA_INDEXER_UPDATE_SWEEP_CONFIG "
         f"device={args.device} batch_sizes={batch_sizes} candidate_lens={candidate_lens} "
         f"selected_lens={selected_lens} k={args.k} warmup={args.warmup} iters={args.iters} "
         f"reset_each_iter={int(args.reset_each_iter)} backends={backends}"
@@ -192,7 +192,7 @@ def main() -> None:
                 count_min = min(counts) if counts else 0
                 count_max = max(counts) if counts else 0
                 print(
-                    "DSA_INDEX_UPDATE_SWEEP "
+                    "DSA_INDEXER_UPDATE_SWEEP "
                     f"backend={backend} batch={batch_size} candidate={candidate_len} selected={selected_len} "
                     f"k={args.k} avg_ms={avg_ms:.6f} counts_min={count_min} counts_max={count_max} "
                     f"est_61_layers_ms={avg_ms * 61.0:.6f}"

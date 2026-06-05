@@ -7,7 +7,7 @@
 #include <c10/core/DeviceGuard.h>
 #include <torch/extension.h>
 
-#include "aclnn_torch_adapter/op_api_common.h"
+#include "common/torch_adapter/op_api_common.h"
 #include "kernels/types.h"
 
 namespace vllm_ascend {

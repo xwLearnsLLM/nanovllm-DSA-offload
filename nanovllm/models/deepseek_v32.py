@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import math
@@ -15,7 +15,7 @@ from transformers import PretrainedConfig
 
 import nanovllm.ops as ascend_ops
 from nanovllm.models.dsa_offload_ops import (
-    dsa_index_update,
+    dsa_indexer_update,
     dsa_indexer_score,
     dsa_scatter_h2d,
 )
@@ -935,7 +935,7 @@ class DeepseekV32Indexer(nn.Module):
             n_head=self.n_head,
             head_dim=self.head_dim,
             rope_dim=self.rope_dim,
-            score_scale=1.0,  # Keep qk_score inputs aligned with vllm-ascend BF16 SFA.
+            score_scale=1.0,  # Keep dsa_indexer_score inputs aligned with vllm-ascend BF16 SFA.
             detail=detail,
             sync_detail=sync_detail,
         )
@@ -1074,7 +1074,7 @@ class DeepseekV32DSAAttention(nn.Module):
             "index_cache": 0.0,
             "q_up": 0.0,
             "dsa_indexer_score": 0.0,
-            "dsa_index_update": 0.0,
+            "dsa_indexer_update": 0.0,
             "dsa_scatter_h2d": 0.0,
             "decode_attention_op": 0.0,
             "v_up": 0.0,
@@ -1286,7 +1286,7 @@ class DeepseekV32DSAAttention(nn.Module):
             n_head=self.indexer.n_head,
             head_dim=self.indexer.head_dim,
             rope_dim=self.indexer.rope_dim,
-            score_scale=1.0,                                   # Keep qk_score inputs aligned with vllm-ascend BF16 SFA.
+            score_scale=1.0,                                   # Keep dsa_indexer_score inputs aligned with vllm-ascend BF16 SFA.
             allow_compile=self.indexer.query_only_backend == "torchair",
             detail=indexer_detail,
             sync_detail=self.decode_timing_sync,
@@ -2114,7 +2114,7 @@ class DeepseekV32DSAAttention(nn.Module):
 
         pool_slice = self.hbm_cached_tokens_pool[self.layer_id]
         start = self._decode_timer_start(profile_decode, score_out.device)
-        dsa_index_update(
+        dsa_indexer_update(
             score_out,
             pool_slice,
             promote_idx,
@@ -2129,7 +2129,7 @@ class DeepseekV32DSAAttention(nn.Module):
         )
         self._decode_timer_end(
             profile_decode,
-            "dsa_index_update",
+            "dsa_indexer_update",
             start,
             score_out.device,
         )
@@ -2441,14 +2441,14 @@ class DeepseekV32DecoderLayer(nn.Module):
             o_proj_total = attention_detail["o_linear"] + attention_detail["o_all_reduce"]
             dsa_total = (
                 attention_detail["dsa_indexer_score"]
-                + attention_detail["dsa_index_update"]
+                + attention_detail["dsa_indexer_update"]
                 + attention_detail["dsa_scatter_h2d"]
             )
             logger.info(
                 "Decode layer timing: rank=%d layer=%d tokens=%d "
                 "attention_total=%.6fs mlapo=%.6fs indexer_project=%.6fs "
                 "index_cache=%.6fs dsa_total=%.6fs dsa_indexer_score=%.6fs "
-                "dsa_index_update=%.6fs dsa_scatter_h2d=%.6fs "
+                "dsa_indexer_update=%.6fs dsa_scatter_h2d=%.6fs "
                 "decode_attention_op=%.6fs v_up=%.6fs "
                 "o_proj=%.6fs attention_gap=%.6fs moe_total=%.6fs "
                 "mlp_kind=%s moe_backend=%s",
@@ -2461,7 +2461,7 @@ class DeepseekV32DecoderLayer(nn.Module):
                 attention_detail["index_cache"],
                 dsa_total,
                 attention_detail["dsa_indexer_score"],
-                attention_detail["dsa_index_update"],
+                attention_detail["dsa_indexer_update"],
                 attention_detail["dsa_scatter_h2d"],
                 attention_detail["decode_attention_op"],
                 attention_detail["v_up"],

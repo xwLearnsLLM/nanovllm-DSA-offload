@@ -50,7 +50,7 @@ def assert_close(name: str, actual: torch.Tensor, expected: torch.Tensor, atol: 
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Probe npu_qk_score_bf16_out against npu_qk_score.")
+    parser = argparse.ArgumentParser(description="Probe npu_dsa_indexer_score_bf16_out against npu_dsa_indexer_score.")
     parser.add_argument("--device", default="npu:0")
     parser.add_argument("--batch-size", type=int, default=10)
     parser.add_argument("--heads", type=int, default=64)
@@ -97,7 +97,7 @@ def main() -> None:
     print(desc("weights", weights))
     print(desc("full_block_table", full_block_table))
 
-    ref = ascend_ops.npu_qk_score(
+    ref = ascend_ops.npu_dsa_indexer_score(
         query,
         key,
         weights,
@@ -110,7 +110,7 @@ def main() -> None:
     out = torch.empty((batch_size, output_stride), dtype=torch.bfloat16, device=device)
     tail_sentinel = torch.full((batch_size, int(args.extra_output_cols)), 7.0, dtype=torch.bfloat16, device=device)
     out[:, score_count:].copy_(tail_sentinel)
-    ascend_ops.npu_qk_score_bf16_out(
+    ascend_ops.npu_dsa_indexer_score_bf16_out(
         query,
         key,
         weights,
@@ -131,7 +131,7 @@ def main() -> None:
         assert_close("tail_unchanged", tail, tail_sentinel, 0.0, 0.0)
 
     for _ in range(args.warmup):
-        _ = ascend_ops.npu_qk_score(
+        _ = ascend_ops.npu_dsa_indexer_score(
             query,
             key,
             weights,
@@ -144,7 +144,7 @@ def main() -> None:
     sync(device)
     t0 = time.perf_counter()
     for _ in range(args.iters):
-        _ = ascend_ops.npu_qk_score(
+        _ = ascend_ops.npu_dsa_indexer_score(
             query,
             key,
             weights,
@@ -158,7 +158,7 @@ def main() -> None:
     old_ms = (time.perf_counter() - t0) * 1000.0 / max(args.iters, 1)
 
     for _ in range(args.warmup):
-        ascend_ops.npu_qk_score_bf16_out(
+        ascend_ops.npu_dsa_indexer_score_bf16_out(
             query,
             key,
             weights,
@@ -173,7 +173,7 @@ def main() -> None:
     sync(device)
     t0 = time.perf_counter()
     for _ in range(args.iters):
-        ascend_ops.npu_qk_score_bf16_out(
+        ascend_ops.npu_dsa_indexer_score_bf16_out(
             query,
             key,
             weights,

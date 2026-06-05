@@ -6,7 +6,7 @@
 #include <pybind11/stl.h>
 #include <acl/acl.h>
 
-#include "aclnn_torch_adapter/op_api_common.h"
+#include "common/torch_adapter/op_api_common.h"
 
 thread_local char g_hashBuf[kHashBufSize];
 thread_local int g_hashOffset = 0;
@@ -55,15 +55,15 @@ extern void mla_preprocess_impl(
     const uint32_t block_dim);
 }  // namespace vllm_ascend
 
-#include "batch_matmul_transpose/batch_matmul_transpose_torch_adpt.h"
-#include "cann_ops/lightning_indexer_vllm/lightning_indexer_vllm_torch_adpt.h"
-#include "cann_ops/moe_gating_top_k/moe_gating_top_k_torch_adpt.h"
-#include "cann_ops/paged_scatter_copy_h2d/paged_scatter_copy_h2d_torch_adpt.h"
-#include "cann_ops/qk_score/qk_score_torch_adpt.h"
-#include "cann_ops/dsa_update_index/dsa_update_index_torch_adpt.h"
-#include "cann_ops/sparse_flash_attention/sparse_flash_attention_torch_adpt.h"
-#include "dsa_indexer_project/dsa_indexer_project_torch_adpt.h"
-#include "mla_preprocess/mla_preprocess_torch_adpt.h"
+#include "ops/batch_matmul_transpose/batch_matmul_transpose_torch_adpt.h"
+#include "ops/lightning_indexer/lightning_indexer_vllm_torch_adpt.h"
+#include "ops/moe_gating_top_k/moe_gating_top_k_torch_adpt.h"
+#include "ops/dsa_scatter_h2d/paged_scatter_copy_h2d_torch_adpt.h"
+#include "ops/dsa_indexer_score/dsa_indexer_score_torch_adpt.h"
+#include "ops/dsa_indexer_update/dsa_indexer_update_torch_adpt.h"
+#include "ops/sparse_flash_attention/sparse_flash_attention_torch_adpt.h"
+#include "ops/dsa_indexer_project/dsa_indexer_project_torch_adpt.h"
+#include "ops/mla_preprocess/mla_preprocess_torch_adpt.h"
 
 namespace py = pybind11;
 
@@ -113,7 +113,7 @@ at::Tensor npu_lightning_indexer_py(
       sparse_mode);
 }
 
-at::Tensor npu_qk_score_py(
+at::Tensor npu_dsa_indexer_score_py(
     const at::Tensor& query,
     const at::Tensor& key,
     const at::Tensor& weights,
@@ -122,7 +122,7 @@ at::Tensor npu_qk_score_py(
     py::object block_table,
     std::string layout_query,
     std::string layout_key) {
-  return vllm_ascend::npu_qk_score(
+  return vllm_ascend::npu_dsa_indexer_score(
       query,
       key,
       weights,
@@ -133,7 +133,7 @@ at::Tensor npu_qk_score_py(
       c10::string_view(layout_key.data(), layout_key.size()));
 }
 
-void npu_qk_score_bf16_out_py(
+void npu_dsa_indexer_score_bf16_out_py(
     const at::Tensor& query,
     const at::Tensor& key,
     const at::Tensor& weights,
@@ -144,7 +144,7 @@ void npu_qk_score_bf16_out_py(
     at::Tensor& score_out,
     std::string layout_query,
     std::string layout_key) {
-  vllm_ascend::npu_qk_score_bf16_out(
+  vllm_ascend::npu_dsa_indexer_score_bf16_out(
       query,
       key,
       weights,
@@ -247,7 +247,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_gating_top_k_py(
       optional_tensor(bias_opt));
 }
 
-void dsa_update_index_py(
+void dsa_indexer_update_py(
     at::Tensor score,
     at::Tensor selected_idx,
     const at::Tensor& seq_len,
@@ -255,7 +255,7 @@ void dsa_update_index_py(
     int64_t k,
     at::Tensor promote_idx,
     at::Tensor demote_idx) {
-  vllm_ascend::dsa_update_index(
+  vllm_ascend::dsa_indexer_update(
       score,
       selected_idx,
       seq_len,
@@ -375,8 +375,8 @@ PYBIND11_MODULE(_C, m) {
       py::arg("sparse_count") = 2048,
       py::arg("sparse_mode") = 3);
   m.def(
-      "npu_qk_score",
-      &npu_qk_score_py,
+      "npu_dsa_indexer_score",
+      &npu_dsa_indexer_score_py,
       py::arg("query"),
       py::arg("key"),
       py::arg("weights"),
@@ -386,8 +386,8 @@ PYBIND11_MODULE(_C, m) {
       py::arg("layout_query") = "BSND",
       py::arg("layout_key") = "PA_BSND");
   m.def(
-      "npu_qk_score_bf16_out",
-      &npu_qk_score_bf16_out_py,
+      "npu_dsa_indexer_score_bf16_out",
+      &npu_dsa_indexer_score_bf16_out_py,
       py::arg("query"),
       py::arg("key"),
       py::arg("weights"),
@@ -448,8 +448,8 @@ PYBIND11_MODULE(_C, m) {
       py::arg("eps"),
       py::arg("bias_opt") = py::none());
   m.def(
-      "dsa_update_index",
-      &dsa_update_index_py,
+      "dsa_indexer_update",
+      &dsa_indexer_update_py,
       py::arg("score"),
       py::arg("selected_idx"),
       py::arg("seq_len"),

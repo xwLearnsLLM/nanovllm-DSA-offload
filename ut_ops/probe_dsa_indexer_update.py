@@ -10,7 +10,7 @@ try:
 except Exception:
     torch_npu = None
 
-from nanovllm.models.dsa_offload_ops import _dsa_index_update_cann, dsa_index_update_torch
+from nanovllm.models.dsa_offload_ops import _dsa_indexer_update_cann, dsa_indexer_update_torch
 
 
 def sync(device: torch.device) -> None:
@@ -197,7 +197,7 @@ def print_overlap_report(
         return f"mean={sum(values) / len(values):.6f} min={min(values):.6f} max={max(values):.6f}"
 
     print(
-        "DSA_INDEX_UPDATE_OVERLAP "
+        "DSA_INDEXER_UPDATE_OVERLAP "
         f"promote={fmt(promote_ratios)} "
         f"demote={fmt(demote_ratios)} "
         f"pool={fmt(pool_ratios)} "
@@ -252,13 +252,13 @@ def main() -> None:
     torch_promote = torch.empty_like(promote)
     torch_demote = torch.empty_like(demote)
     torch_counts = torch.empty_like(counts)
-    dsa_index_update_torch(score.clone(), torch_pool, torch_promote, torch_demote, torch_counts, candidate_lens, selected_lens, req_pool_entries, args.k)
+    dsa_indexer_update_torch(score.clone(), torch_pool, torch_promote, torch_demote, torch_counts, candidate_lens, selected_lens, req_pool_entries, args.k)
 
     cann_pool = pool.clone()
     cann_promote = torch.empty_like(promote)
     cann_demote = torch.empty_like(demote)
     cann_counts = torch.empty_like(counts)
-    _dsa_index_update_cann(score.clone(), cann_pool, cann_promote, cann_demote, cann_counts, candidate_lens, selected_lens, req_pool_entries, args.k)
+    _dsa_indexer_update_cann(score.clone(), cann_pool, cann_promote, cann_demote, cann_counts, candidate_lens, selected_lens, req_pool_entries, args.k)
     sync(device)
 
     validate_hard_invariants(
@@ -295,15 +295,15 @@ def main() -> None:
             raise AssertionError(f"pool mismatch: diff_count={int(diff.shape[0])} first_diff={first}")
 
     def run_torch():
-        dsa_index_update_torch(score.clone(), pool.clone(), torch.empty_like(promote), torch.empty_like(demote), torch.empty_like(counts), candidate_lens, selected_lens, req_pool_entries, args.k)
+        dsa_indexer_update_torch(score.clone(), pool.clone(), torch.empty_like(promote), torch.empty_like(demote), torch.empty_like(counts), candidate_lens, selected_lens, req_pool_entries, args.k)
 
     def run_cann():
-        _dsa_index_update_cann(score.clone(), pool.clone(), torch.empty_like(promote), torch.empty_like(demote), torch.empty_like(counts), candidate_lens, selected_lens, req_pool_entries, args.k)
+        _dsa_indexer_update_cann(score.clone(), pool.clone(), torch.empty_like(promote), torch.empty_like(demote), torch.empty_like(counts), candidate_lens, selected_lens, req_pool_entries, args.k)
 
     torch_ms = bench(run_torch, device, args.warmup, args.iters)
     cann_ms = bench(run_cann, device, args.warmup, args.iters)
     print(
-        "DSA_INDEX_UPDATE_PROBE "
+        "DSA_INDEXER_UPDATE_PROBE "
         f"device={args.device} batch={args.batch} candidate={args.candidate} "
         f"selected={args.selected} k={args.k} counts={cann_counts.cpu().tolist()} "
         f"torch_avg_ms={torch_ms:.6f} cann_avg_ms={cann_ms:.6f}"

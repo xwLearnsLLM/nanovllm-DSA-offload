@@ -13,7 +13,7 @@
 
 #include "acl/acl.h"
 #include "acl/acl_rt.h"
-#include "aclnn_torch_adapter/op_api_common.h"
+#include "common/torch_adapter/op_api_common.h"
 #include "torch_npu/csrc/aten/common/from_blob.h"
 #include "torch_npu/csrc/core/npu/NPUGuard.h"
 
