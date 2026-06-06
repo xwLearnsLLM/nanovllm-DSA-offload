@@ -43,7 +43,7 @@ class Scheduler:
         num_prefill_full_blocks = len(seq) // seq.block_size
         prefill_tail_len = len(seq) - num_prefill_full_blocks * seq.block_size
         num_prefill_tail_blocks = num_prefill_blocks - num_prefill_full_blocks
-        num_sparse_blocks = compute_sparse_blocks(num_prefill_full_blocks)
+        num_sparse_blocks = compute_sparse_blocks(num_prefill_full_blocks, seq.block_size)
 
         seq.num_prefill_blocks = num_prefill_blocks
         seq.num_prefill_full_blocks = num_prefill_full_blocks

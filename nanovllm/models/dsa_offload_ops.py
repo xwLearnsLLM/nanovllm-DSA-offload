@@ -1,286 +1,85 @@
 from __future__ import annotations
 
-import os
+import importlib
 
 import torch
 
 import nanovllm.ops as ascend_ops
 
-_DSA_INDEXER_UPDATE_CANN_MAX_K = 128
+_GATHER_SELECTION_LOADED = False
 
 
-def _env_flag(name: str, default: bool) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    return value.strip().lower() not in ("0", "false", "off", "no", "")
-
-
-_DSA_INDEXER_UPDATE_USE_CANN = _env_flag("NANOVLLM_DSA_INDEXER_UPDATE_USE_CANN", True)
-
-
-def dsa_indexer_score(
+def dsa_lightning_indexer(
     query_index: torch.Tensor,
     index_cache: torch.Tensor,
     index_weights: torch.Tensor,
     index_block_table: torch.Tensor,
     candidate_lens: torch.Tensor,
-    score_out: torch.Tensor,
     *,
-    actual_seq_lengths_query: torch.Tensor | None,
-    block_count: int | None = None,
-) -> None:
-    """Score DSA candidates with the Ascend dsa_indexer_score op."""
-    block_size = int(index_cache.shape[1])
-    score_capacity = int(score_out.shape[1])
-    if score_capacity <= 0:
-        return
-
-    block_count = int(block_count) if block_count is not None else (score_capacity + block_size - 1) // block_size
-    score_count = block_count * block_size
-    if score_count > score_capacity:
-        raise RuntimeError(f"score_out capacity {score_capacity} is smaller than dsa_indexer_score logical length {score_count}.")
-
-    ascend_ops.npu_dsa_indexer_score_bf16_out(
-        query_index,
-        index_cache,
-        index_weights,
-        actual_seq_lengths_query,
-        candidate_lens,
-        index_block_table,
-        block_count,
-        score_out,
-        "TND",
-        "PA_BSND",
+    actual_seq_lengths_query: torch.Tensor,
+    sparse_count: int,
+) -> torch.Tensor:
+    """Return top sparse token ids with the vLLM-Ascend LightningIndexer op."""
+    return ascend_ops.npu_lightning_indexer(
+        query=query_index,
+        key=index_cache,
+        weights=index_weights,
+        actual_seq_lengths_query=actual_seq_lengths_query,
+        actual_seq_lengths_key=candidate_lens,
+        block_table=index_block_table,
+        layout_query="TND",
+        layout_key="PA_BSND",
+        sparse_count=int(sparse_count),
+        sparse_mode=3,
     )
 
 
-def dsa_indexer_update_torch(
-    score: torch.Tensor,
-    hbm_cached_tokens_pool: torch.Tensor,
-    promote_idx: torch.Tensor,
-    demote_idx: torch.Tensor,
-    copy_counts: torch.Tensor,
-    candidate_lens: torch.Tensor,
-    selected_lens: torch.Tensor,
-    req_pool_entries: torch.Tensor,
-    max_copy_tokens: int,
-) -> None:
-    """PyTorch prototype for fixed-Tx sparse budget update."""
-    promote_idx.zero_()
-    demote_idx.zero_()
-    copy_counts.zero_()
-    bs = int(score.shape[0])
-    for b in range(bs):
-        candidate_len = int(candidate_lens[b].item())
-        selected_len = int(selected_lens[b].item())
-        pool_entry = int(req_pool_entries[b].item())
-        if candidate_len <= 0 or selected_len <= 0 or max_copy_tokens <= 0:
-            continue
-
-        selected_tokens = hbm_cached_tokens_pool[
-            pool_entry,
-            :selected_len,
-        ].to(torch.long)
-        valid_selected = selected_tokens[
-            (selected_tokens >= 0) & (selected_tokens < candidate_len)
-        ]
-        uncached_mask = torch.ones(
-            candidate_len,
-            dtype=torch.bool,
-            device=score.device,
-        )
-        if valid_selected.numel() > 0:
-            uncached_mask[valid_selected] = False
-        available_uncached = int(uncached_mask.sum().item())
-        copy_count = min(int(max_copy_tokens), selected_len, available_uncached)
-        if copy_count <= 0:
-            continue
-
-        promote_scores = score[b, :candidate_len].float().clone()
-        promote_scores[~uncached_mask] = -float("inf")
-        promote_tokens = torch.topk(
-            promote_scores,
-            k=copy_count,
-            largest=True,
-        ).indices.to(torch.int32)
-
-        safe_selected_tokens = selected_tokens.clamp(0, candidate_len - 1)
-        selected_scores = score[b].index_select(0, safe_selected_tokens).float()
-        selected_scores[
-            (selected_tokens < 0) | (selected_tokens >= candidate_len)
-        ] = -float("inf")
-        demote_slots = torch.topk(
-            selected_scores,
-            k=copy_count,
-            largest=False,
-        ).indices.to(torch.int32)
-
-        promote_idx[b, :copy_count] = promote_tokens
-        demote_idx[b, :copy_count] = demote_slots
-        copy_counts[b] = copy_count
-        hbm_cached_tokens_pool[
-            pool_entry,
-            demote_slots.to(torch.long),
-        ] = promote_tokens
-
-
-def _dsa_indexer_update_cann(
-    score: torch.Tensor,
-    hbm_cached_tokens_pool: torch.Tensor,
-    promote_idx: torch.Tensor,
-    demote_idx: torch.Tensor,
-    copy_counts: torch.Tensor,
-    candidate_lens: torch.Tensor,
-    selected_lens: torch.Tensor,
-    req_pool_entries: torch.Tensor,
-    max_copy_tokens: int,
-    *,
-    all_copy_count_k: bool = False,
-    pool_entries_start: int = -1,
-) -> None:
-    """Run the CANN dsa_indexer_update op behind the framework-facing interface."""
-    bs = int(score.shape[0])
-    k = int(max_copy_tokens)
-    if bs <= 0 or k <= 0:
+def _ensure_gather_selection_loaded() -> None:
+    global _GATHER_SELECTION_LOADED
+    if _GATHER_SELECTION_LOADED:
         return
-    if k > _DSA_INDEXER_UPDATE_CANN_MAX_K:
+    try:
+        importlib.import_module("gather_selection_custom_ops")
+    except ImportError as exc:
         raise RuntimeError(
-            "CANN dsa_indexer_update supports at most "
-            f"{_DSA_INDEXER_UPDATE_CANN_MAX_K} copy tokens, got {k}. "
-            "Set NANOVLLM_DSA_INDEXER_UPDATE_USE_CANN=0 to use the torch path, "
-            "or lower NANOVLLM_DSA_OFFLOAD_FIXED_TX."
+            "gather_selection_custom_ops is not importable. Build/install "
+            "D:\\vLLM-ascend\\ops_gather_selection_kv_cache first, then run "
+            "nano-vllm with that package on PYTHONPATH."
+        ) from exc
+    if not hasattr(torch.ops, "custom") or not hasattr(torch.ops.custom, "npu_gather_selection_kv_cache"):
+        raise RuntimeError(
+            "torch.ops.custom.npu_gather_selection_kv_cache is unavailable. "
+            "Check that the gather_selection custom op package and OPP vendor "
+            "library are installed for the current CANN environment."
         )
-    
-    if not hasattr(ascend_ops, "dsa_indexer_update"):
-        raise RuntimeError("ascend_ops.dsa_indexer_update is unavailable. Rebuild with `SOC_VERSION=ascend910_9391 PYTHONPATH=$PWD:$PYTHONPATH bash scripts/build_nanovllm_ops.sh`.")
-
-    # Pure long-sequence decode: every row copies exactly fixed Tx tokens, and pool entries are consecutive. Pass the HBM pool view directly; the CANN op updates selected_idx in-place, so no Python-side pool scatter is needed.
-    if all_copy_count_k and pool_entries_start >= 0:
-        pool_start = int(pool_entries_start)
-        selected_idx = hbm_cached_tokens_pool[pool_start:pool_start + bs]
-        ascend_ops.dsa_indexer_update(score, selected_idx, candidate_lens, selected_lens, k, promote_idx, demote_idx)
-        
-    else :
-        score_arg = score if score.is_contiguous() else score.contiguous()
-        candidate_lens_arg = candidate_lens if candidate_lens.is_contiguous() else candidate_lens.contiguous()
-        selected_lens_arg = selected_lens if selected_lens.is_contiguous() else selected_lens.contiguous()
-        promote_arg = promote_idx if int(promote_idx.shape[1]) == k and promote_idx.is_contiguous() else promote_idx[:, :k].contiguous()
-        demote_arg = demote_idx if int(demote_idx.shape[1]) == k and demote_idx.is_contiguous() else demote_idx[:, :k].contiguous()
-
-        pool_entries = req_pool_entries.to(torch.long)
-        selected_idx = hbm_cached_tokens_pool[pool_entries].contiguous()
-
-        # Fallback keeps mixed short/long batch semantics. Rows that already cache all candidate tokens must report copy_count=0 even though the CANN op emits k pairs.
-        max_selected = int(selected_idx.shape[1])
-        col_range = torch.arange(max_selected, device=score.device).unsqueeze(0)
-        within_len = col_range < selected_lens_arg.unsqueeze(1)
-        valid_id = (selected_idx >= 0) & (selected_idx < candidate_lens_arg.unsqueeze(1))
-        selected_valid = within_len & valid_id
-        actual_selected = selected_valid.sum(dim=1).to(candidate_lens_arg.dtype)
-        available = candidate_lens_arg - actual_selected
-        copy_count = torch.clamp(
-            torch.minimum(
-                torch.full_like(selected_lens_arg, k),
-                torch.minimum(selected_lens_arg, available),
-            ),
-            min=0,
-        )
-        copy_counts.copy_(copy_count)
-
-        ascend_ops.dsa_indexer_update(
-            score_arg,
-            selected_idx,
-            candidate_lens_arg,
-            selected_lens_arg,
-            k,
-            promote_arg,
-            demote_arg,
-        )
-
-        if score_arg is not score:
-            score.copy_(score_arg)
-        if promote_arg is not promote_idx:
-            promote_idx[:, :k].copy_(promote_arg)
-        if demote_arg is not demote_idx:
-            demote_idx[:, :k].copy_(demote_arg)
-
-        k_range = torch.arange(k, device=score.device).unsqueeze(0)
-        valid_k = k_range < copy_count.unsqueeze(1)
-        flat_pool_rows = pool_entries.unsqueeze(1).expand(-1, k)[valid_k]
-        flat_slots = demote_idx[:, :k][valid_k].to(torch.long)
-        flat_vals = promote_idx[:, :k][valid_k].to(torch.int32)
-        hbm_cached_tokens_pool[flat_pool_rows, flat_slots] = flat_vals
+    _GATHER_SELECTION_LOADED = True
 
 
-def dsa_indexer_update(
-    score: torch.Tensor,
-    hbm_cached_tokens_pool: torch.Tensor,
-    promote_idx: torch.Tensor,
-    demote_idx: torch.Tensor,
-    copy_counts: torch.Tensor,
-    candidate_lens: torch.Tensor,
-    selected_lens: torch.Tensor,
-    req_pool_entries: torch.Tensor,
-    max_copy_tokens: int,
+def dsa_gather_selection_kv_cache(
     *,
-    all_copy_count_k: bool = False,
-    pool_entries_start: int = -1,
-) -> None:
-    """Update sparse HBM budget.
-    By default this uses the CANN op. Set NANOVLLM_DSA_INDEXER_UPDATE_USE_CANN=0 to force the PyTorch prototype.
-    """
-
-    if _DSA_INDEXER_UPDATE_USE_CANN:
-        _dsa_indexer_update_cann(
-            score,
-            hbm_cached_tokens_pool,
-            promote_idx,
-            demote_idx,
-            copy_counts,
-            candidate_lens,
-            selected_lens,
-            req_pool_entries,
-            int(max_copy_tokens),
-            all_copy_count_k=all_copy_count_k,
-            pool_entries_start=pool_entries_start,
-        )
-        return
-
-    dsa_indexer_update_torch(
-        score,
-        hbm_cached_tokens_pool,
-        promote_idx,
-        demote_idx,
-        copy_counts,
-        candidate_lens,
-        selected_lens,
-        req_pool_entries,
-        int(max_copy_tokens),
-    )
-
-
-def dsa_scatter_h2d(
-    promote_idx: torch.Tensor,
-    demote_idx: torch.Tensor,
-    copy_counts: torch.Tensor,
-    hbm_block_table: torch.Tensor,
-    dram_block_table: torch.Tensor,
-    hbm_ckv_cache: torch.Tensor,
-    hbm_kpe_cache: torch.Tensor,
-    dram_ckv_cache: torch.Tensor,
-    dram_kpe_cache: torch.Tensor,
-) -> None:
-    block_size = int(hbm_ckv_cache.shape[1])
-    ascend_ops.paged_scatter_copy_h2d(
-        hbm_kpe_cache,
-        hbm_ckv_cache,
-        dram_kpe_cache,
-        dram_ckv_cache,
-        hbm_block_table,
-        dram_block_table,
-        demote_idx,
-        promote_idx,
-        copy_counts,
-        block_size,
+    selection_k_rope: torch.Tensor,
+    selection_kv_cache: torch.Tensor,
+    selection_kv_block_table: torch.Tensor,
+    selection_kv_block_status: torch.Tensor,
+    selection_topk_indices: torch.Tensor,
+    full_k_rope: torch.Tensor,
+    full_kv_cache: torch.Tensor,
+    full_kv_block_table: torch.Tensor,
+    full_kv_actual_seq: torch.Tensor,
+    full_q_actual_seq: torch.Tensor,
+) -> torch.Tensor:
+    """Gather top2048 full KV tokens into the HBM sparse budget cache."""
+    _ensure_gather_selection_loaded()
+    return torch.ops.custom.npu_gather_selection_kv_cache(
+        selection_k_rope,
+        selection_kv_cache,
+        selection_kv_block_table,
+        selection_kv_block_status,
+        selection_topk_indices,
+        full_k_rope,
+        full_kv_cache,
+        full_kv_block_table,
+        full_kv_actual_seq,
+        full_q_actual_seq,
+        selection_topk_block_size=1,
     )

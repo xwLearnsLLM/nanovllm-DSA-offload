@@ -10,7 +10,7 @@ class Config:
     model: str
     max_num_prefill_seqs_per_step: int = 1
     max_num_decode_seqs_per_step: int = 256
-    max_model_len: int = 4096
+    max_model_len: int = 65536
     tensor_parallel_size: int = 1
     enable_expert_parallel: bool = False
     enforce_eager: bool = False
@@ -21,8 +21,6 @@ class Config:
     num_index_cache_blocks: int = -1
     num_hbm_kvcache_blocks: int = -1
     num_dram_kvcache_blocks: int = -1
-    dsa_offload_fixed_tx: int = 128
-    dsa_offload_max_copy_tokens: int = 2048
     dsa_offload_max_sparse_tokens: int = -1
     hccl_port: int = 28000
     device = "npu"
@@ -32,14 +30,6 @@ class Config:
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 16 == 0
         assert 1 <= self.tensor_parallel_size
-        self.dsa_offload_fixed_tx = self._env_int(
-            "NANOVLLM_DSA_OFFLOAD_FIXED_TX",
-            self.dsa_offload_fixed_tx,
-        )
-        self.dsa_offload_max_copy_tokens = self._env_int(
-            "NANOVLLM_DSA_OFFLOAD_MAX_COPY_TOKENS",
-            self.dsa_offload_max_copy_tokens,
-        )
         self.max_num_prefill_seqs_per_step = self._env_int(
             "NANOVLLM_MAX_PREFILL_SEQS_PER_STEP",
             self.max_num_prefill_seqs_per_step,
@@ -47,6 +37,10 @@ class Config:
         self.max_num_decode_seqs_per_step = self._env_int(
             "NANOVLLM_MAX_DECODE_SEQS_PER_STEP",
             self.max_num_decode_seqs_per_step,
+        )
+        self.max_model_len = self._env_int(
+            "NANOVLLM_MAX_MODEL_LEN",
+            self.max_model_len,
         )
         self.num_hbm_kvcache_blocks = self._env_int(
             "NANOVLLM_HBM_NUM_BLOCKS",
@@ -73,8 +67,6 @@ class Config:
         self.num_kvcache_blocks = self.num_hbm_kvcache_blocks
         self.num_index_cache_blocks = self.num_dram_kvcache_blocks
         self.dsa_offload_pool_capacity = self.max_num_decode_seqs_per_step
-        if self.dsa_offload_max_copy_tokens < self.dsa_offload_fixed_tx:
-            self.dsa_offload_max_copy_tokens = self.dsa_offload_fixed_tx
         self.hf_config = self._load_hf_config()
         setattr(
             self.hf_config,

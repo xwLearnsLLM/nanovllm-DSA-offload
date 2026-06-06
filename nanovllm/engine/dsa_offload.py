@@ -3,18 +3,20 @@ from __future__ import annotations
 from collections import deque
 
 
-def compute_sparse_blocks(num_prefill_full_blocks: int) -> int:
-    """Default sparse budget piecewise function from the DSA offload design."""
+DSA_OFFLOAD_THRESHOLD_TOKENS = 8192
+DSA_SELECTION_TOPK_TOKENS = 2048
+
+
+def compute_sparse_blocks(num_prefill_full_blocks: int, block_size: int = 128) -> int:
+    """Sparse budget: dense below 8K tokens, fixed 2048-token budget above it."""
     n = int(num_prefill_full_blocks)
-    if n < 64:
+    block_size = int(block_size)
+    if n <= 0:
+        return 0
+    if n * block_size < DSA_OFFLOAD_THRESHOLD_TOKENS:
         return n
-    if n < 128:
-        return (30 * n + 99) // 100
-    if n < 256:
-        return (25 * n + 99) // 100
-    if n < 512:
-        return (22 * n + 99) // 100
-    return (20 * n + 99) // 100
+    budget_blocks = (DSA_SELECTION_TOPK_TOKENS + block_size - 1) // block_size
+    return min(n, budget_blocks)
 
 
 class SimpleBlockManager:

@@ -15,9 +15,8 @@ from transformers import PretrainedConfig
 
 import nanovllm.ops as ascend_ops
 from nanovllm.models.dsa_offload_ops import (
-    dsa_indexer_update,
-    dsa_indexer_score,
-    dsa_scatter_h2d,
+    dsa_gather_selection_kv_cache,
+    dsa_lightning_indexer,
 )
 from nanovllm.models.dsa_indexer_project import (
     dsa_indexer_project,
@@ -46,9 +45,8 @@ logger = init_logger(__name__)
 ACL_FORMAT_FRACTAL_NZ = 29
 _NPU_MLA_ATTENTION_MASK_CACHE: dict[tuple[str, int], torch.Tensor] = {}
 _NPU_MLA_V2_WORKSPACE_CACHE: dict[tuple, torch.Tensor] = {}
-_DSA_OFFLOAD_BUFFER_CACHE = {}
+_DSA_GATHER_TOPK = 2048
 _NPU_MOE_SHARED_STREAM = None
-_DSA_CHECK_ERROR_REPORTED = False
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -935,7 +933,7 @@ class DeepseekV32Indexer(nn.Module):
             n_head=self.n_head,
             head_dim=self.head_dim,
             rope_dim=self.rope_dim,
-            score_scale=1.0,  # Keep dsa_indexer_score inputs aligned with vllm-ascend BF16 SFA.
+            score_scale=1.0,  # Keep lightning_indexer inputs aligned with vllm-ascend BF16 SFA.
             detail=detail,
             sync_detail=sync_detail,
         )
@@ -1022,9 +1020,10 @@ class DeepseekV32DSAAttention(nn.Module):
         self.index_cache = torch.tensor([])
         self.dram_ckv_cache = torch.tensor([])
         self.dram_kpe_cache = torch.tensor([])
-        self.hbm_cached_tokens_pool = torch.tensor([])
-        self.dsa_offload_max_copy_tokens = 2048
-        self.dsa_offload_fixed_tx = 64
+        self.gather_selection_block_table = torch.tensor([])
+        self.gather_selection_status = torch.tensor([])
+        self.gather_selection_topk = _DSA_GATHER_TOPK
+        self.gather_selection_blocks = 0
         self.register_parameter("wd_qkv", None)
         self.w_uk_t = None
         self.w_uv = None
@@ -1043,7 +1042,6 @@ class DeepseekV32DSAAttention(nn.Module):
             "NANOVLLM_DECODE_LAYER_TIMING_SYNC",
             True,
         )
-        self.dsa_check = _env_flag("NANOVLLM_DSA_CHECK", False)
         self.log_decode_layer_timing = _env_flag(
             "NANOVLLM_LOG_DECODE_LAYER_TIMING",
             False,
@@ -1073,9 +1071,8 @@ class DeepseekV32DSAAttention(nn.Module):
             "cache": 0.0,
             "index_cache": 0.0,
             "q_up": 0.0,
-            "dsa_indexer_score": 0.0,
-            "dsa_indexer_update": 0.0,
-            "dsa_scatter_h2d": 0.0,
+            "dsa_lightning_indexer": 0.0,
+            "dsa_gather_selection": 0.0,
             "decode_attention_op": 0.0,
             "v_up": 0.0,
             "o_linear": 0.0,
@@ -1149,18 +1146,18 @@ class DeepseekV32DSAAttention(nn.Module):
         index_cache: torch.Tensor,
         dram_ckv_cache: torch.Tensor,
         dram_kpe_cache: torch.Tensor,
-        hbm_cached_tokens_pool: torch.Tensor,
-        dsa_offload_max_copy_tokens: int,
-        dsa_offload_fixed_tx: int,
+        gather_selection_block_table: torch.Tensor,
+        gather_selection_status: torch.Tensor,
     ) -> None:
         self.ckv_cache = ckv_cache
         self.kpe_cache = kpe_cache
         self.index_cache = index_cache
         self.dram_ckv_cache = dram_ckv_cache
         self.dram_kpe_cache = dram_kpe_cache
-        self.hbm_cached_tokens_pool = hbm_cached_tokens_pool
-        self.dsa_offload_max_copy_tokens = int(dsa_offload_max_copy_tokens)
-        self.dsa_offload_fixed_tx = int(dsa_offload_fixed_tx)
+        self.gather_selection_block_table = gather_selection_block_table
+        self.gather_selection_status = gather_selection_status
+        self.gather_selection_topk = min(_DSA_GATHER_TOPK, int(gather_selection_status.shape[-1]) - 1)
+        self.gather_selection_blocks = int(gather_selection_block_table.shape[1])
 
     def post_load_prepare(self) -> None:
         if self.wd_qkv is None:
@@ -1286,7 +1283,7 @@ class DeepseekV32DSAAttention(nn.Module):
             n_head=self.indexer.n_head,
             head_dim=self.indexer.head_dim,
             rope_dim=self.indexer.rope_dim,
-            score_scale=1.0,                                   # Keep dsa_indexer_score inputs aligned with vllm-ascend BF16 SFA.
+            score_scale=1.0,                                   # Keep lightning_indexer inputs aligned with vllm-ascend BF16 SFA.
             allow_compile=self.indexer.query_only_backend == "torchair",
             detail=indexer_detail,
             sync_detail=self.decode_timing_sync,
@@ -1485,182 +1482,22 @@ class DeepseekV32DSAAttention(nn.Module):
             return context.flat_index_slot_mapping
         return self._flat_slots()
 
-    def _dsa_check_enabled(self) -> bool:
-        if _DSA_CHECK_ERROR_REPORTED:
-            return False
-        return bool(self.dsa_check) and _rank_id() == 0
-
-    def _dsa_check_fail(self, record: dict) -> None:
-        global _DSA_CHECK_ERROR_REPORTED
-        if _DSA_CHECK_ERROR_REPORTED:
-            return
-        _DSA_CHECK_ERROR_REPORTED = True
-        record.setdefault("rank", _rank_id())
-        record.setdefault("layer", self.layer_id)
-        print("DSA_CHECK_FAIL " + json.dumps(record, ensure_ascii=False), flush=True)
-
-    def _dsa_check_after_scatter(
-        self,
-        *,
-        pool_slice: torch.Tensor,
-        promote_idx: torch.Tensor,
-        demote_idx: torch.Tensor,
-        copy_counts: torch.Tensor,
-        candidate_lens: torch.Tensor,
-        selected_lens: torch.Tensor,
-        req_pool_entries: torch.Tensor,
-        hbm_block_tables: torch.Tensor,
-        dram_block_tables: torch.Tensor,
-        batch_size: int,
-    ) -> None:
-        if not self._dsa_check_enabled():
-            return
-        _profile_sync(self.ckv_cache.device)
-
-        candidate_cpu = candidate_lens[:batch_size].detach().to("cpu", dtype=torch.long).tolist()
-        selected_cpu = selected_lens[:batch_size].detach().to("cpu", dtype=torch.long).tolist()
-        entries_cpu = req_pool_entries[:batch_size].detach().to("cpu", dtype=torch.long).tolist()
-        copy_counts_cpu = copy_counts[:batch_size].detach().to("cpu", dtype=torch.long).tolist()
-        promote_cpu = promote_idx[:batch_size].detach().to("cpu", dtype=torch.long)
-        demote_cpu = demote_idx[:batch_size].detach().to("cpu", dtype=torch.long)
-        block_size = self.block_size
-
-        for b in range(batch_size):
-            candidate_len = int(candidate_cpu[b])
-            selected_len = int(selected_cpu[b])
-            entry = int(entries_cpu[b])
-            copy_count = int(copy_counts_cpu[b])
-            base = {
-                "event": "dsa_check",
-                "batch": b,
-                "entry": entry,
-                "candidate_len": candidate_len,
-                "selected_len": selected_len,
-                "copy_count": copy_count,
-            }
-            if candidate_len <= selected_len:
-                continue
-            if selected_len <= 0 or not (0 <= entry < int(pool_slice.shape[0])):
-                self._dsa_check_fail({**base, "reason": "invalid_pool_entry_or_selected_len"})
-                continue
-
-            if copy_count < 0 or copy_count > min(selected_len, int(promote_idx.shape[1]), int(demote_idx.shape[1]), self.dsa_offload_max_copy_tokens):
-                self._dsa_check_fail({**base, "reason": "invalid_copy_count"})
-                continue
-            promote_valid = promote_cpu[b, :copy_count].tolist()
-            demote_valid = demote_cpu[b, :copy_count].tolist()
-            if len(set(promote_valid)) != len(promote_valid):
-                self._dsa_check_fail({**base, "reason": "promote_idx_not_unique", "promote_first": promote_valid[:16]})
-                continue
-            if len(set(demote_valid)) != len(demote_valid):
-                self._dsa_check_fail({**base, "reason": "demote_idx_not_unique", "demote_first": demote_valid[:16]})
-                continue
-            if any(token < 0 or token >= candidate_len for token in promote_valid):
-                self._dsa_check_fail({**base, "reason": "promote_idx_out_of_range", "promote_first": promote_valid[:16]})
-                continue
-            if any(slot < 0 or slot >= selected_len for slot in demote_valid):
-                self._dsa_check_fail({**base, "reason": "demote_idx_out_of_range", "demote_first": demote_valid[:16]})
-                continue
-
-            token_ids = pool_slice[entry, :selected_len].to(torch.long)
-            token_ids_cpu = token_ids.detach().to("cpu", dtype=torch.long).tolist()
-            if any(token < 0 or token >= candidate_len for token in token_ids_cpu):
-                self._dsa_check_fail({**base, "reason": "pool_token_out_of_range", "selected_first": token_ids_cpu[:16], "selected_last": token_ids_cpu[-16:]})
-                continue
-            if len(set(token_ids_cpu)) != len(token_ids_cpu):
-                self._dsa_check_fail({**base, "reason": "pool_not_unique", "selected_first": token_ids_cpu[:16], "selected_last": token_ids_cpu[-16:]})
-                continue
-            for slot, token in zip(demote_valid, promote_valid):
-                if token_ids_cpu[slot] != token:
-                    self._dsa_check_fail({**base, "reason": "demote_slot_not_promoted", "slot": int(slot), "expected_token": int(token), "actual_token": int(token_ids_cpu[slot])})
-                    break
-            if _DSA_CHECK_ERROR_REPORTED:
-                continue
-
-            logical_slots = torch.arange(selected_len, dtype=torch.long, device=token_ids.device)
-            hbm_logical_blocks = logical_slots // block_size
-            hbm_offsets = logical_slots % block_size
-            dram_logical_blocks = token_ids // block_size
-            dram_offsets = token_ids % block_size
-            hbm_table = hbm_block_tables[b].to(torch.long)
-            dram_table = dram_block_tables[b].to(torch.long)
-            if int(hbm_logical_blocks.max().item()) >= int(hbm_table.shape[0]) or int(dram_logical_blocks.max().item()) >= int(dram_table.shape[0]):
-                self._dsa_check_fail({
-                    **base,
-                    "reason": "block_table_too_short",
-                    "max_hbm_logical_block": int(hbm_logical_blocks.max().item()),
-                    "hbm_table_len": int(hbm_table.shape[0]),
-                    "max_dram_logical_block": int(dram_logical_blocks.max().item()),
-                    "dram_table_len": int(dram_table.shape[0]),
-                })
-                continue
-
-            hbm_blocks = hbm_table.index_select(0, hbm_logical_blocks)
-            dram_blocks = dram_table.index_select(0, dram_logical_blocks)
-            hbm_index_device = self.ckv_cache.device
-            dram_index_device = self.dram_ckv_cache.device
-            hbm_blocks = hbm_blocks.to(hbm_index_device)
-            hbm_offsets = hbm_offsets.to(hbm_index_device)
-            dram_blocks = dram_blocks.to(dram_index_device)
-            dram_offsets = dram_offsets.to(dram_index_device)
-            hbm_ckv = self.ckv_cache[hbm_blocks, hbm_offsets].detach().to("cpu")
-            hbm_kpe = self.kpe_cache[hbm_blocks, hbm_offsets].detach().to("cpu")
-            dram_ckv = self.dram_ckv_cache[dram_blocks, dram_offsets].detach().to("cpu")
-            dram_kpe = self.dram_kpe_cache[dram_blocks, dram_offsets].detach().to("cpu")
-            ckv_bad_slots = (hbm_ckv != dram_ckv).reshape(selected_len, -1).any(dim=1)
-            kpe_bad_slots = (hbm_kpe != dram_kpe).reshape(selected_len, -1).any(dim=1)
-            bad_slots = ckv_bad_slots | kpe_bad_slots
-            bad_slot_ids = torch.nonzero(bad_slots, as_tuple=False).flatten()
-            first_bad_slot = int(bad_slot_ids[0].item()) if bad_slot_ids.numel() else -1
-            if first_bad_slot >= 0:
-                ckv_diff = (hbm_ckv.float() - dram_ckv.float()).abs()
-                kpe_diff = (hbm_kpe.float() - dram_kpe.float()).abs()
-                self._dsa_check_fail({
-                    **base,
-                    "reason": "hbm_dram_kv_mismatch",
-                    "mismatch_slots": int(bad_slots.sum().item()),
-                    "first_bad_slot": first_bad_slot,
-                    "first_bad_token": int(token_ids[first_bad_slot].item()),
-                    "first_bad_hbm_block": int(hbm_blocks[first_bad_slot].detach().to("cpu").item()),
-                    "first_bad_hbm_offset": int(hbm_offsets[first_bad_slot].detach().to("cpu").item()),
-                    "first_bad_dram_block": int(dram_blocks[first_bad_slot].detach().to("cpu").item()),
-                    "first_bad_dram_offset": int(dram_offsets[first_bad_slot].detach().to("cpu").item()),
-                    "ckv_max_abs": float(ckv_diff.max().item()) if ckv_diff.numel() else 0.0,
-                    "kpe_max_abs": float(kpe_diff.max().item()) if kpe_diff.numel() else 0.0,
-                    "ckv_nan_count": int(torch.isnan(hbm_ckv.float()).sum().item() + torch.isnan(dram_ckv.float()).sum().item()),
-                    "kpe_nan_count": int(torch.isnan(hbm_kpe.float()).sum().item() + torch.isnan(dram_kpe.float()).sum().item()),
-                    "selected_first": token_ids_cpu[:16],
-                    "selected_last": token_ids_cpu[-16:],
-                })
-
-    def _init_prefill_sparse_token_pool(self, seq) -> None:
+    def _init_prefill_gather_selection_state(self, seq, old_hbm_block_table: list[int]) -> None:
         entry = int(seq.hbm_cached_tokens_pool_entry)
         num_full_blocks = int(seq.num_prefill_full_blocks)
-        num_sparse_blocks = int(seq.num_sparse_blocks)
-        pool = self.hbm_cached_tokens_pool[self.layer_id, entry]
-        pool.fill_(-1)
+        num_sparse_blocks = min(int(seq.num_sparse_blocks), self.gather_selection_blocks)
+        self.gather_selection_status[entry].fill_(-1)
+        self.gather_selection_block_table[entry].fill_(0)
         if num_full_blocks <= 0 or num_sparse_blocks <= 0:
             return
-
         if num_sparse_blocks >= num_full_blocks:
-            dense_tokens = num_full_blocks * self.block_size
-            if dense_tokens > int(pool.shape[0]):
-                raise RuntimeError("DSA sparse token pool is too small for dense prefill bookkeeping.")
-            pool[:dense_tokens] = torch.arange(dense_tokens, dtype=torch.int32, device=pool.device)
-            return
-
-        prefix_tokens = self.block_size                         # Keep the first physical prefix block.
-        suffix_blocks = max(0, num_sparse_blocks - 1)
-        suffix_tokens = suffix_blocks * self.block_size
-        selected_tokens = prefix_tokens + suffix_tokens
-        if selected_tokens > int(pool.shape[0]):
-            raise RuntimeError("DSA sparse token pool is too small for prefix+suffix bookkeeping.")
-
-        pool[:prefix_tokens] = torch.arange(prefix_tokens, dtype=torch.int32, device=pool.device)
-        if suffix_tokens > 0:
-            candidate_tokens = num_full_blocks * self.block_size
-            suffix_start = candidate_tokens - suffix_tokens
-            pool[prefix_tokens:selected_tokens] = torch.arange(suffix_start, candidate_tokens, dtype=torch.int32, device=pool.device)
+            keep_sparse = old_hbm_block_table[:num_sparse_blocks]
+        else:
+            prefix_blocks = 1
+            suffix_blocks = max(0, num_sparse_blocks - prefix_blocks)
+            suffix_start = num_full_blocks - suffix_blocks
+            keep_sparse = old_hbm_block_table[:prefix_blocks] + old_hbm_block_table[suffix_start:num_full_blocks]
+        self.gather_selection_block_table[entry, :len(keep_sparse)] = torch.tensor(keep_sparse, dtype=torch.int32, device=self.gather_selection_block_table.device)
 
     def finalize_prefill_offload(
         self,
@@ -1669,7 +1506,7 @@ class DeepseekV32DSAAttention(nn.Module):
     ) -> None:
         num_full_blocks = int(seq.num_prefill_full_blocks)
         num_sparse_blocks = int(seq.num_sparse_blocks)
-        self._init_prefill_sparse_token_pool(seq)
+        self._init_prefill_gather_selection_state(seq, old_hbm_block_table)
 
         if num_sparse_blocks >= num_full_blocks:
             # Dense/short requests keep every full prefill block in HBM, so their
@@ -1989,69 +1826,6 @@ class DeepseekV32DSAAttention(nn.Module):
         output = self._v_up_proj(latent)
         return output
 
-    def _dsa_offload_buffers(
-        self,
-        batch_size: int,
-        candidate_capacity: int,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        global _DSA_OFFLOAD_BUFFER_CACHE
-        copy_capacity = max(1, min(int(self.dsa_offload_fixed_tx), int(self.dsa_offload_max_copy_tokens)))  # Hot path only needs fixed Tx slots.
-        key = (str(device), dtype)
-        cached = _DSA_OFFLOAD_BUFFER_CACHE.get(key)
-        if cached is None:
-            cached_batch = cached_candidates = cached_copy = 0
-            buffers = None
-        else:
-            cached_batch, cached_candidates, cached_copy, buffers = cached
-
-        if (
-            buffers is None
-            or cached_batch < batch_size
-            or cached_candidates < candidate_capacity
-            or cached_copy < copy_capacity
-        ):
-            cached_batch = max(cached_batch, batch_size)
-            cached_candidates = max(cached_candidates, candidate_capacity)
-            cached_copy = max(cached_copy, copy_capacity)
-            score_out = torch.empty(
-                (cached_batch, cached_candidates),
-                dtype=dtype,
-                device=device,
-            )
-            promote_idx = torch.empty(
-                (cached_batch, cached_copy),
-                dtype=torch.int32,
-                device=device,
-            )
-            demote_idx = torch.empty(
-                (cached_batch, cached_copy),
-                dtype=torch.int32,
-                device=device,
-            )
-            copy_counts = torch.full(
-                (cached_batch,),
-                copy_capacity,
-                dtype=torch.int32,
-                device=device,
-            )
-            buffers = (score_out, promote_idx, demote_idx, copy_counts)
-            _DSA_OFFLOAD_BUFFER_CACHE[key] = (
-                cached_batch,
-                cached_candidates,
-                cached_copy,
-                buffers,
-            )
-
-        score_out, promote_idx, demote_idx, copy_counts = buffers
-        return (
-            score_out[:batch_size, :cached_candidates],
-            promote_idx[:batch_size, :copy_capacity],
-            demote_idx[:batch_size, :copy_capacity],
-            copy_counts[:batch_size],
-        )
-
     def _dsa_offload_update(
         self,
         q_index: torch.Tensor,
@@ -2059,112 +1833,85 @@ class DeepseekV32DSAAttention(nn.Module):
         batch_size: int,
     ) -> None:
         context = get_context()
-        if not context.needs_dsa_update or self.dsa_offload_fixed_tx <= 0:
+        if not context.needs_dsa_update:
             return
         required_context = {
             "candidate_lens": context.candidate_lens,
-            "sparse_selected_lens": context.sparse_selected_lens,
             "req_pool_entries": context.req_pool_entries,
             "index_block_tables": context.index_block_tables,
             "candidate_query_lens": context.candidate_query_lens,
-            "hbm_block_tables": context.hbm_block_tables,
             "dram_block_tables": context.dram_block_tables,
+            "gather_query_lens": context.gather_query_lens,
         }
         missing = [name for name, value in required_context.items() if value is None]
         if missing:
             raise RuntimeError(
                 "DSA offload context is missing: " + ", ".join(missing)
             )
-        candidate_lens = context.candidate_lens[:batch_size]
-        candidate_query_lens = context.candidate_query_lens[:batch_size]
-        selected_lens = context.sparse_selected_lens[:batch_size]
-        req_pool_entries = context.req_pool_entries[:batch_size]
-        max_candidate = max(int(context.max_candidate_len), 1)
-
-        (
-            score_out,
-            promote_idx,
-            demote_idx,
-            copy_counts,
-        ) = self._dsa_offload_buffers(
-            batch_size,
-            max_candidate,
-            q_index.dtype,
-            q_index.device,
-        )
+        if context.dsa_offload_all_rows:
+            active_batch = batch_size
+            q_index_active = q_index[:batch_size]
+            weights_active = weights[:batch_size]
+            index_tables = context.index_block_tables[:batch_size]
+            dram_tables = context.dram_block_tables[:batch_size]
+            candidate_lens = context.candidate_lens[:batch_size]
+            req_pool_entries = context.req_pool_entries[:batch_size]
+        else:
+            rows = context.dsa_offload_rows
+            if rows is None or rows.numel() == 0:
+                return
+            active_batch = int(rows.numel())
+            q_index_active = q_index.index_select(0, rows)
+            weights_active = weights.index_select(0, rows)
+            index_tables = context.index_block_tables.index_select(0, rows)
+            dram_tables = context.dram_block_tables.index_select(0, rows)
+            candidate_lens = context.candidate_lens.index_select(0, rows)
+            req_pool_entries = context.req_pool_entries.index_select(0, rows)
+        candidate_query_lens = context.candidate_query_lens[:active_batch]
+        gather_query_lens = context.gather_query_lens[:active_batch]
 
         profile_decode = self.log_decode_layer_timing
         start = self._decode_timer_start(profile_decode, q_index.device)
-        dsa_indexer_score(
-            q_index[:batch_size],
+        topk_indices = dsa_lightning_indexer(
+            q_index_active,
             self.index_cache,
-            weights[:batch_size],
-            context.index_block_tables[:batch_size],
+            weights_active,
+            index_tables,
             candidate_lens,
-            score_out,
             actual_seq_lengths_query=candidate_query_lens,
-            block_count=(max_candidate + self.block_size - 1) // self.block_size,
+            sparse_count=self.gather_selection_topk,
         )
-        self._decode_timer_end(
-            profile_decode,
-            "dsa_indexer_score",
-            start,
-            score_out.device,
-        )
+        self._decode_timer_end(profile_decode, "dsa_lightning_indexer", start, topk_indices.device)
 
-        pool_slice = self.hbm_cached_tokens_pool[self.layer_id]
-        start = self._decode_timer_start(profile_decode, score_out.device)
-        dsa_indexer_update(
-            score_out,
-            pool_slice,
-            promote_idx,
-            demote_idx,
-            copy_counts,
-            candidate_lens,
-            selected_lens,
-            req_pool_entries,
-            min(self.dsa_offload_fixed_tx, self.dsa_offload_max_copy_tokens),
-            all_copy_count_k=bool(context.dsa_all_copy_count_k),
-            pool_entries_start=int(context.dsa_pool_entries_start),
-        )
-        self._decode_timer_end(
-            profile_decode,
-            "dsa_indexer_update",
-            start,
-            score_out.device,
-        )
+        pool_start = int(context.dsa_pool_entries_start)
+        if pool_start >= 0:
+            selection_block_table = self.gather_selection_block_table[pool_start:pool_start + active_batch]
+            selection_status = self.gather_selection_status[pool_start:pool_start + active_batch]
+            status_needs_writeback = False
+            pool_entries_long = None
+        else:
+            pool_entries_long = req_pool_entries.to(torch.long)
+            selection_block_table = self.gather_selection_block_table.index_select(0, pool_entries_long).contiguous()
+            selection_status = self.gather_selection_status.index_select(0, pool_entries_long).contiguous()
+            status_needs_writeback = True
 
         start = self._decode_timer_start(profile_decode, self.ckv_cache.device)
-        dsa_scatter_h2d(
-            promote_idx,
-            demote_idx,
-            copy_counts,
-            context.hbm_block_tables[:batch_size],
-            context.dram_block_tables[:batch_size],
-            self.ckv_cache,
-            self.kpe_cache,
-            self.dram_ckv_cache,
-            self.dram_kpe_cache,
+        dsa_gather_selection_kv_cache(
+            selection_k_rope=self.kpe_cache.squeeze(2),
+            selection_kv_cache=self.ckv_cache.squeeze(2),
+            selection_kv_block_table=selection_block_table,
+            selection_kv_block_status=selection_status,
+            selection_topk_indices=topk_indices.view(active_batch, 1, 1, self.gather_selection_topk),
+            full_k_rope=self.dram_kpe_cache.squeeze(2),
+            full_kv_cache=self.dram_ckv_cache.squeeze(2),
+            full_kv_block_table=dram_tables,
+            full_kv_actual_seq=candidate_lens,
+            full_q_actual_seq=gather_query_lens,
         )
-        # _profile_sync(self.ckv_cache.device)                    # Scatter updates HBM KV consumed immediately by MLA.
-        self._decode_timer_end(
-            profile_decode,
-            "dsa_scatter_h2d",
-            start,
-            self.ckv_cache.device,
-        )
-        self._dsa_check_after_scatter(
-            pool_slice=pool_slice,
-            promote_idx=promote_idx,
-            demote_idx=demote_idx,
-            copy_counts=copy_counts,
-            candidate_lens=candidate_lens,
-            selected_lens=selected_lens,
-            req_pool_entries=req_pool_entries,
-            hbm_block_tables=context.hbm_block_tables[:batch_size],
-            dram_block_tables=context.dram_block_tables[:batch_size],
-            batch_size=batch_size,
-        )
+        self._decode_timer_end(profile_decode, "dsa_gather_selection", start, self.ckv_cache.device)
+        if status_needs_writeback:
+            self.gather_selection_block_table.index_copy_(0, pool_entries_long, selection_block_table)
+            self.gather_selection_status.index_copy_(0, pool_entries_long, selection_status)
 
     def _decode_forward(
         self,
@@ -2174,7 +1921,7 @@ class DeepseekV32DSAAttention(nn.Module):
         weights: torch.Tensor | None,
     ) -> torch.Tensor:
         self.last_decode_attention_op_time = 0.0
-        if not get_context().needs_dsa_update or self.dsa_offload_fixed_tx <= 0:
+        if not get_context().needs_dsa_update:
             return self._decode_forward_mla(ql_nope, q_pe, q_index, weights)
         if q_index is None or weights is None:
             raise RuntimeError("DSA offload decode requires indexer outputs.")
@@ -2193,7 +1940,7 @@ class DeepseekV32DSAAttention(nn.Module):
         assert actual_seq_lengths_key is not None
         block_table = context.block_tables[:batch_size]
         profile_decode = self.log_decode_layer_timing
-        if context.needs_dsa_update and self.dsa_offload_fixed_tx > 0:
+        if context.needs_dsa_update:
             if q_index is None or weights is None:
                 raise RuntimeError("DSA offload decode requires indexer outputs.")
             self._dsa_offload_update(q_index, weights, batch_size)
@@ -2241,7 +1988,7 @@ class DeepseekV32DSAAttention(nn.Module):
             and not context.is_prefill
             and not context.has_first_decode
         )
-        needs_decode_dsa_update = bool(context.needs_dsa_update and self.dsa_offload_fixed_tx > 0)
+        needs_decode_dsa_update = bool(context.needs_dsa_update)
         if use_decode_mlapo:
             try_torchair_with_qc = needs_decode_dsa_update and self.indexer.query_only_backend in ("torchair", "auto")
             ql_nope, q_pe, q_c = self._decode_mlapo_preprocess(
@@ -2318,7 +2065,7 @@ class DeepseekV32DSAAttention(nn.Module):
         k_pe = _rope_interleaved_to_neox(k_pe)
 
         q_index = index_k = weights = None
-        if context.needs_dsa_update and (context.is_prefill or self.dsa_offload_fixed_tx > 0):
+        if context.needs_dsa_update:
             q_index, index_k, weights = self._run_indexer(
                 hidden_states,
                 q_c,
@@ -2439,16 +2186,12 @@ class DeepseekV32DecoderLayer(nn.Module):
             attention_detail = self.self_attn.last_decode_attention_detail
             attention_gap = attention_total - sum(attention_detail.values())
             o_proj_total = attention_detail["o_linear"] + attention_detail["o_all_reduce"]
-            dsa_total = (
-                attention_detail["dsa_indexer_score"]
-                + attention_detail["dsa_indexer_update"]
-                + attention_detail["dsa_scatter_h2d"]
-            )
+            dsa_total = attention_detail["dsa_lightning_indexer"] + attention_detail["dsa_gather_selection"]
             logger.info(
                 "Decode layer timing: rank=%d layer=%d tokens=%d "
                 "attention_total=%.6fs mlapo=%.6fs indexer_project=%.6fs "
-                "index_cache=%.6fs dsa_total=%.6fs dsa_indexer_score=%.6fs "
-                "dsa_indexer_update=%.6fs dsa_scatter_h2d=%.6fs "
+                "index_cache=%.6fs dsa_total=%.6fs dsa_lightning_indexer=%.6fs "
+                "dsa_gather_selection=%.6fs "
                 "decode_attention_op=%.6fs v_up=%.6fs "
                 "o_proj=%.6fs attention_gap=%.6fs moe_total=%.6fs "
                 "mlp_kind=%s moe_backend=%s",
@@ -2460,9 +2203,8 @@ class DeepseekV32DecoderLayer(nn.Module):
                 attention_detail["indexer_project"],
                 attention_detail["index_cache"],
                 dsa_total,
-                attention_detail["dsa_indexer_score"],
-                attention_detail["dsa_indexer_update"],
-                attention_detail["dsa_scatter_h2d"],
+                attention_detail["dsa_lightning_indexer"],
+                attention_detail["dsa_gather_selection"],
                 attention_detail["decode_attention_op"],
                 attention_detail["v_up"],
                 o_proj_total,

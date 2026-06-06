@@ -11,12 +11,10 @@ import torch
 import torch.distributed as dist
 import torch_npu  # noqa: F401
 
-import nanovllm.ops as ascend_ops
-
 torch.npu.config.allow_internal_format = True
 
 from nanovllm.config import Config
-from nanovllm.engine.dsa_offload import compute_sparse_blocks
+from nanovllm.engine.dsa_offload import DSA_SELECTION_TOPK_TOKENS
 from nanovllm.engine.sequence import Sequence
 from nanovllm.layers.sampler import Sampler
 from nanovllm.models.deepseek_v32 import DeepseekV32ForCausalLM
@@ -197,9 +195,13 @@ class ModelRunner:
             * (kv_lora_rank + rope_dim)
             * self._dtype_itemsize(cache_dtype)
         )
-        blocks_per_seq = (config.max_model_len + self.block_size - 1) // self.block_size
-        max_sparse_blocks = compute_sparse_blocks(blocks_per_seq)
-        config.dsa_offload_max_sparse_tokens = max_sparse_blocks * self.block_size
+        if DSA_SELECTION_TOPK_TOKENS % self.block_size != 0:
+            raise ValueError(
+                "DSA gather_selection path expects 2048 to be divisible by "
+                f"kvcache block_size, got block_size={self.block_size}."
+            )
+        max_sparse_blocks = DSA_SELECTION_TOPK_TOKENS // self.block_size
+        config.dsa_offload_max_sparse_tokens = DSA_SELECTION_TOPK_TOKENS
 
         # Block counts are intentionally explicit. NANOVLLM_HBM_NUM_BLOCKS controls HBM KV,
         # and NANOVLLM_DRAM_NUM_BLOCKS controls both DRAM KV and IndexCache capacity.
@@ -248,10 +250,15 @@ class ModelRunner:
             1,
             rope_dim,
         )
-        pool_shape = (
-            num_layers,
+        gather_block_table_shape = (
             config.dsa_offload_pool_capacity,
-            config.dsa_offload_max_sparse_tokens,
+            max_sparse_blocks,
+        )
+        gather_status_shape = (
+            config.dsa_offload_pool_capacity,
+            1,
+            1,
+            DSA_SELECTION_TOPK_TOKENS + 1,
         )
         self._log_cache_allocation(
             block_bytes=hbm_kv_block_bytes,
@@ -261,15 +268,10 @@ class ModelRunner:
                 ("DeepSeek index cache", index_shape),
                 ("DeepSeek DRAM CKV cache", dram_ckv_shape),
                 ("DeepSeek DRAM KPE cache", dram_kpe_shape),
-                ("DeepSeek sparse token pool", pool_shape),
+                ("DeepSeek gather selection block table", gather_block_table_shape),
+                ("DeepSeek gather selection status", gather_status_shape),
             ],
         )
-        hbm_cached_tokens_pool = torch.empty(
-            pool_shape,
-            dtype=torch.int32,
-            device=self.device,
-        )
-        hbm_cached_tokens_pool.fill_(-1)
         layer_shapes = (
             ckv_shape[1:],
             kpe_shape[1:],
@@ -277,7 +279,6 @@ class ModelRunner:
             dram_ckv_shape[1:],
             dram_kpe_shape[1:],
         )
-        host_cache_template = torch.empty((), dtype=cache_dtype, device="cpu")
         for module in self.model.modules():
             if hasattr(module, "assign_dsa_cache") and hasattr(module, "layer_id"):
                 ckv_cache = torch.empty(
@@ -289,28 +290,39 @@ class ModelRunner:
                 index_cache = torch.empty(
                     layer_shapes[2], dtype=cache_dtype, device=self.device
                 )
-                dram_ckv_cache = ascend_ops.paged_scatter_copy_h2d_alloc_host_mapped_empty(
-                    host_cache_template,
+                dram_ckv_cache = torch_npu.empty_with_swapped_memory(
                     layer_shapes[3],
+                    dtype=cache_dtype,
+                    device=self.device,
                 )
-                dram_kpe_cache = ascend_ops.paged_scatter_copy_h2d_alloc_host_mapped_empty(
-                    host_cache_template,
+                dram_kpe_cache = torch_npu.empty_with_swapped_memory(
                     layer_shapes[4],
+                    dtype=cache_dtype,
+                    device=self.device,
+                )
+                gather_block_table = torch.empty(
+                    gather_block_table_shape,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                gather_status = torch.full(
+                    gather_status_shape,
+                    -1,
+                    dtype=torch.int32,
+                    device=self.device,
                 )
                 ckv_cache.zero_()
                 kpe_cache.zero_()
                 index_cache.zero_()
-                dram_ckv_cache.zero_()
-                dram_kpe_cache.zero_()
+                gather_block_table.zero_()
                 module.assign_dsa_cache(
                     ckv_cache,
                     kpe_cache,
                     index_cache,
                     dram_ckv_cache,
                     dram_kpe_cache,
-                    hbm_cached_tokens_pool,
-                    config.dsa_offload_max_copy_tokens,
-                    config.dsa_offload_fixed_tx,
+                    gather_block_table,
+                    gather_status,
                 )
 
     def prepare_block_tables(
@@ -463,9 +475,11 @@ class ModelRunner:
         decode_lens = []
         sparse_kv_lens = []
         req_pool_entries = []
+        offload_rows = []
+        offload_pool_entries = []
         needs_dsa_update = False
         has_first_decode = False
-        for seq in seqs:
+        for row, seq in enumerate(seqs):
             input_ids.append(seq.last_token)
             position = len(seq) - 1
             positions.append(position)
@@ -484,7 +498,11 @@ class ModelRunner:
             candidate_len = seq.num_prefill_full_blocks * self.block_size
             sparse_selected_len = seq.num_sparse_tokens
             sparse_kv_len = sparse_selected_len + seq.prefill_tail_len + decode_len
-            needs_dsa_update = needs_dsa_update or (candidate_len > sparse_selected_len > 0)
+            row_needs_offload = candidate_len > sparse_selected_len > 0
+            needs_dsa_update = needs_dsa_update or row_needs_offload
+            if row_needs_offload:
+                offload_rows.append(row)
+                offload_pool_entries.append(seq.hbm_cached_tokens_pool_entry)
 
             context_lens.append(sparse_kv_len)
             candidate_lens.append(candidate_len)
@@ -493,18 +511,12 @@ class ModelRunner:
             decode_lens.append(decode_len)
             sparse_kv_lens.append(sparse_kv_len)
             req_pool_entries.append(seq.hbm_cached_tokens_pool_entry)
-        max_candidate_len = max(max(candidate_lens), 1) if candidate_lens else 1
-        dsa_update_k = min(int(self.config.dsa_offload_fixed_tx), int(self.config.dsa_offload_max_copy_tokens))
-        dsa_all_copy_count_k = bool(
-            dsa_update_k > 0
-            and candidate_lens
-            and all(candidate_len > selected_len > 0 and selected_len >= dsa_update_k and candidate_len - selected_len >= dsa_update_k for candidate_len, selected_len in zip(candidate_lens, sparse_selected_lens))
-        )
-        if req_pool_entries:
-            pool_entries_start = int(req_pool_entries[0])
-            dsa_pool_entries_start = pool_entries_start if all(int(entry) == pool_entries_start + i for i, entry in enumerate(req_pool_entries)) else -1
+        if offload_pool_entries:
+            pool_entries_start = int(offload_pool_entries[0])
+            dsa_pool_entries_start = pool_entries_start if all(int(entry) == pool_entries_start + i for i, entry in enumerate(offload_pool_entries)) else -1
         else:
             dsa_pool_entries_start = -1
+        dsa_offload_all_rows = bool(offload_rows and len(offload_rows) == len(seqs))
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).to(self.device, non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).to(self.device, non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
@@ -529,6 +541,10 @@ class ModelRunner:
         decode_lens = torch.tensor(decode_lens, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
         sparse_kv_lens_tensor = torch.tensor(sparse_kv_lens, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
         candidate_query_lens = torch.arange(1, len(seqs) + 1, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
+        gather_query_lens = torch.ones(len(seqs), dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
+        dsa_offload_rows = None
+        if needs_dsa_update and not dsa_offload_all_rows:
+            dsa_offload_rows = torch.tensor(offload_rows, dtype=torch.long, pin_memory=True).to(self.device, non_blocking=True)
         set_context(False,
                     slot_mapping=slot_mapping,
                     flat_slot_mapping=flat_slot_mapping,
@@ -545,14 +561,15 @@ class ModelRunner:
                     req_pool_entries=req_pool_entries,
                     candidate_lens=candidate_lens,
                     candidate_query_lens=candidate_query_lens,
-                    max_candidate_len=max_candidate_len,
                     sparse_selected_lens=sparse_selected_lens,
                     prefill_tail_lens=prefill_tail_lens,
                     decode_lens=decode_lens,
                     sparse_kv_lens=sparse_kv_lens_tensor,
                     needs_dsa_update=needs_dsa_update,
-                    dsa_all_copy_count_k=dsa_all_copy_count_k,
                     dsa_pool_entries_start=dsa_pool_entries_start,
+                    dsa_offload_rows=dsa_offload_rows,
+                    dsa_offload_all_rows=dsa_offload_all_rows,
+                    gather_query_lens=gather_query_lens,
                     has_first_decode=has_first_decode,
                     is_enforce_eager=True,
                     real_bs=len(seqs),
