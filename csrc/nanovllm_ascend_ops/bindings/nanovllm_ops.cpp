@@ -57,6 +57,7 @@ extern void mla_preprocess_impl(
 
 #include "ops/batch_matmul_transpose/batch_matmul_transpose_torch_adpt.h"
 #include "ops/lightning_indexer/lightning_indexer_vllm_torch_adpt.h"
+#include "ops/gather_selection_kv_cache/gather_selection_kv_cache_torch_adpt.h"
 #include "ops/moe_gating_top_k/moe_gating_top_k_torch_adpt.h"
 #include "ops/dsa_scatter_h2d/paged_scatter_copy_h2d_torch_adpt.h"
 #include "ops/dsa_indexer_score/dsa_indexer_score_torch_adpt.h"
@@ -131,6 +132,32 @@ at::Tensor npu_dsa_indexer_score_py(
       optional_tensor(block_table),
       c10::string_view(layout_query.data(), layout_query.size()),
       c10::string_view(layout_key.data(), layout_key.size()));
+}
+
+at::Tensor npu_gather_selection_kv_cache_py(
+    const at::Tensor& selection_k_rope,
+    const at::Tensor& selection_kv_cache,
+    const at::Tensor& selection_kv_block_table,
+    const at::Tensor& selection_kv_block_status,
+    const at::Tensor& selection_topk_indices,
+    const at::Tensor& full_k_rope,
+    const at::Tensor& full_kv_cache,
+    const at::Tensor& full_kv_block_table,
+    const at::Tensor& full_kv_actual_seq,
+    const at::Tensor& full_q_actual_seq,
+    int64_t selection_topk_block_size) {
+  return vllm_ascend::npu_gather_selection_kv_cache(
+      selection_k_rope,
+      selection_kv_cache,
+      selection_kv_block_table,
+      selection_kv_block_status,
+      selection_topk_indices,
+      full_k_rope,
+      full_kv_cache,
+      full_kv_block_table,
+      full_kv_actual_seq,
+      full_q_actual_seq,
+      selection_topk_block_size);
 }
 
 void npu_dsa_indexer_score_bf16_out_py(
@@ -385,6 +412,20 @@ PYBIND11_MODULE(_C, m) {
       py::arg("block_table") = py::none(),
       py::arg("layout_query") = "BSND",
       py::arg("layout_key") = "PA_BSND");
+  m.def(
+      "npu_gather_selection_kv_cache",
+      &npu_gather_selection_kv_cache_py,
+      py::arg("selection_k_rope"),
+      py::arg("selection_kv_cache"),
+      py::arg("selection_kv_block_table"),
+      py::arg("selection_kv_block_status"),
+      py::arg("selection_topk_indices"),
+      py::arg("full_k_rope"),
+      py::arg("full_kv_cache"),
+      py::arg("full_kv_block_table"),
+      py::arg("full_kv_actual_seq"),
+      py::arg("full_q_actual_seq"),
+      py::arg("selection_topk_block_size") = 1);
   m.def(
       "npu_dsa_indexer_score_bf16_out",
       &npu_dsa_indexer_score_bf16_out_py,

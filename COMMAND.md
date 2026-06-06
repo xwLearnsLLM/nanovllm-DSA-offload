@@ -18,6 +18,28 @@ export NANOVLLM_MAX_DECODE_SEQS_PER_STEP=256                    # decode最大ba
 export NANOVLLM_IGNORE_EOS=1
 ```
 
+## 2026-06-06：把 gather_selection_kv_cache 合入 nano-vllm csrc
+
+本次把 `npu_gather_selection_kv_cache` 从外部实验目录合入主仓 `csrc/nanovllm_ascend_ops/ops/gather_selection_kv_cache`。
+之后 nano-vllm 直接调用自己的 `nanovllm.ops.npu_gather_selection_kv_cache`，不再依赖外部 `gather_selection_custom_ops` 包。
+
+下一次请在昇腾上先跑这个：
+
+```bash
+cd /home/w00916487/nanovllm-DSA/nano-vllm-ascend-DeepseekV32-dev_dsa_offload
+rm -rf build/nanovllm_ascend_ops nanovllm/_cann_ops_custom
+NANOVLLM_CANN_BUILD_JOBS=64 NANOVLLM_EXT_BUILD_JOBS=1 SOC_VERSION=ascend910_9391 PYTHONPATH=$PWD:$PYTHONPATH bash scripts/build_nanovllm_ops.sh
+
+PYTHONPATH=$PWD:$PYTHONPATH \
+NANOVLLM_MAX_GEN_TOKENS=8 \
+NANOVLLM_ENABLE_DECODE_MLAPO=1 \
+NANOVLLM_LOG_DECODE_LAYER_TIMING=1 \
+NANOVLLM_DECODE_LAYER_TIMING_SYNC=1 \
+NANOVLLM_PROFILE_LAYER_IDS=mid \
+NANOVLLM_PROMPT_LENGTHS=8200,9000,10000,11000,12000,13000,14000,15000,16000,17000 \
+python3 example/test.py
+```
+
 ## 推32专家残障模型（8卡910C）的公共配置
 
 ```bash

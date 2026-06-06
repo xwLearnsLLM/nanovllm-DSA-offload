@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON_BIN="${PYTHON:-python}"
 RAW_SOC_VERSION="${SOC_VERSION:-ascend910_9391}"
 ASCEND_HOME_PATH="${ASCEND_HOME_PATH:-/usr/local/Ascend/ascend-toolkit/latest}"
-CUSTOM_OPS="lightning_indexer;sparse_flash_attention;moe_gating_top_k;dsa_indexer_score;dsa_scatter_h2d;dsa_indexer_update"
+CUSTOM_OPS="lightning_indexer;gather_selection_kv_cache;sparse_flash_attention;moe_gating_top_k;dsa_indexer_score;dsa_scatter_h2d;dsa_indexer_update"
 NANOVLLM_EXT_BUILD_JOBS="${NANOVLLM_EXT_BUILD_JOBS:-1}"
 
 case "${RAW_SOC_VERSION}" in

@@ -1,12 +1,8 @@
 from __future__ import annotations
 
-import importlib
-
 import torch
 
 import nanovllm.ops as ascend_ops
-
-_GATHER_SELECTION_LOADED = False
 
 
 def dsa_lightning_indexer(
@@ -34,27 +30,6 @@ def dsa_lightning_indexer(
     )
 
 
-def _ensure_gather_selection_loaded() -> None:
-    global _GATHER_SELECTION_LOADED
-    if _GATHER_SELECTION_LOADED:
-        return
-    try:
-        importlib.import_module("gather_selection_custom_ops")
-    except ImportError as exc:
-        raise RuntimeError(
-            "gather_selection_custom_ops is not importable. Build/install "
-            "D:\\vLLM-ascend\\ops_gather_selection_kv_cache first, then run "
-            "nano-vllm with that package on PYTHONPATH."
-        ) from exc
-    if not hasattr(torch.ops, "custom") or not hasattr(torch.ops.custom, "npu_gather_selection_kv_cache"):
-        raise RuntimeError(
-            "torch.ops.custom.npu_gather_selection_kv_cache is unavailable. "
-            "Check that the gather_selection custom op package and OPP vendor "
-            "library are installed for the current CANN environment."
-        )
-    _GATHER_SELECTION_LOADED = True
-
-
 def dsa_gather_selection_kv_cache(
     *,
     selection_k_rope: torch.Tensor,
@@ -69,8 +44,7 @@ def dsa_gather_selection_kv_cache(
     full_q_actual_seq: torch.Tensor,
 ) -> torch.Tensor:
     """Gather top2048 full KV tokens into the HBM sparse budget cache."""
-    _ensure_gather_selection_loaded()
-    return torch.ops.custom.npu_gather_selection_kv_cache(
+    return ascend_ops.npu_gather_selection_kv_cache(
         selection_k_rope,
         selection_kv_cache,
         selection_kv_block_table,

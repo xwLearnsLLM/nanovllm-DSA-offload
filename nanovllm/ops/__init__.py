@@ -41,6 +41,7 @@ except ImportError as exc:
 
 moe_gating_top_k = _C.moe_gating_top_k
 npu_lightning_indexer = _C.npu_lightning_indexer
+npu_gather_selection_kv_cache = _C.npu_gather_selection_kv_cache
 npu_dsa_indexer_score = _C.npu_dsa_indexer_score
 npu_dsa_indexer_score_bf16_out = _C.npu_dsa_indexer_score_bf16_out
 npu_sparse_flash_attention = _C.npu_sparse_flash_attention
@@ -139,6 +140,7 @@ __all__ = [
     "dsa_indexer_update",
     "mla_preprocess",
     "moe_gating_top_k",
+    "npu_gather_selection_kv_cache",
     "npu_lightning_indexer",
     "npu_dsa_indexer_score",
     "npu_dsa_indexer_score_bf16_out",
