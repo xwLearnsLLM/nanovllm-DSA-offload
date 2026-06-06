@@ -9,9 +9,8 @@
 在昇腾机器的仓库根目录执行：
 
 ```bash
-rm -rf build/nanovllm_ascend_ops
+rm -rf build/nanovllm_ascend_ops     # 清除旧的编译
 NANOVLLM_CANN_BUILD_JOBS=64 NANOVLLM_EXT_BUILD_JOBS=1 SOC_VERSION=ascend910_9391 PYTHONPATH=$PWD:$PYTHONPATH bash scripts/build_nanovllm_ops.sh
-ls -lh nanovllm/_C*.so nanovllm/libnanovllm_ascend_kernels.so
 ```
 
 说明：
@@ -54,7 +53,7 @@ export NANOVLLM_MAX_MODEL_LEN=65536
 export NANOVLLM_MAX_PREFILL_SEQS_PER_STEP=1                     # prefill最大batch-size设为1，避免爆显存
 export NANOVLLM_MAX_DECODE_SEQS_PER_STEP=256                    # decode最大batch-size设为256
 export NANOVLLM_IGNORE_EOS=1
-export NANOVLLM_DSA_OFFLOAD_FIXED_TX=128   # 每请求每个decode step 每层换入的token数量
+export NANOVLLM_ENABLE_DECODE_MLAPO=1
 ```
 
 ## 推32专家残障模型（8卡910C）准备工作
@@ -75,7 +74,15 @@ export NANOVLLM_MAX_MODEL_LEN=65536
 export NANOVLLM_MAX_PREFILL_SEQS_PER_STEP=1                     # prefill最大batch-size设为1，避免爆显存
 export NANOVLLM_MAX_DECODE_SEQS_PER_STEP=256                    # decode最大batch-size设为256
 export NANOVLLM_IGNORE_EOS=1
-export NANOVLLM_DSA_OFFLOAD_FIXED_TX=128   # 每请求每个decode step 每层换入的token数量
+export NANOVLLM_ENABLE_DECODE_MLAPO=1
+```
+
+## 开启或者关闭时延分解打印
+
+```
+export NANOVLLM_LOG_DECODE_LAYER_TIMING=0    # 是否打印时延分解
+export NANOVLLM_DECODE_LAYER_TIMING_SYNC=0   # 计时时是否 sync 一下
+export NANOVLLM_PROFILE_LAYER_IDS=mid        # 打印的层
 ```
 
 ## 运行推理
@@ -85,13 +92,13 @@ export NANOVLLM_DSA_OFFLOAD_FIXED_TX=128   # 每请求每个decode step 每层�
 运行推理（不对 query_only_indexer_project 进行组图）：
 
 ```
-PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=8 NANOVLLM_ENABLE_DECODE_MLAPO=1 NANOVLLM_DSA_OFFLOAD_FIXED_TX=128 NANOVLLM_DSA_INDEXER_UPDATE_USE_CANN=1 NANOVLLM_DSA_CHECK=0 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=0 NANOVLLM_PROFILE_LAYER_IDS=mid NANOVLLM_PROMPT_LENGTHS=8200,9000,10000,11000,12000,13000,14000,15000,16000,17000 python3 example/test.py
+PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_PROMPT_LENGTHS=11000,11100,11200,11300,11000,11100,11200,11300,11000,11100,11200,11300,11000,11100,11200,11300 python3 example/test.py
 ```
 
 运行推理（对 query_only_indexer_project 进行组图）：
 
 ```
-PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_DSA_QUERY_ONLY_BACKEND=auto NANOVLLM_DSA_QUERY_ONLY_WARMUP_TOKENS=1,2,4,8,16,32,64,128 NANOVLLM_MAX_GEN_TOKENS=8 NANOVLLM_ENABLE_DECODE_MLAPO=1 NANOVLLM_DSA_OFFLOAD_FIXED_TX=128 NANOVLLM_DSA_INDEXER_UPDATE_USE_CANN=1 NANOVLLM_DSA_CHECK=0 NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=0 NANOVLLM_PROFILE_LAYER_IDS=mid NANOVLLM_PROMPT_LENGTHS=8200,9000,10000,11000,12000,13000,14000,15000,16000,17000 python3 example/test.py
+PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_DSA_QUERY_ONLY_BACKEND=auto NANOVLLM_DSA_QUERY_ONLY_WARMUP_TOKENS=16 NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_PROMPT_LENGTHS=11000,11100,11200,11300,11000,11100,11200,11300,11000,11100,11200,11300,11000,11100,11200,11300 python3 example/test.py
 ```
 
 
@@ -110,7 +117,7 @@ PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_DSA_QUERY_ONLY_BACKEND=auto NANOVLLM_DSA_QU
 | `NANOVLLM_KVCACHE_BLOCK_SIZE` | `128` | Paged KV cache block size。 |
 | `NANOVLLM_HBM_NUM_BLOCKS` | 必填 | HBM KV cache block 数量。 |
 | `NANOVLLM_DRAM_NUM_BLOCKS` | 必填 | DRAM KV cache 和 IndexCache block 数量。 |
-| `NANOVLLM_MAX_MODEL_LEN` | `65536` | engine 最大序列长度，也会影响 sparse token pool 的最大长度。 |
+| `NANOVLLM_MAX_MODEL_LEN` | `65536` | engine 最大序列长度。 |
 | `NANOVLLM_MAX_PREFILL_SEQS_PER_STEP` | `1` | 单次 prefill step 最多调度多少个新请求。 |
 | `NANOVLLM_MAX_DECODE_SEQS_PER_STEP` | example 自推导 | running 队列容量上限和 decode batch size 上限。 |
 | `NANOVLLM_PROMPT_LENGTHS` | 未设置 | 逗号分隔的精确 prompt token 长度。 |
@@ -119,10 +126,7 @@ PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_DSA_QUERY_ONLY_BACKEND=auto NANOVLLM_DSA_QU
 | `NANOVLLM_LOG_DECODE_LAYER_TIMING` | `false` | 是否打印 decode layer timing。 |
 | `NANOVLLM_DECODE_LAYER_TIMING_SYNC` | `true` | timing 前后是否同步。 |
 | `NANOVLLM_PROFILE_LAYER_IDS` | `0,mid,last` | 打印 timing 的层。 |
-| `NANOVLLM_DSA_OFFLOAD_FIXED_TX` | `128` | 每请求每层每个 decode step 最多换入的 token 数。 |
-| `NANOVLLM_DSA_INDEXER_UPDATE_USE_CANN` | `true` | 是否使用 CANN 版 `dsa_indexer_update`，设为 `0` 时走 torch 参考实现。 |
-| `NANOVLLM_DSA_CHECK` | `false` | 是否打开 DSA 轻量正确性校验。 |
-| `NANOVLLM_DSA_QUERY_ONLY_BACKEND` | `auto` | query-only indexer_project 后端选择，常用于测试 TorchAir 组图路径。 |
+| `NANOVLLM_DSA_QUERY_ONLY_BACKEND` | `current` | query-only indexer_project 后端选择，常用于测试 TorchAir 组图路径。 |
 
 　
 
@@ -133,10 +137,9 @@ PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_DSA_QUERY_ONLY_BACKEND=auto NANOVLLM_DSA_QU
 | `attention_total` | 单层 attention block 总耗时。 |
 | `indexer_project` | 生成 `q_index`、`index_k` 和 DSA score 权重。 |
 | `index_cache` | 把当前 token 的 `index_k` 写入 HBM IndexCache。 |
-| `dsa_total` | `dsa_indexer_score + dsa_indexer_update + dsa_scatter_h2d` 总和。 |
-| `dsa_indexer_score` | 基于 query 和 IndexCache 计算候选 token 分数。 |
-| `dsa_indexer_update` | 更新 sparse HBM token budget，并输出 promote/demote 信息。 |
-| `dsa_scatter_h2d` | 根据 promote 结果把 KV 从 DRAM 拷回 HBM。 |
+| `dsa_total` | `dsa_lightning_indexer + dsa_gather_selection` 总和。 |
+| `dsa_lightning_indexer` | 基于 query 和 IndexCache 选择 top sparse token。 |
+| `dsa_gather_selection` | 根据 top sparse token 把 KV 从 DRAM gather 到 HBM sparse budget。 |
 | `decode_attention_op` | 在 sparse HBM KV budget 上执行 decode MLA。 |
 | `moe_total` | attention 后 MLP/MoE block 耗时。 |
 
@@ -145,7 +148,6 @@ PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_DSA_QUERY_ONLY_BACKEND=auto NANOVLLM_DSA_QU
 `ut_ops` 已按功能整理为 `dsa/`、`indexer_project/`、`mla/`、`moe/` 四类，公共工具在 `ut_ops/common/`。常用 smoke test：
 
 ```bash
-PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/dsa/probe_indexer_score_bf16_out.py --device npu:0 --batch-size 10 --block-count 64 --warmup 10 --iters 100
-PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 NANOVLLM_DSA_INDEXER_UPDATE_USE_CANN=1 python3 ut_ops/dsa/probe_indexer_update.py --device npu:0 --batch-size 10 --candidate-len 17000 --selected-len 2560 --k 128 --warmup 10 --iters 100
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/dsa/compare_lightning_indexer_score.py --device npu:0 --batch-size 10 --candidate-len 17000 --topk 2048 --warmup 10 --iters 100
 PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/indexer_project/probe_query_only_torchair_accuracy.py --device npu:0 --tokens 10 --warmup 10 --iters 100
 ```

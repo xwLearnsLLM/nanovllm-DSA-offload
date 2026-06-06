@@ -14,10 +14,6 @@ import torch.nn.functional as F
 from transformers import PretrainedConfig
 
 import nanovllm.ops as ascend_ops
-from nanovllm.models.dsa_offload_ops import (
-    dsa_gather_selection_kv_cache,
-    dsa_lightning_indexer,
-)
 from nanovllm.models.dsa_indexer_project import (
     dsa_indexer_project,
     dsa_indexer_project_post_available,
@@ -1872,14 +1868,17 @@ class DeepseekV32DSAAttention(nn.Module):
 
         profile_decode = self.log_decode_layer_timing
         start = self._decode_timer_start(profile_decode, q_index.device)
-        topk_indices = dsa_lightning_indexer(
-            q_index_active,
-            self.index_cache,
-            weights_active,
-            index_tables,
-            candidate_lens,
+        topk_indices = ascend_ops.npu_lightning_indexer(
+            query=q_index_active,
+            key=self.index_cache,
+            weights=weights_active,
             actual_seq_lengths_query=candidate_query_lens,
+            actual_seq_lengths_key=candidate_lens,
+            block_table=index_tables,
+            layout_query="TND",
+            layout_key="PA_BSND",
             sparse_count=self.gather_selection_topk,
+            sparse_mode=3,
         )
         self._decode_timer_end(profile_decode, "dsa_lightning_indexer", start, topk_indices.device)
 
@@ -1896,17 +1895,18 @@ class DeepseekV32DSAAttention(nn.Module):
             status_needs_writeback = True
 
         start = self._decode_timer_start(profile_decode, self.ckv_cache.device)
-        dsa_gather_selection_kv_cache(
-            selection_k_rope=self.kpe_cache.squeeze(2),
-            selection_kv_cache=self.ckv_cache.squeeze(2),
-            selection_kv_block_table=selection_block_table,
-            selection_kv_block_status=selection_status,
-            selection_topk_indices=topk_indices.view(active_batch, 1, 1, self.gather_selection_topk),
-            full_k_rope=self.dram_kpe_cache.squeeze(2),
-            full_kv_cache=self.dram_ckv_cache.squeeze(2),
-            full_kv_block_table=dram_tables,
-            full_kv_actual_seq=candidate_lens,
-            full_q_actual_seq=gather_query_lens,
+        ascend_ops.npu_gather_selection_kv_cache(
+            self.kpe_cache.squeeze(2),
+            self.ckv_cache.squeeze(2),
+            selection_block_table,
+            selection_status,
+            topk_indices.view(active_batch, 1, 1, self.gather_selection_topk),
+            self.dram_kpe_cache.squeeze(2),
+            self.dram_ckv_cache.squeeze(2),
+            dram_tables,
+            candidate_lens,
+            gather_query_lens,
+            selection_topk_block_size=1,
         )
         self._decode_timer_end(profile_decode, "dsa_gather_selection", start, self.ckv_cache.device)
         if status_needs_writeback:
