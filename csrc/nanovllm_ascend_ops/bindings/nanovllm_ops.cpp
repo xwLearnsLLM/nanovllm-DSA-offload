@@ -3,6 +3,7 @@
 #include <vector>
 
 #include <torch/extension.h>
+#include <torch/library.h>
 #include <pybind11/stl.h>
 #include <acl/acl.h>
 
@@ -133,6 +134,115 @@ void npu_gather_selection_kv_cache_py(
       full_kv_cache,
       full_kv_block_table,
       full_kv_actual_seq);
+}
+
+at::Tensor lightning_indexer_torch_op(
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& weights,
+    const at::Tensor& actual_seq_lengths_query,
+    const at::Tensor& actual_seq_lengths_key,
+    const at::Tensor& block_table,
+    c10::string_view layout_query,
+    c10::string_view layout_key,
+    int64_t sparse_count,
+    int64_t sparse_mode,
+    int64_t pre_tokens,
+    int64_t next_tokens,
+    bool return_value) {
+  (void)pre_tokens;
+  (void)next_tokens;
+  (void)return_value;
+  return vllm_ascend::npu_lightning_indexer(
+      query,
+      key,
+      weights,
+      c10::optional<at::Tensor>(actual_seq_lengths_query),
+      c10::optional<at::Tensor>(actual_seq_lengths_key),
+      c10::optional<at::Tensor>(block_table),
+      layout_query,
+      layout_key,
+      sparse_count,
+      sparse_mode);
+}
+
+at::Tensor lightning_indexer_meta(
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& weights,
+    const at::Tensor& actual_seq_lengths_query,
+    const at::Tensor& actual_seq_lengths_key,
+    const at::Tensor& block_table,
+    c10::string_view layout_query,
+    c10::string_view layout_key,
+    int64_t sparse_count,
+    int64_t sparse_mode,
+    int64_t pre_tokens,
+    int64_t next_tokens,
+    bool return_value) {
+  (void)weights;
+  (void)actual_seq_lengths_query;
+  (void)actual_seq_lengths_key;
+  (void)block_table;
+  (void)sparse_mode;
+  (void)pre_tokens;
+  (void)next_tokens;
+  (void)return_value;
+  TORCH_CHECK(query.dim() >= 2, "lightning_indexer query must have at least 2 dims.");
+  TORCH_CHECK(key.dim() >= 3, "lightning_indexer key must have at least 3 dims.");
+  TORCH_CHECK(sparse_count > 0, "sparse_count must be > 0.");
+  if (std::string(layout_query) == "BSND") {
+    return at::empty({query.size(0), query.size(1), key.size(2), sparse_count}, query.options().dtype(at::kInt));
+  }
+  const int64_t n_dim_index = (std::string(layout_key) == "TND") ? 1 : 2;
+  return at::empty({query.size(0), key.size(n_dim_index), sparse_count}, query.options().dtype(at::kInt));
+}
+
+void gather_selection_kv_cache_torch_op(
+    at::Tensor selection_k_rope,
+    at::Tensor selection_kv_cache,
+    const at::Tensor& selection_kv_block_table,
+    at::Tensor selection_kv_block_status,
+    const at::Tensor& req_pool_entries,
+    const at::Tensor& selection_topk_indices,
+    const at::Tensor& full_k_rope,
+    const at::Tensor& full_kv_cache,
+    const at::Tensor& full_kv_block_table,
+    const at::Tensor& full_kv_actual_seq) {
+  vllm_ascend::npu_gather_selection_kv_cache(
+      selection_k_rope,
+      selection_kv_cache,
+      selection_kv_block_table,
+      selection_kv_block_status,
+      req_pool_entries,
+      selection_topk_indices,
+      full_k_rope,
+      full_kv_cache,
+      full_kv_block_table,
+      full_kv_actual_seq);
+}
+
+void gather_selection_kv_cache_meta(
+    at::Tensor selection_k_rope,
+    at::Tensor selection_kv_cache,
+    const at::Tensor& selection_kv_block_table,
+    at::Tensor selection_kv_block_status,
+    const at::Tensor& req_pool_entries,
+    const at::Tensor& selection_topk_indices,
+    const at::Tensor& full_k_rope,
+    const at::Tensor& full_kv_cache,
+    const at::Tensor& full_kv_block_table,
+    const at::Tensor& full_kv_actual_seq) {
+  (void)selection_k_rope;
+  (void)selection_kv_cache;
+  (void)selection_kv_block_table;
+  (void)selection_kv_block_status;
+  (void)req_pool_entries;
+  (void)selection_topk_indices;
+  (void)full_k_rope;
+  (void)full_kv_cache;
+  (void)full_kv_block_table;
+  (void)full_kv_actual_seq;
 }
 
 at::Tensor npu_sparse_flash_attention_py(
@@ -287,6 +397,31 @@ mla_preprocess_py(
 }
 
 }  // namespace
+
+TORCH_LIBRARY(nanovllm_dsa, ops) {
+  ops.def(
+      "lightning_indexer(Tensor query, Tensor key, Tensor weights,"
+      " Tensor actual_seq_lengths_query, Tensor actual_seq_lengths_key,"
+      " Tensor block_table, str layout_query, str layout_key,"
+      " int sparse_count, int sparse_mode, int pre_tokens, int next_tokens,"
+      " bool return_value) -> Tensor");
+  ops.def(
+      "gather_selection_kv_cache(Tensor(a!) selection_k_rope,"
+      " Tensor(b!) selection_kv_cache, Tensor selection_kv_block_table,"
+      " Tensor(c!) selection_kv_block_status, Tensor req_pool_entries,"
+      " Tensor selection_topk_indices, Tensor full_k_rope, Tensor full_kv_cache,"
+      " Tensor full_kv_block_table, Tensor full_kv_actual_seq) -> ()");
+}
+
+TORCH_LIBRARY_IMPL(nanovllm_dsa, PrivateUse1, ops) {
+  ops.impl("lightning_indexer", &lightning_indexer_torch_op);
+  ops.impl("gather_selection_kv_cache", &gather_selection_kv_cache_torch_op);
+}
+
+TORCH_LIBRARY_IMPL(nanovllm_dsa, Meta, ops) {
+  ops.impl("lightning_indexer", &lightning_indexer_meta);
+  ops.impl("gather_selection_kv_cache", &gather_selection_kv_cache_meta);
+}
 
 PYBIND11_MODULE(_C, m) {
   m.def(

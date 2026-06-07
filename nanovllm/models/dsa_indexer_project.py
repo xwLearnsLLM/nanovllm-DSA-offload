@@ -24,99 +24,8 @@ _GRAPH_GATHER_SELECTION_KV_CACHE = None
 _GRAPH_CUSTOM_OP_ERROR: Exception | None = None
 if ascend_ops is not None:
     try:
-        @torch.library.custom_op("nanovllm_dsa::lightning_indexer", mutates_args=())
-        def _graph_lightning_indexer(
-            query: torch.Tensor,
-            key: torch.Tensor,
-            weights: torch.Tensor,
-            actual_seq_lengths_query: torch.Tensor,
-            actual_seq_lengths_key: torch.Tensor,
-            block_table: torch.Tensor,
-            layout_query: str,
-            layout_key: str,
-            sparse_count: int,
-            sparse_mode: int,
-            pre_tokens: int,
-            next_tokens: int,
-            return_value: bool,
-        ) -> torch.Tensor:
-            return ascend_ops.npu_lightning_indexer(
-                query=query,
-                key=key,
-                weights=weights,
-                actual_seq_lengths_query=actual_seq_lengths_query,
-                actual_seq_lengths_key=actual_seq_lengths_key,
-                block_table=block_table,
-                layout_query=layout_query,
-                layout_key=layout_key,
-                sparse_count=int(sparse_count),
-                sparse_mode=int(sparse_mode),
-            )
-
-        @_graph_lightning_indexer.register_fake
-        def _(
-            query,
-            key,
-            weights,
-            actual_seq_lengths_query,
-            actual_seq_lengths_key,
-            block_table,
-            layout_query: str,
-            layout_key: str,
-            sparse_count: int,
-            sparse_mode: int,
-            pre_tokens: int,
-            next_tokens: int,
-            return_value: bool,
-        ):
-            if str(layout_query) == "BSND":
-                return torch.empty((query.shape[0], query.shape[1], key.shape[2], int(sparse_count)), dtype=torch.int32, device=query.device)
-            n_dim_index = 1 if str(layout_key) == "TND" else 2
-            return torch.empty((query.shape[0], key.shape[n_dim_index], int(sparse_count)), dtype=torch.int32, device=query.device)
-
-        @torch.library.custom_op("nanovllm_dsa::gather_selection_kv_cache", mutates_args=("selection_k_rope", "selection_kv_cache", "selection_kv_block_status"))
-        def _graph_gather_selection_kv_cache(
-            selection_k_rope: torch.Tensor,
-            selection_kv_cache: torch.Tensor,
-            selection_kv_block_table: torch.Tensor,
-            selection_kv_block_status: torch.Tensor,
-            req_pool_entries: torch.Tensor,
-            selection_topk_indices: torch.Tensor,
-            full_k_rope: torch.Tensor,
-            full_kv_cache: torch.Tensor,
-            full_kv_block_table: torch.Tensor,
-            full_kv_actual_seq: torch.Tensor,
-        ) -> None:
-            ascend_ops.npu_gather_selection_kv_cache(
-                selection_k_rope,
-                selection_kv_cache,
-                selection_kv_block_table,
-                selection_kv_block_status,
-                req_pool_entries,
-                selection_topk_indices,
-                full_k_rope,
-                full_kv_cache,
-                full_kv_block_table,
-                full_kv_actual_seq,
-            )
-
-        @_graph_gather_selection_kv_cache.register_fake
-        def _(
-            selection_k_rope,
-            selection_kv_cache,
-            selection_kv_block_table,
-            selection_kv_block_status,
-            req_pool_entries,
-            selection_topk_indices,
-            full_k_rope,
-            full_kv_cache,
-            full_kv_block_table,
-            full_kv_actual_seq,
-        ):
-            return None
-
-        _GRAPH_LIGHTNING_INDEXER = _graph_lightning_indexer
-        _GRAPH_GATHER_SELECTION_KV_CACHE = _graph_gather_selection_kv_cache
+        _GRAPH_LIGHTNING_INDEXER = torch.ops.nanovllm_dsa.lightning_indexer.default
+        _GRAPH_GATHER_SELECTION_KV_CACHE = torch.ops.nanovllm_dsa.gather_selection_kv_cache.default
     except Exception as exc:
         _GRAPH_CUSTOM_OP_ERROR = exc
         _GRAPH_LIGHTNING_INDEXER = None
@@ -1163,7 +1072,7 @@ def dsa_indexer_pipeline_with_qc_torchair(
     if index_weights_out.shape != (hidden_states.shape[0], n_head):
         raise ValueError(f"index_weights_out shape must be {(hidden_states.shape[0], n_head)}, got {tuple(index_weights_out.shape)}")
     if _GRAPH_LIGHTNING_INDEXER is None or _GRAPH_GATHER_SELECTION_KV_CACHE is None:
-        raise RuntimeError("TorchAir DSA pipeline requires torch.library custom-op wrappers for lightning_indexer/gather_selection.") from _GRAPH_CUSTOM_OP_ERROR
+        raise RuntimeError("TorchAir DSA pipeline requires C++ torch.ops.nanovllm_dsa lightning_indexer/gather_selection registrations. Rebuild with `bash scripts/build_nanovllm_ops.sh`.") from _GRAPH_CUSTOM_OP_ERROR
 
     start = _timer_start(detail, sync_detail, hidden_states.device)
     compiled, _ = _QUERY_ONLY_TORCHAIR_CACHE.compile_dsa_pipeline_with_qc(
