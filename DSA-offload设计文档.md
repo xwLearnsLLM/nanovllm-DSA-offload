@@ -1,10 +1,10 @@
 ﻿# Decode 阶段 DSA KVcache 卸载设计文档
 
-本文档描述 `nano-vllm-ascend-DeepSeekV32` 中 decode 阶段 DSA KVcache 卸载机制的稳定设计。
+本文档描述 `nano-vllm-ascend-DeepSeekV32` 当前实现中的 decode 阶段 DSA KVcache 卸载机制。
 
-设计目标是在长序列请求进入 decode 后，将 prefill 阶段的大部分 CKV/KPE 从 NPU HBM 卸载到 CPU DRAM，只在 HBM 中保留一份较小的 sparse budget、prefill 尾块以及 decode 新产生的 KVcache。这样可以显著降低单请求 HBM 占用，提高 decode batch size，并尽量把 TPOT 增量收敛到少数几个 DSA 相关算子中。
+设计目标是在长序列进入 decode 后，把 prefill 满块的 CKV/KPE 备份到 DRAM，只在 HBM 中保留固定 2048 个 prefill sparse token 的空间、prefill 尾块以及 decode 新产生的 KVcache。decode 每层通过 `npu_lightning_indexer` 选出当前 query 需要的 `GT2048`，再由 `npu_gather_selection_kv_cache` 把缺失 token 从 DRAM 加载到 HBM sparse budget 中。这样可以降低长序列 decode 的 HBM 占用，提高 decode batch size，并把额外 TPOT 主要收敛到 `lightning_indexer`、`gather_selection` 和 `indexer_project`。
 
-本文只描述当前收敛后的方案和关键优化方向，不展开每个算子的底层实现细节。尾部附录保留早期设计提纲和讨论记录，作为历史参考，不作为当前实现的唯一依据。
+本文只描述当前主路径和关键语义，不展开每个 CANN 算子的底层实现细节。尾部附录保留早期设计提纲和讨论记录，作为历史参考，不代表当前实现。
 
 ```mermaid
 flowchart LR
@@ -12,38 +12,39 @@ flowchart LR
     Sch --> IBM["IndexBlockManager<br/>管理 IndexCache blocks"]
     Sch --> HBM["HBMBlockManager<br/>管理 HBM KV blocks"]
     Sch --> DBM["DramBlockManager<br/>管理 DRAM KV blocks"]
-    Sch --> PEM["PoolEntryManager<br/>管理 sparse pool entry"]
+    Sch --> PEM["PoolEntryManager<br/>管理 gather status entry"]
 
-    IBM --> IC[("HBM IndexCache<br/>DSA 打分表征，常驻 HBM")]
-    HBM --> HKV[("HBM CKV/KPE<br/>sparse budget + tail + decode KV")]
-    DBM --> DKV[("CPU DRAM CKV/KPE<br/>prefill 满块备份")]
-    PEM --> Pool[("hbm_cached_tokens_pool<br/>每层 sparse slot 到原始 token 的映射")]
+    IBM --> IC[("HBM IndexCache<br/>DSA K 表征，常驻 HBM")]
+    HBM --> HKV[("HBM CKV/KPE<br/>GT2048 sparse budget + tail + decode KV")]
+    DBM --> DKV[("DRAM swapped CKV/KPE<br/>prefill 满块备份")]
+    PEM --> GS[("gather_selection_status<br/>每层每请求的 selection 状态")]
 
-    MR["ModelRunner / Worker<br/>准备 tensor 化元数据"] --> FWD["Model.forward<br/>Indexer + DSA 更新 + MLA"]
+    MR["ModelRunner / Worker<br/>准备 tensor 化元数据"] --> FWD["Model.forward<br/>Indexer Project + Lightning Indexer + Gather Selection + MLA"]
     FWD --> IC
     FWD --> HKV
     FWD --> DKV
-    FWD --> Pool
+    FWD --> GS
 ```
 
 ## 1. 目标和边界
 
 ### 1.1 目标
 
-1. 长序列 prefill 结束后，将 prefill 满块的 CKV/KPE 保存到 CPU DRAM。
-2. decode 阶段只让一部分 prefill 历史 layer_kv_token 常驻 HBM，并允许每层动态更新。
-3. decode 阶段新产生的 KVcache 始终放在 HBM，不参与卸载。
-4. IndexCache 常驻 HBM，用于每层 DSA 打分。
-5. model.forward 需要的调度元数据尽量在 forward 前 tensor 化，避免热路径中出现细碎 H2D/D2H。
-6. decode 热路径必须支持 batch，核心逻辑不能依赖逐请求 Python 循环。
-7. 性能目标是：卸载行为正确时，除 DSA 三大算子和 indexer_project 外，其余 decode 热路径尽量与不卸载 baseline 对齐。
+1. 长序列 prefill 结束后，将 prefill 满块 CKV/KPE 保存到 DRAM swapped memory。
+2. decode 阶段 HBM 中只保留固定 2048 个 prefill sparse token 的空间，prefill 尾块和 decode 新 token 始终完整保留。
+3. 每层 decode 使用 `npu_lightning_indexer` 直接得到 `GT2048`，再用 `npu_gather_selection_kv_cache` materialize 到 HBM sparse budget。
+4. IndexCache 常驻 HBM，用于每层 DSA 检索。
+5. `model.forward` 需要的调度元数据尽量在 forward 前 tensor 化，避免热路径中出现细碎 H2D/D2H。
+6. 长短序列混合 batch 下，短序列保持 baseline 语义，长序列进入 DSA gather-selection 路径。
+7. 性能目标是：除 DSA 检索、gather-selection 和 query-only `indexer_project` 外，其余 decode 热路径尽量与不卸载 baseline 对齐。
 
 ### 1.2 边界
 
-1. 本方案使用 MLA 计算 HBM sparse KV，不走 SFA decode。
-2. 当前实现不做 DRAM/IndexCache 前缀复用；设计上可扩展到前缀复用。
-3. 当前主路径采用固定 `Tx=128` 的有损更新策略；接口保留 `copy_counts`，后续可扩展到动态 `Tx` 或无损策略。
-4. 当前所有 TP rank 冗余执行 DSA 更新。后续可考虑 rank0 计算后广播，但这不是当前主路径。
+1. 当前 decode attention 使用 MLA 计算 HBM sparse KV，不走 SFA decode。
+2. 当前主路径不再使用旧的 `dsa_indexer_score + dsa_indexer_update + dsa_scatter_h2d` 增量更新方案。
+3. 当前 sparse budget 固定为 `2048` 个 prefill 满块 token，不再使用按长度比例变化的 `Ns` 分段函数。
+4. 当前不做 DRAM/IndexCache 前缀复用；设计上仍可扩展。
+5. 当前 TP rank 冗余执行 DSA 检索和 gather-selection。后续可考虑 rank0 计算后广播，但不是主路径。
 
 ## 2. 核心概念
 
@@ -51,49 +52,53 @@ flowchart LR
 
 本文中的 token 若无特别说明，均指 `layer_kv_token`：即某一层中某个序列位置对应的一份 CKV/KPE 表征。DSA sparse budget 管理的是 prefill 满块中的 layer_kv_token。
 
-### 2.2 三类 cache
+### 2.2 cache
 
 | cache | 典型形状 | device | 作用 |
 |---|---:|---|---|
-| `index_cache` | `(L, Cidx, B, 1, 128)` | NPU | DSA indexer 的 K 表征，常驻 HBM |
-| `hbm_ckv_cache` | `(L, Chbm, B, 1, 512)` | NPU | MLA latent KV，decode 直接读取 |
-| `hbm_kpe_cache` | `(L, Chbm, B, 1, 64)` | NPU | MLA RoPE K，decode 直接读取 |
-| `dram_ckv_cache` | `(L, Cdram, B, 1, 512)` | CPU | prefill 满块 CKV 备份 |
-| `dram_kpe_cache` | `(L, Cdram, B, 1, 64)` | CPU | prefill 满块 KPE 备份 |
+| `index_cache` | `(Cidx, B, 1, 128)` | NPU | DSA indexer 的 K 表征，常驻 HBM |
+| `ckv_cache` | `(Chbm, B, 1, 512)` | NPU | MLA latent KV，decode 直接读取 |
+| `kpe_cache` | `(Chbm, B, 1, 64)` | NPU | MLA RoPE K，decode 直接读取 |
+| `dram_ckv_cache` | `(Cdram, B, 1, 512)` | swapped memory | prefill 满块 CKV 备份 |
+| `dram_kpe_cache` | `(Cdram, B, 1, 64)` | swapped memory | prefill 满块 KPE 备份 |
+| `gather_selection_status` | `(pool_capacity, 1, 1, 2049)` | NPU | `npu_gather_selection_kv_cache` 的请求状态池 |
 
-`L` 为层数，DeepSeek V3.2 通常为 61；`B` 为 block size，当前常用 128。
+上表是单层模块内部看到的形状。每一层持有自己的 CKV/KPE、IndexCache、DRAM KV 和 `gather_selection_status`。DRAM KV 使用 `torch_npu.empty_with_swapped_memory` 申请，语义上是给 NPU 算子访问的 swapped/host-mapped 存储，不是普通 `device=cpu` tensor。
 
-DRAM KV 使用可被 NPU 算子访问的 host-mapped/pinned 内存。`dsa_scatter_h2d` 负责从 DRAM KV 按 token 粒度搬回 HBM sparse slot。
-
-### 2.3 三套 block_table
-
-每个请求维护三套 block table：
-
-| block table | 指向 | 语义 |
-|---|---|---|
-| `index_block_table` | HBM IndexCache blocks | 原始序列语义，用于 DSA 打分 |
-| `hbm_block_table` | HBM CKV/KPE blocks | decode 阶段的 sparse KV 语义，用于 MLA 和 scatter 目的地址 |
-| `dram_block_table` | DRAM CKV/KPE blocks | 原始 prefill 满块语义，用于 scatter 源地址 |
-
-三套 block table 都是请求级元数据，不按层拆分。不同层 sparse budget 选中的原始 token id 可能不同，这个逐层差异由 `hbm_cached_tokens_pool[layer, pool_entry, slot]` 表达。
-
-block id `0` 作为 null block / padding，不承载真实 KV；真实 block 从 `1` 开始编号。
-
-### 2.4 hbm_cached_tokens_pool
-
-`hbm_cached_tokens_pool` 的形状为：
+`B` 是 KV block size，当前常用 `128`。要求 `2048 % B == 0`，因此每个长序列的 sparse budget block 数为：
 
 ```text
-Tensor[(L, pool_capacity, max_sparse_tokens), int32, npu]
+max_sparse_blocks = 2048 / B
 ```
 
-其中：
+例如 `B=128` 时为 16 个 block，`B=256` 时为 8 个 block。
 
-- `L`：模型层数。
-- `pool_capacity`：可同时 decode 的请求数，固定等于 `max_num_decode_seqs_per_step`。
-- `max_sparse_tokens`：按 sparse budget 分段函数可计算出的最大 HBM prefill token 预算。
+### 2.3 四套 table
 
-`hbm_cached_tokens_pool[layer, pool_entry, slot]` 表示某层、某请求的第 `slot` 个 HBM sparse token 对应的原始 prefill token id。
+每个 decode batch 会准备以下 table：
+
+| table | 指向 | 语义 |
+|---|---|---|
+| `index_block_tables` | HBM IndexCache blocks | 原始序列语义，用于 `npu_lightning_indexer` |
+| `dram_block_tables` | DRAM CKV/KPE blocks | 原始 prefill 满块语义，用于 gather-selection 源地址 |
+| `hbm_block_tables` / `block_tables` | HBM CKV/KPE blocks | MLA 使用的完整 HBM sparse KV：sparse budget + prefill tail + decode blocks |
+| `selection_block_tables` | HBM CKV/KPE blocks | 只包含 prefill 满块的 sparse budget blocks，用于 gather-selection 目的地址 |
+
+`selection_block_tables` 可以理解为 `hbm_block_tables` 的前缀子集：它只覆盖 DSA 选择出来的 prefill 满块 sparse budget，不包含 prefill 尾块和 decode 新块。
+
+block id `0` 是 null block / padding，不承载真实 KV；真实 block 从 `1` 开始编号。三套请求级 block table 不按层拆分；逐层差异由每层独立的 `gather_selection_status` 维护。
+
+### 2.4 pool entry
+
+`PoolEntryManager` 为每个 running 请求分配一个 persistent entry。历史字段名仍叫 `hbm_cached_tokens_pool_entry`，但在当前实现里它实际指向 `gather_selection_status[entry]`。
+
+decode batch 中会把这些 entry tensor 化成：
+
+```text
+req_pool_entries: Tensor[(bsz,), int32, npu]
+```
+
+`npu_gather_selection_kv_cache` 内部用 `req_pool_entries` 找到每个 active row 对应的状态行，并在算子内部更新该状态。`selection_block_tables` 是 batch 级自然顺序，不使用 pool entry 定位；混合 batch 时只把长序列 active rows 传给 gather-selection。
 
 ## 3. 长度和 sparse budget
 
@@ -102,39 +107,43 @@ Tensor[(L, pool_capacity, max_sparse_tokens), int32, npu]
 | 符号 | 含义 |
 |---|---|
 | `Sp` | 请求 prefill token 数 |
-| `B` | block size |
+| `B` | KV block size |
 | `Nfull = Sp // B` | prefill 阶段完整 block 数 |
+| `candidate_len = Nfull * B` | 参与 DSA 选择的 prefill 满块 token 数 |
 | `tail_len = Sp % B` | prefill 最后一个非满块 token 数 |
-| `Ns` | HBM sparse budget 保留的完整 block 数 |
+| `topk = 2048` | DSA gather-selection 的固定 sparse token 预算 |
+| `Ns` | HBM sparse budget block 数 |
 | `Ts = Ns * B` | HBM sparse budget token 数 |
 | `Sd` | 已经写入 KVcache、会参与本次 MLA 的 decode token 数 |
-| `Tx` | 每层每步最多换入的 token 数 |
 
-MLA decode 阶段的实际 KV 长度为：
+当前判断长短序列只看 prefill 满块：
+
+```text
+短序列：candidate_len <= 2048
+长序列：candidate_len > 2048
+```
+
+短序列不触发卸载，`Ns = Nfull`。长序列触发卸载，`Ns = 2048 / B`。
+
+### 3.2 MLA 实际长度
+
+decode MLA 看到的是 HBM sparse KV 视角，而不是原始序列视角：
 
 ```text
 actual_seq_lengths_kv = Ts + tail_len + Sd
 ```
 
-注意这里不是原始序列长度，而是 HBM sparse KV 视角下的实际参与 attention 的 token 数。
+其中：
 
-### 3.2 sparse budget 分段函数
+- `Ts` 是 HBM sparse budget 的 token 数。短序列时等于 `candidate_len`，长序列时固定等于 2048。
+- `tail_len` 是 prefill 最后一个非满块 token 数，它不参与 DSA 稀疏选择，而是完整参与 MLA。
+- `Sd` 是已经写入 KVcache、会参与本次 MLA 的 decode token 数。
 
-当前按 prefill 满块数 `Nfull` 计算保留块数 `Ns`：
-
-| 条件 | `Ns` |
-|---|---:|
-| `Nfull < 64` | `Nfull`，不触发卸载 |
-| `64 <= Nfull < 128` | `ceil(0.30 * Nfull)` |
-| `128 <= Nfull < 256` | `ceil(0.25 * Nfull)` |
-| `256 <= Nfull < 512` | `ceil(0.22 * Nfull)` |
-| `512 <= Nfull` | `ceil(0.20 * Nfull)` |
-
-按当前配置可假设 `Ts >= 2048`。例如 `64 <= Nfull < 128` 时，`Ns >= ceil(64 * 0.30) = 20`，若 `B=128`，则 `Ts >= 2560`。
+`slot_mapping` 只负责 decode 新 token 写入 HBM 的位置，写入位置在 sparse budget 和 prefill tail 之后。
 
 ## 4. Prefill 结束后的卸载
 
-当前实现把 prefill attention 和 prefill 后卸载分开：prefill 本身仍对完整 KVcache 计算 MLA；prefill 结束后，再重写 HBM block table 并完成 DRAM 备份。
+prefill attention 仍对完整 KVcache 执行 MLA。prefill forward 结束后，ModelRunner 对长序列做 DRAM 备份和 HBM block table 重写。
 
 ```mermaid
 sequenceDiagram
@@ -142,171 +151,180 @@ sequenceDiagram
     participant R as ModelRunner
     participant M as Model.forward
     participant H as HBM KV
-    participant D as DRAM KV
-    participant P as hbm_cached_tokens_pool
+    participant D as DRAM swapped KV
+    participant G as gather_selection_status
 
-    S->>R: 调度 prefill，请求完整 HBM blocks
+    S->>R: 调度 prefill，申请完整 HBM / Index / DRAM blocks
     R->>M: prefill forward
     M->>H: 写完整 prefill CKV/KPE
-    M->>P: 写 IndexCache / 初始化候选元数据
-    R->>D: prefill 结束后，长序列满块 HBM -> DRAM
-    S->>H: 长序列释放中间 HBM blocks
-    S->>H: 保留 prefix first block + suffix blocks + tail/decode block
-    S->>P: 初始化 sparse token id 映射
+    M->>H: 写 IndexCache
+    R->>D: 长序列满块 HBM KV -> DRAM swapped KV
+    R->>G: 重置该请求每层 selection 状态为 -1
+    R->>S: 记录可释放的 HBM 中间 blocks
+    S->>H: prefill 结束后释放中间 HBM blocks
 ```
 
 ### 4.1 短序列
 
-短序列指不会触发 decode 卸载的序列。短序列保持 baseline 语义：
+短序列指 `candidate_len <= 2048`。短序列保持 baseline 语义：
 
 1. 不拷贝到 DRAM。
-2. 不重建 HBM sparse KV。
-3. `hbm_cached_tokens_pool[b]` 写成 dense arange，与原始 token 顺序一致。
-4. `hbm_block_table` 仍指向原始 HBM KV blocks。
+2. 不释放 prefill 满块 HBM blocks。
+3. 不调用 `npu_lightning_indexer` 和 `npu_gather_selection_kv_cache`。
+4. `hbm_block_tables` 仍指向原始 HBM KV blocks。
+5. `selection_block_tables` 可以填实际前缀或 padding；因为短序列不会进入 gather-selection，它不会被读取。
 
 ### 4.2 长序列
 
-长序列指会触发 decode 卸载的序列。prefill 结束后：
+长序列指 `candidate_len > 2048`。prefill 结束后：
 
-1. 将 full prefill 满块 CKV/KPE 从 HBM 拷贝到 DRAM。
-2. 调度侧释放中间 HBM blocks，只保留 prefix first block 和若干 suffix blocks。
-3. 不再执行 DRAM -> HBM 的初始化搬回，因为保留下来的 HBM blocks 本身已经包含 prefix/suffix KV。
-4. `hbm_cached_tokens_pool` 初始化为：
+1. 将 full prefill 满块 CKV/KPE 从 HBM 拷贝到 DRAM swapped memory。
+2. 重置每层 `gather_selection_status[entry] = -1`。
+3. HBM sparse budget 初始保留 prefix first block 和若干 suffix blocks。
+4. 释放中间 HBM blocks，给后续请求复用。
+5. 不做 DRAM -> HBM 的初始化搬回；保留下来的 HBM blocks 本身已经包含 prefix/suffix KV。
+
+若 `B=128`，长序列保留的 16 个 sparse blocks 为：
 
 ```text
-[0, 1, ..., B-1] + [candidate_len - suffix_tokens, ..., candidate_len - 1]
+[第 0 个 prefill 满块] + [最后 15 个 prefill 满块]
 ```
 
-这里的 prefix 是 first block，而不是固定 128 token；如果 `B=256`，则保留 prefix 256 token。
+若 `B=256`，则保留 8 个 sparse blocks：
 
-当前 prefix first block 只作为初始化保留，不永久 pin 住。后续 DSA 更新可以淘汰 prefix slot；如果未来要永久保护 attention sink token，只需要在 `dsa_indexer_update` 算子内部禁止 demote 对应 slot，外层接口不需要变化。
+```text
+[第 0 个 prefill 满块] + [最后 7 个 prefill 满块]
+```
+
+prefix first block 只是初始化状态，不永久 pin 住。后续 `npu_gather_selection_kv_cache` 会按照 `GT2048` 更新 selection 状态和 HBM sparse budget。
 
 ## 5. Decode 阶段流程
 
 ```mermaid
 flowchart TD
-    A["prepare_decode<br/>生成 tensor 化元数据"] --> B["Indexer Project<br/>生成 query_index / index_weights"]
-    B --> C["dsa_indexer_score<br/>计算候选 token 分数"]
-    C --> D["dsa_indexer_update<br/>更新 hbm_cached_tokens_pool"]
-    D --> E["dsa_scatter_h2d<br/>按 promote/demote 拷贝 DRAM KV 到 HBM"]
-    E --> F["MLA decode<br/>读取 HBM sparse KV"]
-    F --> G["输出投影 / MoE / logits"]
+    A["prepare_decode<br/>生成 HBM/DRAM/Index/Selection tables"] --> B["Indexer Project<br/>生成 query_index / index_weights"]
+    B --> C["npu_lightning_indexer<br/>直接选出 GT2048 token ids"]
+    C --> D["npu_gather_selection_kv_cache<br/>按 GT2048 更新 HBM sparse KV"]
+    D --> E["MLA decode<br/>读取 sparse budget + tail + decode KV"]
+    E --> F["输出投影 / MoE / logits"]
 ```
 
-`prepare_decode()` 在 model.forward 前准备以下关键元数据：
+`prepare_decode()` 在 `model.forward` 前准备以下关键元数据：
 
 | 元数据 | 作用 |
 |---|---|
-| `hbm_block_tables` | MLA 和 scatter 的 HBM 目的 block table |
-| `dram_block_tables` | scatter 的 DRAM 源 block table |
-| `index_block_tables` | DSA score 的 IndexCache block table |
-| `slot_mapping` | decode 新 token 写入 HBM 的位置 |
+| `hbm_block_tables` | MLA 的 HBM block table，包含 sparse budget、tail 和 decode blocks |
+| `selection_block_tables` | gather-selection 的 HBM 目的 table，只包含 sparse budget blocks |
+| `dram_block_tables` | gather-selection 的 DRAM 源 table，使用原始 prefill 满块语义 |
+| `index_block_tables` | `npu_lightning_indexer` 的 IndexCache table，使用原始序列语义 |
+| `slot_mapping` / `flat_slot_mapping_i32` | decode 新 token 写入 HBM CKV/KPE 的位置 |
+| `index_slot_mapping` | decode 新 token 写入 IndexCache 的位置 |
 | `actual_seq_lengths_kv` | MLA 实际读取的 sparse KV 长度 |
-| `candidate_lens` | 每个请求可参与 DSA 选择的 prefill token 数 |
-| `selected_lens` | 每个请求当前 HBM sparse budget token 数 |
-| `req_pool_entries` | batch 中请求到 sparse pool entry 的映射 |
+| `candidate_lens` | 每个请求参与 DSA 选择的 prefill 满块 token 数 |
+| `candidate_query_lens` | `npu_lightning_indexer` 的 query 累积长度 |
+| `req_pool_entries` | batch 请求到 `gather_selection_status` pool entry 的映射 |
+| `dsa_offload_rows` | 混合 batch 中需要进入 DSA gather-selection 的行号 |
 
-每层 decode 的 DSA 更新逻辑为：
+每层 decode 的 DSA 路径为：
 
-1. `indexer_project` 计算当前 decode query 对应的 DSA query 表征。
-2. `dsa_indexer_score` 使用 query 表征、IndexCache 和 `index_block_table` 计算候选 token score。
-3. `dsa_indexer_update` 根据 score 选择 promote token 和 demote slot，并更新 `hbm_cached_tokens_pool`。
-4. `dsa_scatter_h2d` 根据 promote/demote 结果，把 DRAM 中的 CKV/KPE 搬到 HBM sparse slot。
-5. MLA 使用更新后的 HBM sparse KV 计算 decode attention。
+1. `indexer_project` 计算当前 decode query 的 DSA query 表征和 weights。
+2. `npu_lightning_indexer` 读取 `query_index`、`index_weights`、`index_cache` 和 `index_block_tables`，直接输出 `GT2048` token ids。
+3. `npu_gather_selection_kv_cache` 根据 `GT2048`、`dram_block_tables`、`selection_block_tables` 和 `gather_selection_status`，把缺失 token 从 DRAM swapped KV 加载到 HBM sparse budget，并更新 selection 状态。
+4. MLA 读取 `hbm_block_tables` 和 `actual_seq_lengths_kv` 计算 attention。
 
-若 `Tx == 0`，则跳过 `dsa_indexer_score`、`dsa_indexer_update` 和 `dsa_scatter_h2d`，只使用 prefill 结束时初始化好的 prefix first block + suffix sparse KV。
+混合 batch 下，当前实现只把长序列 active rows 传给 `npu_lightning_indexer` 和 `npu_gather_selection_kv_cache`；短序列不进入这两个算子。纯长序列 batch 直接使用连续切片，避免额外 row gather。
 
 ## 6. 算子接口
 
-### 6.1 dsa_indexer_score
+### 6.1 npu_lightning_indexer
 
-功能：根据当前 decode query 的 indexer 表征和历史 IndexCache，计算每个候选 layer_kv_token 的 DSA 分数。
+功能：根据当前 decode query 的 indexer 表征，在 IndexCache 中直接检索 `GT2048`。
 
-核心输入包括：
-
-- `query_index`: 当前 decode query 的 indexer Q 表征。
-- `index_weights`: 当前 decode query 的 indexer weights。
-- `index_cache`: 历史 token 的 indexer K 表征。
-- `index_block_table`: 原始序列语义的 IndexCache block table。
-- `candidate_lens`: 每个请求的候选 token 数。
-- `score_out`: 输出分数，当前固定 bf16。
-
-当前实现固定走 bf16-out 新路径，避免旧路径中额外的 fp32 输出和 copy。score tensor 只需要覆盖有效候选区域，后续 `dsa_indexer_update` 按 `candidate_lens` 读取。
-
-### 6.2 dsa_indexer_update
-
-功能：只更新 sparse 索引，不做实际 KV 搬移。
-
-接口语义：
+当前调用语义：
 
 ```text
-输入/输出：score_out, hbm_cached_tokens_pool
-输出：promote_idx, demote_idx, copy_counts
-输入：candidate_lens, selected_lens, req_pool_entries, max_copy_tokens
+npu_lightning_indexer(
+    query=q_index_active,
+    key=index_cache,
+    weights=weights_active,
+    actual_seq_lengths_query=candidate_query_lens,
+    actual_seq_lengths_key=candidate_lens,
+    block_table=index_tables,
+    layout_query="TND",
+    layout_key="PA_BSND",
+    sparse_count=2048,
+    sparse_mode=3,
+)
 ```
 
-其中：
-
-- `promote_idx[b, i]` 是原始 token id，指向 DRAM 中的 prefill token。
-- `demote_idx[b, i]` 是 HBM sparse budget 内的 slot id。
-- `copy_counts[b]` 是该请求本步实际需要换入的 token 数。固定有损策略下通常等于 `Tx`；未来无损或动态策略下可以小于 `Tx`。
-
-需要满足的硬约束：
-
-1. `promote_idx[b, :copy_counts[b]]` 内部 unique。
-2. `demote_idx[b, :copy_counts[b]]` 内部 unique。
-3. 更新后的 `hbm_cached_tokens_pool[layer, entry, :selected_len]` 内部 unique。
-4. 更新后满足：`hbm_cached_tokens_pool[layer, entry, demote_idx] = promote_idx`。
-
-当前默认使用 CANN 真算子；torch 伪算子保留为调试路径。若用户显式选择真算子但算子调用失败，应直接报错，不做 silent fallback。
-
-### 6.3 dsa_scatter_h2d
-
-功能：根据 `promote_idx` 和 `demote_idx`，把 DRAM 中的 CKV/KPE 拷贝到 HBM sparse slot。
-
-核心输入：
-
-- `promote_idx`: 原始 token id。
-- `demote_idx`: HBM sparse slot id。
-- `copy_counts`: 每请求实际 copy 数。
-- `hbm_block_table`: HBM 目的 block table。
-- `dram_block_table`: DRAM 源 block table。
-- `hbm_ckv_cache / hbm_kpe_cache`: 目的 cache。
-- `dram_ckv_cache / dram_kpe_cache`: 源 cache。
-
-`dsa_scatter_h2d` 在当前 NPU stream 上提交拷贝任务。性能路径不在 scatter 后做全 device synchronize；如果需要正确性诊断，可通过 `NANOVLLM_DSA_CHECK=1` 打开校验。
-
-## 7. Indexer Project
-
-`indexer_project` 负责计算 DSA 打分所需的 query 侧表征。它和 `dsa_indexer_score` 的关系是：
+输出为：
 
 ```text
-hidden_states / q_c  --indexer_project-->  query_index, index_weights
-query_index, index_weights, index_cache  --dsa_indexer_score--> score_out
+topk_indices: Tensor[(active_batch, 2048), int32, npu]
 ```
 
-decode 后续 step 主要走 query-only 路径：历史 token 的 IndexCache 已在 prefill 或 decode 写入，不需要每步重复计算 K。当前优化方向包括：
+这里的 `topk_indices` 是原始 prefill 满块 token id，范围为 `[0, candidate_len)`。
+
+### 6.2 npu_gather_selection_kv_cache
+
+功能：根据 `GT2048`，把 DRAM swapped KV 中对应的 CKV/KPE materialize 到 HBM sparse budget，并在算子内部维护 selection 状态。
+
+当前调用语义：
+
+```text
+npu_gather_selection_kv_cache(
+    selection_kpe,              # HBM KPE cache，目的
+    selection_ckv,              # HBM CKV cache，目的
+    selection_block_table,      # active rows 的 HBM sparse budget blocks
+    gather_selection_status,    # 每层 status pool
+    req_pool_entries,           # active rows -> status pool entry
+    topk_indices.view(active_batch, 1, 1, 2048),
+    full_kpe,                   # DRAM swapped KPE cache，源
+    full_ckv,                   # DRAM swapped CKV cache，源
+    dram_block_table,           # active rows 的 DRAM prefill full blocks
+    candidate_lens,             # active rows 的候选长度
+)
+```
+
+这个算子没有返回值，直接原地更新：
+
+- HBM `selection_kpe`
+- HBM `selection_ckv`
+- HBM `gather_selection_status[req_pool_entries]`
+
+与官方 `npu_gather_selection_kv_cache` 相比，当前仓内版本额外加入了 pool-entry 机制，因此外层不需要在每层调用前后手动 gather/scatter `selection_kv_block_status`。`selection_topk_block_size` 固化为 1，不再作为外层参数传递。
+
+### 6.3 dsa_indexer_project_post
+
+`dsa_indexer_project_post` 是 query-only `indexer_project` 的后处理 CANN 算子，主要负责 RoPE 相关后处理和输出整理。decode 后续 step 中历史 token 的 IndexCache 已经写好，因此 query-only 路径只需要生成当前 query 的 `q_index` 和 `index_weights`。
+
+当前优化方向：
 
 1. query-only 输出 buffer 复用，减少临时 tensor 分配。
 2. `weights_proj` 固定 BF16 路径，避免 decode 热路径中不必要的 fp32 投影。
-3. 小 batch 下尝试 TorchAir 组图，降低 Python 调度和小算子开销。
-4. q BMM 路径按 batch 上限选择，避免大 batch 时误走低效路径。
-5. 长期可考虑把 query-only indexer_project 做成融合 CANN 算子。
+3. 小 batch 可尝试 TorchAir 组图，降低 Python 调度和小算子开销。
+4. 长期可考虑把 query-only indexer_project 写成更大的融合 CANN 算子。
 
-这些是性能优化方向，文档不展开底层实现细节。
+## 7. IndexCache 写入
+
+prefill 阶段会为全部 prefill token 写 IndexCache。decode 阶段新 token 也会写 IndexCache，位置由 `index_slot_mapping` 决定。IndexCache 不随 HBM KV sparse budget 释放而释放，因为 `npu_lightning_indexer` 需要在原始序列语义下检索完整历史候选。
+
+IndexCache 容量由 `NANOVLLM_DRAM_NUM_BLOCKS` 决定，和 DRAM KV block 数保持相同，但二者仍然由不同 BlockManager 分开管理。
 
 ## 8. 调度和容量配置
 
-当前块数量直接由环境变量决定，不再通过 warmup 反推：
+当前块数量直接由环境变量决定，不通过 warmup 反推：
 
 | 配置 | 含义 | 默认 |
 |---|---|---:|
 | `NANOVLLM_HBM_NUM_BLOCKS` | HBM CKV/KPE block 数 | 必填 |
 | `NANOVLLM_DRAM_NUM_BLOCKS` | DRAM CKV/KPE block 数，同时也是 IndexCache block 数 | 必填 |
+| `NANOVLLM_KVCACHE_BLOCK_SIZE` | KV block size，要求整除 2048 | 代码默认 256；常用运行命令设为 128 |
 | `NANOVLLM_MAX_MODEL_LEN` | 最大序列长度 | 65536 |
 | `NANOVLLM_MAX_PREFILL_SEQS_PER_STEP` | 单步最多调度多少个 prefill 请求 | 1 |
-| `NANOVLLM_MAX_DECODE_SEQS_PER_STEP` | decode batch 上限，也是 sparse pool capacity | 256 |
-| `NANOVLLM_DSA_OFFLOAD_FIXED_TX` | 固定有损更新的 `Tx` | 128 |
+| `NANOVLLM_MAX_DECODE_SEQS_PER_STEP` | decode batch 上限，也是 gather status pool capacity | 256 |
+| `NANOVLLM_ENABLE_DECODE_MLAPO` | decode 后续 step 是否启用 MLAPO | true |
+| `NANOVLLM_DSA_QUERY_ONLY_BACKEND` | query-only indexer_project 后端，`current/auto/torchair` | current |
 
 调度器保持如下规则：
 
@@ -319,52 +337,46 @@ decode 后续 step 主要走 query-only 路径：历史 token 的 IndexCache 已
 
 为了保证 sparse KV 和 MLA 语义一致，需要持续满足：
 
-1. `hbm_block_table`、`actual_seq_lengths_kv`、`slot_mapping` 必须使用同一套 sparse KV 语义。
-2. `index_block_table` 始终使用原始序列语义。
-3. `dram_block_table` 只覆盖 prefill 满块，使用原始 prefill 满块 token id 语义。
-4. `hbm_cached_tokens_pool` 中有效区域的 token id 必须落在 `[0, candidate_len)`。
-5. 对长序列，每层 `hbm_cached_tokens_pool` 允许不同；三套 block table 不按层拆。
-6. scatter 后，使用 `hbm_cached_tokens_pool` 作为索引从 DRAM 取出的 CKV/KPE，应与 HBM sparse slot 中的数据一致。
-7. 若 `NANOVLLM_DSA_CHECK=1`，只做诊断校验；若为 `0`，性能路径不应引入校验同步。
+1. `hbm_block_tables`、`actual_seq_lengths_kv`、`slot_mapping` 必须使用同一套 HBM sparse KV 语义。
+2. `selection_block_tables` 必须是 `hbm_block_tables` 中 prefill 满块 sparse budget 部分的子集。
+3. `index_block_tables` 始终使用原始序列语义。
+4. `dram_block_tables` 只覆盖 prefill 满块，使用原始 prefill 满块语义。
+5. `candidate_lens` 只统计 prefill 满块 token，不包含 prefill tail 和 decode token。
+6. prefill tail 和 decode 新 token 不参与 DSA topk 选择，但完整参与 MLA。
+7. 短序列不进入 `npu_lightning_indexer` 和 `npu_gather_selection_kv_cache`，保持 baseline KV 语义。
+8. 长序列 gather-selection 后，HBM sparse budget 应与 `GT2048` 对应的 DRAM KV 内容一致。
+9. `gather_selection_status` 是每层独立状态，必须通过 `req_pool_entries` 绑定请求，避免 batch 顺序变化导致状态串行。
 
 ## 10. 性能观察和优化方向
 
 当前 decode TPOT 的主要优化目标集中在：
 
-1. `dsa_indexer_score`
-2. `dsa_indexer_update`
-3. `dsa_scatter_h2d`
-4. query-only `indexer_project`
+1. `npu_lightning_indexer`
+2. `npu_gather_selection_kv_cache`
+3. query-only `indexer_project`
+4. MLA/MLAPO 周边的小 batch 投影路径
 
-其它热路径应尽量与不卸载 baseline 对齐。已经固化的方向包括：
+已经固化的方向包括：
 
 - decode MLA 使用 FIA v2 路径。
 - RoPE cache 使用 neox 语义，与 MLAPO 对齐。
 - qkv_a 投影固定 fused。
-- `kv_b_proj` 加载后释放，只保留 MLA 所需的投影权重。
-- `dsa_indexer_score` 固定写 bf16 `score_out`，减少额外 copy。
-- scatter 后不在性能路径做全 device synchronize。
+- `kv_b_proj` 加载后释放，只保留 MLA 所需投影权重。
+- MoE 固定 grouped 路径。
+- `gather_selection` 状态 pool entry 逻辑下沉到算子内部，减少 Python 前后处理。
+- `selection_block_tables` 在 `prepare_decode` 中构造，和 `hbm_block_tables` 使用同一批请求顺序。
 
 后续可继续优化：
 
-- `dsa_indexer_update` 算子内部 topk 和唯一性维护。
-- query-only indexer_project 的组图或融合算子版本。
-- `dsa_scatter_h2d` 的 AIV 并行搬运效率。
-- 大 batch 下 q_up/v_up 相关 BMM 路径。
-- 动态 `Tx` 或无损更新策略。
+- `npu_gather_selection_kv_cache` 内部状态维护和 DRAM->HBM 搬运效率。
+- `npu_lightning_indexer` 大 batch 下的检索效率。
+- query-only indexer_project 的 TorchAir 组图精度和稳定性。
+- 把 query-only indexer_project 进一步做成融合 CANN 算子。
+- 让 gather-selection 算子直接接收长短序列混合 batch 并内部跳过短序列，进一步减少 Python row 选择。
 
 ## 11. 后续扩展
 
-### 11.1 动态 Tx / 无损策略
-
-当前接口已经有 `copy_counts`，因此未来可以在不改变外层框架接口的情况下，把 `dsa_indexer_update` 改成动态 `Tx`：
-
-- 若 `GT2048` 已全部在 HBM sparse budget 中，则 `copy_counts[b]=0`。
-- 若有缺失，则 promote 缺失部分，并 demote 同等数量低分 token。
-
-这主要改变 `dsa_indexer_update` 内部策略和 `dsa_scatter_h2d` 的实际 copy 数量，不需要重写调度元数据。
-
-### 11.2 前缀复用
+### 11.1 前缀复用
 
 前缀复用主要发生在 `DramBlockManager` 和 `IndexBlockManager`：
 
@@ -374,9 +386,13 @@ Nc = min(DramBlockManager 命中块数, IndexBlockManager 命中块数)
 
 HBM sparse budget 本身不直接表达前缀命中。命中前缀块可在 prefill 前加载到 HBM 参与完整 prefill attention，prefill 结束后再按普通规则释放。
 
-### 11.3 prefix 保护
+### 11.2 prefix 保护
 
-当前 prefix first block 只作为初始化保留，不永久 pin 住。若未来希望永久保护 attention sink token，可在 `dsa_indexer_update` 内部禁止 demote prefix slot，外层 block table、pool 和 scatter 接口不需要变化。
+当前 prefix first block 只作为初始化保留，不永久 pin 住。若未来希望永久保护 attention sink token，需要在 gather-selection / selection 状态更新逻辑中保护对应 token，外层 block table 和 MLA 语义不需要变化。
+
+### 11.3 增量更新方案
+
+旧的 `dsa_indexer_score + dsa_indexer_update + dsa_scatter_h2d` 可以看作增量更新路线：每步只搬运少量缺失 token，理论 H2D 数据量更小，但需要额外维护 promote/demote 唯一性，且无损策略会显著增加 update 复杂度。当前主路径改为每层直接 materialize `GT2048`，把策略复杂度下沉到 `npu_gather_selection_kv_cache` 的 selection 状态机制中。
 
 ## 附录：设计文档提纲（提示词）
 
@@ -680,4 +696,3 @@ HBM sparse budget 本身不直接表达前缀命中。命中前缀块可在 pref
 13. "如果 Ns 太小，输出质量可能明显下降。" ，是的，所以我在想，分段函数可能改成宏定义可配，这样可以调整预算。不过不管怎么配，你都可以假设 Ts >= 2048
 
 ````
-
