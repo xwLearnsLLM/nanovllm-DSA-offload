@@ -279,7 +279,7 @@ def _dsa_indexer_pipeline_with_qc_functional(
         (1 << 63) - 1,
         (1 << 63) - 1,
         False,
-    )
+    )[0]
     _GRAPH_GATHER_SELECTION_KV_CACHE(
         selection_kpe,
         selection_ckv,
