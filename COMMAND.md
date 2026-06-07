@@ -57,3 +57,11 @@ PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/dsa/probe
 
 PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/dsa/probe_gather_selection_pool.py --device npu:0 --batch-size 8 --pool-capacity 16 --full-len 16384 --topk 2048 --block-size 128 --no-mixed-short --warmup 10 --iters 100
 ```
+
+## 2026-06-07 16:46：修复 gather_block_table 残留变量后重跑推理
+
+下一次请在昇腾上先跑这个：
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_PROMPT_LENGTHS=11000,11100,11200,11300,11000,11100,11200,11300,11000,11100,11200,11300,11000,11100,11200,11300 python3 example/test.py
+```

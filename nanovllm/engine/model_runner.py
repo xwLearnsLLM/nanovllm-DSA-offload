@@ -304,7 +304,6 @@ class ModelRunner:
                 ckv_cache.zero_()
                 kpe_cache.zero_()
                 index_cache.zero_()
-                gather_block_table.zero_()
                 module.assign_dsa_cache(
                     ckv_cache,
                     kpe_cache,
