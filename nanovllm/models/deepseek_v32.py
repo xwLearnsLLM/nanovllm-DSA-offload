@@ -18,7 +18,7 @@ from nanovllm.models.dsa_indexer_project import (
     dsa_indexer_project,
     dsa_indexer_project_query_only,
     dsa_indexer_project_query_only_torchair,
-    dsa_indexer_project_query_only_with_qc_torchair,
+    dsa_indexer_pipeline_with_qc_torchair,
     warmup_dsa_query_only_torchair,
     warmup_dsa_query_only_with_qc_torchair,
 )
@@ -663,6 +663,8 @@ class DeepseekV32Indexer(nn.Module):
                 )
                 if used_torchair:
                     return q_index, None, index_weights
+                if self.query_only_backend == "torchair":
+                    raise RuntimeError(f"DSA query-only TorchAir graph failed: {reason}")
             wq_b_bmm_t = self._query_only_wq_b_bmm_t(q_c.dtype, q_c.device)
             dsa_indexer_project_query_only(
                 hidden_states,
@@ -771,6 +773,7 @@ class DeepseekV32DSAAttention(nn.Module):
         self.last_decode_attention_detail = {
             "mlapo": 0.0,
             "indexer_project": 0.0,
+            "dsa_pipeline": 0.0,
             "dsa_lightning_indexer": 0.0,
             "dsa_gather_selection": 0.0,
             "decode_attention_op": 0.0,
@@ -920,45 +923,84 @@ class DeepseekV32DSAAttention(nn.Module):
         )
         self.indexer.query_only_torchair_warmup_status = {int(tokens): f"q_only={q_only_status.get(int(tokens), 'skipped')};with_qc={with_qc_status.get(int(tokens), 'skipped')}" for tokens in self.indexer.query_only_warmup_tokens}
 
-    def _run_indexer_with_qc_torchair(
-        self,
-        hidden_states: torch.Tensor,
-        positions: torch.Tensor,
-        profile_decode: bool,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, bool]:
-        if self.indexer.query_only_backend not in ("torchair", "auto"):
-            return None, None, None, False
+    def _run_dsa_pipeline_with_qc_torchair(self, hidden_states: torch.Tensor, positions: torch.Tensor, batch_size: int, profile_decode: bool) -> bool:
+        context = get_context()
+        if self.indexer.query_only_backend != "torchair":
+            return False
         q_a_weight = None if self.wd_qkv is None else self.wd_qkv[: self.q_lora_rank]
         if q_a_weight is None:
-            return None, None, None, False
+            raise RuntimeError("DSA TorchAir pipeline requires fused q_a weight, but wd_qkv is not prepared.")
+        required_context = {
+            "candidate_lens": context.candidate_lens,
+            "req_pool_entries": context.req_pool_entries,
+            "index_block_tables": context.index_block_tables,
+            "candidate_query_lens": context.candidate_query_lens,
+            "dram_block_tables": context.dram_block_tables,
+            "selection_block_tables": context.selection_block_tables,
+        }
+        missing = [name for name, value in required_context.items() if value is None]
+        if missing:
+            raise RuntimeError("DSA TorchAir pipeline context is missing: " + ", ".join(missing))
+
+        if context.dsa_offload_all_rows:
+            active_batch = int(batch_size)
+            hidden_active = hidden_states[:batch_size]
+            positions_active = positions[:batch_size]
+            index_tables = context.index_block_tables[:batch_size]
+            dram_tables = context.dram_block_tables[:batch_size]
+            selection_block_table = context.selection_block_tables[:batch_size]
+            candidate_lens = context.candidate_lens[:batch_size]
+            req_pool_entries = context.req_pool_entries[:batch_size]
+        else:
+            rows = context.dsa_offload_rows
+            if rows is None or rows.numel() == 0:
+                return True
+            active_batch = int(rows.numel())
+            hidden_active = hidden_states.index_select(0, rows)
+            positions_active = positions.index_select(0, rows)
+            index_tables = context.index_block_tables.index_select(0, rows)
+            dram_tables = context.dram_block_tables.index_select(0, rows)
+            selection_block_table = context.selection_block_tables.index_select(0, rows)
+            candidate_lens = context.candidate_lens.index_select(0, rows)
+            req_pool_entries = context.req_pool_entries.index_select(0, rows)
+        candidate_query_lens = context.candidate_query_lens[:active_batch]
 
         start = self._decode_timer_start(profile_decode, hidden_states.device)
-        cos, sin = self.indexer._rope_cos_sin(positions, self.indexer_rotary_emb, hidden_states.dtype)
-        q_index, _, index_weights = self.indexer._get_output_buffers(hidden_states)
-        weights_proj_weight = self.indexer._query_only_weights_proj_weight(hidden_states.dtype, hidden_states.device)
-        q_index, index_weights, used_torchair, reason = dsa_indexer_project_query_only_with_qc_torchair(
-            hidden_states,
+        cos, sin = self.indexer._rope_cos_sin(positions_active, self.indexer_rotary_emb, hidden_states.dtype)
+        q_index, _, index_weights = self.indexer._get_output_buffers(hidden_active)
+        dsa_indexer_pipeline_with_qc_torchair(
+            hidden_active,
             cos,
             sin,
             q_a_weight,
             self.q_a_layernorm.weight,
             self.indexer.wq_b.weight,
-            weights_proj_weight,
+            self.indexer._query_only_weights_proj_weight(hidden_states.dtype, hidden_states.device),
             q_index,
             index_weights,
+            self.index_cache,
+            candidate_query_lens,
+            candidate_lens,
+            index_tables,
+            self.kpe_cache.squeeze(2),
+            self.ckv_cache.squeeze(2),
+            selection_block_table,
+            self.gather_selection_status,
+            req_pool_entries,
+            self.dram_kpe_cache.squeeze(2),
+            self.dram_ckv_cache.squeeze(2),
+            dram_tables,
             q_norm_eps=float(self.q_a_layernorm.eps),
             n_head=self.indexer.n_head,
             head_dim=self.indexer.head_dim,
             rope_dim=self.indexer.rope_dim,
-            score_scale=1.0,                                   # Keep lightning_indexer inputs aligned with vllm-ascend BF16 SFA.
-            allow_compile=self.indexer.query_only_backend == "torchair",
+            score_scale=1.0,
+            sparse_count=self.gather_selection_topk,
             detail=None,
             sync_detail=False,
         )
-        self._decode_timer_end(profile_decode, "indexer_project", start, hidden_states.device)
-        if not used_torchair:
-            return None, None, None, False
-        return q_index, None, index_weights, True
+        self._decode_timer_end(profile_decode, "dsa_pipeline", start, hidden_states.device)
+        return True
 
     def _prepare_decode_mlapo(self) -> None:
         if self.mlapo_wd_qkv is not None and self.mlapo_wu_q is not None:
@@ -1315,12 +1357,12 @@ class DeepseekV32DSAAttention(nn.Module):
         )
         self._decode_timer_end(profile_decode, "dsa_gather_selection", start, self.ckv_cache.device)
 
-    def _decode_forward_mla(self, ql_nope: torch.Tensor, q_pe: torch.Tensor, q_index: torch.Tensor | None, weights: torch.Tensor | None) -> torch.Tensor:
+    def _decode_forward_mla(self, ql_nope: torch.Tensor, q_pe: torch.Tensor, q_index: torch.Tensor | None, weights: torch.Tensor | None, dsa_updated: bool = False) -> torch.Tensor:
         context = get_context()
         batch_size = int(ql_nope.shape[0])
         assert context.actual_seq_lengths_kv is not None
         profile_decode = self.log_decode_layer_timing
-        if context.needs_dsa_update:
+        if context.needs_dsa_update and not dsa_updated:
             if q_index is None or weights is None:
                 raise RuntimeError("DSA offload decode requires indexer outputs.")
             self._dsa_offload_update(q_index, weights, batch_size)
@@ -1349,21 +1391,21 @@ class DeepseekV32DSAAttention(nn.Module):
         use_decode_mlapo = self.enable_decode_mlapo and not context.is_prefill and not context.has_first_decode
         needs_decode_dsa_update = bool(context.needs_dsa_update)
         if use_decode_mlapo:
-            try_torchair_with_qc = needs_decode_dsa_update and self.indexer.query_only_backend in ("torchair", "auto")
+            try_torchair_with_qc = needs_decode_dsa_update and self.indexer.query_only_backend == "torchair"
             ql_nope, q_pe, q_c = self._decode_mlapo_preprocess(positions, hidden_states, profile_decode, need_inner_out=needs_decode_dsa_update and not try_torchair_with_qc)
             q_index = index_k = weights = None
+            dsa_updated = False
             if needs_decode_dsa_update:
-                used_torchair_with_qc = False
                 if try_torchair_with_qc:
-                    q_index, index_k, weights, used_torchair_with_qc = self._run_indexer_with_qc_torchair(hidden_states, positions, profile_decode)
-                if not used_torchair_with_qc:
+                    dsa_updated = self._run_dsa_pipeline_with_qc_torchair(hidden_states, positions, int(hidden_states.shape[0]), profile_decode)
+                if not dsa_updated:
                     if try_torchair_with_qc or q_c is None or q_c.numel() == 0:
-                        q_c = self._decode_mlapo_q_c_fallback(hidden_states)  # TorchAir unavailable/fallback: compute q_c on the old path.
+                        q_c = self._decode_mlapo_q_c_fallback(hidden_states)
                     q_index, index_k, weights = self._run_indexer(hidden_states, q_c, positions, profile_decode, query_only=True)
             if index_k is not None:
                 self._store_index_cache(index_k)
 
-            attn_output = self._decode_forward_mla(ql_nope, q_pe, q_index, weights)
+            attn_output = self._decode_forward_mla(ql_nope, q_pe, q_index, weights, dsa_updated=dsa_updated)
             return self._o_proj_forward(attn_output, profile_decode)
 
         qkv_a = F.linear(hidden_states, self.wd_qkv)
@@ -1456,11 +1498,11 @@ class DeepseekV32DecoderLayer(nn.Module):
                 _profile_sync(hidden_states.device)
             attention_detail = self.self_attn.last_decode_attention_detail
             o_proj_total = attention_detail["o_linear"] + attention_detail["o_all_reduce"]
-            dsa_total = attention_detail["dsa_lightning_indexer"] + attention_detail["dsa_gather_selection"]
+            dsa_total = attention_detail["dsa_pipeline"] + attention_detail["dsa_lightning_indexer"] + attention_detail["dsa_gather_selection"]
             logger.info(
                 "Decode layer timing: rank=%d layer=%d tokens=%d "
                 "attention_total=%.6fs mlapo=%.6fs indexer_project=%.6fs "
-                "dsa_total=%.6fs dsa_lightning_indexer=%.6fs dsa_gather_selection=%.6fs "
+                "dsa_total=%.6fs dsa_pipeline=%.6fs dsa_lightning_indexer=%.6fs dsa_gather_selection=%.6fs "
                 "decode_attention_op=%.6fs v_up=%.6fs o_proj=%.6fs moe_total=%.6fs",
                 _rank_id(),
                 self.layer_idx,
@@ -1469,6 +1511,7 @@ class DeepseekV32DecoderLayer(nn.Module):
                 attention_detail["mlapo"],
                 attention_detail["indexer_project"],
                 dsa_total,
+                attention_detail["dsa_pipeline"],
                 attention_detail["dsa_lightning_indexer"],
                 attention_detail["dsa_gather_selection"],
                 attention_detail["decode_attention_op"],

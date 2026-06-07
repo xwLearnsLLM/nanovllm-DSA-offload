@@ -1,4 +1,4 @@
-## 推128专家模型（16卡910C）准备工作
+﻿## 推128专家模型（16卡910C）准备工作
 
 先进行一些公用配置：
 
@@ -64,4 +64,16 @@ PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/gather_se
 
 ```bash
 PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_PROMPT_LENGTHS=11000,11100,11200,11300,11000,11100,11200,11300,11000,11100,11200,11300,11000,11100,11200,11300 python3 example/test.py
+```
+
+## 2026-06-07 00:11：尝试把 TorchAir 图边界扩到 DSA 小流水
+
+下一次请在昇腾上先跑这个：
+
+```bash
+python3 -m py_compile nanovllm/models/dsa_indexer_project.py nanovllm/models/deepseek_v32.py ut_ops/indexer_project/probe_dsa_pipeline_torchair.py
+
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/indexer_project/probe_dsa_pipeline_torchair.py --device npu:0 --batch-size 10 --pool-capacity 256 --full-len 16384 --topk 2048 --block-size 128 --warmup 10 --iters 100
+
+PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_DSA_QUERY_ONLY_BACKEND=torchair NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_PROMPT_LENGTHS=11000,11100,11200,11300,11000,11100,11200,11300,11000,11100 python3 example/test.py
 ```
