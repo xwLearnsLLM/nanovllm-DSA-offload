@@ -142,12 +142,3 @@ PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_DSA_QUERY_ONLY_BACKEND=auto NANOVLLM_DSA_QU
 | `dsa_gather_selection` | 根据 top sparse token 把 KV 从 DRAM gather 到 HBM sparse budget。 |
 | `decode_attention_op` | 在 sparse HBM KV budget 上执行 decode MLA。 |
 | `moe_total` | attention 后 MLP/MoE block 耗时。 |
-
-## 算子单测
-
-`ut_ops` 已按功能整理为 `dsa/`、`indexer_project/`、`mla/`、`moe/` 四类，公共工具在 `ut_ops/common/`。常用 smoke test：
-
-```bash
-PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/dsa/compare_lightning_indexer_score.py --device npu:0 --batch-size 10 --candidate-len 17000 --topk 2048 --warmup 10 --iters 100
-PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/indexer_project/probe_query_only_torchair_accuracy.py --device npu:0 --tokens 10 --warmup 10 --iters 100
-```
