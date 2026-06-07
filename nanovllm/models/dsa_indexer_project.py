@@ -19,29 +19,102 @@ except Exception as exc:  # pragma: no cover - nanovllm Ascend ops are built on 
 else:
     ascend_ops_import_error = None
 
-
-def _mark_allow_in_graph(fn):
-    try:
-        from torch.compiler import allow_in_graph  # type: ignore
-    except Exception:
-        try:
-            from torch._dynamo import allow_in_graph  # type: ignore
-        except Exception:
-            return fn
-    try:
-        return allow_in_graph(fn)
-    except Exception:
-        return fn
-
-
+_GRAPH_LIGHTNING_INDEXER = None
+_GRAPH_GATHER_SELECTION_KV_CACHE = None
+_GRAPH_CUSTOM_OP_ERROR: Exception | None = None
 if ascend_ops is not None:
-    # TorchAir/Dynamo cannot see through pybind functions by default. Mark the
-    # DSA custom ops as graph-callable so the mini-pipeline graph does not break
-    # at lightning_indexer/gather_selection.
-    if hasattr(ascend_ops, "npu_lightning_indexer"):
-        ascend_ops.npu_lightning_indexer = _mark_allow_in_graph(ascend_ops.npu_lightning_indexer)
-    if hasattr(ascend_ops, "npu_gather_selection_kv_cache"):
-        ascend_ops.npu_gather_selection_kv_cache = _mark_allow_in_graph(ascend_ops.npu_gather_selection_kv_cache)
+    try:
+        @torch.library.custom_op("nanovllm_dsa::lightning_indexer", mutates_args=())
+        def _graph_lightning_indexer(
+            query: torch.Tensor,
+            key: torch.Tensor,
+            weights: torch.Tensor,
+            actual_seq_lengths_query: torch.Tensor,
+            actual_seq_lengths_key: torch.Tensor,
+            block_table: torch.Tensor,
+            layout_query: str,
+            layout_key: str,
+            sparse_count: int,
+            sparse_mode: int,
+        ) -> torch.Tensor:
+            return ascend_ops.npu_lightning_indexer(
+                query=query,
+                key=key,
+                weights=weights,
+                actual_seq_lengths_query=actual_seq_lengths_query,
+                actual_seq_lengths_key=actual_seq_lengths_key,
+                block_table=block_table,
+                layout_query=layout_query,
+                layout_key=layout_key,
+                sparse_count=int(sparse_count),
+                sparse_mode=int(sparse_mode),
+            )
+
+        @_graph_lightning_indexer.register_fake
+        def _(
+            query,
+            key,
+            weights,
+            actual_seq_lengths_query,
+            actual_seq_lengths_key,
+            block_table,
+            layout_query: str,
+            layout_key: str,
+            sparse_count: int,
+            sparse_mode: int,
+        ):
+            if str(layout_query) == "BSND":
+                return torch.empty((query.shape[0], query.shape[1], key.shape[2], int(sparse_count)), dtype=torch.int32, device=query.device)
+            n_dim_index = 1 if str(layout_key) == "TND" else 2
+            return torch.empty((query.shape[0], key.shape[n_dim_index], int(sparse_count)), dtype=torch.int32, device=query.device)
+
+        @torch.library.custom_op("nanovllm_dsa::gather_selection_kv_cache", mutates_args=("selection_k_rope", "selection_kv_cache", "selection_kv_block_status"))
+        def _graph_gather_selection_kv_cache(
+            selection_k_rope: torch.Tensor,
+            selection_kv_cache: torch.Tensor,
+            selection_kv_block_table: torch.Tensor,
+            selection_kv_block_status: torch.Tensor,
+            req_pool_entries: torch.Tensor,
+            selection_topk_indices: torch.Tensor,
+            full_k_rope: torch.Tensor,
+            full_kv_cache: torch.Tensor,
+            full_kv_block_table: torch.Tensor,
+            full_kv_actual_seq: torch.Tensor,
+        ) -> None:
+            ascend_ops.npu_gather_selection_kv_cache(
+                selection_k_rope,
+                selection_kv_cache,
+                selection_kv_block_table,
+                selection_kv_block_status,
+                req_pool_entries,
+                selection_topk_indices,
+                full_k_rope,
+                full_kv_cache,
+                full_kv_block_table,
+                full_kv_actual_seq,
+            )
+
+        @_graph_gather_selection_kv_cache.register_fake
+        def _(
+            selection_k_rope,
+            selection_kv_cache,
+            selection_kv_block_table,
+            selection_kv_block_status,
+            req_pool_entries,
+            selection_topk_indices,
+            full_k_rope,
+            full_kv_cache,
+            full_kv_block_table,
+            full_kv_actual_seq,
+        ):
+            return None
+
+        _GRAPH_LIGHTNING_INDEXER = _graph_lightning_indexer
+        _GRAPH_GATHER_SELECTION_KV_CACHE = _graph_gather_selection_kv_cache
+    except Exception as exc:
+        _GRAPH_CUSTOM_OP_ERROR = exc
+        _GRAPH_LIGHTNING_INDEXER = None
+        _GRAPH_GATHER_SELECTION_KV_CACHE = None
 
 try:
     import torchair  # type: ignore
@@ -250,19 +323,46 @@ def _dsa_indexer_pipeline_with_qc_functional(
         rope_dim=int(rope_dim),
         score_scale=float(score_scale),
     )
-    topk_indices = ascend_ops.npu_lightning_indexer(
-        query=q_index_out,
-        key=index_cache,
-        weights=index_weights_out,
-        actual_seq_lengths_query=candidate_query_lens,
-        actual_seq_lengths_key=candidate_lens,
-        block_table=index_tables,
-        layout_query="TND",
-        layout_key="PA_BSND",
-        sparse_count=int(sparse_count),
-        sparse_mode=3,
+    if _GRAPH_LIGHTNING_INDEXER is None or _GRAPH_GATHER_SELECTION_KV_CACHE is None:
+        topk_indices = ascend_ops.npu_lightning_indexer(
+            query=q_index_out,
+            key=index_cache,
+            weights=index_weights_out,
+            actual_seq_lengths_query=candidate_query_lens,
+            actual_seq_lengths_key=candidate_lens,
+            block_table=index_tables,
+            layout_query="TND",
+            layout_key="PA_BSND",
+            sparse_count=int(sparse_count),
+            sparse_mode=3,
+        )
+        ascend_ops.npu_gather_selection_kv_cache(
+            selection_kpe,
+            selection_ckv,
+            selection_block_table,
+            gather_selection_status,
+            req_pool_entries,
+            topk_indices.view(q_index_out.shape[0], 1, 1, int(sparse_count)),
+            full_kpe,
+            full_ckv,
+            dram_tables,
+            candidate_lens,
+        )
+        return q_index_out, index_weights_out, topk_indices
+
+    topk_indices = _GRAPH_LIGHTNING_INDEXER(
+        q_index_out,
+        index_cache,
+        index_weights_out,
+        candidate_query_lens,
+        candidate_lens,
+        index_tables,
+        "TND",
+        "PA_BSND",
+        int(sparse_count),
+        3,
     )
-    ascend_ops.npu_gather_selection_kv_cache(
+    _GRAPH_GATHER_SELECTION_KV_CACHE(
         selection_kpe,
         selection_ckv,
         selection_block_table,
@@ -1053,6 +1153,8 @@ def dsa_indexer_pipeline_with_qc_torchair(
         raise ValueError(f"q_index_out shape must be {(hidden_states.shape[0], n_head, head_dim)}, got {tuple(q_index_out.shape)}")
     if index_weights_out.shape != (hidden_states.shape[0], n_head):
         raise ValueError(f"index_weights_out shape must be {(hidden_states.shape[0], n_head)}, got {tuple(index_weights_out.shape)}")
+    if _GRAPH_LIGHTNING_INDEXER is None or _GRAPH_GATHER_SELECTION_KV_CACHE is None:
+        raise RuntimeError("TorchAir DSA pipeline requires torch.library custom-op wrappers for lightning_indexer/gather_selection.") from _GRAPH_CUSTOM_OP_ERROR
 
     start = _timer_start(detail, sync_detail, hidden_states.device)
     compiled, _ = _QUERY_ONLY_TORCHAIR_CACHE.compile_dsa_pipeline_with_qc(
