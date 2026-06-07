@@ -19,6 +19,30 @@ except Exception as exc:  # pragma: no cover - nanovllm Ascend ops are built on 
 else:
     ascend_ops_import_error = None
 
+
+def _mark_allow_in_graph(fn):
+    try:
+        from torch.compiler import allow_in_graph  # type: ignore
+    except Exception:
+        try:
+            from torch._dynamo import allow_in_graph  # type: ignore
+        except Exception:
+            return fn
+    try:
+        return allow_in_graph(fn)
+    except Exception:
+        return fn
+
+
+if ascend_ops is not None:
+    # TorchAir/Dynamo cannot see through pybind functions by default. Mark the
+    # DSA custom ops as graph-callable so the mini-pipeline graph does not break
+    # at lightning_indexer/gather_selection.
+    if hasattr(ascend_ops, "npu_lightning_indexer"):
+        ascend_ops.npu_lightning_indexer = _mark_allow_in_graph(ascend_ops.npu_lightning_indexer)
+    if hasattr(ascend_ops, "npu_gather_selection_kv_cache"):
+        ascend_ops.npu_gather_selection_kv_cache = _mark_allow_in_graph(ascend_ops.npu_gather_selection_kv_cache)
+
 try:
     import torchair  # type: ignore
 except Exception:  # pragma: no cover - TorchAir is optional.
