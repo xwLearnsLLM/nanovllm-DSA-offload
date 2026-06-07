@@ -36,6 +36,9 @@ if ascend_ops is not None:
             layout_key: str,
             sparse_count: int,
             sparse_mode: int,
+            pre_tokens: int,
+            next_tokens: int,
+            return_value: bool,
         ) -> torch.Tensor:
             return ascend_ops.npu_lightning_indexer(
                 query=query,
@@ -62,6 +65,9 @@ if ascend_ops is not None:
             layout_key: str,
             sparse_count: int,
             sparse_mode: int,
+            pre_tokens: int,
+            next_tokens: int,
+            return_value: bool,
         ):
             if str(layout_query) == "BSND":
                 return torch.empty((query.shape[0], query.shape[1], key.shape[2], int(sparse_count)), dtype=torch.int32, device=query.device)
@@ -361,6 +367,9 @@ def _dsa_indexer_pipeline_with_qc_functional(
         "PA_BSND",
         int(sparse_count),
         3,
+        (1 << 63) - 1,
+        (1 << 63) - 1,
+        False,
     )
     _GRAPH_GATHER_SELECTION_KV_CACHE(
         selection_kpe,
