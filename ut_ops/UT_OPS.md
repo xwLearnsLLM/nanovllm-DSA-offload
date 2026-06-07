@@ -7,7 +7,7 @@
 ```text
 ut_ops/
   common/            # 单测公共工具：device/sync/bench/format
-  dsa/               # DSA 三大算子相关单测
+  gather_selection/  # gather-selection KV 选择/搬运单测
   indexer_project/   # indexer_project 与 query-only TorchAir 单测
   mla/               # MLA/MLAPO 正确性探针
   moe/               # MoE gating/grouped MoE 单测
@@ -16,10 +16,7 @@ ut_ops/
 ## 当前推荐入口
 
 ```bash
-python3 ut_ops/dsa/probe_indexer_score_bf16_out.py
-python3 ut_ops/dsa/compare_lightning_indexer_score.py
-python3 ut_ops/dsa/probe_indexer_update.py
-python3 ut_ops/dsa/bench_indexer_update_sweep.py
+python3 ut_ops/gather_selection/probe_pool.py
 
 python3 ut_ops/indexer_project/probe_full.py
 python3 ut_ops/indexer_project/probe_post.py

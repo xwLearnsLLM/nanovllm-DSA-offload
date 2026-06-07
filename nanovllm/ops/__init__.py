@@ -42,15 +42,8 @@ except ImportError as exc:
 moe_gating_top_k = _C.moe_gating_top_k
 npu_lightning_indexer = _C.npu_lightning_indexer
 npu_gather_selection_kv_cache = _C.npu_gather_selection_kv_cache
-npu_dsa_indexer_score = _C.npu_dsa_indexer_score
-npu_dsa_indexer_score_bf16_out = _C.npu_dsa_indexer_score_bf16_out
 npu_sparse_flash_attention = _C.npu_sparse_flash_attention
-paged_scatter_copy_h2d = _C.paged_scatter_copy_h2d
-paged_scatter_copy_h2d_alloc_host_mapped_empty = (
-    _C.paged_scatter_copy_h2d_alloc_host_mapped_empty
-)
 batch_matmul_transpose = _C.batch_matmul_transpose
-dsa_indexer_update = _C.dsa_indexer_update
 
 
 def _missing_dsa_indexer_project(*args, **kwargs):
@@ -137,14 +130,9 @@ __all__ = [
     "dsa_indexer_project_binding_version",
     "dsa_indexer_project_post",
     "dsa_indexer_project_post_out",
-    "dsa_indexer_update",
     "mla_preprocess",
     "moe_gating_top_k",
     "npu_gather_selection_kv_cache",
     "npu_lightning_indexer",
-    "npu_dsa_indexer_score",
-    "npu_dsa_indexer_score_bf16_out",
     "npu_sparse_flash_attention",
-    "paged_scatter_copy_h2d",
-    "paged_scatter_copy_h2d_alloc_host_mapped_empty",
 ]

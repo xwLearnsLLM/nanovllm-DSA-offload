@@ -26,17 +26,10 @@ class Context:
     req_pool_entries: torch.Tensor | None = None
     candidate_lens: torch.Tensor | None = None
     candidate_query_lens: torch.Tensor | None = None
-    sparse_selected_lens: torch.Tensor | None = None
-    prefill_tail_lens: torch.Tensor | None = None
-    decode_lens: torch.Tensor | None = None
-    sparse_kv_lens: torch.Tensor | None = None
     needs_dsa_update: bool = False
-    dsa_pool_entries_start: int = -1
     dsa_offload_rows: torch.Tensor | None = None
     dsa_offload_all_rows: bool = False
     has_first_decode: bool = False
-    is_enforce_eager: bool = True
-    real_bs: int = -1
     block_size: int = 256
     flat_slot_mapping_i32: torch.Tensor | None = None
     scratch: dict = field(default_factory=dict)
@@ -54,22 +47,15 @@ def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0
                 block_tables=None, index_block_tables=None, hbm_block_tables=None, dram_block_tables=None,
                 selection_block_tables=None,
                 index_slot_mapping=None, flat_index_slot_mapping=None, req_pool_entries=None, candidate_lens=None,
-                candidate_query_lens=None, sparse_selected_lens=None, prefill_tail_lens=None,
-                decode_lens=None, sparse_kv_lens=None,
-                needs_dsa_update=None, dsa_pool_entries_start=None,
+                candidate_query_lens=None,
+                needs_dsa_update=None,
                 dsa_offload_rows=None, dsa_offload_all_rows=None,
-                has_first_decode=None, is_enforce_eager=None, real_bs=None, block_size=None, flat_slot_mapping_i32=None):
+                has_first_decode=None, block_size=None, flat_slot_mapping_i32=None):
     global _CONTEXT
-    if is_enforce_eager is None:
-        is_enforce_eager = True
-    if real_bs is None:
-        real_bs = -1
     if block_size is None:
         block_size = 256
     if needs_dsa_update is None:
         needs_dsa_update = False
-    if dsa_pool_entries_start is None:
-        dsa_pool_entries_start = -1
     if dsa_offload_all_rows is None:
         dsa_offload_all_rows = False
     if has_first_decode is None:
@@ -95,17 +81,10 @@ def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0
         req_pool_entries=req_pool_entries,
         candidate_lens=candidate_lens,
         candidate_query_lens=candidate_query_lens,
-        sparse_selected_lens=sparse_selected_lens,
-        prefill_tail_lens=prefill_tail_lens,
-        decode_lens=decode_lens,
-        sparse_kv_lens=sparse_kv_lens,
         needs_dsa_update=needs_dsa_update,
-        dsa_pool_entries_start=int(dsa_pool_entries_start),
         dsa_offload_rows=dsa_offload_rows,
         dsa_offload_all_rows=bool(dsa_offload_all_rows),
         has_first_decode=has_first_decode,
-        is_enforce_eager=is_enforce_eager,
-        real_bs=real_bs,
         block_size=block_size,
         flat_slot_mapping_i32=flat_slot_mapping_i32,
     )

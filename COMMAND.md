@@ -53,9 +53,9 @@ export NANOVLLM_PROFILE_LAYER_IDS=mid        # 打印的层
 ```bash
 NANOVLLM_CANN_BUILD_JOBS=64 NANOVLLM_EXT_BUILD_JOBS=1 SOC_VERSION=ascend910_9391 PYTHONPATH=$PWD:$PYTHONPATH bash scripts/build_nanovllm_ops.sh
 
-PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/dsa/probe_gather_selection_pool.py --device npu:0 --batch-size 4 --pool-capacity 8 --full-len 4096 --topk 2048 --block-size 128 --warmup 10 --iters 100
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/gather_selection/probe_pool.py --device npu:0 --batch-size 4 --pool-capacity 8 --full-len 4096 --topk 2048 --block-size 128 --warmup 10 --iters 100
 
-PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/dsa/probe_gather_selection_pool.py --device npu:0 --batch-size 8 --pool-capacity 16 --full-len 16384 --topk 2048 --block-size 128 --no-mixed-short --warmup 10 --iters 100
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/gather_selection/probe_pool.py --device npu:0 --batch-size 8 --pool-capacity 16 --full-len 16384 --topk 2048 --block-size 128 --no-mixed-short --warmup 10 --iters 100
 ```
 
 ## 2026-06-07 16:46：修复 gather_block_table 残留变量后重跑推理

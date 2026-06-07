@@ -237,9 +237,6 @@ op_add_subdirectory(OP_LIST OP_DIR_LIST)
 
 # Directory names are framework-facing and use DSA vocabulary. A few CANN
 # kernels keep their original registered op names to avoid changing aclnn ABI.
-set(dsa_indexer_score_kernel_aliases qk_score)
-set(dsa_indexer_update_kernel_aliases dsa_update_index)
-set(dsa_scatter_h2d_kernel_aliases paged_scatter_copy_h2d)
 set(lightning_indexer_kernel_aliases lightning_indexer_vllm)
 
 foreach (OP_DIR ${OP_DIR_LIST})
