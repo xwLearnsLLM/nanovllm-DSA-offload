@@ -38,9 +38,8 @@ public:
 
     __aicore__ inline void Init(
         GM_ADDR selection_k_rope, GM_ADDR selection_kv_cache, GM_ADDR selection_kv_block_table,
-        GM_ADDR selection_kv_block_status, GM_ADDR selection_topk_indices, GM_ADDR full_k_rope, GM_ADDR full_kv_cache,
-        GM_ADDR full_kv_block_table, GM_ADDR full_kv_actual_seq, GM_ADDR full_q_actual_seq,
-        GM_ADDR selection_kv_actual_seq)
+        GM_ADDR selection_kv_block_status, GM_ADDR req_pool_entries, GM_ADDR selection_topk_indices,
+        GM_ADDR full_k_rope, GM_ADDR full_kv_cache, GM_ADDR full_kv_block_table, GM_ADDR full_kv_actual_seq)
     {
         blkIdx_ = GetBlockIdx();
         if (blkIdx_ >= tiling_->usedCoreNum) {
@@ -79,8 +78,8 @@ public:
         selKvBlockTableGm_.SetGlobalBuffer(
             (__gm__ int32_t*)selection_kv_block_table + blkIdx_ * BsiSH * tiling_->selMaxBlockNum);
         // [batchsize, seq, headnum, topk+1] 初始全-1，表示全空
-        selKvBlockStatusGm_.SetGlobalBuffer(
-            (__gm__ int32_t*)selection_kv_block_status + blkIdx_ * BsiSH * (tiling_->topk + 1));
+        selKvBlockStatusGm_.SetGlobalBuffer((__gm__ int32_t*)selection_kv_block_status);
+        reqPoolEntriesGm_.SetGlobalBuffer((__gm__ int32_t*)req_pool_entries + blkIdx_ * tiling_->mainCoreBsLoopNum);
         // [batchsize, seq, headnum, topk] token粒度=groupid * selection_topk_block_size
         selTopKIndicesGm_.SetGlobalBuffer((__gm__ int32_t*)selection_topk_indices + blkIdx_ * BsiSH * tiling_->topk);
         // [f_block_num, block_size, k_rope]
@@ -93,9 +92,6 @@ public:
         // [batchsize] 每个batch实际的seq长度
         fullKvActualSeqGm_.SetGlobalBuffer((__gm__ int32_t*)full_kv_actual_seq + blkIdx_ * tiling_->mainCoreBsLoopNum);
         // [batchsize] 每个batch实际的seq长度   用来算MTP场景不同T下面的kv_actual_seq
-        fullQActualSeqGm_.SetGlobalBuffer((__gm__ int32_t*)full_q_actual_seq + blkIdx_ * tiling_->mainCoreBsLoopNum);
-        // [batchsize*seq*headnum]
-        selKvActualSeqGm_.SetGlobalBuffer((__gm__ int32_t*)selection_kv_actual_seq + blkIdx_ * BsiSH);
     }
 
     __aicore__ inline void Process()
@@ -113,10 +109,12 @@ public:
 
         for (int64_t bsIdx = 0; bsIdx < bsLoopNum_; bsIdx++) {
             curFullKvSeqLen = fullKvActualSeqGm_.GetValue(bsIdx);
-            if (curFullKvSeqLen <= 0) {
+            if (curFullKvSeqLen <= tiling_->topk) {
                 continue;
             }
-            curFullQSeqLen = fullQActualSeqGm_.GetValue(bsIdx);
+            int32_t poolEntry = reqPoolEntriesGm_.GetValue(bsIdx);
+            ASSERT_MSG(poolEntry >= 0, "req_pool_entries must be >= 0 for long sequence.");
+            curFullQSeqLen = tiling_->seq;
             ASSERT_MSG(curFullQSeqLen <= tiling_->seq, "curFullQSeqLen:%ld cannot be greater than seq:%ld",
                 curFullQSeqLen, tiling_->seq);
 
@@ -124,7 +122,7 @@ public:
             LocalTensor<int32_t> selTopKIdxLocal = selTopKIdxQue_.DeQue<int32_t>();
 
             SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
-            CopyInBlockStatus(bsIdx, selBlockStatLocal);
+            CopyInBlockStatus(poolEntry, selBlockStatLocal);
 
             CopyInSelKvBlockTable(bsIdx, selKvBlockTableLocal);
 
@@ -146,7 +144,7 @@ public:
             selTopKIdxQue_.FreeTensor(selTopKIdxLocal);
 
             SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
-            CopyOutSelKvBlockTableAndSeqLen(bsIdx, selKvActSeqLocal, selBlockStatLocal);
+            CopyOutBlockStatus(poolEntry, selBlockStatLocal);
         }
     }
 
@@ -171,13 +169,13 @@ private:
         selTopKIdxQue_.EnQue(selTopKIdxLocal);
     }
 
-    __aicore__ inline void CopyInBlockStatus(int64_t bsIdx, LocalTensor<int32_t>& selBlockStatLocal)
+    __aicore__ inline void CopyInBlockStatus(int64_t poolEntry, LocalTensor<int32_t>& selBlockStatLocal)
     {
         DataCopyPadExtParams<int32_t> dataCopyPadParams{false, 0, 0, 0};
         int32_t statSHT = tiling_->seq * tiling_->headnum * (tiling_->topk + 1);
         DataCopyExtParams dataCopyParamsSt{
             static_cast<uint16_t>(1), static_cast<uint32_t>(statSHT * sizeof(int32_t)), 0, 0, 0};
-        DataCopyPad(selBlockStatLocal, selKvBlockStatusGm_[bsIdx * statSHT], dataCopyParamsSt, dataCopyPadParams);
+        DataCopyPad(selBlockStatLocal, selKvBlockStatusGm_[poolEntry * statSHT], dataCopyParamsSt, dataCopyPadParams);
     }
 
     __aicore__ inline void CopyInSelKvBlockTable(int64_t bsIdx, LocalTensor<int32_t>& selKvBlockTableLocal)
@@ -556,18 +554,12 @@ private:
         selKvActSeqLocal.SetValue(seqLenIdx, selActualSeqLen);
     }
 
-    __aicore__ inline void CopyOutSelKvBlockTableAndSeqLen(int64_t bsIdx, LocalTensor<int32_t>& selKvActSeqLocal,
-        LocalTensor<int32_t>& selBlockStatLocal)
+    __aicore__ inline void CopyOutBlockStatus(int64_t poolEntry, LocalTensor<int32_t>& selBlockStatLocal)
     {
-        DataCopyExtParams dataCopyParSeqLen{
-            static_cast<uint16_t>(1), static_cast<uint32_t>(tiling_->seq * tiling_->headnum * sizeof(int32_t)), 0, 0,
-            0};
-        DataCopyPad(selKvActualSeqGm_[bsIdx * tiling_->seq * tiling_->headnum], selKvActSeqLocal, dataCopyParSeqLen);
-
         int32_t statSHT = tiling_->seq * tiling_->headnum * (tiling_->topk + 1);
         DataCopyExtParams dataCopyParBlkStat{
             static_cast<uint16_t>(1), static_cast<uint32_t>(statSHT * sizeof(int32_t)), 0, 0, 0};
-        DataCopyPad(selKvBlockStatusGm_[bsIdx * statSHT], selBlockStatLocal, dataCopyParBlkStat);
+        DataCopyPad(selKvBlockStatusGm_[poolEntry * statSHT], selBlockStatLocal, dataCopyParBlkStat);
     }
 
     template <typename U>
@@ -605,12 +597,11 @@ private:
     GlobalTensor<int32_t> selKvBlockTableGm_;
     GlobalTensor<int32_t> selKvBlockStatusGm_;
     GlobalTensor<int32_t> selTopKIndicesGm_;
+    GlobalTensor<int32_t> reqPoolEntriesGm_;
     GlobalTensor<T> fullKRopeGm_;
     GlobalTensor<T> fullKvCacheGm_;
     GlobalTensor<int32_t> fullKvBlockTableGm_;
     GlobalTensor<int32_t> fullKvActualSeqGm_;
-    GlobalTensor<int32_t> fullQActualSeqGm_;
-    GlobalTensor<int32_t> selKvActualSeqGm_;
 
     TQue<QuePosition::VECIN, 1> selTopKIdxQue_;
     TQueBind<QuePosition::VECIN, QuePosition::VECOUT, 1> kvCacheQue_;

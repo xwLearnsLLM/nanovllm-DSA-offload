@@ -27,12 +27,12 @@ constexpr int32_t SEL_K_ROPE_IDX = 0;
 constexpr int32_t SEL_KV_CACHE_IDX = 1;
 constexpr int32_t SEL_KV_BLOCK_TABLE_IDX = 2;
 constexpr int32_t SEL_KV_BLOCK_STAT_IDX = 3;
-constexpr int32_t SEL_TOPK_INDICES_IDX = 4;
-constexpr int32_t FULL_K_ROPE_IDX = 5;
-constexpr int32_t FULL_KV_CACHE_IDX = 6;
-constexpr int32_t FULL_KV_BLOCK_TABLE_IDX = 7;
-constexpr int32_t FULL_KV_ACTSEQ_IDX = 8;
-constexpr int32_t FULL_Q_ACTSEQ_IDX = 9;
+constexpr int32_t REQ_POOL_ENTRIES_IDX = 4;
+constexpr int32_t SEL_TOPK_INDICES_IDX = 5;
+constexpr int32_t FULL_K_ROPE_IDX = 6;
+constexpr int32_t FULL_KV_CACHE_IDX = 7;
+constexpr int32_t FULL_KV_BLOCK_TABLE_IDX = 8;
+constexpr int32_t FULL_KV_ACTSEQ_IDX = 9;
 
 constexpr size_t CONST1 = 1;
 constexpr size_t CONST2 = 2;
@@ -45,7 +45,6 @@ constexpr int32_t MAX_K_ROPE_DIM = 64;
 constexpr int32_t MAX_KV_CACHE_DIM = 656;
 constexpr int32_t MAX_TOPK_NUM = 2048;
 constexpr int32_t TOPK_SPLIT_NUM = 32;
-constexpr int64_t DEFAULT_TOPK_BLOCK_SIZE = 64;
 constexpr int64_t DEFAULT_WORKSPACE_SIZE = 32;
 
 template <typename T>
@@ -85,15 +84,7 @@ ge::graphStatus GatherSelectionKvCacheTiling::GetPlatformInfo()
 
 ge::graphStatus GatherSelectionKvCacheTiling::GetInputAttrs()
 {
-    auto attrs = context_->GetAttrs();
-    OPS_ERR_IF(attrs == nullptr, OPS_LOG_E(context_->GetNodeName(), "get attrs nullptr."),
-        return ge::GRAPH_FAILED);
-    const int64_t* attrBlockSizePtr = attrs->GetAttrPointer<int64_t>(0);
-    if (attrBlockSizePtr == nullptr || *attrBlockSizePtr <= 0) {
-        selTopKBlockSize_ = DEFAULT_TOPK_BLOCK_SIZE;
-    } else {
-        selTopKBlockSize_ = *attrBlockSizePtr;
-    }
+    selTopKBlockSize_ = 1;
     tilingData_.set_selTopKBlockSize(selTopKBlockSize_);
 
     return ge::GRAPH_SUCCESS;
@@ -202,13 +193,6 @@ ge::graphStatus GatherSelectionKvCacheTiling::GetTopkIndices()
             dimsN),
         return ge::GRAPH_FAILED);
 
-    OPS_ERR_IF(
-        (selKvBlkStShape.GetDimNum() != selTopKInShape.GetDimNum()),
-        OPS_LOG_E(context_->GetNodeName(),
-            "selection_kv_block_status dim:%lu not equal selection_topk_indices dime:%lu.",
-            selKvBlkStShape.GetDimNum(), selTopKInShape.GetDimNum()),
-        return ge::GRAPH_FAILED);
-
     if (dimsN == CONST4) {
         topKLayout_ = DataLayout::BSND;
         batchSize_ = selTopKInShape.GetDim(0);
@@ -216,7 +200,7 @@ ge::graphStatus GatherSelectionKvCacheTiling::GetTopkIndices()
         headnum_ = selTopKInShape.GetDim(CONST2);
         topk_ = selTopKInShape.GetDim(CONST3);
         OPS_ERR_IF(
-            (selKvBlkStShape.GetDim(0) != batchSize_ || selKvBlkStShape.GetDim(1) != seq_ ||
+            (selKvBlkStShape.GetDimNum() != CONST4 || selKvBlkStShape.GetDim(1) != seq_ ||
                 selKvBlkStShape.GetDim(CONST2) != headnum_ || selKvBlkStShape.GetDim(CONST3) != topk_ + 1),
             OPS_LOG_E(context_->GetNodeName(),
                 "selection_kv_block_status[%ld %ld %ld %ld] selection_topk_indices[%ld %ld %ld %ld] is not satisfied",
@@ -229,7 +213,7 @@ ge::graphStatus GatherSelectionKvCacheTiling::GetTopkIndices()
         headnum_ = selTopKInShape.GetDim(CONST1);
         topk_ = selTopKInShape.GetDim(CONST2);
         OPS_ERR_IF(
-            (selKvBlkStShape.GetDim(0) != t_ || selKvBlkStShape.GetDim(1) != headnum_ ||
+            (selKvBlkStShape.GetDimNum() != CONST3 || selKvBlkStShape.GetDim(1) != headnum_ ||
                 selKvBlkStShape.GetDim(CONST2) != topk_ + 1),
             OPS_LOG_E(context_->GetNodeName(),
                 "selection_kv_block_status[%ld %ld %ld] selection_topk_indices[%ld %ld %ld] is not satisfied",
@@ -296,6 +280,29 @@ ge::graphStatus GatherSelectionKvCacheTiling::CheckSelInfo()
             tilingData_.get_selMaxBlockNum(), topk_, selTopKBlockSize_, tilingData_.get_selKvBlockSize()),
         return ge::GRAPH_FAILED);
 
+    return ge::GRAPH_SUCCESS;
+}
+
+ge::graphStatus GatherSelectionKvCacheTiling::GetReqPoolEntries()
+{
+    auto reqPoolIn = context_->GetInputShape(REQ_POOL_ENTRIES_IDX);
+    OPS_ERR_IF(reqPoolIn == nullptr, OPS_LOG_E(context_->GetNodeName(), "get reqPoolIn nullptr."),
+        return ge::GRAPH_FAILED);
+    gert::Shape reqPoolShape = reqPoolIn->GetStorageShape();
+    size_t dimsN = reqPoolShape.GetDimNum();
+    OPS_ERR_IF(
+        (dimsN != 1),
+        OPS_LOG_E(context_->GetNodeName(), "req_pool_entries dim:%lu should be 1.", dimsN),
+        return ge::GRAPH_FAILED);
+    OPS_ERR_IF(
+        (reqPoolShape.GetDim(0) != batchSize_),
+        OPS_LOG_E(context_->GetNodeName(),
+            "req_pool_entries dim0:%ld should be batchSize:%ld.", reqPoolShape.GetDim(0), batchSize_),
+        return ge::GRAPH_FAILED);
+    OPS_ERR_IF(
+        (seq_ != 1),
+        OPS_LOG_E(context_->GetNodeName(), "nano-vllm gather_selection only supports decode seq=1, got:%ld.", seq_),
+        return ge::GRAPH_FAILED);
     return ge::GRAPH_SUCCESS;
 }
 
@@ -430,22 +437,11 @@ ge::graphStatus GatherSelectionKvCacheTiling::GetSeqLenIn()
         OPS_LOG_E(context_->GetNodeName(), "full_kv_actual_seq dim:%lu should be 1.", dimsN),
         return ge::GRAPH_FAILED);
 
-    // full_q_actual_seq: [batchsize]
-    auto fulQSeqIn = context_->GetInputShape(FULL_Q_ACTSEQ_IDX);
-    OPS_ERR_IF(fulQSeqIn == nullptr, OPS_LOG_E(context_->GetNodeName(), "get fulQSeqIn nullptr."),
-        return ge::GRAPH_FAILED);
-    gert::Shape fulQSeqInShape = fulQSeqIn->GetStorageShape();
-    dimsN = fulQSeqInShape.GetDimNum();
     OPS_ERR_IF(
-        (dimsN != 1),
-        OPS_LOG_E(context_->GetNodeName(), "full_q_actual_seq dim:%lu should be 1.", dimsN),
-        return ge::GRAPH_FAILED);
-
-    OPS_ERR_IF(
-        (fulKvSeqInShape.GetDim(0) != batchSize_ || fulQSeqInShape.GetDim(0) != batchSize_),
+        (fulKvSeqInShape.GetDim(0) != batchSize_),
         OPS_LOG_E(context_->GetNodeName(),
-            "full_kv_actual_seq dim0:%ld or full_q_actual_seq dim0:%ld should be equal batchSize:%ld.",
-            fulKvSeqInShape.GetDim(0), fulQSeqInShape.GetDim(0), batchSize_),
+            "full_kv_actual_seq dim0:%ld should be equal batchSize:%ld.",
+            fulKvSeqInShape.GetDim(0), batchSize_),
         return ge::GRAPH_FAILED);
     
     batchSize_ = batchSize_ * seq_;
@@ -466,7 +462,7 @@ ge::graphStatus GatherSelectionKvCacheTiling::GetShapeAttrsInfo()
     }
 
     if (GetSelKvCacheShape() != ge::GRAPH_SUCCESS || GetSelBlockTable() != ge::GRAPH_SUCCESS ||
-        GetTopkIndices() != ge::GRAPH_SUCCESS) {
+        GetTopkIndices() != ge::GRAPH_SUCCESS || GetReqPoolEntries() != ge::GRAPH_SUCCESS) {
         return ge::GRAPH_FAILED;
     }
 
@@ -513,6 +509,11 @@ ge::graphStatus GatherSelectionKvCacheTiling::GetInputDtypeInfo()
         return ge::GRAPH_FAILED);
     ge::DataType selKvBSDtype = selKvBSDesc->GetDataType();
 
+    auto reqPoolEntriesDesc = context_->GetInputDesc(REQ_POOL_ENTRIES_IDX);
+    OPS_ERR_IF(reqPoolEntriesDesc == nullptr, OPS_LOG_E(context_->GetNodeName(), "get reqPoolEntriesDesc nullptr."),
+        return ge::GRAPH_FAILED);
+    ge::DataType reqPoolEntriesDtype = reqPoolEntriesDesc->GetDataType();
+
     auto selTopkInDesc = context_->GetInputDesc(SEL_TOPK_INDICES_IDX);
     OPS_ERR_IF(selTopkInDesc == nullptr, OPS_LOG_E(context_->GetNodeName(), "get selTopkInDesc nullptr."),
         return ge::GRAPH_FAILED);
@@ -538,11 +539,6 @@ ge::graphStatus GatherSelectionKvCacheTiling::GetInputDtypeInfo()
         return ge::GRAPH_FAILED);
     ge::DataType fKvActSeqDtype = fKvActSeqDesc->GetDataType();
 
-    auto fQActSeqDesc = context_->GetInputDesc(FULL_Q_ACTSEQ_IDX);
-    OPS_ERR_IF(fQActSeqDesc == nullptr, OPS_LOG_E(context_->GetNodeName(), "get fQActSeqDesc nullptr."),
-        return ge::GRAPH_FAILED);
-    ge::DataType fQActSeqDtype = fQActSeqDesc->GetDataType();
-
     OPS_ERR_IF(
         (selKvCacheDtype != selKRopeDtype_ || fKRopeDtype != selKRopeDtype_ || fKvCacheDtype != selKRopeDtype_),
         OPS_LOG_E(context_->GetNodeName(), "kv cache dtype is not supported."),
@@ -550,7 +546,7 @@ ge::graphStatus GatherSelectionKvCacheTiling::GetInputDtypeInfo()
 
     OPS_ERR_IF(
         (selKvBTDtype != ge::DT_INT32 || selKvBSDtype != ge::DT_INT32 || selTopkInDtype != ge::DT_INT32 ||
-            fKvBTDtype != ge::DT_INT32 || fKvActSeqDtype != ge::DT_INT32 || fQActSeqDtype != ge::DT_INT32),
+            reqPoolEntriesDtype != ge::DT_INT32 || fKvBTDtype != ge::DT_INT32 || fKvActSeqDtype != ge::DT_INT32),
         OPS_LOG_E(context_->GetNodeName(), "kv cache idx dtype should be int32."),
         return ge::GRAPH_FAILED);
 

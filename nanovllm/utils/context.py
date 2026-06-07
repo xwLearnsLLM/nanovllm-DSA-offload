@@ -20,6 +20,7 @@ class Context:
     index_block_tables: torch.Tensor | None = None
     hbm_block_tables: torch.Tensor | None = None
     dram_block_tables: torch.Tensor | None = None
+    selection_block_tables: torch.Tensor | None = None
     index_slot_mapping: torch.Tensor | None = None
     flat_index_slot_mapping: torch.Tensor | None = None
     req_pool_entries: torch.Tensor | None = None
@@ -33,7 +34,6 @@ class Context:
     dsa_pool_entries_start: int = -1
     dsa_offload_rows: torch.Tensor | None = None
     dsa_offload_all_rows: bool = False
-    gather_query_lens: torch.Tensor | None = None
     has_first_decode: bool = False
     is_enforce_eager: bool = True
     real_bs: int = -1
@@ -52,11 +52,12 @@ def get_context():
 def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0, max_seqlen_k=0, slot_mapping=None,
                 flat_slot_mapping=None, context_lens=None, actual_seq_lengths_query=None, actual_seq_lengths_kv=None,
                 block_tables=None, index_block_tables=None, hbm_block_tables=None, dram_block_tables=None,
+                selection_block_tables=None,
                 index_slot_mapping=None, flat_index_slot_mapping=None, req_pool_entries=None, candidate_lens=None,
                 candidate_query_lens=None, sparse_selected_lens=None, prefill_tail_lens=None,
                 decode_lens=None, sparse_kv_lens=None,
                 needs_dsa_update=None, dsa_pool_entries_start=None,
-                dsa_offload_rows=None, dsa_offload_all_rows=None, gather_query_lens=None,
+                dsa_offload_rows=None, dsa_offload_all_rows=None,
                 has_first_decode=None, is_enforce_eager=None, real_bs=None, block_size=None, flat_slot_mapping_i32=None):
     global _CONTEXT
     if is_enforce_eager is None:
@@ -88,6 +89,7 @@ def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0
         index_block_tables=index_block_tables,
         hbm_block_tables=hbm_block_tables,
         dram_block_tables=dram_block_tables,
+        selection_block_tables=selection_block_tables,
         index_slot_mapping=index_slot_mapping,
         flat_index_slot_mapping=flat_index_slot_mapping,
         req_pool_entries=req_pool_entries,
@@ -101,7 +103,6 @@ def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0
         dsa_pool_entries_start=int(dsa_pool_entries_start),
         dsa_offload_rows=dsa_offload_rows,
         dsa_offload_all_rows=bool(dsa_offload_all_rows),
-        gather_query_lens=gather_query_lens,
         has_first_decode=has_first_decode,
         is_enforce_eager=is_enforce_eager,
         real_bs=real_bs,

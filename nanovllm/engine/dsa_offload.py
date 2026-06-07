@@ -3,17 +3,16 @@ from __future__ import annotations
 from collections import deque
 
 
-DSA_OFFLOAD_THRESHOLD_TOKENS = 8192
 DSA_SELECTION_TOPK_TOKENS = 2048
 
 
 def compute_sparse_blocks(num_prefill_full_blocks: int, block_size: int = 128) -> int:
-    """Sparse budget: dense below 8K tokens, fixed 2048-token budget above it."""
+    """Only sparse-offload full prefill blocks when they exceed the 2048-token budget."""
     n = int(num_prefill_full_blocks)
     block_size = int(block_size)
     if n <= 0:
         return 0
-    if n * block_size < DSA_OFFLOAD_THRESHOLD_TOKENS:
+    if n * block_size <= DSA_SELECTION_TOPK_TOKENS:
         return n
     budget_blocks = (DSA_SELECTION_TOPK_TOKENS + block_size - 1) // block_size
     return min(n, budget_blocks)

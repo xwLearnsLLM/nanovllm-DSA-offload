@@ -45,3 +45,15 @@ export NANOVLLM_LOG_DECODE_LAYER_TIMING=0    # 是否打印时延分解
 export NANOVLLM_DECODE_LAYER_TIMING_SYNC=0   # 计时时是否 sync 一下
 export NANOVLLM_PROFILE_LAYER_IDS=mid        # 打印的层
 ```
+
+## 2026-06-07 16:19：验证 gather_selection_kv_cache pool entry 机制
+
+下一次请在昇腾上先跑这个：
+
+```bash
+NANOVLLM_CANN_BUILD_JOBS=64 NANOVLLM_EXT_BUILD_JOBS=1 SOC_VERSION=ascend910_9391 PYTHONPATH=$PWD:$PYTHONPATH bash scripts/build_nanovllm_ops.sh
+
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/dsa/probe_gather_selection_pool.py --device npu:0 --batch-size 4 --pool-capacity 8 --full-len 4096 --topk 2048 --block-size 128 --warmup 10 --iters 100
+
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/dsa/probe_gather_selection_pool.py --device npu:0 --batch-size 8 --pool-capacity 16 --full-len 16384 --topk 2048 --block-size 128 --no-mixed-short --warmup 10 --iters 100
+```

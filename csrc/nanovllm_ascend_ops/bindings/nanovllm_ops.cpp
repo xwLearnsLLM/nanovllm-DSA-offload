@@ -134,30 +134,28 @@ at::Tensor npu_dsa_indexer_score_py(
       c10::string_view(layout_key.data(), layout_key.size()));
 }
 
-at::Tensor npu_gather_selection_kv_cache_py(
+void npu_gather_selection_kv_cache_py(
     const at::Tensor& selection_k_rope,
     const at::Tensor& selection_kv_cache,
     const at::Tensor& selection_kv_block_table,
     const at::Tensor& selection_kv_block_status,
+    const at::Tensor& req_pool_entries,
     const at::Tensor& selection_topk_indices,
     const at::Tensor& full_k_rope,
     const at::Tensor& full_kv_cache,
     const at::Tensor& full_kv_block_table,
-    const at::Tensor& full_kv_actual_seq,
-    const at::Tensor& full_q_actual_seq,
-    int64_t selection_topk_block_size) {
-  return vllm_ascend::npu_gather_selection_kv_cache(
+    const at::Tensor& full_kv_actual_seq) {
+  vllm_ascend::npu_gather_selection_kv_cache(
       selection_k_rope,
       selection_kv_cache,
       selection_kv_block_table,
       selection_kv_block_status,
+      req_pool_entries,
       selection_topk_indices,
       full_k_rope,
       full_kv_cache,
       full_kv_block_table,
-      full_kv_actual_seq,
-      full_q_actual_seq,
-      selection_topk_block_size);
+      full_kv_actual_seq);
 }
 
 void npu_dsa_indexer_score_bf16_out_py(
@@ -419,13 +417,12 @@ PYBIND11_MODULE(_C, m) {
       py::arg("selection_kv_cache"),
       py::arg("selection_kv_block_table"),
       py::arg("selection_kv_block_status"),
+      py::arg("req_pool_entries"),
       py::arg("selection_topk_indices"),
       py::arg("full_k_rope"),
       py::arg("full_kv_cache"),
       py::arg("full_kv_block_table"),
-      py::arg("full_kv_actual_seq"),
-      py::arg("full_q_actual_seq"),
-      py::arg("selection_topk_block_size") = 1);
+      py::arg("full_kv_actual_seq"));
   m.def(
       "npu_dsa_indexer_score_bf16_out",
       &npu_dsa_indexer_score_bf16_out_py,

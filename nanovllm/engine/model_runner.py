@@ -250,10 +250,6 @@ class ModelRunner:
             1,
             rope_dim,
         )
-        gather_block_table_shape = (
-            config.dsa_offload_pool_capacity,
-            max_sparse_blocks,
-        )
         gather_status_shape = (
             config.dsa_offload_pool_capacity,
             1,
@@ -268,7 +264,6 @@ class ModelRunner:
                 ("DeepSeek index cache", index_shape),
                 ("DeepSeek DRAM CKV cache", dram_ckv_shape),
                 ("DeepSeek DRAM KPE cache", dram_kpe_shape),
-                ("DeepSeek gather selection block table", gather_block_table_shape),
                 ("DeepSeek gather selection status", gather_status_shape),
             ],
         )
@@ -300,11 +295,6 @@ class ModelRunner:
                     dtype=cache_dtype,
                     device=self.device,
                 )
-                gather_block_table = torch.empty(
-                    gather_block_table_shape,
-                    dtype=torch.int32,
-                    device=self.device,
-                )
                 gather_status = torch.full(
                     gather_status_shape,
                     -1,
@@ -321,7 +311,6 @@ class ModelRunner:
                     index_cache,
                     dram_ckv_cache,
                     dram_kpe_cache,
-                    gather_block_table,
                     gather_status,
                 )
 
@@ -343,6 +332,15 @@ class ModelRunner:
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).to(device=self.device,
                                                                                          non_blocking=True)
         return block_tables
+
+    def prepare_selection_block_tables(self, seqs: list[Sequence]) -> torch.Tensor:
+        max_sparse_blocks = DSA_SELECTION_TOPK_TOKENS // self.block_size
+        tables = []
+        for seq in seqs:
+            sparse_blocks = min(int(seq.num_sparse_blocks), max_sparse_blocks)
+            table = list(seq.hbm_block_table[:sparse_blocks])
+            tables.append(table + [0] * (max_sparse_blocks - len(table)))
+        return torch.tensor(tables, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
 
     def _sequence_slots(
         self,
@@ -534,6 +532,7 @@ class ModelRunner:
         hbm_block_tables = self.prepare_block_tables(seqs, "hbm_block_table")
         index_block_tables = self.prepare_block_tables(seqs, "index_block_table")
         dram_block_tables = self.prepare_block_tables(seqs, "dram_block_table")
+        selection_block_tables = self.prepare_selection_block_tables(seqs)
         req_pool_entries = torch.tensor(req_pool_entries, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
         candidate_lens = torch.tensor(candidate_lens, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
         sparse_selected_lens = torch.tensor(sparse_selected_lens, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
@@ -541,7 +540,6 @@ class ModelRunner:
         decode_lens = torch.tensor(decode_lens, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
         sparse_kv_lens_tensor = torch.tensor(sparse_kv_lens, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
         candidate_query_lens = torch.arange(1, len(seqs) + 1, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
-        gather_query_lens = torch.ones(len(seqs), dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
         dsa_offload_rows = None
         if needs_dsa_update and not dsa_offload_all_rows:
             dsa_offload_rows = torch.tensor(offload_rows, dtype=torch.long, pin_memory=True).to(self.device, non_blocking=True)
@@ -558,6 +556,7 @@ class ModelRunner:
                     hbm_block_tables=hbm_block_tables,
                     index_block_tables=index_block_tables,
                     dram_block_tables=dram_block_tables,
+                    selection_block_tables=selection_block_tables,
                     req_pool_entries=req_pool_entries,
                     candidate_lens=candidate_lens,
                     candidate_query_lens=candidate_query_lens,
@@ -569,7 +568,6 @@ class ModelRunner:
                     dsa_pool_entries_start=dsa_pool_entries_start,
                     dsa_offload_rows=dsa_offload_rows,
                     dsa_offload_all_rows=dsa_offload_all_rows,
-                    gather_query_lens=gather_query_lens,
                     has_first_decode=has_first_decode,
                     is_enforce_eager=True,
                     real_bs=len(seqs),

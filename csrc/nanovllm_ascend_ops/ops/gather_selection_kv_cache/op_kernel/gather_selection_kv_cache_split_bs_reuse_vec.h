@@ -43,9 +43,8 @@ public:
 
     __aicore__ inline void Init(
         GM_ADDR selection_k_rope, GM_ADDR selection_kv_cache, GM_ADDR selection_kv_block_table,
-        GM_ADDR selection_kv_block_status, GM_ADDR selection_topk_indices, GM_ADDR full_k_rope, GM_ADDR full_kv_cache,
-        GM_ADDR full_kv_block_table, GM_ADDR full_kv_actual_seq, GM_ADDR full_q_actual_seq,
-        GM_ADDR selection_kv_actual_seq)
+        GM_ADDR selection_kv_block_status, GM_ADDR req_pool_entries, GM_ADDR selection_topk_indices,
+        GM_ADDR full_k_rope, GM_ADDR full_kv_cache, GM_ADDR full_kv_block_table, GM_ADDR full_kv_actual_seq)
     {
         blkIdx_ = GetBlockIdx();
         if (blkIdx_ >= tiling_->usedCoreNum) {
@@ -88,6 +87,7 @@ public:
         selKvBlockTableGm_.SetGlobalBuffer((__gm__ int32_t*)selection_kv_block_table);
         // [batchsize, seq, headnum, topk+1] 初始全-1，表示全空
         selKvBlockStatusGm_.SetGlobalBuffer((__gm__ int32_t*)selection_kv_block_status);
+        reqPoolEntriesGm_.SetGlobalBuffer((__gm__ int32_t*)req_pool_entries);
         // [batchsize, seq, headnum, topk] token粒度=groupid * selection_topk_block_size
         selTopKIndicesGm_.SetGlobalBuffer((__gm__ int32_t*)selection_topk_indices);
         // [f_block_num, block_size, k_rope]
@@ -99,9 +99,6 @@ public:
         // [batchsize] 每个batch实际的seq长度
         fullKvActualSeqGm_.SetGlobalBuffer((__gm__ int32_t*)full_kv_actual_seq);
         // [batchsize] 每个batch实际的seq长度   用来算MTP场景不同T下面的kv_actual_seq
-        fullQActualSeqGm_.SetGlobalBuffer((__gm__ int32_t*)full_q_actual_seq);
-        // [batchsize*seq*headnum]
-        selKvActualSeqGm_.SetGlobalBuffer((__gm__ int32_t*)selection_kv_actual_seq);
     }
 
     __aicore__ inline void Process()
@@ -129,9 +126,11 @@ public:
             int64_t curSeq = (blkIdx_ * tiling_->mainCoreBsLoopNum + bsIdx) % rawSeq_;
             int64_t offset = (rawSeq_ - 1) - (blkIdx_ * tiling_->mainCoreBsLoopNum + bsIdx) % rawSeq_;
             curFullKvSeqLen = fullKvActualSeqGm_.GetValue(curBatchSize);
-            if (curFullKvSeqLen <= 0) {
+            if (curFullKvSeqLen <= tiling_->topk) {
                 continue;
             }
+            int32_t poolEntry = reqPoolEntriesGm_.GetValue(curBatchSize);
+            ASSERT_MSG(poolEntry >= 0, "req_pool_entries must be >= 0 for long sequence.");
 
             curFullQSeqLen = tiling_->seq;
             ASSERT_MSG(curFullQSeqLen <= tiling_->seq, "curFullQSeqLen:%ld cannot be greater than seq:%ld",
@@ -141,7 +140,7 @@ public:
             LocalTensor<int32_t> selTopKIdxLocal = selTopKIdxQue_.DeQue<int32_t>();
 
             SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
-            CopyInBlockStatus(bsIdx, selBlockStatLocal);
+            CopyInBlockStatus(poolEntry, selBlockStatLocal);
 
             CopyInSelKvBlockTable(bsIdx, selKvBlockTableLocal);
 
@@ -160,7 +159,7 @@ public:
             selTopKIdxQue_.FreeTensor(selTopKIdxLocal);
 
             SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
-            CopyOutSelKvBlockTableAndSeqLen(bsIdx, selKvActSeqLocal, selBlockStatLocal);
+            CopyOutBlockStatus(poolEntry, selBlockStatLocal);
         }
     }
 
@@ -171,17 +170,6 @@ private:
         event_t eventId = static_cast<event_t>(GetTPipePtr()->FetchEventID(evt));
         SetFlag<event>(eventId);
         WaitFlag<event>(eventId);
-    }
-
-    __aicore__ inline int64_t GetActualQSeqLen(int64_t bsIdx)
-    {
-        if (tiling_->layOut == static_cast<int64_t>(LAYOUT::BSND)) {
-            return tiling_->seq;
-        } else if (bsIdx > 0) {
-            return fullQActualSeqGm_.GetValue(bsIdx) - fullQActualSeqGm_.GetValue(bsIdx - 1);
-        } else {
-            return fullQActualSeqGm_.GetValue(bsIdx);
-        }
     }
 
     __aicore__ inline void CopyInTopKIndices(int64_t bsIdx)
@@ -204,21 +192,17 @@ private:
         selTopKIdxQue_.EnQue(selTopKIdxLocal);
     }
 
-    __aicore__ inline void CopyInBlockStatus(int64_t bsIdx, LocalTensor<int32_t>& selBlockStatLocal)
+    __aicore__ inline void CopyInBlockStatus(int64_t poolEntry, LocalTensor<int32_t>& selBlockStatLocal)
     {
         uint8_t padCnt = topkOneAlign_ - (tiling_->topk + 1);
         DataCopyPadExtParams<int32_t> dataCopyPadParams{true, 0, padCnt, -1};
         uint32_t dstStride = (topkOneSortAlign_ - topkOneAlign_) / (BLOCK_BYTES / sizeof(int32_t));
-        int64_t SH = rawSeq_ * tiling_->headnum;
-        int64_t curBatchSize = (blkIdx_ * tiling_->mainCoreBsLoopNum + bsIdx) / rawSeq_;
-        int64_t curSeq = (blkIdx_ * tiling_->mainCoreBsLoopNum + bsIdx) % rawSeq_;
-        int64_t batchOffset = curBatchSize * SH * (tiling_->topk + 1);
 
         DataCopyExtParams dataCopyParamsSt{
             static_cast<uint16_t>(tiling_->seq * tiling_->headnum),
             static_cast<uint32_t>((tiling_->topk + 1) * sizeof(int32_t)), 0, dstStride, 0};
         DataCopyPad(selBlockStatLocal,
-            selKvBlockStatusGm_[batchOffset + curSeq * tiling_->headnum * (tiling_->topk + 1)],
+            selKvBlockStatusGm_[poolEntry * rawSeq_ * tiling_->headnum * (tiling_->topk + 1)],
             dataCopyParamsSt,
             dataCopyPadParams);
     }
@@ -704,28 +688,14 @@ private:
         selKvActSeqLocal.SetValue(seqLenIdx, selActualSeqLen);
     }
 
-    __aicore__ inline void CopyOutSelKvBlockTableAndSeqLen(int64_t bsIdx, LocalTensor<int32_t>& selKvActSeqLocal,
-        LocalTensor<int32_t>& selBlockStatLocal)
+    __aicore__ inline void CopyOutBlockStatus(int64_t poolEntry, LocalTensor<int32_t>& selBlockStatLocal)
     {
-        int64_t curBatchSize = (blkIdx_ * tiling_->mainCoreBsLoopNum + bsIdx) / rawSeq_;
-        int64_t curSeq = (blkIdx_ * tiling_->mainCoreBsLoopNum + bsIdx) % rawSeq_;
-
-        DataCopyExtParams dataCopyParSeqLen{
-            static_cast<uint16_t>(1), static_cast<uint32_t>(tiling_->seq * tiling_->headnum * sizeof(int32_t)), 0, 0,
-            0};
-        DataCopyPad(selKvActualSeqGm_[(curBatchSize * rawSeq_) * tiling_->headnum + curSeq * tiling_->headnum],
-                    selKvActSeqLocal, dataCopyParSeqLen);
-
-        int32_t statSH = rawSeq_ * tiling_->headnum;
-        int64_t SH = rawSeq_ * tiling_->headnum;
-        int64_t BsiSH = tiling_->mainCoreBsLoopNum * SH;
         uint32_t srcStride = (topkOneSortAlign_ - topkOneAlign_) / (BLOCK_BYTES / sizeof(int32_t));
-        int64_t batchOffset = curBatchSize * SH * (tiling_->topk + 1);
 
         DataCopyExtParams dataCopyParBlkStat{
             static_cast<uint16_t>(tiling_->headnum),
             static_cast<uint32_t>((tiling_->topk + 1) * sizeof(int32_t)), srcStride, 0, 0};
-        DataCopyPad(selKvBlockStatusGm_[batchOffset + curSeq * tiling_->headnum * (tiling_->topk + 1)],
+        DataCopyPad(selKvBlockStatusGm_[poolEntry * rawSeq_ * tiling_->headnum * (tiling_->topk + 1)],
                     selBlockStatLocal, dataCopyParBlkStat);
     }
 
@@ -773,8 +743,7 @@ private:
     GlobalTensor<T> fullKvCacheGm_;
     GlobalTensor<int32_t> fullKvBlockTableGm_;
     GlobalTensor<int32_t> fullKvActualSeqGm_;
-    GlobalTensor<int32_t> fullQActualSeqGm_;
-    GlobalTensor<int32_t> selKvActualSeqGm_;
+    GlobalTensor<int32_t> reqPoolEntriesGm_;
 
     LocalTensor<int32_t> topkIndicesLocal_;
     LocalTensor<int32_t> insertStatusSameSeqLocal_;

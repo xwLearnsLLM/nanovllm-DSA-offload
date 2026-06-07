@@ -1016,10 +1016,8 @@ class DeepseekV32DSAAttention(nn.Module):
         self.index_cache = torch.tensor([])
         self.dram_ckv_cache = torch.tensor([])
         self.dram_kpe_cache = torch.tensor([])
-        self.gather_selection_block_table = torch.tensor([])
         self.gather_selection_status = torch.tensor([])
         self.gather_selection_topk = _DSA_GATHER_TOPK
-        self.gather_selection_blocks = 0
         self.register_parameter("wd_qkv", None)
         self.w_uk_t = None
         self.w_uv = None
@@ -1142,7 +1140,6 @@ class DeepseekV32DSAAttention(nn.Module):
         index_cache: torch.Tensor,
         dram_ckv_cache: torch.Tensor,
         dram_kpe_cache: torch.Tensor,
-        gather_selection_block_table: torch.Tensor,
         gather_selection_status: torch.Tensor,
     ) -> None:
         self.ckv_cache = ckv_cache
@@ -1150,10 +1147,8 @@ class DeepseekV32DSAAttention(nn.Module):
         self.index_cache = index_cache
         self.dram_ckv_cache = dram_ckv_cache
         self.dram_kpe_cache = dram_kpe_cache
-        self.gather_selection_block_table = gather_selection_block_table
         self.gather_selection_status = gather_selection_status
         self.gather_selection_topk = min(_DSA_GATHER_TOPK, int(gather_selection_status.shape[-1]) - 1)
-        self.gather_selection_blocks = int(gather_selection_block_table.shape[1])
 
     def post_load_prepare(self) -> None:
         if self.wd_qkv is None:
@@ -1478,22 +1473,9 @@ class DeepseekV32DSAAttention(nn.Module):
             return context.flat_index_slot_mapping
         return self._flat_slots()
 
-    def _init_prefill_gather_selection_state(self, seq, old_hbm_block_table: list[int]) -> None:
+    def _init_prefill_gather_selection_state(self, seq) -> None:
         entry = int(seq.hbm_cached_tokens_pool_entry)
-        num_full_blocks = int(seq.num_prefill_full_blocks)
-        num_sparse_blocks = min(int(seq.num_sparse_blocks), self.gather_selection_blocks)
         self.gather_selection_status[entry].fill_(-1)
-        self.gather_selection_block_table[entry].fill_(0)
-        if num_full_blocks <= 0 or num_sparse_blocks <= 0:
-            return
-        if num_sparse_blocks >= num_full_blocks:
-            keep_sparse = old_hbm_block_table[:num_sparse_blocks]
-        else:
-            prefix_blocks = 1
-            suffix_blocks = max(0, num_sparse_blocks - prefix_blocks)
-            suffix_start = num_full_blocks - suffix_blocks
-            keep_sparse = old_hbm_block_table[:prefix_blocks] + old_hbm_block_table[suffix_start:num_full_blocks]
-        self.gather_selection_block_table[entry, :len(keep_sparse)] = torch.tensor(keep_sparse, dtype=torch.int32, device=self.gather_selection_block_table.device)
 
     def finalize_prefill_offload(
         self,
@@ -1502,7 +1484,7 @@ class DeepseekV32DSAAttention(nn.Module):
     ) -> None:
         num_full_blocks = int(seq.num_prefill_full_blocks)
         num_sparse_blocks = int(seq.num_sparse_blocks)
-        self._init_prefill_gather_selection_state(seq, old_hbm_block_table)
+        self._init_prefill_gather_selection_state(seq)
 
         if num_sparse_blocks >= num_full_blocks:
             # Dense/short requests keep every full prefill block in HBM, so their
@@ -1837,7 +1819,7 @@ class DeepseekV32DSAAttention(nn.Module):
             "index_block_tables": context.index_block_tables,
             "candidate_query_lens": context.candidate_query_lens,
             "dram_block_tables": context.dram_block_tables,
-            "gather_query_lens": context.gather_query_lens,
+            "selection_block_tables": context.selection_block_tables,
         }
         missing = [name for name, value in required_context.items() if value is None]
         if missing:
@@ -1850,6 +1832,7 @@ class DeepseekV32DSAAttention(nn.Module):
             weights_active = weights[:batch_size]
             index_tables = context.index_block_tables[:batch_size]
             dram_tables = context.dram_block_tables[:batch_size]
+            selection_block_table = context.selection_block_tables[:batch_size]
             candidate_lens = context.candidate_lens[:batch_size]
             req_pool_entries = context.req_pool_entries[:batch_size]
         else:
@@ -1861,10 +1844,10 @@ class DeepseekV32DSAAttention(nn.Module):
             weights_active = weights.index_select(0, rows)
             index_tables = context.index_block_tables.index_select(0, rows)
             dram_tables = context.dram_block_tables.index_select(0, rows)
+            selection_block_table = context.selection_block_tables.index_select(0, rows)
             candidate_lens = context.candidate_lens.index_select(0, rows)
             req_pool_entries = context.req_pool_entries.index_select(0, rows)
         candidate_query_lens = context.candidate_query_lens[:active_batch]
-        gather_query_lens = context.gather_query_lens[:active_batch]
 
         profile_decode = self.log_decode_layer_timing
         start = self._decode_timer_start(profile_decode, q_index.device)
@@ -1882,36 +1865,20 @@ class DeepseekV32DSAAttention(nn.Module):
         )
         self._decode_timer_end(profile_decode, "dsa_lightning_indexer", start, topk_indices.device)
 
-        pool_start = int(context.dsa_pool_entries_start)
-        if pool_start >= 0:
-            selection_block_table = self.gather_selection_block_table[pool_start:pool_start + active_batch]
-            selection_status = self.gather_selection_status[pool_start:pool_start + active_batch]
-            status_needs_writeback = False
-            pool_entries_long = None
-        else:
-            pool_entries_long = req_pool_entries.to(torch.long)
-            selection_block_table = self.gather_selection_block_table.index_select(0, pool_entries_long).contiguous()
-            selection_status = self.gather_selection_status.index_select(0, pool_entries_long).contiguous()
-            status_needs_writeback = True
-
         start = self._decode_timer_start(profile_decode, self.ckv_cache.device)
         ascend_ops.npu_gather_selection_kv_cache(
             self.kpe_cache.squeeze(2),
             self.ckv_cache.squeeze(2),
             selection_block_table,
-            selection_status,
+            self.gather_selection_status,
+            req_pool_entries,
             topk_indices.view(active_batch, 1, 1, self.gather_selection_topk),
             self.dram_kpe_cache.squeeze(2),
             self.dram_ckv_cache.squeeze(2),
             dram_tables,
             candidate_lens,
-            gather_query_lens,
-            selection_topk_block_size=1,
         )
         self._decode_timer_end(profile_decode, "dsa_gather_selection", start, self.ckv_cache.device)
-        if status_needs_writeback:
-            self.gather_selection_block_table.index_copy_(0, pool_entries_long, selection_block_table)
-            self.gather_selection_status.index_copy_(0, pool_entries_long, selection_status)
 
     def _decode_forward(
         self,

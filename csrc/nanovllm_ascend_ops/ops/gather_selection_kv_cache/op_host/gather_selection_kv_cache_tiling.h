@@ -86,6 +86,7 @@ private:
     ge::graphStatus GetSelKvCacheShape();
     ge::graphStatus GetSelBlockTable();
     ge::graphStatus GetTopkIndices();
+    ge::graphStatus GetReqPoolEntries();
     ge::graphStatus CheckSelInfo();
     ge::graphStatus GetFullKvCacheShape();
     ge::graphStatus GetFullKvBlkTable();
