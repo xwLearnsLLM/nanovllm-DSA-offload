@@ -324,7 +324,7 @@ IndexCache 容量由 `NANOVLLM_DRAM_NUM_BLOCKS` 决定，和 DRAM KV block 数�
 | `NANOVLLM_MAX_PREFILL_SEQS_PER_STEP` | 单步最多调度多少个 prefill 请求 | 1 |
 | `NANOVLLM_MAX_DECODE_SEQS_PER_STEP` | decode batch 上限，也是 gather status pool capacity | 256 |
 | `NANOVLLM_ENABLE_DECODE_MLAPO` | decode 后续 step 是否启用 MLAPO | true |
-| `NANOVLLM_DSA_QUERY_ONLY_BACKEND` | query-only indexer_project 后端，`current/auto/torchair` | current |
+| `NANOVLLM_DSA_QUERY_ONLY_BACKEND` | DSA decode 后端，`current` 为非图路径，`torchair` 为 DSA 小流水组图路径 | current |
 
 调度器保持如下规则：
 

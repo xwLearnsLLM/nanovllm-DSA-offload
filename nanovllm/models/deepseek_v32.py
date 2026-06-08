@@ -17,10 +17,7 @@ import nanovllm.ops as ascend_ops
 from nanovllm.models.dsa_indexer_project import (
     dsa_indexer_project,
     dsa_indexer_project_query_only,
-    dsa_indexer_project_query_only_torchair,
     dsa_indexer_pipeline_with_qc_torchair,
-    warmup_dsa_query_only_torchair,
-    warmup_dsa_query_only_with_qc_torchair,
 )
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
@@ -58,22 +55,6 @@ def _env_int(name: str, default: int) -> int:
         return int(value)
     except ValueError:
         return default
-
-
-def _env_csv_ints(name: str, default: str) -> list[int]:
-    value = os.environ.get(name, default)
-    result: list[int] = []
-    for item in value.split(","):
-        item = item.strip()
-        if not item:
-            continue
-        try:
-            parsed = int(item)
-        except ValueError:
-            continue
-        if parsed > 0:
-            result.append(parsed)
-    return result
 
 
 def _rank_id() -> int:
@@ -564,10 +545,8 @@ class DeepseekV32Indexer(nn.Module):
         self._wq_b_bmm_t_key = None
         self._wq_b_bmm_t = None
         self.query_only_backend = os.environ.get("NANOVLLM_DSA_QUERY_ONLY_BACKEND", "current").strip().lower()
-        if self.query_only_backend not in ("current", "torchair", "auto"):
+        if self.query_only_backend not in ("current", "torchair"):
             self.query_only_backend = "current"
-        self.query_only_warmup_tokens = _env_csv_ints("NANOVLLM_DSA_QUERY_ONLY_WARMUP_TOKENS", "1,2,4,8,16,32,64,128")
-        self.query_only_torchair_warmup_status: dict[int, str] = {}
 
     # Output tensors are owned by this layer and reused only in decode. Prefill may have
     # thousands of tokens, so caching those temporary outputs would pin huge per-layer tensors.
@@ -643,28 +622,6 @@ class DeepseekV32Indexer(nn.Module):
         if query_only:
             # Decode DSA only scores prefill candidates. The decode token key is already in the MLA tail budget, so skip index_k projection/cache.
             weights_proj_weight = self._query_only_weights_proj_weight(hidden_states.dtype, hidden_states.device)
-            if self.query_only_backend in ("torchair", "auto"):
-                _, _, used_torchair, reason = dsa_indexer_project_query_only_torchair(
-                    hidden_states,
-                    q_c,
-                    cos,
-                    sin,
-                    self.wq_b.weight,
-                    weights_proj_weight,
-                    q_index,
-                    index_weights,
-                    n_head=self.n_head,
-                    head_dim=self.head_dim,
-                    rope_dim=self.rope_dim,
-                    score_scale=1.0,  # vllm-ascend BF16 lightning_indexer consumes raw weights_proj(x).
-                    allow_compile=self.query_only_backend == "torchair",
-                    detail=detail,
-                    sync_detail=sync_detail,
-                )
-                if used_torchair:
-                    return q_index, None, index_weights
-                if self.query_only_backend == "torchair":
-                    raise RuntimeError(f"DSA query-only TorchAir graph failed: {reason}")
             wq_b_bmm_t = self._query_only_wq_b_bmm_t(q_c.dtype, q_c.device)
             dsa_indexer_project_query_only(
                 hidden_states,
@@ -880,48 +837,6 @@ class DeepseekV32DSAAttention(nn.Module):
 
         if self.enable_decode_mlapo:
             self._prepare_decode_mlapo()
-        self._warmup_query_only_with_qc_torchair()
-
-    def _warmup_query_only_with_qc_torchair(self) -> None:
-        if self.indexer.query_only_backend not in ("torchair", "auto"):
-            return
-        if self.layer_id != 0:                                  # Graph is shape-based; one layer warms the rank cache.
-            return
-        q_a_weight = None if self.wd_qkv is None else self.wd_qkv[: self.q_lora_rank]
-        weights_proj_weight = self.indexer._query_only_weights_proj_weight(self.indexer.wq_b.weight.dtype, self.indexer.wq_b.weight.device)
-        q_only_status = warmup_dsa_query_only_torchair(
-            tokens_list=self.indexer.query_only_warmup_tokens,
-            hidden_size=self.hidden_size,
-            q_lora_rank=self.q_lora_rank,
-            n_head=self.indexer.n_head,
-            head_dim=self.indexer.head_dim,
-            rope_dim=self.indexer.rope_dim,
-            dtype=self.indexer.wq_b.weight.dtype,
-            device=self.indexer.wq_b.weight.device,
-            wq_b_weight=self.indexer.wq_b.weight,
-            weights_proj_weight=weights_proj_weight,
-            score_scale=1.0,
-        )
-        if q_a_weight is None:
-            self.indexer.query_only_torchair_warmup_status = {int(tokens): f"q_only={q_only_status.get(int(tokens), 'skipped')};with_qc=q_a_weight_unavailable" for tokens in self.indexer.query_only_warmup_tokens}
-            return
-        with_qc_status = warmup_dsa_query_only_with_qc_torchair(
-            tokens_list=self.indexer.query_only_warmup_tokens,
-            hidden_size=self.hidden_size,
-            q_lora_rank=self.q_lora_rank,
-            n_head=self.indexer.n_head,
-            head_dim=self.indexer.head_dim,
-            rope_dim=self.indexer.rope_dim,
-            dtype=q_a_weight.dtype,
-            device=q_a_weight.device,
-            q_a_weight=q_a_weight,
-            q_norm_weight=self.q_a_layernorm.weight,
-            wq_b_weight=self.indexer.wq_b.weight,
-            weights_proj_weight=weights_proj_weight,
-            q_norm_eps=float(self.q_a_layernorm.eps),
-            score_scale=1.0,
-        )
-        self.indexer.query_only_torchair_warmup_status = {int(tokens): f"q_only={q_only_status.get(int(tokens), 'skipped')};with_qc={with_qc_status.get(int(tokens), 'skipped')}" for tokens in self.indexer.query_only_warmup_tokens}
 
     def _run_dsa_pipeline_with_qc_torchair(self, hidden_states: torch.Tensor, positions: torch.Tensor, batch_size: int, profile_decode: bool) -> bool:
         context = get_context()
