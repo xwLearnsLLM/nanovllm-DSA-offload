@@ -323,13 +323,13 @@ def _dsa_indexer_pipeline_with_qc_functional(
         return q_index_out, index_weights_out, topk_indices
 
     topk_indices = _GRAPH_LIGHTNING_INDEXER(
-        q_index_out,
+        q_index_out.unsqueeze(1),      # BSND avoids a GE Reshape after LightningIndexer.
         index_cache,
-        index_weights_out,
+        index_weights_out.unsqueeze(1),
         candidate_query_lens,
         candidate_lens,
         index_tables,
-        "TND",
+        "BSND",
         "PA_BSND",
         int(sparse_count),
         3,
@@ -343,7 +343,7 @@ def _dsa_indexer_pipeline_with_qc_functional(
         selection_block_table,
         gather_selection_status,
         req_pool_entries,
-        topk_indices.view(q_index_out.shape[0], 1, 1, int(sparse_count)),
+        topk_indices,
         full_kpe,
         full_ckv,
         dram_tables,

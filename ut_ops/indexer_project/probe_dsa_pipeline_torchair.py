@@ -135,7 +135,8 @@ def main() -> None:
 
     q_diff, _ = diff("q_index", q_graph, q_eager)
     w_diff, _ = diff("index_weights", w_graph, w_eager)
-    topk_bad = int((topk_graph != topk_eager).sum().item())
+    topk_graph_cmp = topk_graph.reshape_as(topk_eager) if topk_graph.shape != topk_eager.shape else topk_graph
+    topk_bad = int((topk_graph_cmp != topk_eager).sum().item())
     print(f"DSA_PIPELINE_DIFF topk_bad_count={topk_bad}")
     kpe_diff, _ = diff("selection_kpe", graph["selection_kpe"], eager["selection_kpe"])
     ckv_diff, _ = diff("selection_ckv", graph["selection_ckv"], eager["selection_ckv"])
