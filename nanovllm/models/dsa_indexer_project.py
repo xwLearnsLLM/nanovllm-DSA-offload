@@ -210,17 +210,44 @@ def _query_only_weights_proj(
     index_weights_out: torch.Tensor,
     score_scale: float,
 ) -> torch.Tensor:
+    index_weights_out.copy_(_query_only_weights_proj_pure(hidden_states, weights_proj_weight, float(score_scale)))
+    return index_weights_out
+
+
+def _query_only_weights_proj_pure(
+    hidden_states: torch.Tensor,
+    weights_proj_weight: torch.Tensor,
+    score_scale: float,
+) -> torch.Tensor:
     if weights_proj_weight.dtype == hidden_states.dtype:
         weights = F.linear(hidden_states, weights_proj_weight)
         if float(score_scale) != 1.0:
             weights = weights * float(score_scale)
-        index_weights_out.copy_(weights)
-        return index_weights_out
+        return weights
     weights = F.linear(hidden_states.float(), weights_proj_weight.float()).contiguous()
     if float(score_scale) != 1.0:
         weights = weights * float(score_scale)
-    index_weights_out.copy_(weights.to(hidden_states.dtype))
-    return index_weights_out
+    return weights.to(hidden_states.dtype)
+
+
+def _dsa_indexer_project_query_only_pure(
+    hidden_states: torch.Tensor,
+    q_c: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    wq_b_weight: torch.Tensor,
+    weights_proj_weight: torch.Tensor,
+    *,
+    n_head: int,
+    head_dim: int,
+    rope_dim: int,
+    score_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    q = F.linear(q_c, wq_b_weight).view(-1, int(n_head), int(head_dim))
+    index_weights = _query_only_weights_proj_pure(hidden_states, weights_proj_weight, float(score_scale))
+    q_pe, q_nope = torch.split(q, [int(rope_dim), int(head_dim) - int(rope_dim)], dim=-1)
+    q_pe = _apply_query_rope_like_runtime(q_pe, cos, sin, int(rope_dim))
+    return torch.cat((q_pe, q_nope), dim=-1), index_weights
 
 
 def _dsa_indexer_project_query_only_out_functional(
@@ -238,13 +265,52 @@ def _dsa_indexer_project_query_only_out_functional(
     rope_dim: int,
     score_scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    q = F.linear(q_c, wq_b_weight).view(-1, int(n_head), int(head_dim))
-    _query_only_weights_proj(hidden_states, weights_proj_weight, index_weights_out, float(score_scale))
-    q_pe, q_nope = torch.split(q, [int(rope_dim), int(head_dim) - int(rope_dim)], dim=-1)
-    q_pe = _apply_query_rope_like_runtime(q_pe, cos, sin, int(rope_dim))
-    q_index_out[..., : int(rope_dim)].copy_(q_pe)
-    q_index_out[..., int(rope_dim) :].copy_(q_nope)
+    q_index, index_weights = _dsa_indexer_project_query_only_pure(
+        hidden_states,
+        q_c,
+        cos,
+        sin,
+        wq_b_weight,
+        weights_proj_weight,
+        n_head=int(n_head),
+        head_dim=int(head_dim),
+        rope_dim=int(rope_dim),
+        score_scale=float(score_scale),
+    )
+    q_index_out.copy_(q_index)
+    index_weights_out.copy_(index_weights)
     return q_index_out, index_weights_out
+
+
+def _dsa_indexer_project_query_only_with_qc_pure(
+    hidden_states: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    q_a_weight: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    wq_b_weight: torch.Tensor,
+    weights_proj_weight: torch.Tensor,
+    *,
+    q_norm_eps: float,
+    n_head: int,
+    head_dim: int,
+    rope_dim: int,
+    score_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    q_c = F.linear(hidden_states, q_a_weight)
+    q_c = _rms_norm_reference(q_c, q_norm_weight, float(q_norm_eps))
+    return _dsa_indexer_project_query_only_pure(
+        hidden_states,
+        q_c,
+        cos,
+        sin,
+        wq_b_weight,
+        weights_proj_weight,
+        n_head=int(n_head),
+        head_dim=int(head_dim),
+        rope_dim=int(rope_dim),
+        score_scale=float(score_scale),
+    )
 
 
 def _dsa_indexer_project_query_only_with_qc_out_functional(
@@ -264,22 +330,23 @@ def _dsa_indexer_project_query_only_with_qc_out_functional(
     rope_dim: int,
     score_scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    q_c = F.linear(hidden_states, q_a_weight)
-    q_c = _rms_norm_reference(q_c, q_norm_weight, float(q_norm_eps))
-    return _dsa_indexer_project_query_only_out_functional(
+    q_index, index_weights = _dsa_indexer_project_query_only_with_qc_pure(
         hidden_states,
-        q_c,
         cos,
         sin,
+        q_a_weight,
+        q_norm_weight,
         wq_b_weight,
         weights_proj_weight,
-        q_index_out,
-        index_weights_out,
+        q_norm_eps=float(q_norm_eps),
         n_head=int(n_head),
         head_dim=int(head_dim),
         rope_dim=int(rope_dim),
         score_scale=float(score_scale),
     )
+    q_index_out.copy_(q_index)
+    index_weights_out.copy_(index_weights)
+    return q_index_out, index_weights_out
 
 
 def _dsa_indexer_pipeline_with_qc_functional(
@@ -315,7 +382,7 @@ def _dsa_indexer_pipeline_with_qc_functional(
 ) -> tuple[torch.Tensor, ...]:
     if ascend_ops is None:
         raise RuntimeError("nanovllm Ascend ops are unavailable; rebuild with `bash scripts/build_nanovllm_ops.sh`.") from ascend_ops_import_error
-    _dsa_indexer_project_query_only_with_qc_out_functional(
+    q_index, index_weights = _dsa_indexer_project_query_only_with_qc_pure(
         hidden_states,
         cos,
         sin,
@@ -323,8 +390,6 @@ def _dsa_indexer_pipeline_with_qc_functional(
         q_norm_weight,
         wq_b_weight,
         weights_proj_weight,
-        q_index_out,
-        index_weights_out,
         q_norm_eps=float(q_norm_eps),
         n_head=int(n_head),
         head_dim=int(head_dim),
@@ -333,9 +398,9 @@ def _dsa_indexer_pipeline_with_qc_functional(
     )
     if _GRAPH_LIGHTNING_INDEXER is None or _GRAPH_GATHER_SELECTION_KV_CACHE is None:
         topk_indices = ascend_ops.npu_lightning_indexer(
-            query=q_index_out,
+            query=q_index,
             key=index_cache,
-            weights=index_weights_out,
+            weights=index_weights,
             actual_seq_lengths_query=candidate_query_lens,
             actual_seq_lengths_key=candidate_lens,
             block_table=index_tables,
@@ -350,20 +415,20 @@ def _dsa_indexer_pipeline_with_qc_functional(
             selection_block_table,
             gather_selection_status,
             req_pool_entries,
-            topk_indices.view(q_index_out.shape[0], 1, 1, int(sparse_count)),
+            topk_indices.view(q_index.shape[0], 1, 1, int(sparse_count)),
             full_kpe,
             full_ckv,
             dram_tables,
             candidate_lens,
         )
         if return_gather_outputs:
-            return q_index_out, index_weights_out, topk_indices, selection_kpe, selection_ckv, selection_block_table, gather_selection_status
-        return q_index_out, index_weights_out, topk_indices
+            return q_index, index_weights, topk_indices, selection_kpe, selection_ckv, selection_block_table, gather_selection_status
+        return q_index, index_weights, topk_indices
 
     topk_indices = _GRAPH_LIGHTNING_INDEXER(
-        q_index_out.unsqueeze(1),      # BSND avoids a GE Reshape after LightningIndexer.
+        q_index.unsqueeze(1),          # BSND avoids a GE Reshape after LightningIndexer.
         index_cache,
-        index_weights_out.unsqueeze(1),
+        index_weights.unsqueeze(1),
         candidate_query_lens,
         candidate_lens,
         index_tables,
@@ -388,8 +453,8 @@ def _dsa_indexer_pipeline_with_qc_functional(
         candidate_lens,
     )
     if return_gather_outputs:
-        return q_index_out, index_weights_out, topk_indices, selection_kpe_out, selection_ckv_out, selection_block_table_out, gather_selection_status_out
-    return q_index_out, index_weights_out, topk_indices
+        return q_index, index_weights, topk_indices, selection_kpe_out, selection_ckv_out, selection_block_table_out, gather_selection_status_out
+    return q_index, index_weights, topk_indices
 
 
 class DsaQueryOnlyTorchAirCache:
@@ -500,25 +565,21 @@ class DsaQueryOnlyTorchAirCache:
     ) -> tuple[Callable[..., tuple[torch.Tensor, torch.Tensor]] | None, str, tuple]:
         key = self._key("query_only", hidden_states, q_rank=int(q_c.shape[1]), n_head=int(n_head), head_dim=int(head_dim), rope_dim=int(rope_dim))
 
-        def fn(hidden_states_arg, q_c_arg, cos_arg, sin_arg, wq_b_weight_arg, weights_proj_weight_arg, q_index_out_arg, index_weights_out_arg):
-            return _dsa_indexer_project_query_only_out_functional(
+        def fn(hidden_states_arg, q_c_arg, cos_arg, sin_arg, wq_b_weight_arg, weights_proj_weight_arg):
+            return _dsa_indexer_project_query_only_pure(
                 hidden_states_arg,
                 q_c_arg,
                 cos_arg,
                 sin_arg,
                 wq_b_weight_arg,
                 weights_proj_weight_arg,
-                q_index_out_arg,
-                index_weights_out_arg,
                 n_head=int(n_head),
                 head_dim=int(head_dim),
                 rope_dim=int(rope_dim),
                 score_scale=float(score_scale),
             )
 
-        q_index_out = torch.empty((hidden_states.shape[0], int(n_head), int(head_dim)), dtype=hidden_states.dtype, device=hidden_states.device)
-        index_weights_out = torch.empty((hidden_states.shape[0], int(n_head)), dtype=hidden_states.dtype, device=hidden_states.device)
-        args = (hidden_states, q_c, cos, sin, wq_b_weight, weights_proj_weight, q_index_out, index_weights_out)
+        args = (hidden_states, q_c, cos, sin, wq_b_weight, weights_proj_weight)
         compiled, reason = self._compile(key, fn, args, hidden_states.device)
         return compiled, reason, key
 
@@ -540,8 +601,8 @@ class DsaQueryOnlyTorchAirCache:
     ) -> tuple[Callable[..., tuple[torch.Tensor, torch.Tensor]] | None, str, tuple]:
         key = self._key("query_only_with_qc", hidden_states, q_rank=int(q_a_weight.shape[0]), n_head=int(n_head), head_dim=int(head_dim), rope_dim=int(rope_dim), q_norm_eps=float(q_norm_eps))
 
-        def fn(hidden_states_arg, cos_arg, sin_arg, q_a_weight_arg, q_norm_weight_arg, wq_b_weight_arg, weights_proj_weight_arg, q_index_out_arg, index_weights_out_arg):
-            return _dsa_indexer_project_query_only_with_qc_out_functional(
+        def fn(hidden_states_arg, cos_arg, sin_arg, q_a_weight_arg, q_norm_weight_arg, wq_b_weight_arg, weights_proj_weight_arg):
+            return _dsa_indexer_project_query_only_with_qc_pure(
                 hidden_states_arg,
                 cos_arg,
                 sin_arg,
@@ -549,8 +610,6 @@ class DsaQueryOnlyTorchAirCache:
                 q_norm_weight_arg,
                 wq_b_weight_arg,
                 weights_proj_weight_arg,
-                q_index_out_arg,
-                index_weights_out_arg,
                 q_norm_eps=float(q_norm_eps),
                 n_head=int(n_head),
                 head_dim=int(head_dim),
@@ -558,9 +617,7 @@ class DsaQueryOnlyTorchAirCache:
                 score_scale=float(score_scale),
             )
 
-        q_index_out = torch.empty((hidden_states.shape[0], int(n_head), int(head_dim)), dtype=hidden_states.dtype, device=hidden_states.device)
-        index_weights_out = torch.empty((hidden_states.shape[0], int(n_head)), dtype=hidden_states.dtype, device=hidden_states.device)
-        args = (hidden_states, cos, sin, q_a_weight, q_norm_weight, wq_b_weight, weights_proj_weight, q_index_out, index_weights_out)
+        args = (hidden_states, cos, sin, q_a_weight, q_norm_weight, wq_b_weight, weights_proj_weight)
         compiled, reason = self._compile(key, fn, args, hidden_states.device)
         return compiled, reason, key
 
@@ -1002,7 +1059,9 @@ def dsa_indexer_project_query_only_torchair(
 
     try:
         with torch.inference_mode():
-            _ = compiled(hidden_states, q_c, cos, sin, wq_b_weight, weights_proj_weight, q_index_out, index_weights_out)
+            q_result, weights_result = compiled(hidden_states, q_c, cos, sin, wq_b_weight, weights_proj_weight)
+            q_index_out.copy_(q_result)
+            index_weights_out.copy_(weights_result)
         _timer_end(detail, "torchair", start, sync_detail, hidden_states.device)
         return q_index_out, index_weights_out, True, "torchair"
     except Exception as exc:  # pragma: no cover - depends on Ascend/TorchAir runtime.
@@ -1062,7 +1121,9 @@ def dsa_indexer_project_query_only_with_qc_torchair(
 
     try:
         with torch.inference_mode():
-            _ = compiled(hidden_states, cos, sin, q_a_weight, q_norm_weight, wq_b_weight, weights_proj_weight, q_index_out, index_weights_out)
+            q_result, weights_result = compiled(hidden_states, cos, sin, q_a_weight, q_norm_weight, wq_b_weight, weights_proj_weight)
+            q_index_out.copy_(q_result)
+            index_weights_out.copy_(weights_result)
         _timer_end(detail, "torchair_with_qc", start, sync_detail, hidden_states.device)
         return q_index_out, index_weights_out, True, "torchair_with_qc"
     except Exception as exc:  # pragma: no cover - depends on Ascend/TorchAir runtime.

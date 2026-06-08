@@ -304,3 +304,19 @@ test -f nanovllm/_cann_ops_custom/vendors/nanovllm-ascend/op_impl/ai_core/tbe/na
 ```bash
 PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/indexer_project/probe_dsa_pipeline_torchair.py --device npu:0 --batch-size 10 --pool-capacity 256 --full-len 16384 --topk 2048 --block-size 128 --warmup 10 --iters 100
 ```
+
+## 2026-06-08 16:10：修复 DSA 小流水图内 query-only projection 依赖 output buffer 副作用
+
+`runlog/13.txt` 已经不是编译错误，而是 `q_index/index_weights` 在图内就和 eager 不一致。原因是之前图内通过 `copy_` 写入传入的 output buffer，再把这个 buffer 返回；TorchAir 对这种输入 tensor 的副作用不稳定。现在改成图内纯函数直接返回 `q_index/index_weights`，图外需要兼容旧接口时再写回 buffer。
+
+这次只改 Python，不需要重新编译算子。下一次请在昇腾上先跑这个：
+
+```bash
+python3 -m py_compile nanovllm/models/dsa_indexer_project.py nanovllm/models/deepseek_v32.py ut_ops/indexer_project/probe_dsa_pipeline_torchair.py
+```
+
+然后重跑 DSA 小流水 TorchAir 单测：
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/indexer_project/probe_dsa_pipeline_torchair.py --device npu:0 --batch-size 10 --pool-capacity 256 --full-len 16384 --topk 2048 --block-size 128 --warmup 10 --iters 100
+```
