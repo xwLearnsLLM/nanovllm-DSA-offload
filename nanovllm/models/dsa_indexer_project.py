@@ -24,7 +24,11 @@ _GRAPH_GATHER_SELECTION_KV_CACHE = None
 _GRAPH_CUSTOM_OP_ERROR: Exception | None = None
 if ascend_ops is not None:
     try:
-        _GRAPH_LIGHTNING_INDEXER = torch.ops.nanovllm_dsa.lightning_indexer.default
+        graph_lightning = torch.ops.nanovllm_dsa.lightning_indexer.default
+        graph_schema = str(graph_lightning._schema)
+        if "-> (Tensor)" not in graph_schema:
+            raise RuntimeError(f"torch.ops.nanovllm_dsa.lightning_indexer schema is stale: {graph_schema}; rebuild nanovllm ops.")
+        _GRAPH_LIGHTNING_INDEXER = graph_lightning
         _GRAPH_GATHER_SELECTION_KV_CACHE = torch.ops.nanovllm_dsa.gather_selection_kv_cache.default
     except Exception as exc:
         _GRAPH_CUSTOM_OP_ERROR = exc
