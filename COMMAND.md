@@ -320,3 +320,19 @@ python3 -m py_compile nanovllm/models/dsa_indexer_project.py nanovllm/models/dee
 ```bash
 PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/indexer_project/probe_dsa_pipeline_torchair.py --device npu:0 --batch-size 10 --pool-capacity 256 --full-len 16384 --topk 2048 --block-size 128 --warmup 10 --iters 100
 ```
+
+## 2026-06-08 16:28：把 DSA 小流水 TorchAir probe 改成模型量级输入和 topk overlap 判定
+
+`runlog/14.txt` 仍然显示 `q_index/index_weights` 差异很大，但原 probe 用标准正态大随机权重，远大于真实模型权重量级，会放大 BF16 图编译/eager 的数值差异。这次只改 probe：权重缩放到模型量级，`q_norm_weight` 固定为 1，并打印 `topk_min_overlap`。
+
+这次只改单测，不需要重新编译算子。下一次请在昇腾上先跑这个：
+
+```bash
+python3 -m py_compile ut_ops/indexer_project/probe_dsa_pipeline_torchair.py nanovllm/models/dsa_indexer_project.py
+```
+
+然后重跑 DSA 小流水 TorchAir 单测：
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/indexer_project/probe_dsa_pipeline_torchair.py --device npu:0 --batch-size 10 --pool-capacity 256 --full-len 16384 --topk 2048 --block-size 128 --warmup 10 --iters 100
+```
