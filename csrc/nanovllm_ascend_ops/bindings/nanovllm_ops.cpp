@@ -204,7 +204,7 @@ std::tuple<at::Tensor, at::Tensor> lightning_indexer_meta(
   return std::make_tuple(output, output);
 }
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor> gather_selection_kv_cache_torch_op(
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> gather_selection_kv_cache_torch_op(
     at::Tensor selection_k_rope,
     at::Tensor selection_kv_cache,
     const at::Tensor& selection_kv_block_table,
@@ -226,10 +226,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> gather_selection_kv_cache_torch_o
       full_kv_cache,
       full_kv_block_table,
       full_kv_actual_seq);
-  return std::make_tuple(selection_k_rope, selection_kv_cache, selection_kv_block_status);
+  return std::make_tuple(selection_k_rope, selection_kv_cache, selection_kv_block_table, selection_kv_block_status);
 }
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor> gather_selection_kv_cache_meta(
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> gather_selection_kv_cache_meta(
     at::Tensor selection_k_rope,
     at::Tensor selection_kv_cache,
     const at::Tensor& selection_kv_block_table,
@@ -250,6 +250,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> gather_selection_kv_cache_meta(
   return std::make_tuple(
       at::empty_like(selection_k_rope),
       at::empty_like(selection_kv_cache),
+      at::empty_like(selection_kv_block_table),
       at::empty_like(selection_kv_block_status));
 }
 
@@ -419,7 +420,7 @@ TORCH_LIBRARY(nanovllm_dsa, ops) {
       " Tensor selection_kv_block_status, Tensor req_pool_entries,"
       " Tensor selection_topk_indices, Tensor full_k_rope, Tensor full_kv_cache,"
       " Tensor full_kv_block_table, Tensor full_kv_actual_seq)"
-      " -> (Tensor, Tensor, Tensor)");
+      " -> (Tensor, Tensor, Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(nanovllm_dsa, PrivateUse1, ops) {

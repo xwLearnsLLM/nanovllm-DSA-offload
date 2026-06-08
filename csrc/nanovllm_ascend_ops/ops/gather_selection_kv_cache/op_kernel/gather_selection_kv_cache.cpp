@@ -29,7 +29,8 @@ extern "C" __global__ __aicore__ void gather_selection_kv_cache(
     GM_ADDR selection_k_rope, GM_ADDR selection_kv_cache, GM_ADDR selection_kv_block_table,
     GM_ADDR selection_kv_block_status, GM_ADDR req_pool_entries, GM_ADDR selection_topk_indices, GM_ADDR full_k_rope,
     GM_ADDR full_kv_cache, GM_ADDR full_kv_block_table, GM_ADDR full_kv_actual_seq, GM_ADDR selection_k_rope_out,
-    GM_ADDR selection_kv_cache_out, GM_ADDR selection_kv_block_status_out, GM_ADDR workspace, GM_ADDR tiling)
+    GM_ADDR selection_kv_cache_out, GM_ADDR selection_kv_block_table_out, GM_ADDR selection_kv_block_status_out,
+    GM_ADDR workspace, GM_ADDR tiling)
 {
     if (g_coreType == AIC) {
         return;

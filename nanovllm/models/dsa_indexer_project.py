@@ -31,7 +31,7 @@ if ascend_ops is not None:
         _GRAPH_LIGHTNING_INDEXER = graph_lightning
         graph_gather = torch.ops.nanovllm_dsa.gather_selection_kv_cache.default
         gather_schema = str(graph_gather._schema)
-        if "-> (Tensor" not in gather_schema:
+        if "-> (Tensor, Tensor, Tensor, Tensor)" not in gather_schema:
             raise RuntimeError(f"torch.ops.nanovllm_dsa.gather_selection_kv_cache schema is stale: {gather_schema}; rebuild nanovllm ops.")
         _GRAPH_GATHER_SELECTION_KV_CACHE = graph_gather
     except Exception as exc:
@@ -84,7 +84,7 @@ def _register_nanovllm_dsa_torchair_converters() -> None:
                 "full_kv_actual_seq": full_kv_actual_seq,
             },
             attrs={},
-            outputs=["selection_k_rope", "selection_kv_cache", "selection_kv_block_status"],
+            outputs=["selection_k_rope", "selection_kv_cache", "selection_kv_block_table", "selection_kv_block_status"],
         )
 
 
@@ -319,7 +319,7 @@ def _dsa_indexer_pipeline_with_qc_functional(
             candidate_lens,
         )
         if return_gather_outputs:
-            return q_index_out, index_weights_out, topk_indices, selection_kpe, selection_ckv, gather_selection_status
+            return q_index_out, index_weights_out, topk_indices, selection_kpe, selection_ckv, selection_block_table, gather_selection_status
         return q_index_out, index_weights_out, topk_indices
 
     topk_indices = _GRAPH_LIGHTNING_INDEXER(
@@ -337,7 +337,7 @@ def _dsa_indexer_pipeline_with_qc_functional(
         (1 << 63) - 1,
         False,
     )[0]
-    selection_kpe_out, selection_ckv_out, gather_selection_status_out = _GRAPH_GATHER_SELECTION_KV_CACHE(
+    selection_kpe_out, selection_ckv_out, selection_block_table_out, gather_selection_status_out = _GRAPH_GATHER_SELECTION_KV_CACHE(
         selection_kpe,
         selection_ckv,
         selection_block_table,
@@ -350,7 +350,7 @@ def _dsa_indexer_pipeline_with_qc_functional(
         candidate_lens,
     )
     if return_gather_outputs:
-        return q_index_out, index_weights_out, topk_indices, selection_kpe_out, selection_ckv_out, gather_selection_status_out
+        return q_index_out, index_weights_out, topk_indices, selection_kpe_out, selection_ckv_out, selection_block_table_out, gather_selection_status_out
     return q_index_out, index_weights_out, topk_indices
 
 
@@ -1161,6 +1161,7 @@ def dsa_indexer_pipeline_with_qc_torchair(
                 topk_indices,
                 _selection_kpe_out,
                 _selection_ckv_out,
+                _selection_block_table_out,
                 _gather_selection_status_out,
             ) = compiled(
                 hidden_states,

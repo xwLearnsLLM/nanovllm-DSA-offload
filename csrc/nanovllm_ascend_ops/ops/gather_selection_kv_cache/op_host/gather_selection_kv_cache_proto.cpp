@@ -22,13 +22,16 @@ using namespace ge;
 namespace ops {
 constexpr size_t INPUT_IDX_SELECTION_K_ROPE = 0;
 constexpr size_t INPUT_IDX_SELECTION_KV_CACHE = 1;
+constexpr size_t INPUT_IDX_SELECTION_KV_BLOCK_TABLE = 2;
 constexpr size_t INPUT_IDX_SELECTION_KV_BLOCK_STATUS = 3;
 const int32_t INDEX_INPUT_0 = 0;
 const int32_t INDEX_INPUT_1 = 1;
+const int32_t INDEX_INPUT_2 = 2;
 const int32_t INDEX_INPUT_3 = 3;
 const int32_t INDEX_OUTPUT_0 = 0;
 const int32_t INDEX_OUTPUT_1 = 1;
 const int32_t INDEX_OUTPUT_2 = 2;
+const int32_t INDEX_OUTPUT_3 = 3;
 
 static ge::graphStatus InferShape4GatherSelectionKvCache(gert::InferShapeContext* context)
 {
@@ -44,9 +47,14 @@ static ge::graphStatus InferShape4GatherSelectionKvCache(gert::InferShapeContext
     auto selectionKvCacheInplaceShape = context->GetOutputShape(INDEX_OUTPUT_1);
     *selectionKvCacheInplaceShape = *selectionKvCacheShape;
 
+    const gert::Shape* selectionKvBlockTableShape = context->GetInputShape(INDEX_INPUT_2);
+    OPS_LOG_E_IF_NULL(context, selectionKvBlockTableShape, return ge::GRAPH_FAILED);
+    auto selectionKvBlockTableInplaceShape = context->GetOutputShape(INDEX_OUTPUT_2);
+    *selectionKvBlockTableInplaceShape = *selectionKvBlockTableShape;
+
     const gert::Shape* selectionKvBlockStatusShape = context->GetInputShape(INDEX_INPUT_3);
     OPS_LOG_E_IF_NULL(context, selectionKvBlockStatusShape, return ge::GRAPH_FAILED);
-    auto selectionKvBlockStatusInplaceShape = context->GetOutputShape(INDEX_OUTPUT_2);
+    auto selectionKvBlockStatusInplaceShape = context->GetOutputShape(INDEX_OUTPUT_3);
     *selectionKvBlockStatusInplaceShape = *selectionKvBlockStatusShape;
 
     OPS_LOG_I(context->GetNodeName(), "End to do InferShape4GatherSelectionKvCache");
@@ -59,10 +67,12 @@ static ge::graphStatus InferDtype4GatherSelectionKvCache(gert::InferDataTypeCont
 
     const auto selectionKRopeDtype = context->GetInputDataType(INPUT_IDX_SELECTION_K_ROPE);
     const auto selectionKvCacheDtype = context->GetInputDataType(INPUT_IDX_SELECTION_KV_CACHE);
+    const auto selectionKvBlockTableDtype = context->GetInputDataType(INPUT_IDX_SELECTION_KV_BLOCK_TABLE);
     const auto selectionKvBlockStatusDtype = context->GetInputDataType(INPUT_IDX_SELECTION_KV_BLOCK_STATUS);
     context->SetOutputDataType(INDEX_OUTPUT_0, selectionKRopeDtype);
     context->SetOutputDataType(INDEX_OUTPUT_1, selectionKvCacheDtype);
-    context->SetOutputDataType(INDEX_OUTPUT_2, selectionKvBlockStatusDtype);
+    context->SetOutputDataType(INDEX_OUTPUT_2, selectionKvBlockTableDtype);
+    context->SetOutputDataType(INDEX_OUTPUT_3, selectionKvBlockStatusDtype);
 
     OPS_LOG_I(context->GetNodeName(), "InferDtype4GatherSelectionKvCache end");
     return GRAPH_SUCCESS;
