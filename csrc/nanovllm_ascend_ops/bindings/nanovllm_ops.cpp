@@ -419,7 +419,7 @@ TORCH_LIBRARY(nanovllm_dsa, ops) {
       " Tensor(c!) selection_kv_block_status, Tensor req_pool_entries,"
       " Tensor selection_topk_indices, Tensor full_k_rope, Tensor full_kv_cache,"
       " Tensor full_kv_block_table, Tensor full_kv_actual_seq)"
-      " -> (Tensor(a!), Tensor(b!), Tensor(c!))");
+      " -> (Tensor, Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(nanovllm_dsa, PrivateUse1, ops) {
