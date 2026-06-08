@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from time import perf_counter
-from typing import Callable
+from typing import Any, Callable
 
 import torch
 import torch.nn.functional as F
@@ -43,6 +43,52 @@ try:
     import torchair  # type: ignore
 except Exception:  # pragma: no cover - TorchAir is optional.
     torchair = None
+
+
+def _register_nanovllm_dsa_torchair_converters() -> None:
+    if torchair is None or _GRAPH_GATHER_SELECTION_KV_CACHE is None:
+        return
+    try:
+        from torchair._ge_concrete_graph.fx2ge_converter import register_fx_node_ge_converter  # type: ignore
+    except Exception:
+        return
+
+    @register_fx_node_ge_converter(torch.ops.nanovllm_dsa.gather_selection_kv_cache.default)
+    def convert_nanovllm_gather_selection_kv_cache(
+        selection_k_rope,
+        selection_kv_cache,
+        selection_kv_block_table,
+        selection_kv_block_status,
+        req_pool_entries,
+        selection_topk_indices,
+        full_k_rope,
+        full_kv_cache,
+        full_kv_block_table,
+        full_kv_actual_seq,
+        meta_outputs: Any = None,
+    ):
+        # The CANN kernel writes selection_k_rope/selection_kv_cache/status in place.
+        # Keep original inputs here; TensorMove would hide that side effect.
+        return torchair.ge.custom_op(
+            "GatherSelectionKvCache",
+            inputs={
+                "selection_k_rope": selection_k_rope,
+                "selection_kv_cache": selection_kv_cache,
+                "selection_kv_block_table": selection_kv_block_table,
+                "selection_kv_block_status": selection_kv_block_status,
+                "req_pool_entries": req_pool_entries,
+                "selection_topk_indices": selection_topk_indices,
+                "full_k_rope": full_k_rope,
+                "full_kv_cache": full_kv_cache,
+                "full_kv_block_table": full_kv_block_table,
+                "full_kv_actual_seq": full_kv_actual_seq,
+            },
+            attrs={},
+            outputs=["selection_k_rope", "selection_kv_cache", "selection_kv_block_status"],
+        )
+
+
+_register_nanovllm_dsa_torchair_converters()
 
 _POST_OPS = None
 _POST_IMPORT_ERROR: Exception | None = None

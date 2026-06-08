@@ -203,3 +203,25 @@ python3 -m py_compile nanovllm/models/dsa_indexer_project.py nanovllm/models/dee
 
 PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/indexer_project/probe_dsa_pipeline_torchair.py --device npu:0 --batch-size 10 --pool-capacity 256 --full-len 16384 --topk 2048 --block-size 128 --warmup 10 --iters 100
 ```
+## 2026-06-08 11:23：给 gather_selection_kv_cache 注册显式 TorchAir converter 后重跑
+
+下一次请在昇腾上先跑这个：
+
+```bash
+python3 -m py_compile nanovllm/models/dsa_indexer_project.py nanovllm/models/deepseek_v32.py ut_ops/indexer_project/probe_dsa_pipeline_torchair.py
+```
+
+然后 clean 并重新编译算子：
+
+```bash
+rm -rf build/nanovllm_ascend_ops
+rm -rf csrc/nanovllm_ascend_ops/build csrc/nanovllm_ascend_ops/dist csrc/nanovllm_ascend_ops/*.egg-info
+rm -rf nanovllm/_C*.so nanovllm/libnanovllm_ascend_kernels.so nanovllm/_cann_ops_custom
+NANOVLLM_EXT_BUILD_JOBS=1 SOC_VERSION=ascend910_9391 PYTHONPATH=$PWD:$PYTHONPATH bash scripts/build_nanovllm_ops.sh
+```
+
+最后重跑 DSA 小流水 TorchAir 单测：
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/indexer_project/probe_dsa_pipeline_torchair.py --device npu:0 --batch-size 10 --pool-capacity 256 --full-len 16384 --topk 2048 --block-size 128 --warmup 10 --iters 100
+```
