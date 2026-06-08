@@ -100,6 +100,19 @@ def topk_overlap(actual: torch.Tensor, expected: torch.Tensor) -> float:
     return min(ratios) if ratios else 1.0
 
 
+def print_topk_row_report(actual: torch.Tensor, expected: torch.Tensor) -> None:
+    actual_cpu = actual.reshape(actual.shape[0], -1).detach().cpu()
+    expected_cpu = expected.reshape(expected.shape[0], -1).detach().cpu()
+    reports = []
+    for row in range(actual_cpu.shape[0]):
+        bad = int((actual_cpu[row] != expected_cpu[row]).sum().item())
+        actual_set = set(int(v) for v in actual_cpu[row].tolist())
+        expected_set = set(int(v) for v in expected_cpu[row].tolist())
+        overlap = len(actual_set & expected_set) / max(len(expected_set), 1)
+        reports.append(f"row{row}:bad={bad},overlap={overlap:.4f}")
+    print("DSA_PIPELINE_TOPK_ROWS " + " ".join(reports))
+
+
 def bench(fn, device: torch.device, warmup: int, iters: int) -> float:
     for _ in range(max(warmup, 0)):
         fn()
@@ -162,6 +175,7 @@ def main() -> None:
     topk_bad = int((topk_graph_cmp != topk_eager).sum().item())
     overlap = topk_overlap(topk_graph_cmp, topk_eager)
     print(f"DSA_PIPELINE_DIFF topk_bad_count={topk_bad} topk_min_overlap={overlap:.6f}")
+    print_topk_row_report(topk_graph_cmp, topk_eager)
     kpe_diff, _ = diff("selection_kpe", graph["selection_kpe"], eager["selection_kpe"])
     ckv_diff, _ = diff("selection_ckv", graph["selection_ckv"], eager["selection_ckv"])
     status_bad = int((graph["gather_selection_status"] != eager["gather_selection_status"]).sum().item())

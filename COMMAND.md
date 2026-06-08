@@ -336,3 +336,19 @@ python3 -m py_compile ut_ops/indexer_project/probe_dsa_pipeline_torchair.py nano
 ```bash
 PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/indexer_project/probe_dsa_pipeline_torchair.py --device npu:0 --batch-size 10 --pool-capacity 256 --full-len 16384 --topk 2048 --block-size 128 --warmup 10 --iters 100
 ```
+
+## 2026-06-08 16:40：修复 DSA 小流水 BSND LightningIndexer 的 query length 语义
+
+`runlog/15.txt` 中 `q_index/index_weights` 已经完全对齐，但 topk 只有约 11% overlap。原因是正常 TND decode path 使用 cumulative `candidate_query_lens=[1,2,...]`，而 TorchAir 小流水里 LightningIndexer 输入改成了 BSND `query=[B,1,N,D]`，此时每行 query length 应该都是 1。现在图路径内部改成 `torch.ones_like(candidate_query_lens)`，并额外打印逐 row topk bad/overlap。
+
+这次只改 Python，不需要重新编译算子。下一次请在昇腾上先跑这个：
+
+```bash
+python3 -m py_compile nanovllm/models/dsa_indexer_project.py ut_ops/indexer_project/probe_dsa_pipeline_torchair.py
+```
+
+然后重跑 DSA 小流水 TorchAir 单测：
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/indexer_project/probe_dsa_pipeline_torchair.py --device npu:0 --batch-size 10 --pool-capacity 256 --full-len 16384 --topk 2048 --block-size 128 --warmup 10 --iters 100
+```

@@ -425,11 +425,14 @@ def _dsa_indexer_pipeline_with_qc_functional(
             return q_index, index_weights, topk_indices, selection_kpe, selection_ckv, selection_block_table, gather_selection_status
         return q_index, index_weights, topk_indices
 
+    # candidate_query_lens is cumulative for the normal TND decode path. The
+    # TorchAir mini-pipeline uses BSND query=[B, 1, N, D], so each row has S=1.
+    bsnd_query_lens = torch.ones_like(candidate_query_lens)
     topk_indices = _GRAPH_LIGHTNING_INDEXER(
         q_index.unsqueeze(1),          # BSND avoids a GE Reshape after LightningIndexer.
         index_cache,
         index_weights.unsqueeze(1),
-        candidate_query_lens,
+        bsnd_query_lens,
         candidate_lens,
         index_tables,
         "BSND",
