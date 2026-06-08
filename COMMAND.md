@@ -273,3 +273,34 @@ python3 -m py_compile nanovllm/models/dsa_indexer_project.py nanovllm/models/dee
 ```bash
 PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/indexer_project/probe_dsa_pipeline_torchair.py --device npu:0 --batch-size 10 --pool-capacity 256 --full-len 16384 --topk 2048 --block-size 128 --warmup 10 --iters 100
 ```
+
+## 2026-06-08 15:49：修复 LightningIndexerVllm 动态编译缺 ascendc 源文件
+
+`runlog/12.txt` 的错误是 CANN 动态编译找不到 `ascendc/lightning_indexer_vllm/lightning_indexer_vllm.cpp`。这次改了 CANN OPP 安装规则，让 `lightning_indexer` 的 kernel 文件同时安装到 alias 目录 `lightning_indexer_vllm`。
+
+下一次请在昇腾上先跑这个：
+
+```bash
+python3 -m py_compile nanovllm/models/dsa_indexer_project.py nanovllm/models/deepseek_v32.py ut_ops/indexer_project/probe_dsa_pipeline_torchair.py
+```
+
+然后 clean 并重新编译算子：
+
+```bash
+rm -rf build/nanovllm_ascend_ops
+rm -rf csrc/nanovllm_ascend_ops/cann_ops/build csrc/nanovllm_ascend_ops/cann_ops/output
+rm -rf nanovllm/_C*.so nanovllm/libnanovllm_ascend_kernels.so nanovllm/_cann_ops_custom
+NANOVLLM_EXT_BUILD_JOBS=1 SOC_VERSION=ascend910_9391 PYTHONPATH=$PWD:$PYTHONPATH bash scripts/build_nanovllm_ops.sh
+```
+
+检查 LightningIndexerVllm 的动态编译源码是否已经被装进自定义 OPP 包：
+
+```bash
+test -f nanovllm/_cann_ops_custom/vendors/nanovllm-ascend/op_impl/ai_core/tbe/nanovllm-ascend_impl/ascendc/lightning_indexer_vllm/lightning_indexer_vllm.cpp && echo OK_lightning_indexer_vllm_cpp_installed
+```
+
+最后重跑 DSA 小流水 TorchAir 单测：
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/indexer_project/probe_dsa_pipeline_torchair.py --device npu:0 --batch-size 10 --pool-capacity 256 --full-len 16384 --topk 2048 --block-size 128 --warmup 10 --iters 100
+```

@@ -581,10 +581,16 @@ foreach (op_dir ${OP_DIR_LIST})
             ${op_dir}/op_kernel/*.h
     )
 
-    install(FILES ${KERNEL_FILES}
-            DESTINATION ${IMPL_INSTALL_DIR}/ascendc/${_op_name}
-            OPTIONAL
-    )
+    set(_kernel_install_names ${_op_name})
+    if (DEFINED ${_op_name}_kernel_aliases)
+        list(APPEND _kernel_install_names ${${_op_name}_kernel_aliases})
+    endif()
+    foreach (_kernel_install_name ${_kernel_install_names})
+        install(FILES ${KERNEL_FILES}
+                DESTINATION ${IMPL_INSTALL_DIR}/ascendc/${_kernel_install_name}
+                OPTIONAL
+        )
+    endforeach()
 endforeach ()
 
 # ------------------------------------------------ generate compile cmd ------------------------------------------------
