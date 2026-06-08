@@ -31,9 +31,19 @@ class Scheduler:
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
         self.max_model_len = config.max_model_len
+        self.num_index_blocks = config.num_index_cache_blocks
+        self.num_hbm_blocks = config.num_hbm_kvcache_blocks
+        self.num_dram_blocks = config.num_dram_kvcache_blocks
 
     def is_finished(self):
         return not self.waiting and not self.running
+
+    def dsa_block_usage(self) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int]]:
+        # CPU-side counters only; printing them cannot disturb async NPU execution.
+        hbm_kv = (len(self.hbm_block_manager.used_block_ids), self.num_hbm_blocks)
+        dram_kv = (len(self.dram_block_manager.used_block_ids), self.num_dram_blocks)
+        hbm_index = (len(self.index_block_manager.used_block_ids), self.num_index_blocks)
+        return hbm_kv, dram_kv, hbm_index
 
     def add(self, seq: Sequence):
         self.waiting.append(seq)

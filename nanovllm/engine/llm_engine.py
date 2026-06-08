@@ -246,9 +246,13 @@ class LLMEngine:
                 or self.is_finished()
             ):
                 latency_name = "TTFT" if is_prefill else "TPOT"
+                (hbm_used, hbm_total), (dram_used, dram_total), (index_used, index_total) = self.scheduler.dsa_block_usage()
                 print(
                     f"[step{i_step:4d} {'Prefill' if is_prefill else ' Decode'}] "
                     f"bsz={batch_size}, num_tokens={step_tokens}, "
+                    f"HBM_KV={hbm_used}/{hbm_total}, "
+                    f"DRAM_KV={dram_used}/{dram_total}, "
+                    f"HBM_INDEX={index_used}/{index_total}, "
                     f"{latency_name}={step_elapsed:.4f} sec, "
                     f"TPS={step_tps:.2f} tok/s"
                 )
