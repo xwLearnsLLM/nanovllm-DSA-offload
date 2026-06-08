@@ -204,7 +204,7 @@ std::tuple<at::Tensor, at::Tensor> lightning_indexer_meta(
   return std::make_tuple(output, output);
 }
 
-void gather_selection_kv_cache_torch_op(
+std::tuple<at::Tensor, at::Tensor, at::Tensor> gather_selection_kv_cache_torch_op(
     at::Tensor selection_k_rope,
     at::Tensor selection_kv_cache,
     const at::Tensor& selection_kv_block_table,
@@ -226,9 +226,10 @@ void gather_selection_kv_cache_torch_op(
       full_kv_cache,
       full_kv_block_table,
       full_kv_actual_seq);
+  return std::make_tuple(selection_k_rope, selection_kv_cache, selection_kv_block_status);
 }
 
-void gather_selection_kv_cache_meta(
+std::tuple<at::Tensor, at::Tensor, at::Tensor> gather_selection_kv_cache_meta(
     at::Tensor selection_k_rope,
     at::Tensor selection_kv_cache,
     const at::Tensor& selection_kv_block_table,
@@ -249,6 +250,7 @@ void gather_selection_kv_cache_meta(
   (void)full_kv_cache;
   (void)full_kv_block_table;
   (void)full_kv_actual_seq;
+  return std::make_tuple(selection_k_rope, selection_kv_cache, selection_kv_block_status);
 }
 
 at::Tensor npu_sparse_flash_attention_py(
@@ -416,7 +418,8 @@ TORCH_LIBRARY(nanovllm_dsa, ops) {
       " Tensor(b!) selection_kv_cache, Tensor selection_kv_block_table,"
       " Tensor(c!) selection_kv_block_status, Tensor req_pool_entries,"
       " Tensor selection_topk_indices, Tensor full_k_rope, Tensor full_kv_cache,"
-      " Tensor full_kv_block_table, Tensor full_kv_actual_seq) -> ()");
+      " Tensor full_kv_block_table, Tensor full_kv_actual_seq)"
+      " -> (Tensor(a!), Tensor(b!), Tensor(c!))");
 }
 
 TORCH_LIBRARY_IMPL(nanovllm_dsa, PrivateUse1, ops) {
