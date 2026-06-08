@@ -46,12 +46,50 @@ except Exception:  # pragma: no cover - TorchAir is optional.
 
 
 def _register_nanovllm_dsa_torchair_converters() -> None:
-    if torchair is None or _GRAPH_GATHER_SELECTION_KV_CACHE is None:
+    if torchair is None or _GRAPH_LIGHTNING_INDEXER is None or _GRAPH_GATHER_SELECTION_KV_CACHE is None:
         return
     try:
         from torchair._ge_concrete_graph.fx2ge_converter import register_fx_node_ge_converter  # type: ignore
+        from torchair.ge import attr  # type: ignore
     except Exception:
         return
+
+    @register_fx_node_ge_converter(torch.ops.nanovllm_dsa.lightning_indexer.default)
+    def convert_nanovllm_lightning_indexer(
+        query,
+        key,
+        weights,
+        actual_seq_lengths_query,
+        actual_seq_lengths_key,
+        block_table,
+        layout_query: str,
+        layout_key: str,
+        sparse_count: int,
+        sparse_mode: int,
+        pre_tokens: int,
+        next_tokens: int,
+        return_value: bool,
+        meta_outputs: Any = None,
+    ):
+        sparse_indices = torchair.ge.custom_op(
+            "LightningIndexerVllm",
+            inputs={
+                "query": query,
+                "key": key,
+                "weights": weights,
+                "actual_seq_lengths_query": actual_seq_lengths_query,
+                "actual_seq_lengths_key": actual_seq_lengths_key,
+                "block_table": block_table,
+            },
+            attrs={
+                "layout_query": attr.Str(layout_query),
+                "layout_key": attr.Str(layout_key),
+                "sparse_count": attr.Int(sparse_count),
+                "sparse_mode": attr.Int(sparse_mode),
+            },
+            outputs=["sparse_indices"],
+        )
+        return sparse_indices, sparse_indices
 
     @register_fx_node_ge_converter(torch.ops.nanovllm_dsa.gather_selection_kv_cache.default)
     def convert_nanovllm_gather_selection_kv_cache(
