@@ -183,3 +183,23 @@ python3 -m py_compile nanovllm/models/dsa_indexer_project.py nanovllm/models/dee
 
 PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/indexer_project/probe_dsa_pipeline_torchair.py --device npu:0 --batch-size 10 --pool-capacity 256 --full-len 16384 --topk 2048 --block-size 128 --warmup 10 --iters 100
 ```
+
+## 2026-06-08 11:28：把 gather_selection 图内 schema 改成函数式返回并显式使用返回值后重跑
+
+清理 build
+
+```bash
+rm -rf build/nanovllm_ascend_ops
+rm -rf nanovllm/_C*.so nanovllm/libnanovllm_ascend_kernels.so
+rm -rf nanovllm/_cann_ops_custom
+```
+
+下一次请在昇腾上先跑这个：
+
+```bash
+NANOVLLM_CANN_BUILD_JOBS=64 NANOVLLM_EXT_BUILD_JOBS=1 SOC_VERSION=ascend910_9391 PYTHONPATH=$PWD:$PYTHONPATH bash scripts/build_nanovllm_ops.sh
+
+python3 -m py_compile nanovllm/models/dsa_indexer_project.py nanovllm/models/deepseek_v32.py ut_ops/indexer_project/probe_dsa_pipeline_torchair.py
+
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/indexer_project/probe_dsa_pipeline_torchair.py --device npu:0 --batch-size 10 --pool-capacity 256 --full-len 16384 --topk 2048 --block-size 128 --warmup 10 --iters 100
+```

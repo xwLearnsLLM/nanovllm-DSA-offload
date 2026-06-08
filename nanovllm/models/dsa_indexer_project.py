@@ -227,7 +227,8 @@ def _dsa_indexer_pipeline_with_qc_functional(
     rope_dim: int,
     score_scale: float,
     sparse_count: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return_gather_outputs: bool = False,
+) -> tuple[torch.Tensor, ...]:
     if ascend_ops is None:
         raise RuntimeError("nanovllm Ascend ops are unavailable; rebuild with `bash scripts/build_nanovllm_ops.sh`.") from ascend_ops_import_error
     _dsa_indexer_project_query_only_with_qc_out_functional(
@@ -271,6 +272,8 @@ def _dsa_indexer_pipeline_with_qc_functional(
             dram_tables,
             candidate_lens,
         )
+        if return_gather_outputs:
+            return q_index_out, index_weights_out, topk_indices, selection_kpe, selection_ckv, gather_selection_status
         return q_index_out, index_weights_out, topk_indices
 
     topk_indices = _GRAPH_LIGHTNING_INDEXER(
@@ -288,7 +291,7 @@ def _dsa_indexer_pipeline_with_qc_functional(
         (1 << 63) - 1,
         False,
     )[0]
-    _GRAPH_GATHER_SELECTION_KV_CACHE(
+    selection_kpe_out, selection_ckv_out, gather_selection_status_out = _GRAPH_GATHER_SELECTION_KV_CACHE(
         selection_kpe,
         selection_ckv,
         selection_block_table,
@@ -300,6 +303,8 @@ def _dsa_indexer_pipeline_with_qc_functional(
         dram_tables,
         candidate_lens,
     )
+    if return_gather_outputs:
+        return q_index_out, index_weights_out, topk_indices, selection_kpe_out, selection_ckv_out, gather_selection_status_out
     return q_index_out, index_weights_out, topk_indices
 
 
@@ -569,6 +574,7 @@ class DsaQueryOnlyTorchAirCache:
                 rope_dim=int(rope_dim),
                 score_scale=float(score_scale),
                 sparse_count=int(sparse_count),
+                return_gather_outputs=True,
             )
 
         return self._compile_lazy_or_raise(key, fn, hidden_states.device), key
@@ -1103,7 +1109,14 @@ def dsa_indexer_pipeline_with_qc_torchair(
     )
     try:
         with torch.inference_mode():
-            q_index_out, index_weights_out, topk_indices = compiled(
+            (
+                q_index_out,
+                index_weights_out,
+                topk_indices,
+                _selection_kpe_out,
+                _selection_ckv_out,
+                _gather_selection_status_out,
+            ) = compiled(
                 hidden_states,
                 cos,
                 sin,

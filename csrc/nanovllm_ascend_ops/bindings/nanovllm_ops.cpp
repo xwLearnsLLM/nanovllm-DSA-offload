@@ -240,17 +240,17 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> gather_selection_kv_cache_meta(
     const at::Tensor& full_kv_cache,
     const at::Tensor& full_kv_block_table,
     const at::Tensor& full_kv_actual_seq) {
-  (void)selection_k_rope;
-  (void)selection_kv_cache;
   (void)selection_kv_block_table;
-  (void)selection_kv_block_status;
   (void)req_pool_entries;
   (void)selection_topk_indices;
   (void)full_k_rope;
   (void)full_kv_cache;
   (void)full_kv_block_table;
   (void)full_kv_actual_seq;
-  return std::make_tuple(selection_k_rope, selection_kv_cache, selection_kv_block_status);
+  return std::make_tuple(
+      at::empty_like(selection_k_rope),
+      at::empty_like(selection_kv_cache),
+      at::empty_like(selection_kv_block_status));
 }
 
 at::Tensor npu_sparse_flash_attention_py(
@@ -414,9 +414,9 @@ TORCH_LIBRARY(nanovllm_dsa, ops) {
       " int sparse_count, int sparse_mode, int pre_tokens, int next_tokens,"
       " bool return_value) -> (Tensor, Tensor)");
   ops.def(
-      "gather_selection_kv_cache(Tensor(a!) selection_k_rope,"
-      " Tensor(b!) selection_kv_cache, Tensor selection_kv_block_table,"
-      " Tensor(c!) selection_kv_block_status, Tensor req_pool_entries,"
+      "gather_selection_kv_cache(Tensor selection_k_rope,"
+      " Tensor selection_kv_cache, Tensor selection_kv_block_table,"
+      " Tensor selection_kv_block_status, Tensor req_pool_entries,"
       " Tensor selection_topk_indices, Tensor full_k_rope, Tensor full_kv_cache,"
       " Tensor full_kv_block_table, Tensor full_kv_actual_seq)"
       " -> (Tensor, Tensor, Tensor)");
