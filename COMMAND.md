@@ -147,3 +147,15 @@ python3 -m py_compile nanovllm/models/dsa_indexer_project.py nanovllm/models/dee
 
 PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/indexer_project/probe_dsa_pipeline_torchair.py --device npu:0 --batch-size 10 --pool-capacity 256 --full-len 16384 --topk 2048 --block-size 128 --warmup 10 --iters 100
 ```
+
+## 2026-06-08 10:42：把 lightning_indexer Torch op 改成双 Tensor 返回后重跑
+
+下一次请在昇腾上先跑这个：
+
+```bash
+NANOVLLM_CANN_BUILD_JOBS=64 NANOVLLM_EXT_BUILD_JOBS=1 SOC_VERSION=ascend910_9391 PYTHONPATH=$PWD:$PYTHONPATH bash scripts/build_nanovllm_ops.sh
+
+python3 -m py_compile nanovllm/models/dsa_indexer_project.py nanovllm/models/deepseek_v32.py ut_ops/indexer_project/probe_dsa_pipeline_torchair.py
+
+PYTHONPATH=$PWD:$PYTHONPATH ASCEND_RT_VISIBLE_DEVICES=0 python3 ut_ops/indexer_project/probe_dsa_pipeline_torchair.py --device npu:0 --batch-size 10 --pool-capacity 256 --full-len 16384 --topk 2048 --block-size 128 --warmup 10 --iters 100
+```

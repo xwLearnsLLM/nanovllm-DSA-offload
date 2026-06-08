@@ -136,7 +136,7 @@ void npu_gather_selection_kv_cache_py(
       full_kv_actual_seq);
 }
 
-std::tuple<at::Tensor> lightning_indexer_torch_op(
+std::tuple<at::Tensor, at::Tensor> lightning_indexer_torch_op(
     const at::Tensor& query,
     const at::Tensor& key,
     const at::Tensor& weights,
@@ -153,7 +153,7 @@ std::tuple<at::Tensor> lightning_indexer_torch_op(
   (void)pre_tokens;
   (void)next_tokens;
   (void)return_value;
-  return std::make_tuple(vllm_ascend::npu_lightning_indexer(
+  auto output = vllm_ascend::npu_lightning_indexer(
       query,
       key,
       weights,
@@ -163,10 +163,11 @@ std::tuple<at::Tensor> lightning_indexer_torch_op(
       layout_query,
       layout_key,
       sparse_count,
-      sparse_mode));
+      sparse_mode);
+  return std::make_tuple(output, output);
 }
 
-std::tuple<at::Tensor> lightning_indexer_meta(
+std::tuple<at::Tensor, at::Tensor> lightning_indexer_meta(
     const at::Tensor& query,
     const at::Tensor& key,
     const at::Tensor& weights,
@@ -191,11 +192,16 @@ std::tuple<at::Tensor> lightning_indexer_meta(
   TORCH_CHECK(query.dim() >= 2, "lightning_indexer query must have at least 2 dims.");
   TORCH_CHECK(key.dim() >= 3, "lightning_indexer key must have at least 3 dims.");
   TORCH_CHECK(sparse_count > 0, "sparse_count must be > 0.");
+  at::Tensor output;
   if (std::string(layout_query) == "BSND") {
-    return std::make_tuple(at::empty({query.size(0), query.size(1), key.size(2), sparse_count}, query.options().dtype(at::kInt)));
+    output = at::empty({query.size(0), query.size(1), key.size(2), sparse_count}, query.options().dtype(at::kInt));
+  } else {
+    const int64_t n_dim_index = (std::string(layout_key) == "TND") ? 1 : 2;
+    output = at::empty({query.size(0), key.size(n_dim_index), sparse_count}, query.options().dtype(at::kInt));
   }
-  const int64_t n_dim_index = (std::string(layout_key) == "TND") ? 1 : 2;
-  return std::make_tuple(at::empty({query.size(0), key.size(n_dim_index), sparse_count}, query.options().dtype(at::kInt)));
+  // TorchAir's generic custom-op path expects tuple/list meta_outputs.
+  // The second tensor is intentionally ignored by Python callers.
+  return std::make_tuple(output, output);
 }
 
 void gather_selection_kv_cache_torch_op(
@@ -404,7 +410,7 @@ TORCH_LIBRARY(nanovllm_dsa, ops) {
       " Tensor actual_seq_lengths_query, Tensor actual_seq_lengths_key,"
       " Tensor block_table, str layout_query, str layout_key,"
       " int sparse_count, int sparse_mode, int pre_tokens, int next_tokens,"
-      " bool return_value) -> (Tensor)");
+      " bool return_value) -> (Tensor, Tensor)");
   ops.def(
       "gather_selection_kv_cache(Tensor(a!) selection_k_rope,"
       " Tensor(b!) selection_kv_cache, Tensor selection_kv_block_table,"
