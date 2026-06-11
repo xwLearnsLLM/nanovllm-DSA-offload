@@ -59,6 +59,7 @@ extern void mla_preprocess_impl(
 #include "ops/batch_matmul_transpose/batch_matmul_transpose_torch_adpt.h"
 #include "ops/lightning_indexer/lightning_indexer_vllm_torch_adpt.h"
 #include "ops/gather_selection_kv_cache/gather_selection_kv_cache_torch_adpt.h"
+#include "ops/matmul_allreduce_add_rmsnorm/matmul_allreduce_add_rmsnorm_torch_adpt.h"
 #include "ops/moe_gating_top_k/moe_gating_top_k_torch_adpt.h"
 #include "ops/sparse_flash_attention/sparse_flash_attention_torch_adpt.h"
 #include "ops/dsa_indexer_project/dsa_indexer_project_torch_adpt.h"
@@ -312,6 +313,30 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_gating_top_k_py(
       optional_tensor(bias_opt));
 }
 
+std::tuple<at::Tensor, at::Tensor> matmul_allreduce_add_rmsnorm_py(
+    const at::Tensor& x1,
+    const at::Tensor& x2,
+    const at::Tensor& residual,
+    const at::Tensor& gamma,
+    std::string group_tp,
+    int64_t tp_rank_size,
+    int64_t tp_rank_id,
+    double epsilon,
+    bool is_trans_b,
+    bool is_gather_add_out) {
+  return vllm_ascend::matmul_allreduce_add_rmsnorm(
+      x1,
+      x2,
+      residual,
+      gamma,
+      c10::string_view(group_tp.data(), group_tp.size()),
+      tp_rank_size,
+      tp_rank_id,
+      epsilon,
+      is_trans_b,
+      is_gather_add_out);
+}
+
 void batch_matmul_transpose_py(
     const at::Tensor& tensor_a,
     const at::Tensor& tensor_b,
@@ -491,6 +516,19 @@ PYBIND11_MODULE(_C, m) {
       py::arg("routed_scaling_factor"),
       py::arg("eps"),
       py::arg("bias_opt") = py::none());
+  m.def(
+      "matmul_allreduce_add_rmsnorm",
+      &matmul_allreduce_add_rmsnorm_py,
+      py::arg("x1"),
+      py::arg("x2"),
+      py::arg("residual"),
+      py::arg("gamma"),
+      py::arg("group_tp"),
+      py::arg("tp_rank_size"),
+      py::arg("tp_rank_id"),
+      py::arg("epsilon"),
+      py::arg("is_trans_b"),
+      py::arg("is_gather_add_out"));
   m.def(
       "batch_matmul_transpose",
       &batch_matmul_transpose_py,

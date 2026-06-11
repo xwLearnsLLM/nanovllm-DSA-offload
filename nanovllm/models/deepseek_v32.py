@@ -71,6 +71,15 @@ def _profile_sync(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
+def _hccl_comm_name(group: dist.ProcessGroup, rank: int) -> str:
+    backend = group._get_backend(torch.device("npu"))
+    try:
+        rank = dist.get_global_rank(group, rank)
+    except Exception:
+        pass
+    return backend.get_hccl_comm_name(rank)
+
+
 def _moe_shared_stream():
     global _NPU_MOE_SHARED_STREAM
     if _NPU_MOE_SHARED_STREAM is None:
@@ -697,6 +706,7 @@ class DeepseekV32DSAAttention(nn.Module):
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=float(config.rms_norm_eps))
         self.kv_b_proj = ColumnParallelLinear(self.kv_lora_rank, self.total_num_heads * (self.qk_nope_head_dim + self.v_head_dim), bias=False)
         self.o_proj = RowParallelLinear(self.total_num_heads * self.v_head_dim, self.hidden_size, bias=False)
+        self._tp_hcomm_info = None
         self.rotary_emb = DeepseekScalingRotaryEmbedding(self.qk_rope_head_dim, max_position_embeddings=int(config.max_position_embeddings), rope_parameters=config.rope_parameters, is_neox_style=False)
         self.indexer_rotary_emb = DeepseekScalingRotaryEmbedding(self.qk_rope_head_dim, max_position_embeddings=int(config.max_position_embeddings), rope_parameters=config.rope_parameters, is_neox_style=not getattr(config, "indexer_rope_interleave", False))
         self.indexer = DeepseekV32Indexer(config)
@@ -735,8 +745,7 @@ class DeepseekV32DSAAttention(nn.Module):
             "dsa_gather_selection": 0.0,
             "decode_attention_op": 0.0,
             "v_up": 0.0,
-            "o_linear": 0.0,
-            "o_all_reduce": 0.0,
+            "o_proj": 0.0,
         }
 
     def _decode_timer_start(self, profile_decode: bool, device) -> float | None:
@@ -746,49 +755,43 @@ class DeepseekV32DSAAttention(nn.Module):
             _profile_sync(device)
         return perf_counter()
 
-    def _decode_timer_end(
-        self,
-        profile_decode: bool,
-        name: str,
-        start: float | None,
-        device,
-    ) -> None:
+    def _decode_timer_end(self, profile_decode: bool, name: str, start: float | None, device) -> None:
         if not profile_decode or start is None:
             return
         if self.decode_timing_sync:
             _profile_sync(device)
         self.last_decode_attention_detail[name] += perf_counter() - start
 
-    def _o_proj_forward(
-        self,
-        attn_output: torch.Tensor,
-        profile_decode: bool,
-    ) -> torch.Tensor:
+    def _o_proj_forward(self, attn_output: torch.Tensor, profile_decode: bool) -> torch.Tensor:
         if not profile_decode:
             return self.o_proj(attn_output)
 
         start = self._decode_timer_start(True, attn_output.device)
         if self.o_proj.disable_tp:
-            output = F.linear(
-                attn_output,
-                self.o_proj.weight,
-                self.o_proj.bias,
-            )
-            self._decode_timer_end(True, "o_linear", start, output.device)
+            output = F.linear(attn_output, self.o_proj.weight, self.o_proj.bias)
+            self._decode_timer_end(True, "o_proj", start, output.device)
             return output
 
-        output = F.linear(
-            attn_output,
-            self.o_proj.weight,
-            self.o_proj.bias if self.o_proj.tp_rank == 0 else None,
-        )
-        self._decode_timer_end(True, "o_linear", start, output.device)
+        output = F.linear(attn_output, self.o_proj.weight, self.o_proj.bias if self.o_proj.tp_rank == 0 else None)
+        self._decode_timer_end(True, "o_proj", start, output.device)
 
         if self.o_proj.tp_size > 1 and self.o_proj.reduce_results:
             start = self._decode_timer_start(True, output.device)
             dist.all_reduce(output)
-            self._decode_timer_end(True, "o_all_reduce", start, output.device)
+            self._decode_timer_end(True, "o_proj", start, output.device)
         return output
+
+    def can_fuse_o_proj_add_rms_norm(self) -> bool:
+        return not self.o_proj.disable_tp and self.o_proj.tp_size > 1 and self.o_proj.reduce_results and self.o_proj.bias is None and hasattr(ascend_ops, "matmul_allreduce_add_rmsnorm")
+
+    def _tp_comm_name(self) -> str:
+        if self._tp_hcomm_info is None:
+            self._tp_hcomm_info = _hccl_comm_name(dist.group.WORLD, self.o_proj.tp_rank)
+        return self._tp_hcomm_info
+
+    # Decode fast path: fuse o_proj + TP all_reduce + residual add + post-attention RMSNorm.
+    def o_proj_add_rms_norm(self, attn_output: torch.Tensor, residual: torch.Tensor, norm: RMSNorm) -> tuple[torch.Tensor, torch.Tensor]:
+        return ascend_ops.matmul_allreduce_add_rmsnorm(attn_output, self.o_proj.weight, residual, norm.weight, self._tp_comm_name(), self.o_proj.tp_size, self.o_proj.tp_rank, norm.eps, True, True)
 
     def assign_dsa_cache(
         self,
@@ -1289,7 +1292,7 @@ class DeepseekV32DSAAttention(nn.Module):
         self._decode_timer_end(profile_decode, "v_up", start, output.device)
         return output
 
-    def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor, skip_o_proj: bool = False) -> torch.Tensor:
         context = get_context()
         profile_decode = self.log_decode_layer_timing and not context.is_prefill
         if profile_decode:
@@ -1321,7 +1324,7 @@ class DeepseekV32DSAAttention(nn.Module):
                 self._store_index_cache(index_k)
 
             attn_output = self._decode_forward_mla(ql_nope, q_pe, q_index, weights, dsa_updated=dsa_updated)
-            return self._o_proj_forward(attn_output, profile_decode)
+            return attn_output if skip_o_proj else self._o_proj_forward(attn_output, profile_decode)
 
         qkv_a = F.linear(hidden_states, self.wd_qkv)
         q_c, kv = torch.split(qkv_a, [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1)
@@ -1363,7 +1366,7 @@ class DeepseekV32DSAAttention(nn.Module):
         else:
             attn_output = self._decode_forward_mla(ql_nope, q_pe, q_index, weights)
 
-        return self._o_proj_forward(attn_output, profile_decode)
+        return attn_output if skip_o_proj else self._o_proj_forward(attn_output, profile_decode)
 
 
 class DeepseekV32DecoderLayer(nn.Module):
@@ -1393,26 +1396,34 @@ class DeepseekV32DecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         context = get_context()
         profile_decode = self.log_decode_layer_timing and not context.is_prefill
+        sync_decode = profile_decode and self.decode_timing_sync
+        fuse_o_proj_norm = (not context.is_prefill) and self.self_attn.can_fuse_o_proj_add_rms_norm()
         if profile_decode:
-            if self.decode_timing_sync:
+            if sync_decode:
                 _profile_sync(hidden_states.device)
             attention_start = perf_counter()
-        hidden_states = self.self_attn(positions, hidden_states)
-        if profile_decode:
-            if self.decode_timing_sync:
+        hidden_states = self.self_attn(positions, hidden_states, skip_o_proj=fuse_o_proj_norm)
+        if fuse_o_proj_norm:
+            start = self.self_attn._decode_timer_start(profile_decode, hidden_states.device)
+            hidden_states, residual = self.self_attn.o_proj_add_rms_norm(hidden_states, residual, self.post_attention_layernorm)
+            self.self_attn._decode_timer_end(profile_decode, "o_proj", start, hidden_states.device)
+        else:
+            if profile_decode and sync_decode:
                 _profile_sync(hidden_states.device)
-            attention_total = perf_counter() - attention_start
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+            if profile_decode:
+                attention_total = perf_counter() - attention_start
+            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         if profile_decode:
-            if self.decode_timing_sync:
+            if sync_decode:
                 _profile_sync(hidden_states.device)
+            if fuse_o_proj_norm:
+                attention_total = perf_counter() - attention_start
             mlp_start = perf_counter()
         hidden_states = self.mlp(hidden_states)
         if profile_decode:
-            if self.decode_timing_sync:
+            if sync_decode:
                 _profile_sync(hidden_states.device)
             attention_detail = self.self_attn.last_decode_attention_detail
-            o_proj_total = attention_detail["o_linear"] + attention_detail["o_all_reduce"]
             dsa_total = attention_detail["dsa_pipeline"] + attention_detail["dsa_lightning_indexer"] + attention_detail["dsa_gather_selection"]
             logger.info(
                 "Decode layer timing: rank=%d layer=%d tokens=%d "
@@ -1431,7 +1442,7 @@ class DeepseekV32DecoderLayer(nn.Module):
                 attention_detail["dsa_gather_selection"],
                 attention_detail["decode_attention_op"],
                 attention_detail["v_up"],
-                o_proj_total,
+                attention_detail["o_proj"],
                 perf_counter() - mlp_start,
             )
         return hidden_states, residual

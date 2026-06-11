@@ -8,3 +8,5 @@ csrc/nanovllm_ascend_ops/cann_ops/build/
 csrc/nanovllm_ascend_ops/cann_ops/output/
 resume_log.txt
 runlog/
+
+dsa_offload_o_proj_rmsnorm_fusion_guide.md

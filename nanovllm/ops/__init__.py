@@ -44,6 +44,7 @@ npu_lightning_indexer = _C.npu_lightning_indexer
 npu_gather_selection_kv_cache = _C.npu_gather_selection_kv_cache
 npu_sparse_flash_attention = _C.npu_sparse_flash_attention
 batch_matmul_transpose = _C.batch_matmul_transpose
+matmul_allreduce_add_rmsnorm = _C.matmul_allreduce_add_rmsnorm
 
 
 def _missing_dsa_indexer_project(*args, **kwargs):
@@ -130,6 +131,7 @@ __all__ = [
     "dsa_indexer_project_binding_version",
     "dsa_indexer_project_post",
     "dsa_indexer_project_post_out",
+    "matmul_allreduce_add_rmsnorm",
     "mla_preprocess",
     "moe_gating_top_k",
     "npu_gather_selection_kv_cache",

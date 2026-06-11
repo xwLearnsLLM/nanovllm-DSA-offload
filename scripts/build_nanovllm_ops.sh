@@ -5,8 +5,24 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON_BIN="${PYTHON:-python}"
 RAW_SOC_VERSION="${SOC_VERSION:-ascend910_9391}"
 ASCEND_HOME_PATH="${ASCEND_HOME_PATH:-/usr/local/Ascend/ascend-toolkit/latest}"
-CUSTOM_OPS="lightning_indexer;gather_selection_kv_cache;sparse_flash_attention;moe_gating_top_k"
+CUSTOM_OPS="lightning_indexer;gather_selection_kv_cache;sparse_flash_attention;moe_gating_top_k;matmul_allreduce_add_rmsnorm"
 NANOVLLM_EXT_BUILD_JOBS="${NANOVLLM_EXT_BUILD_JOBS:-1}"
+
+prepare_catlass() {
+  local catlass_root="${ROOT_DIR}/csrc/third_party/catlass"
+  local catlass_include="${catlass_root}/include"
+  local catlass_header="${catlass_include}/catlass/catlass.hpp"
+  if [[ ! -f "${catlass_header}" ]]; then
+    echo "[nanovllm ops] catlass headers are missing, fetch ${catlass_root}"
+    rm -rf "${catlass_root}"
+    git clone --depth 1 https://gitcode.com/cann/catlass.git "${catlass_root}"
+  fi
+  if [[ ! -f "${catlass_header}" ]]; then
+    echo "[nanovllm ops] ERROR: catlass/catlass.hpp was not found in ${catlass_include}" >&2
+    exit 1
+  fi
+  export CPATH="$(cd "${catlass_include}" && pwd):${CPATH:-}"
+}
 
 case "${RAW_SOC_VERSION}" in
   ascend910_93*)
@@ -34,6 +50,10 @@ echo "[nanovllm ops] python: $(${PYTHON_BIN} -c 'import sys; print(sys.executabl
 echo "[nanovllm ops] soc: raw=${RAW_SOC_VERSION}, cann_opp=${CANN_OPP_SOC_VERSION}, ascendc=${ASCENDC_SOC_VERSION}"
 echo "[nanovllm ops] ascend: ${ASCEND_HOME_PATH}"
 echo "[nanovllm ops] extension build jobs: ${NANOVLLM_EXT_BUILD_JOBS}"
+
+if [[ "${CUSTOM_OPS}" == *"matmul_allreduce_add_rmsnorm"* ]]; then
+  prepare_catlass
+fi
 
 echo "[nanovllm ops] normalize build script line endings"
 find "${ROOT_DIR}/csrc/nanovllm_ascend_ops" -type f \
