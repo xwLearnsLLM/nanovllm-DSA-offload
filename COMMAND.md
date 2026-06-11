@@ -38,22 +38,6 @@ export NANOVLLM_MAX_DECODE_SEQS_PER_STEP=256                    # decode最大ba
 export NANOVLLM_IGNORE_EOS=1
 ```
 
-## 2026-06-08 17:02：DSA 小流水 TorchAir 单测已全量对齐，进入真实推理验证
-
-`runlog/16.txt` 已确认 `q_index/index_weights/topk/gather/status` 全部 0 diff，`topk_min_overlap=1.0`。下一步验证真实推理路径是否能正常走组图，并观察稳定 TPOT。
-
-这次不需要重新编译算子。下一次请在昇腾上先跑这个：
-
-```bash
-python3 -m py_compile nanovllm/models/dsa_indexer_project.py nanovllm/models/deepseek_v32.py
-```
-
-然后跑真实推理，重点看输出正确性和稳定 TPOT：
-
-```bash
-PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_DSA_QUERY_ONLY_BACKEND=torchair NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=1 NANOVLLM_PROFILE_LAYER_IDS=mid NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_PROMPT_LENGTHS=11000,11100,11200,11300,11000,11100,11200,11300,11000,11100 python3 example/test.py
-```
-
 ## 2026-06-11：集成 matmul_allreduce_add_rmsnorm 融合 o_proj + all_reduce + residual add + RMSNorm
 
 这次新增了 CANN/aclnn 算子和 pybind 导出，必须先重新编译算子。下一次请在昇腾上先跑这个：
@@ -62,18 +46,8 @@ PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_DSA_QUERY_ONLY_BACKEND=torchair NANOVLLM_LO
 SOC_VERSION=ascend910_9391 PYTHONPATH=$PWD:$PYTHONPATH bash scripts/build_nanovllm_ops.sh
 ```
 
-然后做 Python 静态检查：
+推理：
 
 ```bash
-PYTHONPATH=$PWD:$PYTHONPATH python3 -m py_compile nanovllm/models/deepseek_v32.py nanovllm/ops/__init__.py
-```
-
-最后跑两组 decode timing，重点看 `o_proj`、稳定 TPOT、输出是否正常：
-
-```bash
-PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_DSA_QUERY_ONLY_BACKEND=torchair NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=1 NANOVLLM_PROFILE_LAYER_IDS=mid NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_PROMPT_LENGTHS=11000,11100,11200,11300,11000,11100,11200,11300,11000,11100 python3 example/test.py
-```
-
-```bash
-PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_DSA_QUERY_ONLY_BACKEND=torchair NANOVLLM_LOG_DECODE_LAYER_TIMING=1 NANOVLLM_DECODE_LAYER_TIMING_SYNC=0 NANOVLLM_PROFILE_LAYER_IDS=mid NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_PROMPT_LENGTHS=11000,11100,11200,11300,11000,11100,11200,11300,11000,11100 python3 example/test.py
+PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_PROMPT_LENGTHS=16200,16201,16202,16203,16204,16205,16206,16207,16208,16209,16210,16211,16212,16213,16214,16215 NANOVLLM_LOG_DECODE_LAYER_TIMING=0 NANOVLLM_DECODE_LAYER_TIMING_SYNC=0 NANOVLLM_PROFILE_LAYER_IDS=mid python3 example/test.py
 ```
