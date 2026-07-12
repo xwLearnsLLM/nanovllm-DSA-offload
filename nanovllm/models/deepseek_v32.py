@@ -14,10 +14,15 @@ import torch.nn.functional as F
 from transformers import PretrainedConfig
 
 import nanovllm.ops as ascend_ops
+from nanovllm.engine.full_decode_graph import (
+    MLAGraphTask,
+    is_full_decode_graph_capturing,
+    record_mla_graph_task,
+)
 from nanovllm.models.dsa_indexer_project import (
     dsa_indexer_project,
     dsa_indexer_project_query_only,
-    dsa_indexer_pipeline_with_qc_torchair,
+    dsa_indexer_pipeline_with_qc_full_graph,
 )
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
@@ -553,9 +558,6 @@ class DeepseekV32Indexer(nn.Module):
         self._weights_proj_bf16 = None
         self._wq_b_bmm_t_key = None
         self._wq_b_bmm_t = None
-        self.query_only_backend = os.environ.get("NANOVLLM_DSA_QUERY_ONLY_BACKEND", "current").strip().lower()
-        if self.query_only_backend not in ("current", "torchair"):
-            self.query_only_backend = "current"
 
     # Output tensors are owned by this layer and reused only in decode. Prefill may have
     # thousands of tokens, so caching those temporary outputs would pin huge per-layer tensors.
@@ -841,13 +843,24 @@ class DeepseekV32DSAAttention(nn.Module):
         if self.enable_decode_mlapo:
             self._prepare_decode_mlapo()
 
-    def _run_dsa_pipeline_with_qc_torchair(self, hidden_states: torch.Tensor, positions: torch.Tensor, batch_size: int, profile_decode: bool) -> bool:
+    def _run_dsa_pipeline_with_qc_full_graph(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        batch_size: int,
+    ) -> None:
         context = get_context()
-        if self.indexer.query_only_backend != "torchair":
-            return False
+        if not context.full_decode_graph or not context.dsa_offload_all_rows:
+            raise RuntimeError(
+                "The graph-visible DSA pipeline only supports an exact-size "
+                "FULL_DECODE_ONLY batch in which every row is offloaded."
+            )
         q_a_weight = None if self.wd_qkv is None else self.wd_qkv[: self.q_lora_rank]
         if q_a_weight is None:
-            raise RuntimeError("DSA TorchAir pipeline requires fused q_a weight, but wd_qkv is not prepared.")
+            raise RuntimeError(
+                "DSA FULL_DECODE_ONLY requires fused q_a weight, but wd_qkv "
+                "is not prepared."
+            )
         required_context = {
             "candidate_lens": context.candidate_lens,
             "req_pool_entries": context.req_pool_entries,
@@ -858,36 +871,19 @@ class DeepseekV32DSAAttention(nn.Module):
         }
         missing = [name for name, value in required_context.items() if value is None]
         if missing:
-            raise RuntimeError("DSA TorchAir pipeline context is missing: " + ", ".join(missing))
+            raise RuntimeError(
+                "DSA FULL_DECODE_ONLY context is missing: " + ", ".join(missing)
+            )
 
-        if context.dsa_offload_all_rows:
-            active_batch = int(batch_size)
-            hidden_active = hidden_states[:batch_size]
-            positions_active = positions[:batch_size]
-            index_tables = context.index_block_tables[:batch_size]
-            dram_tables = context.dram_block_tables[:batch_size]
-            selection_block_table = context.selection_block_tables[:batch_size]
-            candidate_lens = context.candidate_lens[:batch_size]
-            req_pool_entries = context.req_pool_entries[:batch_size]
-        else:
-            rows = context.dsa_offload_rows
-            if rows is None or rows.numel() == 0:
-                return True
-            active_batch = int(rows.numel())
-            hidden_active = hidden_states.index_select(0, rows)
-            positions_active = positions.index_select(0, rows)
-            index_tables = context.index_block_tables.index_select(0, rows)
-            dram_tables = context.dram_block_tables.index_select(0, rows)
-            selection_block_table = context.selection_block_tables.index_select(0, rows)
-            candidate_lens = context.candidate_lens.index_select(0, rows)
-            req_pool_entries = context.req_pool_entries.index_select(0, rows)
-        candidate_query_lens = context.candidate_query_lens[:active_batch]
-
-        start = self._decode_timer_start(profile_decode, hidden_states.device)
-        cos, sin = self.indexer._rope_cos_sin(positions_active, self.indexer_rotary_emb, hidden_states.dtype)
-        q_index, _, index_weights = self.indexer._get_output_buffers(hidden_active)
-        dsa_indexer_pipeline_with_qc_torchair(
-            hidden_active,
+        active_batch = int(batch_size)
+        cos, sin = self.indexer._rope_cos_sin(
+            positions,
+            self.indexer_rotary_emb,
+            hidden_states.dtype,
+        )
+        q_index, _, index_weights = self.indexer._get_output_buffers(hidden_states)
+        dsa_indexer_pipeline_with_qc_full_graph(
+            hidden_states,
             cos,
             sin,
             q_a_weight,
@@ -897,28 +893,24 @@ class DeepseekV32DSAAttention(nn.Module):
             q_index,
             index_weights,
             self.index_cache,
-            candidate_query_lens,
-            candidate_lens,
-            index_tables,
+            context.candidate_query_lens[:active_batch],
+            context.candidate_lens[:active_batch],
+            context.index_block_tables[:active_batch],
             self.kpe_cache.squeeze(2),
             self.ckv_cache.squeeze(2),
-            selection_block_table,
+            context.selection_block_tables[:active_batch],
             self.gather_selection_status,
-            req_pool_entries,
+            context.req_pool_entries[:active_batch],
             self.dram_kpe_cache.squeeze(2),
             self.dram_ckv_cache.squeeze(2),
-            dram_tables,
+            context.dram_block_tables[:active_batch],
             q_norm_eps=float(self.q_a_layernorm.eps),
             n_head=self.indexer.n_head,
             head_dim=self.indexer.head_dim,
             rope_dim=self.indexer.rope_dim,
             score_scale=1.0,
             sparse_count=self.gather_selection_topk,
-            detail=None,
-            sync_detail=False,
         )
-        self._decode_timer_end(profile_decode, "dsa_pipeline", start, hidden_states.device)
-        return True
 
     def _prepare_decode_mlapo(self) -> None:
         if self.mlapo_wd_qkv is not None and self.mlapo_wu_q is not None:
@@ -1127,6 +1119,7 @@ class DeepseekV32DSAAttention(nn.Module):
             _NPU_MLA_V2_WORKSPACE_CACHE[key] = workspace
         return workspace
 
+    @torch.compiler.disable
     def _decode_forward_mla_v2(
         self,
         ql_nope: torch.Tensor,
@@ -1142,7 +1135,12 @@ class DeepseekV32DSAAttention(nn.Module):
         # DeepSeek MLA has kv_heads=1 here, so this is a metadata-only view,
         # not a big cache copy.
         key_cache = self.ckv_cache.view(-1, 1, self.block_size, self.kv_lora_rank)
-        key_rope_cache = self.kpe_cache.view(-1, 1, self.block_size, self.qk_rope_head_dim)
+        key_rope_cache = self.kpe_cache.view(
+            -1,
+            1,
+            self.block_size,
+            self.qk_rope_head_dim,
+        )
         kwargs = {
             "query_rope": query_rope,
             "key_rope": key_rope_cache,
@@ -1159,14 +1157,52 @@ class DeepseekV32DSAAttention(nn.Module):
         }
         out, lse = self._decode_mla_v2_buffers(batch_size, ql_nope.dtype, ql_nope.device)
         workspace = self._decode_mla_v2_workspace_get(batch_size, query, key_cache, kwargs)
-        torch_npu.npu_fused_infer_attention_score_v2.out(
-            query,
-            key_cache,
-            key_cache,
-            **kwargs,
-            workspace=workspace,
-            out=[out, lse],
-        )
+        attention_op = torch_npu.npu_fused_infer_attention_score_v2.out
+        if is_full_decode_graph_capturing():
+            # FIA-v2 receives actual_seq_kvlen as a host-side list rather than
+            # a tensor. Capture it as a refreshable graph task so every replay
+            # sees the current sparse-KV length instead of warmup values.
+            stream = torch.npu.current_stream()
+            event = torch.npu.ExternalEvent()
+            event.wait(stream)
+            event.reset(stream)
+            torch.npu.graph_task_group_begin(stream)
+            attention_op(
+                query,
+                key_cache,
+                key_cache,
+                **kwargs,
+                workspace=workspace,
+                out=[out, lse],
+            )
+            handle = torch.npu.graph_task_group_end(stream)
+            record_mla_graph_task(
+                MLAGraphTask(
+                    handle=handle,
+                    event=event,
+                    op=attention_op,
+                    query=query,
+                    key_cache=key_cache,
+                    query_rope=query_rope,
+                    key_rope_cache=key_rope_cache,
+                    block_table=block_table,
+                    workspace=workspace,
+                    output=out,
+                    softmax_lse=lse,
+                    num_query_heads=self.num_local_heads,
+                    block_size=self.block_size,
+                    softmax_scale=float(self.scale),
+                )
+            )
+        else:
+            attention_op(
+                query,
+                key_cache,
+                key_cache,
+                **kwargs,
+                workspace=workspace,
+                out=[out, lse],
+            )
         # FIA v2 writes NBSD-like output [heads, tokens, 1, dim], matching
         # vllm-ascend's trick to feed v-up without a transpose/copy round trip.
         return out
@@ -1275,7 +1311,14 @@ class DeepseekV32DSAAttention(nn.Module):
         )
         self._decode_timer_end(profile_decode, "dsa_gather_selection", start, self.ckv_cache.device)
 
-    def _decode_forward_mla(self, ql_nope: torch.Tensor, q_pe: torch.Tensor, q_index: torch.Tensor | None, weights: torch.Tensor | None, dsa_updated: bool = False) -> torch.Tensor:
+    def _decode_forward_mla(
+        self,
+        ql_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        q_index: torch.Tensor | None,
+        weights: torch.Tensor | None,
+        dsa_updated: bool = False,
+    ) -> torch.Tensor:
         context = get_context()
         batch_size = int(ql_nope.shape[0])
         assert context.actual_seq_lengths_kv is not None
@@ -1285,7 +1328,12 @@ class DeepseekV32DSAAttention(nn.Module):
                 raise RuntimeError("DSA offload decode requires indexer outputs.")
             self._dsa_offload_update(q_index, weights, batch_size)
         start = self._decode_timer_start(profile_decode, ql_nope.device)
-        latent = self._decode_forward_mla_v2(ql_nope, q_pe, context.block_tables[:batch_size], context.actual_seq_lengths_kv)
+        latent = self._decode_forward_mla_v2(
+            ql_nope,
+            q_pe,
+            context.block_tables[:batch_size],
+            context.actual_seq_lengths_kv,
+        )
         self._decode_timer_end(profile_decode, "decode_attention_op", start, ql_nope.device)
         start = self._decode_timer_start(profile_decode, latent.device)
         output = torch_npu.npu_transpose_batchmatmul(latent.view(self.num_local_heads, batch_size, self.kv_lora_rank), self.w_uv, perm_y=(1, 0, 2)).reshape(batch_size, -1)
@@ -1309,21 +1357,37 @@ class DeepseekV32DSAAttention(nn.Module):
         use_decode_mlapo = self.enable_decode_mlapo and not context.is_prefill and not context.has_first_decode
         needs_decode_dsa_update = bool(context.needs_dsa_update)
         if use_decode_mlapo:
-            try_torchair_with_qc = needs_decode_dsa_update and self.indexer.query_only_backend == "torchair"
-            ql_nope, q_pe, q_c = self._decode_mlapo_preprocess(positions, hidden_states, profile_decode, need_inner_out=needs_decode_dsa_update and not try_torchair_with_qc)
+            use_full_graph_dsa = needs_decode_dsa_update and context.full_decode_graph
+            ql_nope, q_pe, q_c = self._decode_mlapo_preprocess(
+                positions,
+                hidden_states,
+                profile_decode,
+                need_inner_out=needs_decode_dsa_update and not use_full_graph_dsa,
+            )
             q_index = index_k = weights = None
             dsa_updated = False
             if needs_decode_dsa_update:
-                if try_torchair_with_qc:
-                    dsa_updated = self._run_dsa_pipeline_with_qc_torchair(hidden_states, positions, int(hidden_states.shape[0]), profile_decode)
-                if not dsa_updated:
-                    if try_torchair_with_qc or q_c is None or q_c.numel() == 0:
+                if use_full_graph_dsa:
+                    self._run_dsa_pipeline_with_qc_full_graph(
+                        hidden_states,
+                        positions,
+                        int(hidden_states.shape[0]),
+                    )
+                    dsa_updated = True
+                else:
+                    if q_c is None or q_c.numel() == 0:
                         q_c = self._decode_mlapo_q_c_fallback(hidden_states)
                     q_index, index_k, weights = self._run_indexer(hidden_states, q_c, positions, profile_decode, query_only=True)
             if index_k is not None:
                 self._store_index_cache(index_k)
 
-            attn_output = self._decode_forward_mla(ql_nope, q_pe, q_index, weights, dsa_updated=dsa_updated)
+            attn_output = self._decode_forward_mla(
+                ql_nope,
+                q_pe,
+                q_index,
+                weights,
+                dsa_updated=dsa_updated,
+            )
             return attn_output if skip_o_proj else self._o_proj_forward(attn_output, profile_decode)
 
         qkv_a = F.linear(hidden_states, self.wd_qkv)

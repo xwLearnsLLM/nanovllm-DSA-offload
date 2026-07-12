@@ -30,6 +30,7 @@ class Context:
     dsa_offload_rows: torch.Tensor | None = None
     dsa_offload_all_rows: bool = False
     has_first_decode: bool = False
+    full_decode_graph: bool = False
     block_size: int = 256
     flat_slot_mapping_i32: torch.Tensor | None = None
     scratch: dict = field(default_factory=dict)
@@ -50,7 +51,8 @@ def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0
                 candidate_query_lens=None,
                 needs_dsa_update=None,
                 dsa_offload_rows=None, dsa_offload_all_rows=None,
-                has_first_decode=None, block_size=None, flat_slot_mapping_i32=None):
+                has_first_decode=None, full_decode_graph=None,
+                block_size=None, flat_slot_mapping_i32=None):
     global _CONTEXT
     if block_size is None:
         block_size = 256
@@ -60,6 +62,8 @@ def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0
         dsa_offload_all_rows = False
     if has_first_decode is None:
         has_first_decode = False
+    if full_decode_graph is None:
+        full_decode_graph = False
     _CONTEXT = Context(
         is_prefill=is_prefill,
         cu_seqlens_q=cu_seqlens_q,
@@ -85,6 +89,7 @@ def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0
         dsa_offload_rows=dsa_offload_rows,
         dsa_offload_all_rows=bool(dsa_offload_all_rows),
         has_first_decode=has_first_decode,
+        full_decode_graph=bool(full_decode_graph),
         block_size=block_size,
         flat_slot_mapping_i32=flat_slot_mapping_i32,
     )

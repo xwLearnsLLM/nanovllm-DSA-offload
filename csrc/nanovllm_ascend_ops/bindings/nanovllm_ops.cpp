@@ -440,9 +440,9 @@ TORCH_LIBRARY(nanovllm_dsa, ops) {
       " int sparse_count, int sparse_mode, int pre_tokens, int next_tokens,"
       " bool return_value) -> (Tensor, Tensor)");
   ops.def(
-      "gather_selection_kv_cache(Tensor selection_k_rope,"
-      " Tensor selection_kv_cache, Tensor selection_kv_block_table,"
-      " Tensor selection_kv_block_status, Tensor req_pool_entries,"
+      "gather_selection_kv_cache(Tensor! selection_k_rope,"
+      " Tensor! selection_kv_cache, Tensor selection_kv_block_table,"
+      " Tensor! selection_kv_block_status, Tensor req_pool_entries,"
       " Tensor selection_topk_indices, Tensor full_k_rope, Tensor full_kv_cache,"
       " Tensor full_kv_block_table, Tensor full_kv_actual_seq)"
       " -> (Tensor, Tensor, Tensor, Tensor)");

@@ -1,5 +1,7 @@
 # nano-vllm-ascend DeepSeek V3.2 DSA 卸载说明
 
+稳定 decode 的完整图模式、编译和验收命令见 [FULL_DECODE_ONLY.md](FULL_DECODE_ONLY.md)。
+
 昇腾上做 DSA 模型的 decode 阶段 KVcache offload ，节省显存，提升 batch-size
 
 　
@@ -56,7 +58,6 @@ export NANOVLLM_MAX_PREFILL_SEQS_PER_STEP=1                     # prefill最大b
 export NANOVLLM_MAX_DECODE_SEQS_PER_STEP=256                    # decode最大batch-size设为256
 export NANOVLLM_IGNORE_EOS=1
 export NANOVLLM_ENABLE_DECODE_MLAPO=1
-export NANOVLLM_DSA_QUERY_ONLY_BACKEND=torchair
 ```
 
 　
@@ -80,7 +81,6 @@ export NANOVLLM_MAX_PREFILL_SEQS_PER_STEP=1                     # prefill最大b
 export NANOVLLM_MAX_DECODE_SEQS_PER_STEP=256                    # decode最大batch-size设为256
 export NANOVLLM_IGNORE_EOS=1
 export NANOVLLM_ENABLE_DECODE_MLAPO=1
-export NANOVLLM_DSA_QUERY_ONLY_BACKEND=torchair
 ```
 
 　
@@ -124,7 +124,7 @@ PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_PROMPT_LENGTHS=1
 | `NANOVLLM_LOG_DECODE_LAYER_TIMING` | `false` | 是否打印 decode layer timing。 |
 | `NANOVLLM_DECODE_LAYER_TIMING_SYNC` | `true` | timing 前后是否同步。 |
 | `NANOVLLM_PROFILE_LAYER_IDS` | `0,mid,last` | 打印 timing 的层。 |
-| `NANOVLLM_DSA_QUERY_ONLY_BACKEND` | `current` | DSA decode 后端：`current` 为不组图路径，`torchair` 为 DSA 小流水组图路径。 |
+| `NANOVLLM_DECODE_GRAPH_MODE` | `none` | `none` 为 eager；`full_decode_only` 为稳定 DSA decode 完整图。详见 `FULL_DECODE_ONLY.md`。 |
 
 　
 

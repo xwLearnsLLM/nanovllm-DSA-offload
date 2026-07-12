@@ -38,7 +38,7 @@ def make_llm(
 ) -> LLM:
     return LLM(
         model_path(),
-        enforce_eager=True,
+        enforce_eager=env_bool("NANOVLLM_ENFORCE_EAGER", False),
         tensor_parallel_size=env_int("NANOVLLM_TP_SIZE", TP_SIZE),
         enable_expert_parallel=env_bool("NANOVLLM_ENABLE_EXPERT_PARALLEL", True),
         max_model_len=max_model_len,

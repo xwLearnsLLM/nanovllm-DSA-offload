@@ -302,7 +302,7 @@ npu_gather_selection_kv_cache(
 
 1. query-only 输出 buffer 复用，减少临时 tensor 分配。
 2. `weights_proj` 固定 BF16 路径，避免 decode 热路径中不必要的 fp32 投影。
-3. 小 batch 可尝试 TorchAir 组图，降低 Python 调度和小算子开销。
+3. 稳定的纯长序列 decode 使用 `FULL_DECODE_ONLY + npugraph_ex + ACLGraph`，降低整层 Python 调度和小算子 launch 开销。
 4. 长期可考虑把 query-only indexer_project 写成更大的融合 CANN 算子。
 
 ## 7. IndexCache 写入
@@ -324,7 +324,7 @@ IndexCache 容量由 `NANOVLLM_DRAM_NUM_BLOCKS` 决定，和 DRAM KV block 数�
 | `NANOVLLM_MAX_PREFILL_SEQS_PER_STEP` | 单步最多调度多少个 prefill 请求 | 1 |
 | `NANOVLLM_MAX_DECODE_SEQS_PER_STEP` | decode batch 上限，也是 gather status pool capacity | 256 |
 | `NANOVLLM_ENABLE_DECODE_MLAPO` | decode 后续 step 是否启用 MLAPO | true |
-| `NANOVLLM_DSA_QUERY_ONLY_BACKEND` | DSA decode 后端，`current` 为非图路径，`torchair` 为 DSA 小流水组图路径 | current |
+| `NANOVLLM_DECODE_GRAPH_MODE` | `none` 为 eager；`full_decode_only` 为稳定 DSA decode 完整图 | none |
 
 调度器保持如下规则：
 
@@ -370,7 +370,7 @@ IndexCache 容量由 `NANOVLLM_DRAM_NUM_BLOCKS` 决定，和 DRAM KV block 数�
 
 - `npu_gather_selection_kv_cache` 内部状态维护和 DRAM->HBM 搬运效率。
 - `npu_lightning_indexer` 大 batch 下的检索效率。
-- query-only indexer_project 的 TorchAir 组图精度和稳定性。
+- query-only indexer_project 在完整 decode 图内的融合和稳定性。
 - 把 query-only indexer_project 进一步做成融合 CANN 算子。
 - 让 gather-selection 算子直接接收长短序列混合 batch 并内部跳过短序列，进一步减少 Python row 选择。
 

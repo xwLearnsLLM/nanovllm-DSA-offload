@@ -15,6 +15,10 @@ torch.npu.config.allow_internal_format = True
 
 from nanovllm.config import Config
 from nanovllm.engine.dsa_offload import DSA_SELECTION_TOPK_TOKENS
+from nanovllm.engine.full_decode_graph import (
+    FULL_DECODE_ONLY,
+    FullDecodeOnlyGraphManager,
+)
 from nanovllm.engine.sequence import Sequence
 from nanovllm.layers.sampler import Sampler
 from nanovllm.models.deepseek_v32 import DeepseekV32ForCausalLM
@@ -49,6 +53,23 @@ class ModelRunner:
         self.sampler = Sampler()
         torch.npu.empty_cache()
         self.allocate_kv_cache()
+        self.decode_graph_manager = None
+        if config.decode_graph_mode == FULL_DECODE_ONLY:
+            text_config = getattr(config.hf_config, "text_config", config.hf_config)
+            self.decode_graph_manager = FullDecodeOnlyGraphManager(
+                self.model,
+                capture_sizes=config.decode_graph_capture_sizes,
+                max_model_len=config.max_model_len,
+                block_size=config.kvcache_block_size,
+                device=self.device,
+                expected_mla_tasks=int(text_config.num_hidden_layers),
+                warmup_iters=config.decode_graph_warmup_iters,
+            )
+            if self.world_size > 1:
+                dist.barrier()
+            self.decode_graph_manager.capture_all()
+            if self.world_size > 1:
+                dist.barrier()
 
         # npu profiler state (lazy-init in run_model)
         self._prof = None
@@ -125,6 +146,11 @@ class ModelRunner:
         return torch_dtype
 
     def exit(self):
+        if self.decode_graph_manager is not None:
+            logger.info(
+                "DSA FULL_DECODE_ONLY final stats: %s",
+                self.decode_graph_manager.stats(),
+            )
         if self.world_size > 1:
             self.shm.close()
             dist.barrier()
@@ -132,6 +158,11 @@ class ModelRunner:
                 self.shm.unlink()
         torch.npu.synchronize()
         dist.destroy_process_group()
+
+    def get_decode_graph_stats(self):
+        if self.decode_graph_manager is None:
+            return {"enabled": False, "mode": "none"}
+        return self.decode_graph_manager.stats()
 
     def loop(self):
         while True:
@@ -487,7 +518,10 @@ class ModelRunner:
                 prof = self._prof          # forward call is inside active profiling window
 
         try:
-            hidden_states = self.model(input_ids, positions)
+            if is_prefill or self.decode_graph_manager is None:
+                hidden_states = self.model(input_ids, positions)
+            else:
+                hidden_states = self.decode_graph_manager.run(input_ids, positions)
             logits = self.model.compute_logits(hidden_states)
         finally:
             if prof is not None and hasattr(prof, "step"):

@@ -31,7 +31,10 @@ if ascend_ops is not None:
         _GRAPH_LIGHTNING_INDEXER = graph_lightning
         graph_gather = torch.ops.nanovllm_dsa.gather_selection_kv_cache.default
         gather_schema = str(graph_gather._schema)
-        if "-> (Tensor, Tensor, Tensor, Tensor)" not in gather_schema:
+        if (
+            "-> (Tensor, Tensor, Tensor, Tensor)" not in gather_schema
+            or gather_schema.count("!") < 3
+        ):
             raise RuntimeError(f"torch.ops.nanovllm_dsa.gather_selection_kv_cache schema is stale: {gather_schema}; rebuild nanovllm ops.")
         _GRAPH_GATHER_SELECTION_KV_CACHE = graph_gather
     except Exception as exc:
@@ -357,8 +360,8 @@ def _dsa_indexer_pipeline_with_qc_functional(
             return q_index, index_weights, topk_indices, selection_kpe, selection_ckv, selection_block_table, gather_selection_status
         return q_index, index_weights, topk_indices
 
-    # candidate_query_lens is cumulative for the normal TND decode path. The
-    # TorchAir mini-pipeline uses BSND query=[B, 1, N, D], so each row has S=1.
+    # candidate_query_lens is cumulative for the normal TND eager path. The
+    # full-decode graph uses BSND query=[B, 1, N, D], so each row has S=1.
     bsnd_query_lens = torch.ones_like(candidate_query_lens)
     topk_indices = _GRAPH_LIGHTNING_INDEXER(
         q_index.unsqueeze(1),          # BSND avoids a GE Reshape after LightningIndexer.
@@ -863,6 +866,80 @@ def dsa_indexer_pipeline_with_qc_eager(
     )
 
 
+def dsa_indexer_pipeline_with_qc_full_graph(
+    hidden_states: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    q_a_weight: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    wq_b_weight: torch.Tensor,
+    weights_proj_weight: torch.Tensor,
+    q_index_out: torch.Tensor,
+    index_weights_out: torch.Tensor,
+    index_cache: torch.Tensor,
+    candidate_query_lens: torch.Tensor,
+    candidate_lens: torch.Tensor,
+    index_tables: torch.Tensor,
+    selection_kpe: torch.Tensor,
+    selection_ckv: torch.Tensor,
+    selection_block_table: torch.Tensor,
+    gather_selection_status: torch.Tensor,
+    req_pool_entries: torch.Tensor,
+    full_kpe: torch.Tensor,
+    full_ckv: torch.Tensor,
+    dram_tables: torch.Tensor,
+    *,
+    q_norm_eps: float,
+    n_head: int,
+    head_dim: int,
+    rope_dim: int,
+    score_scale: float,
+    sparse_count: int,
+) -> tuple[torch.Tensor, ...]:
+    """Graph-visible DSA projection, selection, and DRAM-to-HBM gather.
+
+    The gather inputs are declared mutable in the torch.library schema. This
+    keeps the cache/status update observable even though the CANN kernel writes
+    those buffers in place and the model does not consume its synthetic outputs.
+    """
+    if _GRAPH_LIGHTNING_INDEXER is None or _GRAPH_GATHER_SELECTION_KV_CACHE is None:
+        raise RuntimeError(
+            "DSA FULL_DECODE_ONLY requires the torch.library lightning_indexer "
+            "and gather_selection_kv_cache registrations. Rebuild with "
+            "`bash scripts/build_nanovllm_ops.sh`."
+        ) from _GRAPH_CUSTOM_OP_ERROR
+    return _dsa_indexer_pipeline_with_qc_functional(
+        hidden_states,
+        cos,
+        sin,
+        q_a_weight,
+        q_norm_weight,
+        wq_b_weight,
+        weights_proj_weight,
+        q_index_out,
+        index_weights_out,
+        index_cache,
+        candidate_query_lens,
+        candidate_lens,
+        index_tables,
+        selection_kpe,
+        selection_ckv,
+        selection_block_table,
+        gather_selection_status,
+        req_pool_entries,
+        full_kpe,
+        full_ckv,
+        dram_tables,
+        q_norm_eps=float(q_norm_eps),
+        n_head=int(n_head),
+        head_dim=int(head_dim),
+        rope_dim=int(rope_dim),
+        score_scale=float(score_scale),
+        sparse_count=int(sparse_count),
+        return_gather_outputs=True,
+    )
+
+
 def dsa_indexer_pipeline_with_qc_torchair(
     hidden_states: torch.Tensor,
     cos: torch.Tensor,
@@ -995,6 +1072,7 @@ __all__ = [
     "dsa_indexer_project_q_path",
     "dsa_indexer_project_query_only",
     "dsa_indexer_pipeline_with_qc_eager",
+    "dsa_indexer_pipeline_with_qc_full_graph",
     "dsa_indexer_pipeline_with_qc_torchair",
     "dsa_indexer_project_torch",
 ]
