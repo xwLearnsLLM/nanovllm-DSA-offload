@@ -28,18 +28,6 @@ DSA 整图采用精确 batch size。只有 batch 内所有请求均已进入 DSA
 NANOVLLM_CANN_BUILD_JOBS=64 SOC_VERSION=ascend910_9391 PYTHONPATH=$PWD:$PYTHONPATH bash scripts/build_nanovllm_ops.sh
 ```
 
-`catlass` 仍然是必要依赖，因为 decode 的 `matmul_allreduce_add_rmsnorm` 融合算子使用它。
-
-若编译命令卡在 catlass 下载，请提前手动下载 catlass 并把 catlass 放到 `csrc/third_party/catlass`。方法如下：
-
-```
-mkdir -p csrc/third_party/
-cd csrc/third_party/
-git clone --depth 1 --branch master https://gitcode.com/cann/catlass.git 
-cd ../..
-ls csrc/third_party/catlass/include/catlass/catlass.hpp    # 检查关键头文件存在
-```
-
 　
 
 ## 推荐验证命令（128 专家模型、TP16）
