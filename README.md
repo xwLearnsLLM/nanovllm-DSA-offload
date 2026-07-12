@@ -48,8 +48,22 @@ export NANOVLLM_DRAM_NUM_BLOCKS=200
 
 du -sh "$NANOVLLM_MODEL"    # 检查模型存在
 
-PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_PROMPT_LENGTHS=8200,8201 python3 example/test.py
+PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_PREFILL_CHUNK_SIZE=0 NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_PROMPT_LENGTHS=8200,8201 python3 example/test.py
+PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_PREFILL_CHUNK_SIZE=1024 NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_PROMPT_LENGTHS=8200,8201 python3 example/test.py
+
+NANOVLLM_DRAM_NUM_BLOCKS=300 PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_PREFILL_CHUNK_SIZE=1024 NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_PROMPT_LENGTHS=16200,16201 python3 example/test.py  # 16.2K 双请求
+NANOVLLM_DRAM_NUM_BLOCKS=300 PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_PREFILL_CHUNK_SIZE=0 NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_PROMPT_LENGTHS=16200,16201 python3 example/test.py     # 整段 prefill 对照，可能因激活峰值 OOM
 ```
+
+前两行用于比较 8.2K 整段/chunk prefill；`temperature=0` 时生成 token IDs 应
+一致。16.2K 双请求需要同时保留两条请求的完整 DRAM KV 和 IndexCache，因此示例
+把 `NANOVLLM_DRAM_NUM_BLOCKS` 提高到 300。实际需要量仍取决于 block size 和请求
+长度。
+
+`NANOVLLM_PREFILL_CHUNK_SIZE=1024` 时，日志中的 `num_tokens` 是当前 chunk
+token 数，`progress=已完成/请求总长度`，并使用 `PREFILL_STEP` 而不是把中间
+chunk 时延误写成 TTFT。当前请求的所有 chunk 会连续执行，期间不插入 decode。
+Python API 对应参数是 `LLM(..., prefill_chunk_size=0)`。
 
 `example/test.py` 会自动设置：
 
@@ -80,7 +94,7 @@ DSA FULL_DECODE_ONLY proof: capture_sizes=[2], captures=1, replays=14, eager_fir
 保留其他环境变量不变，仅执行：
 
 ```bash
-PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_PROMPT_LENGTHS=8200,8201 NANOVLLM_ENFORCE_EAGER=1 python3 example/test.py
+PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_PREFILL_CHUNK_SIZE=1024 NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_PROMPT_LENGTHS=8200,8201 NANOVLLM_ENFORCE_EAGER=1 python3 example/test.py
 ```
 
 　
@@ -96,16 +110,19 @@ PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_PROMPT_LENGTHS=8
 | `NANOVLLM_KVCACHE_BLOCK_SIZE` | KV block size，必须是 16 的倍数，当前推荐 128 |
 | `NANOVLLM_HBM_NUM_BLOCKS` | HBM KV block 数，必须大于 2 |
 | `NANOVLLM_DRAM_NUM_BLOCKS` | DRAM KV block 数，同时也是 HBM IndexCache block 数，必须大于 2 |
+| `NANOVLLM_PREFILL_CHUNK_SIZE` | 仅允许 `0` 或 `1024`；`0` 为整段 prefill，`1024` 为单请求 chunk prefill |
 | `NANOVLLM_PROMPT_LENGTHS` | 精确 prompt token 长度，逗号分隔；条目数就是测试 batch size |
 | `NANOVLLM_MAX_GEN_TOKENS` | 每个请求生成 token 数，默认 16 |
 
 　
 
-## 当前边界
+## Chunk prefill 行为与当前边界
 
 - DSA sparse budget 固定为 2048 token；短于该条件的请求没有卸载收益，会走 eager decode。
-- 尚未实现 chunked prefill。长 prompt 仍是单次 prefill forward，过长时可能因激活值 OOM。
-- 将来实现 chunked prefill 时，仍保持 prefill 与 decode 分开调度，不做混合 forward。
+- `prefill_chunk_size=1024` 强制 `max_num_prefill_seqs_per_step=1`。每个 forward 最多处理单条请求的 1024 个 token；当前请求完成前不会进入 decode running 队列，也不做 prefill/decode 混合 forward。
+- 中间 chunk 只写当前 token 对应的 HBM KV 和 IndexCache，不运行 LM head/sampler，也不会提前执行 DRAM KV finalize 或释放 HBM 中间块；只有最后一个 chunk 完成这些操作并采样首个输出 token。
+- Paged MLA FIA 继续使用 `sparse_mode=3` 的右下角因果 mask；query 长度为当前 chunk 长度，KV 有效长度为“历史前缀 + 当前 chunk”的总长度。算子语义见 [CANN FIA V4 文档](https://gitcode.com/cann/ops-transformer/blob/master/attention/fused_infer_attention_score/docs/aclnnFusedInferAttentionScoreV4.md)。
+- Chunk prefill 只降低激活值峰值。调度器仍为完整请求预先分配 HBM KV、DRAM KV 和 IndexCache blocks，因此不能解决 cache 容量不足。
 - DSA 整图不能用 padding bucket：`gather_selection_status` 是跨 step 持久化状态，虚假 padding 行可能污染真实请求状态。
 
 实现与判定细节见 [FULL_DECODE_ONLY.md](FULL_DECODE_ONLY.md)。

@@ -75,6 +75,7 @@ class LLMEngine:
         self.tokenizer = self._load_tokenizer(config)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
+        self._last_prefill_chunk_progress = None
         atexit.register(self.exit)
 
     @staticmethod
@@ -183,13 +184,24 @@ class LLMEngine:
 
     def step(self, return_stats: bool = False):
         seqs, is_prefill = self.scheduler.schedule()
+        self._last_prefill_chunk_progress = None
+        is_final_prefill_step = is_prefill
+        if is_prefill and self.config.prefill_chunk_size:
+            num_tokens = sum(seq.num_scheduled_tokens for seq in seqs)
+            seq = seqs[0]
+            progress = (
+                seq.num_prefill_tokens_processed + seq.num_scheduled_tokens
+            )
+            self._last_prefill_chunk_progress = (progress, len(seq))
+            is_final_prefill_step = progress == len(seq)
+        else:
+            num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
         token_ids = self.model_runner.call("run", seqs, is_prefill)
-        if is_prefill:
+        if is_final_prefill_step:
             self.scheduler.release_prefill_hbm_blocks(seqs)
-        self.scheduler.postprocess(seqs, token_ids)
+        self.scheduler.postprocess(seqs, token_ids, is_prefill)
         outputs = [(seq.seq_id, seq.completion_token_ids, seq.num_prompt_tokens, seq.num_cached_tokens) for seq in seqs
                    if seq.is_finished]
-        num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
         if return_stats:
             return outputs, num_tokens, len(seqs), is_prefill
         return outputs, num_tokens
@@ -252,11 +264,17 @@ class LLMEngine:
                 or i_step % 1 == 0
                 or self.is_finished()
             ):
-                latency_name = "TTFT" if is_prefill else "TPOT"
+                progress_text = ""
+                if is_prefill and self._last_prefill_chunk_progress is not None:
+                    latency_name = "PREFILL_STEP"
+                    progress, prompt_length = self._last_prefill_chunk_progress
+                    progress_text = f", progress={progress}/{prompt_length}"
+                else:
+                    latency_name = "TTFT" if is_prefill else "TPOT"
                 (hbm_used, hbm_total), (dram_used, dram_total), (index_used, index_total) = self.scheduler.dsa_block_usage()
                 print(
                     f"[step{i_step:4d} {'Prefill' if is_prefill else ' Decode'}] "
-                    f"bsz={batch_size}, num_tokens={step_tokens}, "
+                    f"bsz={batch_size}, num_tokens={step_tokens}{progress_text}, "
                     f"HBM_KV={hbm_used}/{hbm_total}, "
                     f"DRAM_KV={dram_used}/{dram_total}, "
                     f"HBM_INDEX={index_used}/{index_total}, "
@@ -307,7 +325,12 @@ class LLMEngine:
             f"decode TPS = {decode_tps:.2f} tok/s\n"
             f"    e2e input TPS = {e2e_input_tps:.2f} tok/s, "
             f"e2e output TPS = {e2e_output_tps:.2f} tok/s\n"
-            f"    TTFT/TPOT are per-step request latencies printed above."
+            + (
+                "    PREFILL_STEP is one chunk latency; TPOT is the per-step "
+                "decode latency printed above."
+                if self.config.prefill_chunk_size
+                else "    TTFT/TPOT are per-step request latencies printed above."
+            )
         )
         if graph_stats.get("enabled"):
             print(

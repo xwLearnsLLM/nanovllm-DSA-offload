@@ -36,6 +36,8 @@ class Sequence:
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
         self.num_cached_tokens = 0
+        self.num_prefill_tokens_processed = 0
+        self.num_scheduled_tokens = 0
         self.block_table = []
         self.index_block_table = []
         self.hbm_block_table = self.block_table
@@ -70,6 +72,17 @@ class Sequence:
         return self.num_tokens - self.num_prompt_tokens
 
     @property
+    def is_first_decode_after_prefill(self):
+        return (
+            self.num_prefill_tokens_processed > 0
+            and self.num_decode_tokens_since_prefill == 1
+        )
+
+    @property
+    def num_decode_tokens_since_prefill(self):
+        return len(self) - self.num_prefill_tokens_processed
+
+    @property
     def prompt_token_ids(self):
         return self.token_ids[:self.num_prompt_tokens]
 
@@ -98,6 +111,50 @@ class Sequence:
         self.last_token = token_id
         self.num_tokens += 1
 
+    def reset_prefill_progress(self):
+        self.num_prefill_tokens_processed = 0
+        self.num_scheduled_tokens = 0
+
+    def scheduled_prefill_chunk(
+        self,
+    ) -> tuple[
+        list[int],
+        list[int],
+        list[int],
+        list[int],
+        int,
+        bool,
+    ]:
+        start = self.num_prefill_tokens_processed
+        end = start + self.num_scheduled_tokens
+        if self.num_scheduled_tokens <= 0 or not (0 <= start < end <= len(self)):
+            raise RuntimeError(
+                "Invalid scheduled prefill range: "
+                f"start={start}, end={end}, sequence_length={len(self)}."
+            )
+
+        positions = list(range(start, end))
+
+        def slot_mapping(block_table: list[int]) -> list[int]:
+            if end > len(block_table) * self.block_size:
+                raise RuntimeError(
+                    "Scheduled prefill range exceeds its cache block table."
+                )
+            return [
+                block_table[position // self.block_size] * self.block_size
+                + position % self.block_size
+                for position in positions
+            ]
+
+        return (
+            self.token_ids[start:end],
+            positions,
+            slot_mapping(self.hbm_block_table),
+            slot_mapping(self.index_block_table),
+            end,
+            end == len(self),
+        )
+
     def __getstate__(self):
         return {
             "seq_id": self.seq_id,
@@ -105,6 +162,8 @@ class Sequence:
             "num_tokens": self.num_tokens,
             "num_prompt_tokens": self.num_prompt_tokens,
             "num_cached_tokens": self.num_cached_tokens,
+            "num_prefill_tokens_processed": self.num_prefill_tokens_processed,
+            "num_scheduled_tokens": self.num_scheduled_tokens,
             "block_table": self.block_table,
             "index_block_table": self.index_block_table,
             "hbm_block_table": self.hbm_block_table,
@@ -134,6 +193,10 @@ class Sequence:
         self.num_tokens = state["num_tokens"]
         self.num_prompt_tokens = state["num_prompt_tokens"]
         self.num_cached_tokens = state["num_cached_tokens"]
+        self.num_prefill_tokens_processed = state.get(
+            "num_prefill_tokens_processed", 0
+        )
+        self.num_scheduled_tokens = state.get("num_scheduled_tokens", 0)
         self.block_table = state["block_table"]
         self.index_block_table = state.get("index_block_table", self.block_table)
         self.hbm_block_table = state.get("hbm_block_table", self.block_table)

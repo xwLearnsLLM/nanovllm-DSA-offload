@@ -1,10 +1,12 @@
+from __future__ import annotations
+
 import json
 import os
 from dataclasses import dataclass, field
+from typing import Any
 
 from nanovllm.engine.dsa_offload import DSA_SELECTION_TOPK_TOKENS
 from nanovllm.engine.full_decode_graph import normalize_capture_sizes
-from nanovllm.models.deepseek_v32 import DeepseekV32Config
 
 
 @dataclass
@@ -17,7 +19,7 @@ class Config:
     enable_expert_parallel: bool = False
     enforce_eager: bool = False
     decode_graph_capture_sizes: tuple[int, ...] | list[int] | None = None
-    hf_config: DeepseekV32Config = field(init=False)
+    hf_config: Any = field(init=False)
     eos: int = field(init=False, default=-1)
     kvcache_block_size: int = 256
     num_hbm_kvcache_blocks: int = -1
@@ -25,6 +27,7 @@ class Config:
     hccl_port: int = 28000
     device = "npu"
     trust_remote_code: bool = False
+    prefill_chunk_size: int = 0
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -42,6 +45,10 @@ class Config:
             )
         if self.max_num_prefill_seqs_per_step <= 0:
             raise ValueError("max_num_prefill_seqs_per_step must be > 0.")
+        self._validate_prefill_chunking(
+            self.prefill_chunk_size,
+            self.max_num_prefill_seqs_per_step,
+        )
         if self.max_num_decode_seqs_per_step <= 0:
             raise ValueError("max_num_decode_seqs_per_step must be > 0.")
         if self.max_model_len <= 0:
@@ -70,6 +77,20 @@ class Config:
         if eos_token_id is not None:
             self.eos = eos_token_id
         self._configure_decode_graph()
+
+    @staticmethod
+    def _validate_prefill_chunking(
+        prefill_chunk_size: int,
+        max_num_prefill_seqs_per_step: int,
+    ) -> None:
+        if type(prefill_chunk_size) is not int:
+            raise TypeError("prefill_chunk_size must be an int.")
+        if prefill_chunk_size not in (0, 1024):
+            raise ValueError("prefill_chunk_size must be either 0 or 1024.")
+        if prefill_chunk_size and max_num_prefill_seqs_per_step != 1:
+            raise ValueError(
+                "Chunk prefill requires max_num_prefill_seqs_per_step=1."
+            )
 
     def _configure_decode_graph(self) -> None:
         # There are exactly two execution modes. Prefill and first decode are
@@ -128,6 +149,8 @@ class Config:
         )
 
     def _load_hf_config(self):
+        from nanovllm.models.deepseek_v32 import DeepseekV32Config
+
         config_path = os.path.join(self.model, "config.json")
         raw_config = {}
         if os.path.isfile(config_path):

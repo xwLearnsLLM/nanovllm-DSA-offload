@@ -1100,7 +1100,11 @@ class DeepseekV32DSAAttention(nn.Module):
         context = get_context()
         cu_seqlens = context.cu_seqlens_q
         actual_seq_lengths_query = cu_seqlens[1:]
-        actual_seq_lengths_key = cu_seqlens[1:] - cu_seqlens[:-1]
+        actual_seq_lengths_key = context.actual_seq_lengths_kv
+        if actual_seq_lengths_key is None:
+            actual_seq_lengths_key = (
+                cu_seqlens[1:] - cu_seqlens[:-1]
+            ).detach().cpu().tolist()
         mla_result = torch_npu.npu_fused_infer_attention_score(
             ql_nope,
             self.ckv_cache.transpose(1, 2),
@@ -1119,7 +1123,7 @@ class DeepseekV32DSAAttention(nn.Module):
             block_size=self.block_size,
             softmax_lse_flag=False,
             actual_seq_lengths=actual_seq_lengths_query.detach().cpu().tolist(),
-            actual_seq_lengths_kv=actual_seq_lengths_key.detach().cpu().tolist(),
+            actual_seq_lengths_kv=actual_seq_lengths_key,
         )
         latent = mla_result[0] if isinstance(mla_result, (tuple, list)) else mla_result
         return torch_npu.npu_transpose_batchmatmul(latent.transpose(0, 1).contiguous(), self.w_uv, perm_y=(1, 0, 2)).reshape(latent.shape[0], -1)

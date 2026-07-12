@@ -277,21 +277,45 @@ class ModelRunner:
         flat_slot_mapping = []
         flat_index_slot_mapping = []
         needs_dsa_update = False
+        actual_seq_lengths_kv = None
+        is_last_chunk = True
 
-        for seq in seqs:
-            input_ids.extend(seq[:])
-            seqlen = len(seq)
-            positions.extend(range(seqlen))
-            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen)
-            if seq.hbm_block_table:
-                flat_slot_mapping.extend(
-                    self._sequence_slots(seq.hbm_block_table, seqlen)
+        if self.config.prefill_chunk_size:
+            if len(seqs) != 1:
+                raise RuntimeError("Chunk prefill requires exactly one sequence.")
+            (
+                chunk_input_ids,
+                chunk_positions,
+                chunk_slot_mapping,
+                chunk_index_slot_mapping,
+                chunk_end,
+                is_last_chunk,
+            ) = seqs[0].scheduled_prefill_chunk()
+            input_ids.extend(chunk_input_ids)
+            positions.extend(chunk_positions)
+            flat_slot_mapping.extend(chunk_slot_mapping)
+            flat_index_slot_mapping.extend(chunk_index_slot_mapping)
+            cu_seqlens_q.append(len(chunk_input_ids))
+            actual_seq_lengths_kv = [chunk_end]
+            candidate_len = seqs[0].num_prefill_full_blocks * self.block_size
+            needs_dsa_update = candidate_len > seqs[0].num_sparse_tokens > 0
+        else:
+            for seq in seqs:
+                input_ids.extend(seq[:])
+                seqlen = len(seq)
+                positions.extend(range(seqlen))
+                cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen)
+                if seq.hbm_block_table:
+                    flat_slot_mapping.extend(
+                        self._sequence_slots(seq.hbm_block_table, seqlen)
+                    )
+                    flat_index_slot_mapping.extend(
+                        self._sequence_slots(seq.index_block_table, seqlen)
+                    )
+                candidate_len = seq.num_prefill_full_blocks * self.block_size
+                needs_dsa_update = needs_dsa_update or (
+                    candidate_len > seq.num_sparse_tokens > 0
                 )
-                flat_index_slot_mapping.extend(
-                    self._sequence_slots(seq.index_block_table, seqlen)
-                )
-            candidate_len = seq.num_prefill_full_blocks * self.block_size
-            needs_dsa_update = needs_dsa_update or (candidate_len > seq.num_sparse_tokens > 0)
 
         input_ids = torch.tensor(input_ids, dtype=torch.int64).to(self.device)
         positions = torch.tensor(positions, dtype=torch.int64).to(self.device)
@@ -308,11 +332,12 @@ class ModelRunner:
             cu_seqlens_q=cu_seqlens_q,
             flat_slot_mapping=flat_slot_mapping,
             flat_index_slot_mapping=flat_index_slot_mapping,
+            actual_seq_lengths_kv=actual_seq_lengths_kv,
             block_tables=self.prepare_block_tables(seqs, "hbm_block_table"),
             needs_dsa_update=needs_dsa_update,
         )
 
-        return input_ids, positions
+        return input_ids, positions, is_last_chunk
 
     def prepare_decode(self, seqs: list[Sequence]):
         input_ids = []
@@ -328,8 +353,10 @@ class ModelRunner:
             input_ids.append(seq.last_token)
             position = len(seq) - 1
             positions.append(position)
-            decode_len = len(seq) - seq.num_prompt_tokens
-            has_first_decode = has_first_decode or decode_len <= 1
+            decode_len = seq.num_decode_tokens_since_prefill
+            has_first_decode = (
+                has_first_decode or seq.is_first_decode_after_prefill
+            )
             tail_decode_offset = position - seq.num_prefill_full_blocks * self.block_size
             hbm_logical_block = seq.num_sparse_blocks + tail_decode_offset // self.block_size
             hbm_offset = tail_decode_offset % self.block_size
@@ -424,24 +451,24 @@ class ModelRunner:
     @torch.inference_mode()
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int] | None:
         try:
-            input_ids, positions = (
-                self.prepare_prefill(seqs)
-                if is_prefill
-                else self.prepare_decode(seqs)
-            )
-            temperatures = (
-                torch.tensor(
+            if is_prefill:
+                input_ids, positions, should_sample = self.prepare_prefill(seqs)
+            else:
+                input_ids, positions = self.prepare_decode(seqs)
+                should_sample = True
+            temperatures = None
+            if should_sample and self.rank == 0:
+                temperatures = torch.tensor(
                     [seq.temperature for seq in seqs],
                     dtype=torch.float32,
                     pin_memory=True,
                 ).to(self.device, non_blocking=True)
-                if self.rank == 0
-                else None
-            )
             if is_prefill or self.decode_graph_manager is None:
                 hidden_states = self.model(input_ids, positions)
             else:
                 hidden_states = self.decode_graph_manager.run(input_ids, positions)
+            if not should_sample:
+                return None
             logits = self.model.compute_logits(hidden_states)
             if is_prefill:
                 self.finalize_prefill_offload(seqs)

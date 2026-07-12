@@ -187,6 +187,7 @@ def main() -> None:
         f"prompt_max={max(prompt_lengths)}, "
         f"max_model_len={max_model_len}, "
         f"max_num_prefill_seqs_per_step={max_num_prefill_seqs_per_step}, "
+        f"prefill_chunk_size={env_int('NANOVLLM_PREFILL_CHUNK_SIZE', 0)}, "
         f"max_num_decode_seqs_per_step={max_num_decode_seqs_per_step}, "
         f"max_gen_tokens={max_gen_tokens}, "
         f"meaningful_base_tokens={len(base_ids)}"
