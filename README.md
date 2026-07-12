@@ -38,32 +38,21 @@ NANOVLLM_CANN_BUILD_JOBS=64 SOC_VERSION=ascend910_9391 PYTHONPATH=$PWD:$PYTHONPA
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export ASCEND_LAUNCH_BLOCKING=0
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
-export NANOVLLM_MODEL=/home/models/DeepSeek-V3.2-REAP-345B-A37B-BF16/
 export NANOVLLM_TP_SIZE=16
+export NANOVLLM_MODEL=/home/models/DeepSeek-V3.2-REAP-345B-A37B-BF16/
 export NANOVLLM_ENABLE_EXPERT_PARALLEL=1
 export NANOVLLM_ENFORCE_EAGER=0
 export NANOVLLM_KVCACHE_BLOCK_SIZE=128
-export NANOVLLM_HBM_NUM_BLOCKS=200
-export NANOVLLM_DRAM_NUM_BLOCKS=200
+export NANOVLLM_HBM_NUM_BLOCKS=350
+export NANOVLLM_DRAM_NUM_BLOCKS=1500
+export NANOVLLM_PREFILL_CHUNK_SIZE=1024   # chunk-prefill模式，可避免激活爆显存
 
 du -sh "$NANOVLLM_MODEL"    # 检查模型存在
 
-PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_PREFILL_CHUNK_SIZE=0 NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_PROMPT_LENGTHS=8200,8201 python3 example/test.py
-PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_PREFILL_CHUNK_SIZE=1024 NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_PROMPT_LENGTHS=8200,8201 python3 example/test.py
+PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_IGNORE_EOS=1 NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_PROMPT_LENGTHS=30000,30001 python3 example/test.py 
 
-NANOVLLM_DRAM_NUM_BLOCKS=300 PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_PREFILL_CHUNK_SIZE=1024 NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_PROMPT_LENGTHS=16200,16201 python3 example/test.py  # 16.2K 双请求
-NANOVLLM_DRAM_NUM_BLOCKS=300 PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_PREFILL_CHUNK_SIZE=0 NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_PROMPT_LENGTHS=16200,16201 python3 example/test.py     # 整段 prefill 对照，可能因激活峰值 OOM
+PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_IGNORE_EOS=1 NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_PROMPT_LENGTHS=30000,30001,30002,30003,30004,30005 python3 example/test.py
 ```
-
-前两行用于比较 8.2K 整段/chunk prefill；`temperature=0` 时生成 token IDs 应
-一致。16.2K 双请求需要同时保留两条请求的完整 DRAM KV 和 IndexCache，因此示例
-把 `NANOVLLM_DRAM_NUM_BLOCKS` 提高到 300。实际需要量仍取决于 block size 和请求
-长度。
-
-`NANOVLLM_PREFILL_CHUNK_SIZE=1024` 时，日志中的 `num_tokens` 是当前 chunk
-token 数，`progress=已完成/请求总长度`，并使用 `PREFILL_STEP` 而不是把中间
-chunk 时延误写成 TTFT。当前请求的所有 chunk 会连续执行，期间不插入 decode。
-Python API 对应参数是 `LLM(..., prefill_chunk_size=0)`。
 
 `example/test.py` 会自动设置：
 
@@ -126,3 +115,23 @@ PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_PREFILL_CHUNK_SIZE=1024 NANOVLLM_MAX_GEN_TO
 - DSA 整图不能用 padding bucket：`gather_selection_status` 是跨 step 持久化状态，虚假 padding 行可能污染真实请求状态。
 
 实现与判定细节见 [FULL_DECODE_ONLY.md](FULL_DECODE_ONLY.md)。
+
+　
+
+## 当前效果
+
+DeepSeek-V3.2-REAP-345B-A37B-BF16 模型，TP16+EP16，序列长度 30k
+
+| 推理框架                | NPU KV 块数量 | NPU Index块数量  | bs     | TPOT         | TPS        |
+| --------                | ------------- | ---------------- | ------ | ------------ | ---------- |
+| vLLM 0.19 (不卸载)      | -             | -                | 2      | 54 ms        | 37 TPS     | 
+| nanovllm (不卸载)       | 700           | 700              | 2      | 58 ms        | 34 TPS     | 
+| nanovllm (卸载, GS算子) | 350           | 1500             | 2      | 79 ms        | 25 TPS     | 
+| nanovllm (卸载, GS算子) | 350           | 1500             | 6      | 97 ms        | 61 TPS     | 
+
+
+
+
+
+
+
