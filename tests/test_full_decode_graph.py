@@ -14,7 +14,10 @@ from nanovllm.engine.full_decode_graph import (
 from nanovllm.utils.context import Context, reset_context, set_context
 
 
-def _decode_context(batch_size: int = 2) -> Context:
+def _decode_context(
+    batch_size: int = 2,
+    metadata_key=None,
+) -> Context:
     block_tables = torch.tensor(
         [[row + 1, row + 3, 0] for row in range(batch_size)],
         dtype=torch.int32,
@@ -39,6 +42,7 @@ def _decode_context(batch_size: int = 2) -> Context:
         candidate_query_lens=torch.arange(1, batch_size + 1, dtype=torch.int32),
         needs_dsa_update=True,
         dsa_offload_all_rows=True,
+        decode_metadata_key=metadata_key,
     )
 
 
@@ -73,6 +77,42 @@ def test_static_entry_copies_all_dsa_metadata():
     assert entry.selection_block_tables.equal(context.selection_block_tables)
     assert entry.req_pool_entries.tolist() == [0, 1]
     assert entry.candidate_lens.tolist() == [4096, 4097]
+
+
+def test_static_entry_reuses_unchanged_decode_metadata():
+    entry = FullDecodeGraphEntry.allocate(2, 4, 2, torch.device("cpu"))
+    key = ((10, 3), (11, 7))
+    first = _decode_context(metadata_key=key)
+    entry.copy_runtime_inputs(
+        torch.tensor([11, 12], dtype=torch.int64),
+        torch.tensor([2199, 2200], dtype=torch.int64),
+        first,
+    )
+    original_tables = entry.block_tables.clone()
+
+    same_revision = _decode_context(metadata_key=key)
+    same_revision.block_tables.add_(1000)
+    entry.copy_runtime_inputs(
+        torch.tensor([21, 22], dtype=torch.int64),
+        torch.tensor([2200, 2201], dtype=torch.int64),
+        same_revision,
+    )
+
+    assert entry.input_ids.tolist() == [21, 22]
+    assert entry.positions.tolist() == [2200, 2201]
+    assert entry.block_tables.equal(original_tables)
+    assert entry.metadata_refresh_count == 1
+    assert entry.metadata_reuse_count == 1
+
+    next_revision = _decode_context(metadata_key=((10, 4), (11, 7)))
+    next_revision.block_tables.add_(2000)
+    entry.copy_runtime_inputs(
+        torch.tensor([31, 32], dtype=torch.int64),
+        torch.tensor([2201, 2202], dtype=torch.int64),
+        next_revision,
+    )
+    assert entry.block_tables[:, :3].equal(next_revision.block_tables)
+    assert entry.metadata_refresh_count == 2
 
 
 def test_static_entry_rejects_bucket_padding():

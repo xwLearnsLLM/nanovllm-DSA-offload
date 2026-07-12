@@ -132,6 +132,9 @@ class FullDecodeGraphEntry:
     graph: Any | None = None
     output: torch.Tensor | None = None
     mla_tasks: list[MLAGraphTask] = field(default_factory=list)
+    decode_metadata_key: tuple[tuple[int, int], ...] | None = None
+    metadata_refresh_count: int = 0
+    metadata_reuse_count: int = 0
 
     @classmethod
     def allocate(
@@ -265,25 +268,38 @@ class FullDecodeGraphEntry:
         self.input_ids.copy_(input_ids)
         self.positions.copy_(positions)
         self.flat_slot_mapping_i32.copy_(context.flat_slot_mapping_i32)
-        self.req_pool_entries.copy_(context.req_pool_entries)
-        self.candidate_lens.copy_(context.candidate_lens)
-        self.candidate_query_lens.copy_(context.candidate_query_lens)
-        self._copy_table(self.block_tables, context.block_tables, "block_tables")
-        self._copy_table(
-            self.index_block_tables,
-            context.index_block_tables,
-            "index_block_tables",
+        metadata_key = context.decode_metadata_key
+        refresh_metadata = (
+            metadata_key is None or metadata_key != self.decode_metadata_key
         )
-        self._copy_table(
-            self.dram_block_tables,
-            context.dram_block_tables,
-            "dram_block_tables",
-        )
-        self._copy_table(
-            self.selection_block_tables,
-            context.selection_block_tables,
-            "selection_block_tables",
-        )
+        if refresh_metadata:
+            self.req_pool_entries.copy_(context.req_pool_entries)
+            self.candidate_lens.copy_(context.candidate_lens)
+            self.candidate_query_lens.copy_(context.candidate_query_lens)
+            self._copy_table(
+                self.block_tables,
+                context.block_tables,
+                "block_tables",
+            )
+            self._copy_table(
+                self.index_block_tables,
+                context.index_block_tables,
+                "index_block_tables",
+            )
+            self._copy_table(
+                self.dram_block_tables,
+                context.dram_block_tables,
+                "dram_block_tables",
+            )
+            self._copy_table(
+                self.selection_block_tables,
+                context.selection_block_tables,
+                "selection_block_tables",
+            )
+            self.decode_metadata_key = metadata_key
+            self.metadata_refresh_count += 1
+        else:
+            self.metadata_reuse_count += 1
 
         seq_lens = list(context.actual_seq_lengths_kv or ())
         if len(seq_lens) != self.batch_size:
@@ -566,4 +582,10 @@ class FullDecodeOnlyGraphManager:
             "eager_no_dsa": self.eager_no_dsa_count,
             "eager_mixed_batch": self.eager_mixed_batch_count,
             "eager_uncaptured_batch": self.eager_uncaptured_batch_count,
+            "metadata_refreshes": sum(
+                entry.metadata_refresh_count for entry in self._entries.values()
+            ),
+            "metadata_reuses": sum(
+                entry.metadata_reuse_count for entry in self._entries.values()
+            ),
         }

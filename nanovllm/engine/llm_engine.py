@@ -343,4 +343,13 @@ class LLMEngine:
                 f"eager_mixed_batch={graph_stats['eager_mixed_batch']}, "
                 f"eager_uncaptured_batch={graph_stats['eager_uncaptured_batch']}"
             )
+            print(
+                "    DSA decode hot path: "
+                f"compact_ipc_steps={graph_stats['compact_ipc_steps']}, "
+                f"average_ipc_bytes={graph_stats['average_ipc_bytes']}, "
+                f"metadata_cache_hits={graph_stats['metadata_cache_hits']}, "
+                f"metadata_cache_misses={graph_stats['metadata_cache_misses']}, "
+                f"graph_metadata_refreshes={graph_stats['metadata_refreshes']}, "
+                f"graph_metadata_reuses={graph_stats['metadata_reuses']}"
+            )
         return outputs

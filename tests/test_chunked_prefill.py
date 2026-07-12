@@ -5,7 +5,12 @@ import pytest
 
 from nanovllm.config import Config
 from nanovllm.engine.scheduler import Scheduler
-from nanovllm.engine.sequence import FinishReason, Sequence, SequenceStatus
+from nanovllm.engine.sequence import (
+    DecodeSequenceMetadata,
+    FinishReason,
+    Sequence,
+    SequenceStatus,
+)
 from nanovllm.sampling_params import SamplingParams
 
 
@@ -136,6 +141,7 @@ def test_partial_prefill_state_and_dsa_tables_survive_serialization():
     seq.dram_block_table = [21, 23, 25, 27]
     seq.num_prefill_tokens_processed = 16
     seq.num_scheduled_tokens = 8
+    seq.decode_metadata_version = 7
 
     restored = pickle.loads(pickle.dumps(seq))
 
@@ -144,7 +150,36 @@ def test_partial_prefill_state_and_dsa_tables_survive_serialization():
     assert restored.hbm_block_table == [3, 7, 9, 11]
     assert restored.index_block_table == [13, 15, 17, 19]
     assert restored.dram_block_table == [21, 23, 25, 27]
+    assert restored.decode_metadata_version == 7
     assert restored.scheduled_prefill_chunk()[4:] == (24, False)
+
+
+def test_decode_worker_snapshot_drops_full_token_history():
+    seq = make_sequence(9000, block_size=128)
+    seq.num_prefill_tokens_processed = 9000
+    seq.append_token(42)
+    seq.hbm_block_table = list(range(20))
+    seq.block_table = seq.hbm_block_table
+    seq.index_block_table = list(range(100, 171))
+    seq.dram_block_table = list(range(200, 270))
+    seq.hbm_cached_tokens_pool_entry = 3
+    seq.num_prefill_full_blocks = 70
+    seq.num_sparse_blocks = 16
+    seq.num_sparse_tokens = 2048
+    seq.prefill_tail_len = 40
+    seq.decode_metadata_version = 5
+
+    snapshot = DecodeSequenceMetadata.from_sequence(seq)
+
+    assert len(snapshot) == len(seq)
+    assert snapshot.last_token == 42
+    assert snapshot.num_decode_tokens_since_prefill == 1
+    assert snapshot.is_first_decode_after_prefill
+    assert snapshot.decode_metadata_version == 5
+    assert not hasattr(snapshot, "token_ids")
+    full_payload = pickle.dumps(seq, protocol=pickle.HIGHEST_PROTOCOL)
+    compact_payload = pickle.dumps(snapshot, protocol=pickle.HIGHEST_PROTOCOL)
+    assert len(compact_payload) < len(full_payload) // 5
 
 
 def test_abort_releases_all_partially_prefilled_dsa_resources():

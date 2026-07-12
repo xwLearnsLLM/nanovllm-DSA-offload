@@ -24,6 +24,7 @@ class Context:
     dsa_offload_rows: torch.Tensor | None = None
     dsa_offload_all_rows: bool = False
     has_first_decode: bool = False
+    decode_metadata_key: tuple[tuple[int, int], ...] | None = None
     full_decode_graph: bool = False
     scratch: dict = field(default_factory=dict)
 
@@ -54,6 +55,7 @@ def set_context(
     dsa_offload_rows=None,
     dsa_offload_all_rows=False,
     has_first_decode=False,
+    decode_metadata_key=None,
     full_decode_graph=False,
 ) -> None:
     global _CONTEXT
@@ -75,6 +77,7 @@ def set_context(
         dsa_offload_rows=dsa_offload_rows,
         dsa_offload_all_rows=bool(dsa_offload_all_rows),
         has_first_decode=bool(has_first_decode),
+        decode_metadata_key=decode_metadata_key,
         full_decode_graph=bool(full_decode_graph),
     )
 

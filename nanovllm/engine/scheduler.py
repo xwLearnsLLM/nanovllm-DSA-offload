@@ -97,6 +97,7 @@ class Scheduler:
             seq.num_prefill_full_blocks,
         )
         seq.hbm_cached_tokens_pool_entry = self.pool_entry_manager.allocate()
+        seq.bump_decode_metadata_version()
 
     def schedule(self) -> tuple[list[Sequence], bool]:
         if self.prefill_chunk_size and (
@@ -190,6 +191,7 @@ class Scheduler:
             self.hbm_block_manager.allocate_blocks(1),
         )
         seq.block_table = seq.hbm_block_table
+        seq.bump_decode_metadata_version()
 
     def release_prefill_hbm_blocks(self, seqs: list[Sequence]) -> None:
         for seq in seqs:
@@ -212,6 +214,7 @@ class Scheduler:
         seq.hbm_blocks_to_release.clear()
         seq.hbm_cached_tokens_pool_entry = -1
         seq.offload_finalized = False
+        seq.bump_decode_metadata_version()
 
     def preempt(self, seq: Sequence):
         seq.status = SequenceStatus.WAITING

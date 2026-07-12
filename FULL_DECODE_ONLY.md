@@ -39,6 +39,11 @@
 
 ```text
 DSA FULL_DECODE_ONLY proof: capture_sizes=[2], captures=1, replays=14, eager_first_decode=1, eager_no_dsa=0, eager_mixed_batch=0, eager_uncaptured_batch=0
+DSA decode hot path: compact_ipc_steps=15, average_ipc_bytes=..., metadata_cache_hits=..., metadata_cache_misses=..., graph_metadata_refreshes=..., graph_metadata_reuses=...
 ```
+
+稳定 batch 下，`compact_ipc_steps` 应随 decode step 增长，`metadata_cache_hits`
+和 `graph_metadata_reuses` 应持续增长；miss/refresh 通常只发生在首次进入 decode、
+请求集合变化或每 128 token 新增 KV block 时。
 
 实际性能以预热后的稳定 TPOT 为准；前几个 decode step 的时延不作为优化目标。

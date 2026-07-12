@@ -1,4 +1,5 @@
 from copy import copy
+from dataclasses import dataclass
 from enum import Enum, auto
 from itertools import count
 
@@ -52,6 +53,10 @@ class Sequence:
         self.num_sparse_tokens = 0
         self.prefill_tail_len = 0
         self.hbm_blocks_to_release = []
+        # Incremented only when decode metadata changes, not for every sampled
+        # token.  ModelRunner uses this revision to keep the large DSA block
+        # tables resident across steady-state decode steps.
+        self.decode_metadata_version = 0
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
@@ -110,6 +115,9 @@ class Sequence:
         self.token_ids.append(token_id)
         self.last_token = token_id
         self.num_tokens += 1
+
+    def bump_decode_metadata_version(self) -> None:
+        self.decode_metadata_version += 1
 
     def reset_prefill_progress(self):
         self.num_prefill_tokens_processed = 0
@@ -178,6 +186,7 @@ class Sequence:
             "num_sparse_tokens": self.num_sparse_tokens,
             "prefill_tail_len": self.prefill_tail_len,
             "hbm_blocks_to_release": self.hbm_blocks_to_release,
+            "decode_metadata_version": self.decode_metadata_version,
             "token_ids": self.token_ids,
             "status": self.status,
             "temperature": self.temperature,
@@ -214,6 +223,7 @@ class Sequence:
         self.num_sparse_tokens = state.get("num_sparse_tokens", 0)
         self.prefill_tail_len = state.get("prefill_tail_len", 0)
         self.hbm_blocks_to_release = state.get("hbm_blocks_to_release", [])
+        self.decode_metadata_version = state.get("decode_metadata_version", 0)
         self.token_ids = state["token_ids"]
         self.status = state["status"]
         self.temperature = state["temperature"]
@@ -226,3 +236,63 @@ class Sequence:
 
     def __repr__(self):
         return f"Seq(id={self.seq_id}, status={self.status.name}, reason={self.finish_reason.name if self.finish_reason else 'None'})"
+
+
+@dataclass
+class DecodeSequenceMetadata:
+    """Small worker-side view of a sequence for a decode-only forward.
+
+    Full ``Sequence`` serialization includes the complete prompt and generated
+    token history.  Stable decode only needs the last token plus cache layout
+    metadata, so TP workers receive this compact snapshot instead.
+    """
+
+    seq_id: int
+    num_tokens: int
+    last_token: int
+    num_prefill_tokens_processed: int
+    block_size: int
+    hbm_block_table: list[int]
+    index_block_table: list[int]
+    dram_block_table: list[int]
+    hbm_cached_tokens_pool_entry: int
+    num_prefill_full_blocks: int
+    num_sparse_blocks: int
+    num_sparse_tokens: int
+    prefill_tail_len: int
+    temperature: float
+    decode_metadata_version: int
+
+    @classmethod
+    def from_sequence(cls, seq: Sequence) -> "DecodeSequenceMetadata":
+        return cls(
+            seq_id=seq.seq_id,
+            num_tokens=len(seq),
+            last_token=seq.last_token,
+            num_prefill_tokens_processed=seq.num_prefill_tokens_processed,
+            block_size=seq.block_size,
+            hbm_block_table=list(seq.hbm_block_table),
+            index_block_table=list(seq.index_block_table),
+            dram_block_table=list(seq.dram_block_table),
+            hbm_cached_tokens_pool_entry=seq.hbm_cached_tokens_pool_entry,
+            num_prefill_full_blocks=seq.num_prefill_full_blocks,
+            num_sparse_blocks=seq.num_sparse_blocks,
+            num_sparse_tokens=seq.num_sparse_tokens,
+            prefill_tail_len=seq.prefill_tail_len,
+            temperature=seq.temperature,
+            decode_metadata_version=seq.decode_metadata_version,
+        )
+
+    def __len__(self) -> int:
+        return self.num_tokens
+
+    @property
+    def num_decode_tokens_since_prefill(self) -> int:
+        return self.num_tokens - self.num_prefill_tokens_processed
+
+    @property
+    def is_first_decode_after_prefill(self) -> bool:
+        return (
+            self.num_prefill_tokens_processed > 0
+            and self.num_decode_tokens_since_prefill == 1
+        )

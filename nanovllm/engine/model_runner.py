@@ -1,9 +1,13 @@
 ﻿# SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the Nano-vLLM project
 
+from __future__ import annotations
+
 import pickle
+from dataclasses import dataclass
 from multiprocessing.shared_memory import SharedMemory
 from multiprocessing.synchronize import Event
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -14,7 +18,7 @@ torch.npu.config.allow_internal_format = True
 from nanovllm.config import Config
 from nanovllm.engine.dsa_offload import DSA_SELECTION_TOPK_TOKENS
 from nanovllm.engine.full_decode_graph import FullDecodeOnlyGraphManager
-from nanovllm.engine.sequence import Sequence
+from nanovllm.engine.sequence import DecodeSequenceMetadata, Sequence
 from nanovllm.layers.sampler import Sampler
 from nanovllm.models.deepseek_v32 import DeepseekV32ForCausalLM
 from nanovllm.utils.context import set_context, reset_context
@@ -22,6 +26,82 @@ from nanovllm.utils.loader import load_model
 from nanovllm.utils.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class _HostDeviceVector:
+    host: torch.Tensor
+    device: torch.Tensor
+    host_array: Any
+
+    @classmethod
+    def allocate(
+        cls,
+        size: int,
+        dtype: torch.dtype,
+        device: str,
+    ) -> "_HostDeviceVector":
+        host = torch.empty(
+            size,
+            dtype=dtype,
+            device="cpu",
+            pin_memory=True,
+        )
+        return cls(
+            host=host,
+            device=torch.empty(size, dtype=dtype, device=device),
+            host_array=host.numpy(),
+        )
+
+    def stage(self, values: list[int] | list[float]) -> torch.Tensor:
+        if len(values) != self.host.numel():
+            raise ValueError(
+                f"Decode vector size changed: runtime={len(values)}, "
+                f"buffer={self.host.numel()}."
+            )
+        self.host_array[...] = values
+        self.device.copy_(self.host, non_blocking=True)
+        return self.device
+
+
+@dataclass
+class _DecodeDynamicBuffers:
+    input_ids: _HostDeviceVector
+    positions: _HostDeviceVector
+    slot_mapping_i32: _HostDeviceVector
+
+    @classmethod
+    def allocate(cls, batch_size: int, device: str) -> "_DecodeDynamicBuffers":
+        return cls(
+            input_ids=_HostDeviceVector.allocate(
+                batch_size,
+                torch.int64,
+                device,
+            ),
+            positions=_HostDeviceVector.allocate(
+                batch_size,
+                torch.int64,
+                device,
+            ),
+            slot_mapping_i32=_HostDeviceVector.allocate(
+                batch_size,
+                torch.int32,
+                device,
+            ),
+        )
+
+
+@dataclass
+class _DecodeStaticMetadata:
+    key: tuple[tuple[int, int], ...]
+    block_tables: torch.Tensor
+    index_block_tables: torch.Tensor
+    dram_block_tables: torch.Tensor
+    selection_block_tables: torch.Tensor
+    req_pool_entries: torch.Tensor
+    candidate_lens: torch.Tensor
+    candidate_query_lens: torch.Tensor
+    temperatures: torch.Tensor | None
 
 
 class ModelRunner:
@@ -46,6 +126,12 @@ class ModelRunner:
         self.model = self._load_default_strategy()
 
         self.sampler = Sampler()
+        self._decode_dynamic_buffers: dict[int, _DecodeDynamicBuffers] = {}
+        self._decode_static_metadata: _DecodeStaticMetadata | None = None
+        self._decode_metadata_cache_hits = 0
+        self._decode_metadata_cache_misses = 0
+        self._compact_decode_ipc_steps = 0
+        self._compact_decode_ipc_bytes = 0
         torch.npu.empty_cache()
         self._allocate_deepseek_dsa_cache()
         self.decode_graph_manager = None
@@ -137,6 +223,20 @@ class ModelRunner:
                 "DSA FULL_DECODE_ONLY final stats: %s",
                 self.decode_graph_manager.stats(),
             )
+        if self.rank == 0:
+            average_ipc_bytes = (
+                self._compact_decode_ipc_bytes
+                // max(self._compact_decode_ipc_steps, 1)
+            )
+            logger.info(
+                "Decode hot-path stats: compact_ipc_steps=%d, "
+                "average_ipc_bytes=%d, metadata_cache_hits=%d, "
+                "metadata_cache_misses=%d",
+                self._compact_decode_ipc_steps,
+                average_ipc_bytes,
+                self._decode_metadata_cache_hits,
+                self._decode_metadata_cache_misses,
+            )
         if self.world_size > 1:
             self.shm.close()
             dist.barrier()
@@ -148,7 +248,17 @@ class ModelRunner:
     def get_decode_graph_stats(self):
         if self.decode_graph_manager is None:
             return {"enabled": False, "mode": "eager"}
-        return self.decode_graph_manager.stats()
+        stats = self.decode_graph_manager.stats()
+        stats.update(
+            compact_ipc_steps=self._compact_decode_ipc_steps,
+            average_ipc_bytes=(
+                self._compact_decode_ipc_bytes
+                // max(self._compact_decode_ipc_steps, 1)
+            ),
+            metadata_cache_hits=self._decode_metadata_cache_hits,
+            metadata_cache_misses=self._decode_metadata_cache_misses,
+        )
+        return stats
 
     def loop(self):
         while True:
@@ -161,22 +271,55 @@ class ModelRunner:
         assert self.world_size > 1 and self.rank > 0
         self.event.wait()
         n = int.from_bytes(self.shm.buf[0:4], "little")
+        if n <= 0 or n + 4 > len(self.shm.buf):
+            raise RuntimeError(
+                f"Invalid TP worker IPC payload size {n}; "
+                f"shared memory capacity is {len(self.shm.buf) - 4}."
+            )
         method_name, *args = pickle.loads(self.shm.buf[4:n + 4])
         self.event.clear()
         return method_name, args
 
     def write_shm(self, method_name, *args):
         assert self.world_size > 1 and self.rank == 0
-        data = pickle.dumps([method_name, *args])
+        data = pickle.dumps(
+            (method_name, *args),
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
         n = len(data)
+        if n + 4 > len(self.shm.buf):
+            raise RuntimeError(
+                "TP worker IPC payload exceeds the shared-memory buffer: "
+                f"payload={n}, capacity={len(self.shm.buf) - 4}. "
+                "Enable chunk prefill or reduce the prefill batch size."
+            )
         self.shm.buf[0:4] = n.to_bytes(4, "little")
         self.shm.buf[4:n + 4] = data
         for event in self.event:
             event.set()
+        return n
+
+    @staticmethod
+    def _compact_worker_args(method_name: str, args: tuple) -> tuple:
+        if (
+            method_name == "run"
+            and len(args) == 2
+            and args[1] is False
+        ):
+            seqs = [
+                DecodeSequenceMetadata.from_sequence(seq)
+                for seq in args[0]
+            ]
+            return seqs, False
+        return args
 
     def call(self, method_name, *args):
         if self.world_size > 1 and self.rank == 0:
-            self.write_shm(method_name, *args)
+            worker_args = self._compact_worker_args(method_name, args)
+            payload_bytes = self.write_shm(method_name, *worker_args)
+            if worker_args is not args:
+                self._compact_decode_ipc_steps += 1
+                self._compact_decode_ipc_bytes += payload_bytes
         method = getattr(self, method_name, None)
         return method(*args)
 
@@ -257,6 +400,78 @@ class ModelRunner:
             table = list(seq.hbm_block_table[:sparse_blocks])
             tables.append(table + [0] * (max_sparse_blocks - len(table)))
         return torch.tensor(tables, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
+
+    def _get_decode_dynamic_buffers(
+        self,
+        batch_size: int,
+    ) -> _DecodeDynamicBuffers:
+        buffers = self._decode_dynamic_buffers.get(batch_size)
+        if buffers is None:
+            buffers = _DecodeDynamicBuffers.allocate(batch_size, self.device)
+            self._decode_dynamic_buffers[batch_size] = buffers
+        return buffers
+
+    @staticmethod
+    def _decode_metadata_key(
+        seqs: list[Sequence | DecodeSequenceMetadata],
+    ) -> tuple[tuple[int, int], ...]:
+        return tuple(
+            (int(seq.seq_id), int(seq.decode_metadata_version))
+            for seq in seqs
+        )
+
+    def _get_decode_static_metadata(
+        self,
+        seqs: list[Sequence | DecodeSequenceMetadata],
+        candidate_lens: list[int],
+        req_pool_entries: list[int],
+    ) -> _DecodeStaticMetadata:
+        key = self._decode_metadata_key(seqs)
+        cached = self._decode_static_metadata
+        if cached is not None and cached.key == key:
+            self._decode_metadata_cache_hits += 1
+            return cached
+
+        self._decode_metadata_cache_misses += 1
+        temperatures = None
+        if self.rank == 0:
+            temperatures = torch.tensor(
+                [seq.temperature for seq in seqs],
+                dtype=torch.float32,
+                pin_memory=True,
+            ).to(self.device, non_blocking=True)
+        cached = _DecodeStaticMetadata(
+            key=key,
+            block_tables=self.prepare_block_tables(seqs, "hbm_block_table"),
+            index_block_tables=self.prepare_block_tables(
+                seqs,
+                "index_block_table",
+            ),
+            dram_block_tables=self.prepare_block_tables(
+                seqs,
+                "dram_block_table",
+            ),
+            selection_block_tables=self.prepare_selection_block_tables(seqs),
+            req_pool_entries=torch.tensor(
+                req_pool_entries,
+                dtype=torch.int32,
+                pin_memory=True,
+            ).to(self.device, non_blocking=True),
+            candidate_lens=torch.tensor(
+                candidate_lens,
+                dtype=torch.int32,
+                pin_memory=True,
+            ).to(self.device, non_blocking=True),
+            candidate_query_lens=torch.arange(
+                1,
+                len(seqs) + 1,
+                dtype=torch.int32,
+                pin_memory=True,
+            ).to(self.device, non_blocking=True),
+            temperatures=temperatures,
+        )
+        self._decode_static_metadata = cached
+        return cached
 
     def _sequence_slots(self, block_table: list[int], seq_len: int) -> list[int]:
         slots: list[int] = []
@@ -339,7 +554,10 @@ class ModelRunner:
 
         return input_ids, positions, is_last_chunk
 
-    def prepare_decode(self, seqs: list[Sequence]):
+    def prepare_decode(
+        self,
+        seqs: list[Sequence | DecodeSequenceMetadata],
+    ):
         input_ids = []
         positions = []
         flat_slot_mapping = []
@@ -374,27 +592,53 @@ class ModelRunner:
             sparse_kv_lens.append(sparse_kv_len)
             req_pool_entries.append(seq.hbm_cached_tokens_pool_entry)
         dsa_offload_all_rows = bool(offload_rows and len(offload_rows) == len(seqs))
-        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).to(self.device, non_blocking=True)
-        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).to(self.device, non_blocking=True)
-        flat_slot_mapping_i32 = torch.tensor(
-            flat_slot_mapping,
-            dtype=torch.int32,
-            pin_memory=True,
-        ).to(self.device, non_blocking=True)
-        flat_slot_mapping_i64 = None
-        if has_first_decode:
-            flat_slot_mapping_i64 = torch.tensor(
-                flat_slot_mapping,
+        use_persistent_decode_buffers = (
+            self.decode_graph_manager is not None
+            and not has_first_decode
+            and dsa_offload_all_rows
+            and len(seqs) in self.decode_graph_manager.capture_sizes
+        )
+        if use_persistent_decode_buffers:
+            # FULL_DECODE_ONLY synchronizes the current stream before replay,
+            # so these pinned buffers are safe to reuse on the next step.
+            dynamic_buffers = self._get_decode_dynamic_buffers(len(seqs))
+            input_ids = dynamic_buffers.input_ids.stage(input_ids)
+            positions = dynamic_buffers.positions.stage(positions)
+            flat_slot_mapping_i32 = dynamic_buffers.slot_mapping_i32.stage(
+                flat_slot_mapping
+            )
+            flat_slot_mapping_i64 = None
+        else:
+            # Preserve the allocation-based eager path.  Worker ranks can
+            # return before their stream finishes, so a single pinned staging
+            # buffer must not be overwritten by the following eager step.
+            input_ids = torch.tensor(
+                input_ids,
                 dtype=torch.int64,
                 pin_memory=True,
             ).to(self.device, non_blocking=True)
-        hbm_block_tables = self.prepare_block_tables(seqs, "hbm_block_table")
-        index_block_tables = self.prepare_block_tables(seqs, "index_block_table")
-        dram_block_tables = self.prepare_block_tables(seqs, "dram_block_table")
-        selection_block_tables = self.prepare_selection_block_tables(seqs)
-        req_pool_entries = torch.tensor(req_pool_entries, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
-        candidate_lens = torch.tensor(candidate_lens, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
-        candidate_query_lens = torch.arange(1, len(seqs) + 1, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
+            positions = torch.tensor(
+                positions,
+                dtype=torch.int64,
+                pin_memory=True,
+            ).to(self.device, non_blocking=True)
+            flat_slot_mapping_i32 = torch.tensor(
+                flat_slot_mapping,
+                dtype=torch.int32,
+                pin_memory=True,
+            ).to(self.device, non_blocking=True)
+            flat_slot_mapping_i64 = None
+            if has_first_decode:
+                flat_slot_mapping_i64 = torch.tensor(
+                    flat_slot_mapping,
+                    dtype=torch.int64,
+                    pin_memory=True,
+                ).to(self.device, non_blocking=True)
+        static_metadata = self._get_decode_static_metadata(
+            seqs,
+            candidate_lens,
+            req_pool_entries,
+        )
         dsa_offload_rows = None
         if needs_dsa_update and not dsa_offload_all_rows:
             dsa_offload_rows = torch.tensor(offload_rows, dtype=torch.long, pin_memory=True).to(self.device, non_blocking=True)
@@ -403,17 +647,18 @@ class ModelRunner:
             flat_slot_mapping=flat_slot_mapping_i64,
             flat_slot_mapping_i32=flat_slot_mapping_i32,
             actual_seq_lengths_kv=sparse_kv_lens,
-            block_tables=hbm_block_tables,
-            index_block_tables=index_block_tables,
-            dram_block_tables=dram_block_tables,
-            selection_block_tables=selection_block_tables,
-            req_pool_entries=req_pool_entries,
-            candidate_lens=candidate_lens,
-            candidate_query_lens=candidate_query_lens,
+            block_tables=static_metadata.block_tables,
+            index_block_tables=static_metadata.index_block_tables,
+            dram_block_tables=static_metadata.dram_block_tables,
+            selection_block_tables=static_metadata.selection_block_tables,
+            req_pool_entries=static_metadata.req_pool_entries,
+            candidate_lens=static_metadata.candidate_lens,
+            candidate_query_lens=static_metadata.candidate_query_lens,
             needs_dsa_update=needs_dsa_update,
             dsa_offload_rows=dsa_offload_rows,
             dsa_offload_all_rows=dsa_offload_all_rows,
             has_first_decode=has_first_decode,
+            decode_metadata_key=static_metadata.key,
         )
         return input_ids, positions
 
@@ -447,9 +692,14 @@ class ModelRunner:
             seq.block_table = seq.hbm_block_table
             seq.hbm_blocks_to_release = release_blocks
             seq.offload_finalized = True
+            seq.bump_decode_metadata_version()
 
     @torch.inference_mode()
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int] | None:
+    def run(
+        self,
+        seqs: list[Sequence | DecodeSequenceMetadata],
+        is_prefill: bool,
+    ) -> list[int] | None:
         try:
             if is_prefill:
                 input_ids, positions, should_sample = self.prepare_prefill(seqs)
@@ -457,12 +707,17 @@ class ModelRunner:
                 input_ids, positions = self.prepare_decode(seqs)
                 should_sample = True
             temperatures = None
-            if should_sample and self.rank == 0:
+            if should_sample and self.rank == 0 and is_prefill:
                 temperatures = torch.tensor(
                     [seq.temperature for seq in seqs],
                     dtype=torch.float32,
                     pin_memory=True,
                 ).to(self.device, non_blocking=True)
+            elif should_sample and self.rank == 0:
+                static_metadata = self._decode_static_metadata
+                if static_metadata is None:
+                    raise RuntimeError("Decode sampling metadata was not prepared.")
+                temperatures = static_metadata.temperatures
             if is_prefill or self.decode_graph_manager is None:
                 hidden_states = self.model(input_ids, positions)
             else:
