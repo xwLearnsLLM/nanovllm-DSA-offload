@@ -22,22 +22,16 @@ FULL_DECODE_ONLY = "full_decode_only"
 
 def normalize_capture_sizes(
     values: Iterable[int],
-    max_batch_size: int,
 ) -> tuple[int, ...]:
     """Validate, sort, and deduplicate full-decode graph batch sizes."""
     sizes = tuple(sorted({int(value) for value in values}))
     if not sizes:
         raise ValueError(
             "FULL_DECODE_ONLY requires at least one exact decode graph capture "
-            "size. Set NANOVLLM_DECODE_GRAPH_CAPTURE_SIZES, for example to '16'."
+            "size. Pass decode_graph_capture_sizes, for example (16,)."
         )
     if sizes[0] <= 0:
         raise ValueError(f"Decode graph capture sizes must be positive, got {sizes}.")
-    if sizes[-1] > int(max_batch_size):
-        raise ValueError(
-            "Decode graph capture size exceeds max_num_decode_seqs_per_step: "
-            f"sizes={sizes}, max={max_batch_size}."
-        )
     return sizes
 
 
@@ -127,12 +121,7 @@ class FullDecodeGraphEntry:
     selection_block_columns: int
     input_ids: torch.Tensor
     positions: torch.Tensor
-    slot_mapping: torch.Tensor
-    flat_slot_mapping: torch.Tensor
     flat_slot_mapping_i32: torch.Tensor
-    index_slot_mapping: torch.Tensor
-    flat_index_slot_mapping: torch.Tensor
-    context_lens: torch.Tensor
     block_tables: torch.Tensor
     index_block_tables: torch.Tensor
     dram_block_tables: torch.Tensor
@@ -152,14 +141,11 @@ class FullDecodeGraphEntry:
         selection_block_columns: int,
         device: torch.device,
     ) -> "FullDecodeGraphEntry":
-        null_offsets_i32 = torch.arange(
+        flat_slot_mapping_i32 = torch.arange(
             batch_size,
             dtype=torch.int32,
             device=device,
         )
-        slot_mapping = torch.zeros(batch_size, 2, dtype=torch.int32, device=device)
-        slot_mapping[:, 1].copy_(null_offsets_i32)
-        index_slot_mapping = slot_mapping.clone()
         candidate_query_lens = torch.arange(
             1,
             batch_size + 1,
@@ -172,17 +158,7 @@ class FullDecodeGraphEntry:
             selection_block_columns=selection_block_columns,
             input_ids=torch.zeros(batch_size, dtype=torch.int64, device=device),
             positions=torch.zeros(batch_size, dtype=torch.int64, device=device),
-            slot_mapping=slot_mapping,
-            flat_slot_mapping=null_offsets_i32.to(torch.int64),
-            flat_slot_mapping_i32=null_offsets_i32,
-            index_slot_mapping=index_slot_mapping,
-            flat_index_slot_mapping=null_offsets_i32.to(torch.int64),
-            context_lens=torch.full(
-                (batch_size,),
-                DSA_SELECTION_TOPK_TOKENS,
-                dtype=torch.int32,
-                device=device,
-            ),
+            flat_slot_mapping_i32=flat_slot_mapping_i32,
             block_tables=torch.zeros(
                 batch_size,
                 max_block_columns,
@@ -270,12 +246,7 @@ class FullDecodeGraphEntry:
                 f"{self.batch_size} != {positions.shape[0]}."
             )
         required_metadata = {
-            "slot_mapping": context.slot_mapping,
-            "flat_slot_mapping": context.flat_slot_mapping,
             "flat_slot_mapping_i32": context.flat_slot_mapping_i32,
-            "index_slot_mapping": context.index_slot_mapping,
-            "flat_index_slot_mapping": context.flat_index_slot_mapping,
-            "context_lens": context.context_lens,
             "block_tables": context.block_tables,
             "index_block_tables": context.index_block_tables,
             "dram_block_tables": context.dram_block_tables,
@@ -293,12 +264,7 @@ class FullDecodeGraphEntry:
 
         self.input_ids.copy_(input_ids)
         self.positions.copy_(positions)
-        self.slot_mapping.copy_(context.slot_mapping)
-        self.flat_slot_mapping.copy_(context.flat_slot_mapping)
         self.flat_slot_mapping_i32.copy_(context.flat_slot_mapping_i32)
-        self.index_slot_mapping.copy_(context.index_slot_mapping)
-        self.flat_index_slot_mapping.copy_(context.flat_index_slot_mapping)
-        self.context_lens.copy_(context.context_lens)
         self.req_pool_entries.copy_(context.req_pool_entries)
         self.candidate_lens.copy_(context.candidate_lens)
         self.candidate_query_lens.copy_(context.candidate_query_lens)
@@ -346,7 +312,7 @@ class FullDecodeOnlyGraphManager:
         block_size: int,
         device: str | torch.device,
         expected_mla_tasks: int,
-        warmup_iters: int = 1,
+        log_enabled: bool = True,
     ) -> None:
         self.model = model
         self.capture_sizes = tuple(int(size) for size in capture_sizes)
@@ -368,12 +334,7 @@ class FullDecodeOnlyGraphManager:
             )
         self.device = torch.device(device)
         self.expected_mla_tasks = int(expected_mla_tasks)
-        self.warmup_iters = int(warmup_iters)
-        if self.warmup_iters < 1:
-            raise ValueError(
-                "decode graph warmup_iters must be >= 1 because decode buffers "
-                "and auxiliary streams are allocated lazily."
-            )
+        self.log_enabled = bool(log_enabled)
         self._entries: dict[int, FullDecodeGraphEntry] = {}
         self._graph_pool = None
         self._update_stream = None
@@ -435,10 +396,11 @@ class FullDecodeOnlyGraphManager:
         compiler_config.debug.run_eagerly = True
         compiler_config.debug.aclgraph.disable_reinplace_inplaceable_ops_pass = True
         backend = torchair.get_npu_backend(compiler_config=compiler_config)
-        logger.info(
-            "DSA FULL_DECODE_ONLY: enabling npugraph_ex FX optimization with "
-            "one outer ACLGraph per exact batch size."
-        )
+        if self.log_enabled:
+            logger.info(
+                "DSA FULL_DECODE_ONLY: enabling npugraph_ex FX optimization "
+                "with one outer ACLGraph per exact batch size."
+            )
         return torch.compile(
             model,
             backend=backend,
@@ -456,23 +418,16 @@ class FullDecodeOnlyGraphManager:
         self._entries[batch_size] = entry
         return entry
 
-    def _set_static_context(
+    def _set_capture_context(
         self,
         entry: FullDecodeGraphEntry,
         actual_seq_kvlen: list[int],
     ) -> None:
         set_context(
             False,
-            slot_mapping=entry.slot_mapping,
-            flat_slot_mapping=entry.flat_slot_mapping,
             flat_slot_mapping_i32=entry.flat_slot_mapping_i32,
-            index_slot_mapping=entry.index_slot_mapping,
-            flat_index_slot_mapping=entry.flat_index_slot_mapping,
-            context_lens=entry.context_lens,
-            actual_seq_lengths_query=list(range(1, entry.batch_size + 1)),
             actual_seq_lengths_kv=actual_seq_kvlen,
             block_tables=entry.block_tables,
-            hbm_block_tables=entry.block_tables,
             index_block_tables=entry.index_block_tables,
             dram_block_tables=entry.dram_block_tables,
             selection_block_tables=entry.selection_block_tables,
@@ -483,7 +438,6 @@ class FullDecodeOnlyGraphManager:
             dsa_offload_rows=None,
             dsa_offload_all_rows=True,
             has_first_decode=False,
-            block_size=self.block_size,
             full_decode_graph=True,
         )
 
@@ -493,12 +447,11 @@ class FullDecodeOnlyGraphManager:
         if self._update_stream is None:
             self._update_stream = torch.npu.Stream()
 
-        logger.info(
-            "DSA FULL_DECODE_ONLY: pre-capturing exact decode sizes=%s, "
-            "warmup_iters=%d",
-            self.capture_sizes,
-            self.warmup_iters,
-        )
+        if self.log_enabled:
+            logger.info(
+                "DSA FULL_DECODE_ONLY: pre-capturing exact decode sizes=%s",
+                self.capture_sizes,
+            )
         try:
             with torch.inference_mode():
                 for batch_size in self.capture_sizes:
@@ -511,11 +464,10 @@ class FullDecodeOnlyGraphManager:
 
     def _capture(self, entry: FullDecodeGraphEntry) -> None:
         dummy_seq_lens = [DSA_SELECTION_TOPK_TOKENS] * entry.batch_size
-        self._set_static_context(entry, dummy_seq_lens)
+        self._set_capture_context(entry, dummy_seq_lens)
         capture_context = get_context()
-        for _ in range(self.warmup_iters):
-            capture_context.scratch.clear()
-            self._callable(entry.input_ids, entry.positions)
+        capture_context.scratch.clear()
+        self._callable(entry.input_ids, entry.positions)
         torch.npu.synchronize()
         gc.collect()
         torch.npu.empty_cache()
@@ -541,12 +493,13 @@ class FullDecodeOnlyGraphManager:
                 "actual_seq_kvlen."
             )
         self.capture_count += 1
-        logger.info(
-            "DSA FULL_DECODE_ONLY: captured complete decode graph for "
-            "batch_size=%d with %d refreshable MLA tasks.",
-            entry.batch_size,
-            len(entry.mla_tasks),
-        )
+        if self.log_enabled:
+            logger.info(
+                "DSA FULL_DECODE_ONLY: captured complete decode graph for "
+                "batch_size=%d with %d refreshable MLA tasks.",
+                entry.batch_size,
+                len(entry.mla_tasks),
+            )
 
     def _run_eager(
         self,
@@ -582,7 +535,6 @@ class FullDecodeOnlyGraphManager:
             )
 
         seq_lens = entry.copy_runtime_inputs(input_ids, positions, runtime_context)
-        self._set_static_context(entry, seq_lens)
 
         # Wait for H2D metadata staging and the previous replay before changing
         # task parameters. The graph itself is enqueued first; captured external
@@ -592,7 +544,7 @@ class FullDecodeOnlyGraphManager:
         with torch.npu.stream(self._update_stream):
             for task in entry.mla_tasks:
                 task.update(self._update_stream, seq_lens)
-        if self.replay_count == 0:
+        if self.log_enabled and self.replay_count == 0:
             logger.info(
                 "DSA FULL_DECODE_ONLY: first complete graph replay entered "
                 "for exact batch_size=%d.",

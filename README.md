@@ -1,24 +1,15 @@
-# nano-vllm-ascend DeepSeek V3.2 DSA 卸载说明
+# nano-vLLM Ascend DeepSeek V3.2 DSA offload
 
-稳定 decode 的完整图模式、编译和验收命令见 [FULL_DECODE_ONLY.md](FULL_DECODE_ONLY.md)。
+本分支在 nano-vLLM Ascend 的 DeepSeek V3.2 BF16 推理上增加 DSA decode KV cache 卸载。后续以 128 专家模型为主。运行时只保留两种模式：
 
-昇腾上做 DSA 模型的 decode 阶段 KVcache offload ，节省显存，提升 batch-size
+| `NANOVLLM_ENFORCE_EAGER` | Prefill | 第一个 decode step | 稳定 decode |
+| --- | --- | --- | --- |
+| `0`（默认） | eager | eager | 满足 DSA 条件时使用 `FULL_DECODE_ONLY + npugraph_ex + ACLGraph` |
+| `1` | eager | eager | eager |
 
-　
+LM head 和 sampler 始终在整图之外。
 
-##  编译算子
-
-在昇腾机器的仓库根目录执行：
-
-```bash
-rm -rf build/nanovllm_ascend_ops     # 清除旧的编译
-NANOVLLM_CANN_BUILD_JOBS=64 NANOVLLM_EXT_BUILD_JOBS=1 SOC_VERSION=ascend910_9391 PYTHONPATH=$PWD:$PYTHONPATH bash scripts/build_nanovllm_ops.sh
-```
-
-说明：
-
-- `SOC_VERSION=ascend910_9391` 按机器实际 SoC 设置。
-- 如果只改了 pybind extension，可以设置 `NANOVLLM_SKIP_CANN_OPP_BUILD=1` 跳过较慢的 OPP 重建。
+DSA 整图采用精确 batch size。只有 batch 内所有请求均已进入 DSA offload 的稳定 decode，才会 replay 整图；短请求、首个 decode、混合 batch 和未 capture 的 batch size 会明确走 eager，并在最终统计中分别计数。
 
 　
 
@@ -31,112 +22,102 @@ NANOVLLM_CANN_BUILD_JOBS=64 NANOVLLM_EXT_BUILD_JOBS=1 SOC_VERSION=ascend910_9391
 
 　
 
-## 添加prof
+## 编译算子
+
 ```bash
-NANOVLLM_NPU_PROFILE = 1
-NANOVLLM_NPU_PROFILE_DIR = xx
+NANOVLLM_CANN_BUILD_JOBS=64 SOC_VERSION=ascend910_9391 PYTHONPATH=$PWD:$PYTHONPATH bash scripts/build_nanovllm_ops.sh
+```
+
+`catlass` 仍然是必要依赖，因为 decode 的 `matmul_allreduce_add_rmsnorm` 融合算子使用它。
+
+若编译命令卡在 catlass 下载，请提前手动下载 catlass 并把 catlass 放到 `csrc/third_party/catlass`。方法如下：
+
+```
+mkdir -p csrc/third_party/
+cd csrc/third_party/
+git clone --depth 1 --branch master https://gitcode.com/cann/catlass.git 
+cd ../..
+ls csrc/third_party/catlass/include/catlass/catlass.hpp    # 检查关键头文件存在
 ```
 
 　
 
-## 推128专家模型（16卡910C）准备工作
+## 推荐验证命令（128 专家模型、TP16）
 
-先进行一些公用配置：
-
-```bash
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export ASCEND_LAUNCH_BLOCKING=0
-export NANOVLLM_MODEL=/var/models/DeepSeek-V3.2-REAP-345B-A37B-BF16/   # 模型路径
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 # 16卡
-export NANOVLLM_TP_SIZE=16                                      # TP16
-export NANOVLLM_ENABLE_EXPERT_PARALLEL=1
-export NANOVLLM_KVCACHE_BLOCK_SIZE=128
-export NANOVLLM_HBM_NUM_BLOCKS=200                              # 200个HBM blocks
-export NANOVLLM_DRAM_NUM_BLOCKS=800                             # 800个DRAM blocks 以及 800个HBM IndexCache Blocks
-export NANOVLLM_MAX_MODEL_LEN=65536
-export NANOVLLM_MAX_PREFILL_SEQS_PER_STEP=1                     # prefill最大batch-size设为1，避免爆显存
-export NANOVLLM_MAX_DECODE_SEQS_PER_STEP=256                    # decode最大batch-size设为256
-export NANOVLLM_IGNORE_EOS=1
-export NANOVLLM_ENABLE_DECODE_MLAPO=1
-```
-
-　
-
-## 推32专家残障模型（8卡910C）准备工作
-
-先进行一些公用配置：
+在仓库根目录执行：
 
 ```bash
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export ASCEND_LAUNCH_BLOCKING=0
-export NANOVLLM_MODEL=/mnt/models/Deepseek-V3.2-Pruned-95B-BF/  # 模型路径
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7                # 8 卡
-export NANOVLLM_TP_SIZE=8                                       # TP8 
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+export NANOVLLM_MODEL=/home/models/DeepSeek-V3.2-REAP-345B-A37B-BF16/
+export NANOVLLM_TP_SIZE=16
 export NANOVLLM_ENABLE_EXPERT_PARALLEL=1
+export NANOVLLM_ENFORCE_EAGER=0
 export NANOVLLM_KVCACHE_BLOCK_SIZE=128
-export NANOVLLM_HBM_NUM_BLOCKS=600                              # 600个HBM blocks
-export NANOVLLM_DRAM_NUM_BLOCKS=3000                            # 3000个DRAM blocks 以及 2000个HBM IndexCache Blocks
-export NANOVLLM_MAX_MODEL_LEN=65536
-export NANOVLLM_MAX_PREFILL_SEQS_PER_STEP=1                     # prefill最大batch-size设为1，避免爆显存
-export NANOVLLM_MAX_DECODE_SEQS_PER_STEP=256                    # decode最大batch-size设为256
-export NANOVLLM_IGNORE_EOS=1
-export NANOVLLM_ENABLE_DECODE_MLAPO=1
+export NANOVLLM_HBM_NUM_BLOCKS=200
+export NANOVLLM_DRAM_NUM_BLOCKS=200
+
+du -sh "$NANOVLLM_MODEL"    # 检查模型存在
+
+PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_PROMPT_LENGTHS=8200,8201 python3 example/test.py
+```
+
+`example/test.py` 会自动设置：
+
+- `max_model_len = 最长 prompt + max_gen_tokens`
+- prefill batch 上限为 1，避免一次 prefill 多条长序列
+- decode batch 上限和 graph capture size 均为 prompt 数量；上面的命令即精确 batch size 2
+- `temperature=0`、`ignore_eos=True`
+
+运行结束必须看到类似：
+
+```text
+DSA FULL_DECODE_ONLY proof: capture_sizes=[2], captures=1, replays=14, eager_first_decode=1, eager_no_dsa=0, eager_mixed_batch=0, eager_uncaptured_batch=0
+```
+
+验收要求：
+
+- `captures=1`
+- `replays > 0`
+- 推荐命令中后三个 eager 回退计数均为 0
+- `eager_first_decode=1` 是当前 MLAPO 正确性约束，不是异常回退
+
+如果 `replays=0`，先看最终统计属于 `eager_no_dsa`、`eager_mixed_batch` 还是 `eager_uncaptured_batch`。尤其要确认 HBM/DRAM block 足够让两条请求同时驻留，否则实际稳定 decode batch 会与精确 capture size 不一致。
+
+　
+
+## eager 对照
+
+保留其他环境变量不变，仅执行：
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_PROMPT_LENGTHS=8200,8201 NANOVLLM_ENFORCE_EAGER=1 python3 example/test.py
 ```
 
 　
 
-## 开启或者关闭时延分解打印
+## 主要 bash 参数
 
-```
-export NANOVLLM_LOG_DECODE_LAYER_TIMING=0    # 是否打印时延分解
-export NANOVLLM_DECODE_LAYER_TIMING_SYNC=0   # 计时时是否 sync 一下
-export NANOVLLM_PROFILE_LAYER_IDS=mid        # 打印的层
-```
-
-　
-
-## 运行推理
-
-然后进入目录，不需要 `pip install -e .` ，直接推：
-
-```
-PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_PROMPT_LENGTHS=16200,16201,16202,16203,16204,16205,16206,16207,16208,16209,16210,16211,16212,16213,16214,16215 NANOVLLM_LOG_DECODE_LAYER_TIMING=0 NANOVLLM_DECODE_LAYER_TIMING_SYNC=0 NANOVLLM_PROFILE_LAYER_IDS=mid python3 example/test.py
-```
+| 参数 | 说明 |
+| --- | --- |
+| `NANOVLLM_MODEL` | BF16 模型目录 |
+| `NANOVLLM_TP_SIZE` | TP 大小 |
+| `NANOVLLM_ENABLE_EXPERT_PARALLEL` | 是否启用 EP |
+| `NANOVLLM_ENFORCE_EAGER` | `0` 为 DSA full-decode-only，`1` 为 eager |
+| `NANOVLLM_KVCACHE_BLOCK_SIZE` | KV block size，必须是 16 的倍数，当前推荐 128 |
+| `NANOVLLM_HBM_NUM_BLOCKS` | HBM KV block 数，必须大于 2 |
+| `NANOVLLM_DRAM_NUM_BLOCKS` | DRAM KV block 数，同时也是 HBM IndexCache block 数，必须大于 2 |
+| `NANOVLLM_PROMPT_LENGTHS` | 精确 prompt token 长度，逗号分隔；条目数就是测试 batch size |
+| `NANOVLLM_MAX_GEN_TOKENS` | 每个请求生成 token 数，默认 16 |
 
 　
 
-## 主要环境变量含义
+## 当前边界
 
-| 变量 | 默认值 | 含义 |
-|---|---:|---|
-| `NANOVLLM_MODEL` | `/home/models/Deepseek-V3.2-Pruned-95B-BF/` | 模型目录。 |
-| `NANOVLLM_TP_SIZE` | `4` | Tensor parallel world size。 |
-| `NANOVLLM_ENABLE_EXPERT_PARALLEL` | `true` | 是否启用 MoE expert parallel。 |
-| `NANOVLLM_KVCACHE_BLOCK_SIZE` | `128` | Paged KV cache block size。 |
-| `NANOVLLM_HBM_NUM_BLOCKS` | 必填 | HBM KV cache block 数量。 |
-| `NANOVLLM_DRAM_NUM_BLOCKS` | 必填 | DRAM KV cache 和 IndexCache block 数量。 |
-| `NANOVLLM_MAX_MODEL_LEN` | `65536` | engine 最大序列长度。 |
-| `NANOVLLM_MAX_PREFILL_SEQS_PER_STEP` | `1` | 单次 prefill step 最多调度多少个新请求。 |
-| `NANOVLLM_MAX_DECODE_SEQS_PER_STEP` | example 自推导 | running 队列容量上限和 decode batch size 上限。 |
-| `NANOVLLM_PROMPT_LENGTHS` | 未设置 | 逗号分隔的精确 prompt token 长度。 |
-| `NANOVLLM_MAX_GEN_TOKENS` | 脚本自定义 | 每个请求最大 decode token 数。 |
-| `NANOVLLM_IGNORE_EOS` | `false` | 是否忽略 EOS，持续 decode 到 `max_tokens`。 |
-| `NANOVLLM_LOG_DECODE_LAYER_TIMING` | `false` | 是否打印 decode layer timing。 |
-| `NANOVLLM_DECODE_LAYER_TIMING_SYNC` | `true` | timing 前后是否同步。 |
-| `NANOVLLM_PROFILE_LAYER_IDS` | `0,mid,last` | 打印 timing 的层。 |
-| `NANOVLLM_DECODE_GRAPH_MODE` | `none` | `none` 为 eager；`full_decode_only` 为稳定 DSA decode 完整图。详见 `FULL_DECODE_ONLY.md`。 |
+- DSA sparse budget 固定为 2048 token；短于该条件的请求没有卸载收益，会走 eager decode。
+- 尚未实现 chunked prefill。长 prompt 仍是单次 prefill forward，过长时可能因激活值 OOM。
+- 将来实现 chunked prefill 时，仍保持 prefill 与 decode 分开调度，不做混合 forward。
+- DSA 整图不能用 padding bucket：`gather_selection_status` 是跨 step 持久化状态，虚假 padding 行可能污染真实请求状态。
 
-　
-
-## Decode 时延分解字段含义
-
-| 字段 | 含义 |
-|---|---|
-| `attention_total` | 单层 attention block 总耗时。 |
-| `indexer_project` | 生成 `q_index`、`index_k` 和 DSA score 权重。 |
-| `index_cache` | 把当前 token 的 `index_k` 写入 HBM IndexCache。 |
-| `dsa_total` | `dsa_lightning_indexer + dsa_gather_selection` 总和。 |
-| `dsa_lightning_indexer` | 基于 query 和 IndexCache 选择 top sparse token。 |
-| `dsa_gather_selection` | 根据 top sparse token 把 KV 从 DRAM gather 到 HBM sparse budget。 |
-| `decode_attention_op` | 在 sparse HBM KV budget 上执行 decode MLA。 |
-| `moe_total` | attention 后 MLP/MoE block 耗时。 |
+实现与判定细节见 [FULL_DECODE_ONLY.md](FULL_DECODE_ONLY.md)。

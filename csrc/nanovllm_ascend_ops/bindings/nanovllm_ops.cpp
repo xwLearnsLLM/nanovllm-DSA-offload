@@ -61,7 +61,6 @@ extern void mla_preprocess_impl(
 #include "ops/gather_selection_kv_cache/gather_selection_kv_cache_torch_adpt.h"
 #include "ops/matmul_allreduce_add_rmsnorm/matmul_allreduce_add_rmsnorm_torch_adpt.h"
 #include "ops/moe_gating_top_k/moe_gating_top_k_torch_adpt.h"
-#include "ops/sparse_flash_attention/sparse_flash_attention_torch_adpt.h"
 #include "ops/dsa_indexer_project/dsa_indexer_project_torch_adpt.h"
 #include "ops/mla_preprocess/mla_preprocess_torch_adpt.h"
 
@@ -253,38 +252,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> gather_selection_kv_c
       at::empty_like(selection_kv_cache),
       at::empty_like(selection_kv_block_table),
       at::empty_like(selection_kv_block_status));
-}
-
-at::Tensor npu_sparse_flash_attention_py(
-    const at::Tensor& query,
-    const at::Tensor& key,
-    const at::Tensor& value,
-    const at::Tensor& sparse_indices,
-    double scale_value,
-    int64_t sparse_block_size,
-    py::object block_table,
-    py::object actual_seq_lengths_query,
-    py::object actual_seq_lengths_kv,
-    py::object query_rope,
-    py::object key_rope,
-    std::string layout_query,
-    std::string layout_kv,
-    int64_t sparse_mode) {
-  return vllm_ascend::npu_sparse_flash_attention(
-      query,
-      key,
-      value,
-      sparse_indices,
-      scale_value,
-      sparse_block_size,
-      optional_tensor(block_table),
-      optional_tensor(actual_seq_lengths_query),
-      optional_tensor(actual_seq_lengths_kv),
-      optional_tensor(query_rope),
-      optional_tensor(key_rope),
-      c10::string_view(layout_query.data(), layout_query.size()),
-      c10::string_view(layout_kv.data(), layout_kv.size()),
-      sparse_mode);
 }
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_gating_top_k_py(
@@ -485,23 +452,6 @@ PYBIND11_MODULE(_C, m) {
       py::arg("full_kv_cache"),
       py::arg("full_kv_block_table"),
       py::arg("full_kv_actual_seq"));
-  m.def(
-      "npu_sparse_flash_attention",
-      &npu_sparse_flash_attention_py,
-      py::arg("query"),
-      py::arg("key"),
-      py::arg("value"),
-      py::arg("sparse_indices"),
-      py::arg("scale_value") = 1.0,
-      py::arg("sparse_block_size") = 1,
-      py::arg("block_table") = py::none(),
-      py::arg("actual_seq_lengths_query") = py::none(),
-      py::arg("actual_seq_lengths_kv") = py::none(),
-      py::arg("query_rope") = py::none(),
-      py::arg("key_rope") = py::none(),
-      py::arg("layout_query") = "BSND",
-      py::arg("layout_kv") = "BSND",
-      py::arg("sparse_mode") = 3);
   m.def(
       "moe_gating_top_k",
       &moe_gating_top_k_py,

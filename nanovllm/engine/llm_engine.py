@@ -7,8 +7,6 @@ import os
 from dataclasses import fields
 from time import perf_counter
 
-import torch
-import torch_npu
 from transformers import LlamaTokenizerFast, PreTrainedTokenizerFast
 import torch.multiprocessing as mp
 
@@ -49,12 +47,21 @@ DEEPSEEK_V32_CHAT_TEMPLATE = """{% if not add_generation_prompt is defined %}{% 
 class LLMEngine:
 
     def __init__(self, model, **kwargs):
-        config_fields = {field.name for field in fields(Config)}
-        config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
-        config = Config(model, **config_kwargs)
+        config_fields = {field.name for field in fields(Config) if field.init}
+        unknown = sorted(set(kwargs) - config_fields)
+        if unknown:
+            raise TypeError(
+                "Unknown LLM configuration argument(s): " + ", ".join(unknown)
+            )
+        config = Config(model, **kwargs)
         self.block_size = config.kvcache_block_size
         self.config = config
         logger.info(f"config: {config}")
+        logger.info(
+            "execution mode: prefill=eager, first_decode=eager, "
+            "stable_decode=%s",
+            "eager" if config.enforce_eager else "full_decode_only+npugraph_ex",
+        )
         self.ps = []
         self.events = []
         ctx = mp.get_context("spawn")
@@ -285,6 +292,7 @@ class LLMEngine:
         )
         e2e_input_tps = total_input_tokens / elapsed if elapsed > 0 else 0.0
         e2e_output_tps = total_output_tokens / elapsed if elapsed > 0 else 0.0
+        graph_stats = self.model_runner.call("get_decode_graph_stats")
         print(
             f"llm.generate {total_prompts} requests in {i_step} steps, "
             f"e2e latency = {elapsed:.2f} sec\n"
@@ -301,4 +309,15 @@ class LLMEngine:
             f"e2e output TPS = {e2e_output_tps:.2f} tok/s\n"
             f"    TTFT/TPOT are per-step request latencies printed above."
         )
+        if graph_stats.get("enabled"):
+            print(
+                "    DSA FULL_DECODE_ONLY proof: "
+                f"capture_sizes={graph_stats['capture_sizes']}, "
+                f"captures={graph_stats['captures']}, "
+                f"replays={graph_stats['replays']}, "
+                f"eager_first_decode={graph_stats['eager_first_decode']}, "
+                f"eager_no_dsa={graph_stats['eager_no_dsa']}, "
+                f"eager_mixed_batch={graph_stats['eager_mixed_batch']}, "
+                f"eager_uncaptured_batch={graph_stats['eager_uncaptured_batch']}"
+            )
         return outputs

@@ -1,30 +1,8 @@
 import os
-import random
-import ctypes
-from pathlib import Path
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-custom_so_path = (
-PROJECT_ROOT
-/ "nanovllm"
-/ "_cann_ops_custom"
-/ "vendors"
-/ "nanovllm-ascend"
-/ "op_api"
-/ "lib"
-/ "libopapi.so"
-)
-so_str = str(custom_so_path)
-try:
-    ctypes.CDLL(so_str, mode=ctypes.RTLD_GLOBAL)
-except Exception as e:
-    print("load custom op failed.")
 
 from _deepseek_example_utils import (
     DEEPSEEK_ASSISTANT_TOKEN,
     DEEPSEEK_USER_TOKEN,
-    env_bool,
-    env_float,
     env_int,
     make_llm,
     print_outputs,
@@ -34,61 +12,18 @@ from nanovllm.engine.dsa_offload import compute_sparse_blocks
 from nanovllm import SamplingParams
 
 
-def _env_int_any(names: tuple[str, ...], default: int) -> int:
-    for name in names:
-        value = os.environ.get(name)
-        if value is not None:
-            return int(value)
-    return default
-
-
 def parse_prompt_lengths() -> list[int]:
-    exact_lengths = os.environ.get("NANOVLLM_PROMPT_LENGTHS", "").strip()
-    if exact_lengths:
-        lengths = [
-            int(item.strip())
-            for item in exact_lengths.split(",")
-            if item.strip()
-        ]
-        if not lengths:
-            raise ValueError("NANOVLLM_PROMPT_LENGTHS is set but empty")
-        return lengths
-
-    legacy_long = env_int("NANOVLLM_LONG_PROMPT_TOKENS", 0)
-    default_min = legacy_long if legacy_long > 0 else 128
-    default_max = legacy_long if legacy_long > 0 else default_min
-    num_prompts = _env_int_any(
-        ("NANOVLLM_TEST_NUM_PROMPTS", "NANOVLLM_NUM_PROMPTS"),
-        1,
-    )
-    min_tokens = _env_int_any(
-        ("NANOVLLM_PROMPT_MIN_TOKENS", "NANOVLLM_MIN_PROMPT_TOKENS"),
-        default_min,
-    )
-    max_tokens = _env_int_any(
-        ("NANOVLLM_PROMPT_MAX_TOKENS", "NANOVLLM_MAX_PROMPT_TOKENS"),
-        default_max,
-    )
-    if num_prompts <= 0:
-        raise ValueError("num prompts must be positive")
-    if min_tokens <= 0 or max_tokens <= 0:
-        raise ValueError("prompt token lengths must be positive")
-    if min_tokens > max_tokens:
-        raise ValueError("prompt min tokens must be <= prompt max tokens")
-
-    seed = env_int("NANOVLLM_PROMPT_SEED", 0)
-    rng = random.Random(seed)
-    return [rng.randint(min_tokens, max_tokens) for _ in range(num_prompts)]
+    value = os.environ.get("NANOVLLM_PROMPT_LENGTHS", "8200,8201")
+    lengths = [int(item.strip()) for item in value.split(",") if item.strip()]
+    if not lengths or any(length <= 0 for length in lengths):
+        raise ValueError("NANOVLLM_PROMPT_LENGTHS must contain positive integers.")
+    return lengths
 
 
 def _prompt_wrapper_ids(tokenizer) -> tuple[list[int], list[int]]:
-    use_chat = env_bool("NANOVLLM_USE_DEEPSEEK_CHAT", True)
-    add_bos = env_bool("NANOVLLM_ADD_BOS", use_chat)
-    prefix = DEEPSEEK_USER_TOKEN if use_chat else ""
-    suffix = DEEPSEEK_ASSISTANT_TOKEN if use_chat else ""
-    prefix_ids = tokenizer.encode(prefix, add_special_tokens=False)
-    suffix_ids = tokenizer.encode(suffix, add_special_tokens=False)
-    if add_bos and tokenizer.bos_token_id is not None:
+    prefix_ids = tokenizer.encode(DEEPSEEK_USER_TOKEN, add_special_tokens=False)
+    suffix_ids = tokenizer.encode(DEEPSEEK_ASSISTANT_TOKEN, add_special_tokens=False)
+    if tokenizer.bos_token_id is not None:
         prefix_ids = [tokenizer.bos_token_id] + prefix_ids
     return prefix_ids, suffix_ids
 
@@ -192,10 +127,7 @@ def build_meaningful_prompt_from_base(base_ids: list[int], target_len: int) -> l
 
 def build_exact_token_prompt(tokenizer, target_len: int, base_ids: list[int] | None = None) -> list[int]:
     if base_ids is None:
-        base_ids = build_base_meaningful_prompt(
-            tokenizer,
-            env_int("NANOVLLM_MEANINGFUL_BASE_TOKENS", 10000),
-        )
+        base_ids = build_base_meaningful_prompt(tokenizer)
     return build_meaningful_prompt_from_base(base_ids, target_len)
 
 
@@ -208,29 +140,11 @@ def _decode_prompt_tail(tokenizer, token_ids: list[int], max_chars: int = 300) -
     return text[-max_chars:]
 
 
-def build_random_exact_token_prompt(tokenizer, target_len: int) -> list[int]:
-    if target_len <= 0:
-        raise ValueError("target_len must be positive")
-
-    prefix_ids, suffix_ids = _prompt_wrapper_ids(tokenizer)
-    body_len = target_len - len(prefix_ids) - len(suffix_ids)
-    if body_len <= 0:
-        raise ValueError("target_len is too small for the prompt wrapper")
-
-    seed = (
-        "DeepSeek sparse attention validation. "
-        "This deterministic sentence builds a controlled prefill prompt. "
-    )
-    seed_ids = tokenizer.encode(seed, add_special_tokens=False)
-    repeats = (body_len + len(seed_ids) - 1) // len(seed_ids)
-    return prefix_ids + (seed_ids * repeats)[:body_len] + suffix_ids
-
-
 def print_prompt_plan(lengths: list[int], block_size: int) -> None:
     print("prompt plan:")
     for i, length in enumerate(lengths, 1):
         full_blocks = length // block_size
-        sparse_blocks = compute_sparse_blocks(full_blocks)
+        sparse_blocks = compute_sparse_blocks(full_blocks, block_size)
         release_blocks = max(0, full_blocks - sparse_blocks)
         print(
             f"  prompt {i}: target_len={length}, "
@@ -242,21 +156,10 @@ def print_prompt_plan(lengths: list[int], block_size: int) -> None:
 def main() -> None:
     prompt_lengths = parse_prompt_lengths()
     max_prompt_len = max(prompt_lengths)
-    max_gen_tokens = env_int("NANOVLLM_MAX_GEN_TOKENS", 1)
-    max_model_len = env_int("NANOVLLM_MAX_MODEL_LEN", 65536)
-    if max_model_len < max_prompt_len + max_gen_tokens:
-        raise ValueError(
-            "NANOVLLM_MAX_MODEL_LEN must cover prompt length plus generation "
-            f"tokens: got {max_model_len}, need at least "
-            f"{max_prompt_len + max_gen_tokens}."
-        )
-
-    max_num_prefill_seqs_per_step = env_int("NANOVLLM_MAX_PREFILL_SEQS_PER_STEP", 1)
-    max_num_decode_seqs_per_step = env_int("NANOVLLM_MAX_DECODE_SEQS_PER_STEP", len(prompt_lengths))
-    if max_num_prefill_seqs_per_step <= 0:
-        raise ValueError("NANOVLLM_MAX_PREFILL_SEQS_PER_STEP must be > 0.")
-    if max_num_decode_seqs_per_step <= 0:
-        raise ValueError("NANOVLLM_MAX_DECODE_SEQS_PER_STEP must be > 0.")
+    max_gen_tokens = env_int("NANOVLLM_MAX_GEN_TOKENS", 16)
+    max_model_len = max_prompt_len + max_gen_tokens
+    max_num_prefill_seqs_per_step = 1
+    max_num_decode_seqs_per_step = len(prompt_lengths)
     block_size = env_int("NANOVLLM_KVCACHE_BLOCK_SIZE", 128)
 
     llm = make_llm(
@@ -266,20 +169,16 @@ def main() -> None:
     )
     tokenizer = prompt_tokenizer(llm)
 
-    prompt_style = os.environ.get("NANOVLLM_TEST_PROMPT_STYLE", "meaningful").strip().lower()
-    if prompt_style == "random":
-        base_ids = None
-        prompt_token_ids = [build_random_exact_token_prompt(tokenizer, length) for length in prompt_lengths]
-        prompts = [f"<random exact-token prompt {i}: target_len={length}>" for i, length in enumerate(prompt_lengths, 1)]
-    elif prompt_style == "meaningful":
-        base_ids = build_base_meaningful_prompt(tokenizer, env_int("NANOVLLM_MEANINGFUL_BASE_TOKENS", 10000))
-        prompt_token_ids = [build_exact_token_prompt(tokenizer, length, base_ids) for length in prompt_lengths]
-        prompts = [
-            f"<meaningful long-QA suffix prompt {i}: target_len={length}, tail='{_decode_prompt_tail(tokenizer, ids)}'>"
-            for i, (length, ids) in enumerate(zip(prompt_lengths, prompt_token_ids), 1)
-        ]
-    else:
-        raise ValueError("NANOVLLM_TEST_PROMPT_STYLE must be 'meaningful' or 'random'.")
+    base_ids = build_base_meaningful_prompt(tokenizer)
+    prompt_token_ids = [
+        build_exact_token_prompt(tokenizer, length, base_ids)
+        for length in prompt_lengths
+    ]
+    prompts = [
+        f"<meaningful long-QA suffix prompt {i}: target_len={length}, "
+        f"tail='{_decode_prompt_tail(tokenizer, ids)}'>"
+        for i, (length, ids) in enumerate(zip(prompt_lengths, prompt_token_ids), 1)
+    ]
 
     print(
         "test config: "
@@ -290,8 +189,7 @@ def main() -> None:
         f"max_num_prefill_seqs_per_step={max_num_prefill_seqs_per_step}, "
         f"max_num_decode_seqs_per_step={max_num_decode_seqs_per_step}, "
         f"max_gen_tokens={max_gen_tokens}, "
-        f"prompt_style={prompt_style}, "
-        f"meaningful_base_tokens={len(base_ids) if base_ids is not None else 0}"
+        f"meaningful_base_tokens={len(base_ids)}"
     )
     print_prompt_plan([len(ids) for ids in prompt_token_ids], block_size)
     for i, ids in enumerate(prompt_token_ids, 1):
@@ -300,9 +198,9 @@ def main() -> None:
     outputs = llm.generate(
         prompt_token_ids,
         SamplingParams(
-            temperature=env_float("NANOVLLM_TEMPERATURE", 0.0),
+            temperature=0.0,
             max_tokens=max_gen_tokens,
-            ignore_eos=env_bool("NANOVLLM_IGNORE_EOS", True),
+            ignore_eos=True,
         ),
     )
     print_outputs(prompts, prompt_token_ids, outputs)

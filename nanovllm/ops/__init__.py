@@ -28,8 +28,7 @@ if _CUSTOM_OPP_VENDOR.exists():
     _prepend_env_path("ASCEND_CUSTOM_OPP_PATH", _CUSTOM_OPP_VENDOR)
 
 try:
-    import torch_npu  # type: ignore  # noqa: F401
-
+    importlib.import_module("torch_npu")
     _C = importlib.import_module("nanovllm._C")
 except ImportError as exc:
     raise ImportError(
@@ -42,7 +41,6 @@ except ImportError as exc:
 moe_gating_top_k = _C.moe_gating_top_k
 npu_lightning_indexer = _C.npu_lightning_indexer
 npu_gather_selection_kv_cache = _C.npu_gather_selection_kv_cache
-npu_sparse_flash_attention = _C.npu_sparse_flash_attention
 batch_matmul_transpose = _C.batch_matmul_transpose
 matmul_allreduce_add_rmsnorm = _C.matmul_allreduce_add_rmsnorm
 
@@ -136,5 +134,4 @@ __all__ = [
     "moe_gating_top_k",
     "npu_gather_selection_kv_cache",
     "npu_lightning_indexer",
-    "npu_sparse_flash_attention",
 ]

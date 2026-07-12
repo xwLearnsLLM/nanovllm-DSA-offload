@@ -20,7 +20,9 @@ prompts = [
 
 if __name__ == "__main__":
     llm = make_llm(
-        max_model_len=512,
+        # DSA graph capture has a fixed 2048-token sparse budget even though
+        # these short requests themselves remain on the eager decode path.
+        max_model_len=2048,
         max_num_prefill_seqs_per_step=1,
         max_num_decode_seqs_per_step=len(prompts),
     )

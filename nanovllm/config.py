@@ -1,12 +1,9 @@
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from nanovllm.engine.dsa_offload import DSA_SELECTION_TOPK_TOKENS
-from nanovllm.engine.full_decode_graph import (
-    FULL_DECODE_ONLY,
-    normalize_capture_sizes,
-)
+from nanovllm.engine.full_decode_graph import normalize_capture_sizes
 from nanovllm.models.deepseek_v32 import DeepseekV32Config
 
 
@@ -19,17 +16,12 @@ class Config:
     tensor_parallel_size: int = 1
     enable_expert_parallel: bool = False
     enforce_eager: bool = False
-    decode_graph_mode: str = "none"
     decode_graph_capture_sizes: tuple[int, ...] | list[int] | None = None
-    decode_graph_warmup_iters: int = 1
-    hf_config: DeepseekV32Config | None = None
-    eos: int = -1
+    hf_config: DeepseekV32Config = field(init=False)
+    eos: int = field(init=False, default=-1)
     kvcache_block_size: int = 256
-    num_kvcache_blocks: int = -1
-    num_index_cache_blocks: int = -1
     num_hbm_kvcache_blocks: int = -1
     num_dram_kvcache_blocks: int = -1
-    dsa_offload_max_sparse_tokens: int = -1
     hccl_port: int = 28000
     device = "npu"
     trust_remote_code: bool = False
@@ -38,43 +30,22 @@ class Config:
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 16 == 0
         assert 1 <= self.tensor_parallel_size
-        self.max_num_prefill_seqs_per_step = self._env_int(
-            "NANOVLLM_MAX_PREFILL_SEQS_PER_STEP",
-            self.max_num_prefill_seqs_per_step,
-        )
-        self.max_num_decode_seqs_per_step = self._env_int(
-            "NANOVLLM_MAX_DECODE_SEQS_PER_STEP",
-            self.max_num_decode_seqs_per_step,
-        )
-        self.max_model_len = self._env_int(
-            "NANOVLLM_MAX_MODEL_LEN",
-            self.max_model_len,
-        )
-        self.num_hbm_kvcache_blocks = self._env_int(
-            "NANOVLLM_HBM_NUM_BLOCKS",
-            self.num_hbm_kvcache_blocks,
-        )
-        self.num_dram_kvcache_blocks = self._env_int(
-            "NANOVLLM_DRAM_NUM_BLOCKS",
-            self.num_dram_kvcache_blocks,
-        )
         if self.num_hbm_kvcache_blocks <= 2:
             raise ValueError(
-                "NANOVLLM_HBM_NUM_BLOCKS must be set to a value > 2. "
-                "It directly controls HBM KV cache block count."
+                "num_hbm_kvcache_blocks must be > 2. The example scripts "
+                "read it from NANOVLLM_HBM_NUM_BLOCKS."
             )
         if self.num_dram_kvcache_blocks <= 2:
             raise ValueError(
-                "NANOVLLM_DRAM_NUM_BLOCKS must be set to a value > 2. "
-                "It directly controls both DRAM KV cache and IndexCache block counts."
+                "num_dram_kvcache_blocks must be > 2. The example scripts "
+                "read it from NANOVLLM_DRAM_NUM_BLOCKS."
             )
         if self.max_num_prefill_seqs_per_step <= 0:
-            raise ValueError("NANOVLLM_MAX_PREFILL_SEQS_PER_STEP must be > 0.")
+            raise ValueError("max_num_prefill_seqs_per_step must be > 0.")
         if self.max_num_decode_seqs_per_step <= 0:
-            raise ValueError("NANOVLLM_MAX_DECODE_SEQS_PER_STEP must be > 0.")
-        self.num_kvcache_blocks = self.num_hbm_kvcache_blocks
-        self.num_index_cache_blocks = self.num_dram_kvcache_blocks
-        self.dsa_offload_pool_capacity = self.max_num_decode_seqs_per_step
+            raise ValueError("max_num_decode_seqs_per_step must be > 0.")
+        if self.max_model_len <= 0:
+            raise ValueError("max_model_len must be > 0.")
         self.hf_config = self._load_hf_config()
         setattr(
             self.hf_config,
@@ -100,82 +71,17 @@ class Config:
             self.eos = eos_token_id
         self._configure_decode_graph()
 
-    @staticmethod
-    def _env_int(name: str, default: int) -> int:
-        value = os.environ.get(name)
-        if value is None:
-            return int(default)
-        try:
-            return int(value)
-        except ValueError:
-            raise ValueError(f"{name} must be an integer, got {value!r}.")
-
-    @staticmethod
-    def _env_bool(name: str, default: bool) -> bool:
-        value = os.environ.get(name)
-        if value is None:
-            return bool(default)
-        normalized = value.strip().lower()
-        if normalized in ("1", "true", "yes", "on"):
-            return True
-        if normalized in ("0", "false", "no", "off"):
-            return False
-        raise ValueError(f"{name} must be a boolean, got {value!r}.")
-
-    @staticmethod
-    def _parse_capture_sizes(value: str) -> tuple[int, ...]:
-        try:
-            return tuple(
-                int(item.strip())
-                for item in value.split(",")
-                if item.strip()
-            )
-        except ValueError as exc:
-            raise ValueError(
-                "NANOVLLM_DECODE_GRAPH_CAPTURE_SIZES must be a comma-separated "
-                f"integer list, got {value!r}."
-            ) from exc
-
     def _configure_decode_graph(self) -> None:
-        requested_enforce_eager = bool(self.enforce_eager)
-        mode_value = os.environ.get(
-            "NANOVLLM_DECODE_GRAPH_MODE",
-            self.decode_graph_mode,
-        )
-        mode = str(mode_value).strip().lower()
-        if mode in ("", "none", "eager"):
-            mode = "none"
-        elif mode in ("full_decode_only", "full-decode-only"):
-            mode = FULL_DECODE_ONLY
-        else:
-            raise ValueError(
-                "NANOVLLM_DECODE_GRAPH_MODE only supports 'none' and "
-                f"'full_decode_only', got {mode!r}."
-            )
-
-        self.decode_graph_mode = mode
-        self.enforce_eager = mode == "none"
-        if mode == "none":
+        # There are exactly two execution modes. Prefill and first decode are
+        # always eager; enforce_eager controls steady-state decode.
+        if not isinstance(self.enforce_eager, bool):
+            raise TypeError("enforce_eager must be a bool.")
+        if self.enforce_eager:
             self.decode_graph_capture_sizes = ()
             return
-
-        if requested_enforce_eager:
-            raise ValueError(
-                "enforce_eager=True conflicts with "
-                "NANOVLLM_DECODE_GRAPH_MODE=full_decode_only."
-            )
         if os.environ.get("ASCEND_LAUNCH_BLOCKING") == "1":
             raise ValueError(
                 "ASCEND_LAUNCH_BLOCKING=1 is incompatible with FULL_DECODE_ONLY."
-            )
-        if not self._env_bool("NANOVLLM_ENABLE_DECODE_MLAPO", True):
-            raise ValueError(
-                "DSA FULL_DECODE_ONLY requires NANOVLLM_ENABLE_DECODE_MLAPO=1."
-            )
-        if self._env_bool("NANOVLLM_LOG_DECODE_LAYER_TIMING", False):
-            raise ValueError(
-                "NANOVLLM_LOG_DECODE_LAYER_TIMING must be 0 during graph "
-                "capture. Use torch_npu.profiler to profile graph replay."
             )
         if self.max_model_len < DSA_SELECTION_TOPK_TOKENS:
             raise ValueError(
@@ -189,22 +95,17 @@ class Config:
                 f"{self.kvcache_block_size}."
             )
 
-        sizes_env = os.environ.get("NANOVLLM_DECODE_GRAPH_CAPTURE_SIZES")
-        sizes = (
-            self._parse_capture_sizes(sizes_env)
-            if sizes_env is not None
-            else tuple(self.decode_graph_capture_sizes or ())
-        )
         self.decode_graph_capture_sizes = normalize_capture_sizes(
-            sizes,
-            self.max_num_decode_seqs_per_step,
+            self.decode_graph_capture_sizes
+            or (self.max_num_decode_seqs_per_step,)
         )
-        self.decode_graph_warmup_iters = self._env_int(
-            "NANOVLLM_DECODE_GRAPH_WARMUP_ITERS",
-            self.decode_graph_warmup_iters,
-        )
-        if self.decode_graph_warmup_iters < 1:
-            raise ValueError("NANOVLLM_DECODE_GRAPH_WARMUP_ITERS must be >= 1.")
+        if self.decode_graph_capture_sizes[-1] > self.max_num_decode_seqs_per_step:
+            raise ValueError(
+                "decode_graph_capture_sizes must not exceed "
+                "max_num_decode_seqs_per_step: "
+                f"sizes={self.decode_graph_capture_sizes}, "
+                f"max={self.max_num_decode_seqs_per_step}."
+            )
 
     def _validate_model_format(self):
         quantization_config = getattr(

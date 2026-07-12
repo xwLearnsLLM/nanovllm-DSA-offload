@@ -16,7 +16,7 @@ class Scheduler:
         self.block_size = config.kvcache_block_size
         self.eos = config.eos
         self.index_block_manager = SimpleBlockManager(
-            config.num_index_cache_blocks - 1,
+            config.num_dram_kvcache_blocks - 1,
             reserve_null_block=True,
         )
         self.hbm_block_manager = SimpleBlockManager(
@@ -27,11 +27,13 @@ class Scheduler:
             config.num_dram_kvcache_blocks,
             reserve_null_block=True,
         )
-        self.pool_entry_manager = PoolEntryManager(config.dsa_offload_pool_capacity)
+        self.pool_entry_manager = PoolEntryManager(
+            config.max_num_decode_seqs_per_step
+        )
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
         self.max_model_len = config.max_model_len
-        self.num_index_blocks = config.num_index_cache_blocks
+        self.num_index_blocks = config.num_dram_kvcache_blocks
         self.num_hbm_blocks = config.num_hbm_kvcache_blocks
         self.num_dram_blocks = config.num_dram_kvcache_blocks
 

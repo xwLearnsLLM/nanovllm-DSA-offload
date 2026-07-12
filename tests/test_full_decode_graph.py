@@ -21,30 +21,13 @@ def _decode_context(batch_size: int = 2) -> Context:
     )
     return Context(
         is_prefill=False,
-        slot_mapping=torch.tensor(
-            [[row + 1, row] for row in range(batch_size)],
-            dtype=torch.int32,
-        ),
-        flat_slot_mapping=torch.arange(10, 10 + batch_size, dtype=torch.int64),
         flat_slot_mapping_i32=torch.arange(
             10,
             10 + batch_size,
             dtype=torch.int32,
         ),
-        index_slot_mapping=torch.tensor(
-            [[row + 5, row] for row in range(batch_size)],
-            dtype=torch.int32,
-        ),
-        flat_index_slot_mapping=torch.arange(
-            20,
-            20 + batch_size,
-            dtype=torch.int64,
-        ),
-        context_lens=torch.arange(2200, 2200 + batch_size, dtype=torch.int32),
-        actual_seq_lengths_query=list(range(1, batch_size + 1)),
         actual_seq_lengths_kv=list(range(2200, 2200 + batch_size)),
         block_tables=block_tables,
-        hbm_block_tables=block_tables,
         index_block_tables=block_tables + 10,
         dram_block_tables=block_tables + 20,
         selection_block_tables=torch.tensor(
@@ -60,13 +43,13 @@ def _decode_context(batch_size: int = 2) -> Context:
 
 
 def test_normalize_capture_sizes():
-    assert normalize_capture_sizes([16, 4, 16, 8], 16) == (4, 8, 16)
+    assert normalize_capture_sizes([16, 4, 16, 8]) == (4, 8, 16)
 
 
-@pytest.mark.parametrize("values", [[], [0], [-1, 4], [4, 32]])
+@pytest.mark.parametrize("values", [[], [0], [-1, 4]])
 def test_normalize_capture_sizes_rejects_invalid_values(values):
     with pytest.raises(ValueError):
-        normalize_capture_sizes(values, 16)
+        normalize_capture_sizes(values)
 
 
 def test_static_entry_copies_all_dsa_metadata():
@@ -82,8 +65,7 @@ def test_static_entry_copies_all_dsa_metadata():
     assert seq_lens == [2200, 2201]
     assert entry.input_ids.tolist() == [11, 12]
     assert entry.positions.tolist() == [2199, 2200]
-    assert entry.flat_slot_mapping.tolist() == [10, 11]
-    assert entry.flat_index_slot_mapping.tolist() == [20, 21]
+    assert entry.flat_slot_mapping_i32.tolist() == [10, 11]
     assert entry.block_tables[:, :3].equal(context.block_tables)
     assert entry.block_tables[:, 3].count_nonzero().item() == 0
     assert entry.index_block_tables[:, :3].equal(context.index_block_tables)
@@ -154,6 +136,7 @@ def test_ineligible_decode_paths_stay_eager():
     manager.eager_no_dsa_count = 0
     manager.eager_mixed_batch_count = 0
     manager.eager_uncaptured_batch_count = 0
+    manager.log_enabled = False
     manager.capture_sizes = (16,)
 
     set_context(False, has_first_decode=True)
@@ -226,21 +209,14 @@ def test_exact_eligible_batch_replays_graph(monkeypatch):
     manager.eager_no_dsa_count = 0
     manager.eager_mixed_batch_count = 0
     manager.eager_uncaptured_batch_count = 0
-    manager._set_static_context = lambda *_args: None
+    manager.log_enabled = False
 
     context = _decode_context()
     set_context(
         False,
-        slot_mapping=context.slot_mapping,
-        flat_slot_mapping=context.flat_slot_mapping,
         flat_slot_mapping_i32=context.flat_slot_mapping_i32,
-        index_slot_mapping=context.index_slot_mapping,
-        flat_index_slot_mapping=context.flat_index_slot_mapping,
-        context_lens=context.context_lens,
-        actual_seq_lengths_query=context.actual_seq_lengths_query,
         actual_seq_lengths_kv=context.actual_seq_lengths_kv,
         block_tables=context.block_tables,
-        hbm_block_tables=context.hbm_block_tables,
         index_block_tables=context.index_block_tables,
         dram_block_tables=context.dram_block_tables,
         selection_block_tables=context.selection_block_tables,
@@ -300,6 +276,7 @@ def test_decode_callable_uses_npugraph_ex(monkeypatch):
     monkeypatch.setattr(torch, "compile", compile_model)
 
     manager = object.__new__(FullDecodeOnlyGraphManager)
+    manager.log_enabled = False
     model = object()
     compiled = manager._build_decode_callable(model)
 

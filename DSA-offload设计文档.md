@@ -307,24 +307,22 @@ npu_gather_selection_kv_cache(
 
 ## 7. IndexCache 写入
 
-prefill 阶段会为全部 prefill token 写 IndexCache。decode 阶段新 token 也会写 IndexCache，位置由 `index_slot_mapping` 决定。IndexCache 不随 HBM KV sparse budget 释放而释放，因为 `npu_lightning_indexer` 需要在原始序列语义下检索完整历史候选。
+prefill 阶段会为全部 prefill token 写 IndexCache。当前 decode 的候选区固定为 prefill 满块，因此 query-only decode 不再写新的 IndexCache token。IndexCache 不随 HBM KV sparse budget 释放而释放，因为 `npu_lightning_indexer` 需要在原始 prefill 序列语义下检索完整历史候选。
 
 IndexCache 容量由 `NANOVLLM_DRAM_NUM_BLOCKS` 决定，和 DRAM KV block 数保持相同，但二者仍然由不同 BlockManager 分开管理。
 
 ## 8. 调度和容量配置
 
-当前块数量直接由环境变量决定，不通过 warmup 反推：
+示例脚本从精简后的环境变量读取配置，并作为明确的 `LLM(...)` 参数传入，不通过 warmup 反推：
 
 | 配置 | 含义 | 默认 |
 |---|---|---:|
 | `NANOVLLM_HBM_NUM_BLOCKS` | HBM CKV/KPE block 数 | 必填 |
 | `NANOVLLM_DRAM_NUM_BLOCKS` | DRAM CKV/KPE block 数，同时也是 IndexCache block 数 | 必填 |
 | `NANOVLLM_KVCACHE_BLOCK_SIZE` | KV block size，要求整除 2048 | 代码默认 256；常用运行命令设为 128 |
-| `NANOVLLM_MAX_MODEL_LEN` | 最大序列长度 | 65536 |
-| `NANOVLLM_MAX_PREFILL_SEQS_PER_STEP` | 单步最多调度多少个 prefill 请求 | 1 |
-| `NANOVLLM_MAX_DECODE_SEQS_PER_STEP` | decode batch 上限，也是 gather status pool capacity | 256 |
-| `NANOVLLM_ENABLE_DECODE_MLAPO` | decode 后续 step 是否启用 MLAPO | true |
-| `NANOVLLM_DECODE_GRAPH_MODE` | `none` 为 eager；`full_decode_only` 为稳定 DSA decode 完整图 | none |
+| `NANOVLLM_ENFORCE_EAGER` | `1` 为 eager；`0` 为稳定 DSA decode 完整图 | 0 |
+| `NANOVLLM_PROMPT_LENGTHS` | 精确 prompt 长度；条目数决定测试 decode 上限、pool capacity 和精确 capture size | 8200,8201 |
+| `NANOVLLM_MAX_GEN_TOKENS` | 测试生成 token 数 | 16 |
 
 调度器保持如下规则：
 
@@ -337,8 +335,8 @@ IndexCache 容量由 `NANOVLLM_DRAM_NUM_BLOCKS` 决定，和 DRAM KV block 数�
 
 为了保证 sparse KV 和 MLA 语义一致，需要持续满足：
 
-1. `hbm_block_tables`、`actual_seq_lengths_kv`、`slot_mapping` 必须使用同一套 HBM sparse KV 语义。
-2. `selection_block_tables` 必须是 `hbm_block_tables` 中 prefill 满块 sparse budget 部分的子集。
+1. `block_tables`、`actual_seq_lengths_kv`、`flat_slot_mapping_i32` 必须使用同一套 HBM sparse KV 语义。
+2. `selection_block_tables` 必须是 `block_tables` 中 prefill 满块 sparse budget 部分的子集。
 3. `index_block_tables` 始终使用原始序列语义。
 4. `dram_block_tables` 只覆盖 prefill 满块，使用原始 prefill 满块语义。
 5. `candidate_lens` 只统计 prefill 满块 token，不包含 prefill tail 和 decode token。

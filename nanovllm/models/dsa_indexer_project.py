@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from time import perf_counter
-from typing import Any, Callable
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -395,137 +395,6 @@ def _dsa_indexer_pipeline_with_qc_functional(
     return q_index, index_weights, topk_indices
 
 
-class DsaPipelineTorchAirCache:
-    def __init__(self) -> None:
-        self._compiled: dict[tuple, Callable[..., object]] = {}
-        self._disabled: dict[tuple, str] = {}
-
-    def disable(self, key: tuple, reason: str) -> None:
-        self._disabled[key] = reason
-        self._compiled.pop(key, None)
-
-    def _compile_lazy_or_raise(self, key: tuple, fn, device: torch.device) -> Callable[..., object]:
-        if key in self._compiled:
-            return self._compiled[key]
-        if key in self._disabled:
-            raise RuntimeError(f"TorchAir graph is disabled for key={key}: {self._disabled[key]}")
-        if torchair is None:
-            self._disabled[key] = "torchair_unavailable"
-            raise RuntimeError("TorchAir is unavailable; set NANOVLLM_DSA_QUERY_ONLY_BACKEND=current or install TorchAir.")
-        if device.type != "npu":
-            self._disabled[key] = "non_npu_device"
-            raise RuntimeError(f"TorchAir DSA pipeline requires NPU tensors, got device={device}.")
-        try:
-            config = torchair.CompilerConfig()
-            compiled = torch.compile(fn, backend=torchair.get_npu_backend(compiler_config=config), dynamic=False)
-            self._compiled[key] = compiled
-            return compiled
-        except Exception as exc:  # pragma: no cover - depends on Ascend/TorchAir runtime.
-            reason = f"compile_failed:{type(exc).__name__}"
-            self._disabled[key] = reason
-            raise RuntimeError(f"TorchAir DSA pipeline compile failed: {reason}") from exc
-
-    def compile_dsa_pipeline_with_qc(
-        self,
-        hidden_states: torch.Tensor,
-        q_a_weight: torch.Tensor,
-        index_cache: torch.Tensor,
-        selection_kpe: torch.Tensor,
-        selection_ckv: torch.Tensor,
-        selection_block_table: torch.Tensor,
-        gather_selection_status: torch.Tensor,
-        full_kpe: torch.Tensor,
-        full_ckv: torch.Tensor,
-        dram_tables: torch.Tensor,
-        *,
-        q_norm_eps: float,
-        n_head: int,
-        head_dim: int,
-        rope_dim: int,
-        score_scale: float,
-        sparse_count: int,
-    ) -> tuple[Callable[..., object], tuple]:
-        key = (
-            "dsa_pipeline_with_qc",
-            int(hidden_states.shape[0]),
-            int(hidden_states.shape[1]),
-            int(q_a_weight.shape[0]),
-            str(hidden_states.dtype),
-            str(hidden_states.device),
-            int(n_head),
-            int(head_dim),
-            int(rope_dim),
-            float(q_norm_eps),
-            float(score_scale),
-            int(sparse_count),
-            tuple(index_cache.shape),
-            tuple(selection_kpe.shape),
-            tuple(selection_ckv.shape),
-            int(selection_block_table.shape[1]),
-            int(gather_selection_status.shape[-1]),
-            tuple(full_kpe.shape),
-            tuple(full_ckv.shape),
-            int(dram_tables.shape[1]),
-        )
-
-        def fn(
-            hidden_states_arg,
-            cos_arg,
-            sin_arg,
-            q_a_weight_arg,
-            q_norm_weight_arg,
-            wq_b_weight_arg,
-            weights_proj_weight_arg,
-            q_index_out_arg,
-            index_weights_out_arg,
-            index_cache_arg,
-            candidate_query_lens_arg,
-            candidate_lens_arg,
-            index_tables_arg,
-            selection_kpe_arg,
-            selection_ckv_arg,
-            selection_block_table_arg,
-            gather_selection_status_arg,
-            req_pool_entries_arg,
-            full_kpe_arg,
-            full_ckv_arg,
-            dram_tables_arg,
-        ):
-            return _dsa_indexer_pipeline_with_qc_functional(
-                hidden_states_arg,
-                cos_arg,
-                sin_arg,
-                q_a_weight_arg,
-                q_norm_weight_arg,
-                wq_b_weight_arg,
-                weights_proj_weight_arg,
-                q_index_out_arg,
-                index_weights_out_arg,
-                index_cache_arg,
-                candidate_query_lens_arg,
-                candidate_lens_arg,
-                index_tables_arg,
-                selection_kpe_arg,
-                selection_ckv_arg,
-                selection_block_table_arg,
-                gather_selection_status_arg,
-                req_pool_entries_arg,
-                full_kpe_arg,
-                full_ckv_arg,
-                dram_tables_arg,
-                q_norm_eps=float(q_norm_eps),
-                n_head=int(n_head),
-                head_dim=int(head_dim),
-                rope_dim=int(rope_dim),
-                score_scale=float(score_scale),
-                sparse_count=int(sparse_count),
-                return_gather_outputs=True,
-            )
-
-        return self._compile_lazy_or_raise(key, fn, hidden_states.device), key
-
-
-_DSA_PIPELINE_TORCHAIR_CACHE = DsaPipelineTorchAirCache()
 _Q_BMM_MAX_TOKENS = 64  # Keep larger decode batches on the q BMM path; tokens=128 was slower in probe.
 
 
@@ -805,67 +674,6 @@ def dsa_indexer_project_query_only(
     return q_index_out, index_weights_out
 
 
-def dsa_indexer_pipeline_with_qc_eager(
-    hidden_states: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    q_a_weight: torch.Tensor,
-    q_norm_weight: torch.Tensor,
-    wq_b_weight: torch.Tensor,
-    weights_proj_weight: torch.Tensor,
-    q_index_out: torch.Tensor,
-    index_weights_out: torch.Tensor,
-    index_cache: torch.Tensor,
-    candidate_query_lens: torch.Tensor,
-    candidate_lens: torch.Tensor,
-    index_tables: torch.Tensor,
-    selection_kpe: torch.Tensor,
-    selection_ckv: torch.Tensor,
-    selection_block_table: torch.Tensor,
-    gather_selection_status: torch.Tensor,
-    req_pool_entries: torch.Tensor,
-    full_kpe: torch.Tensor,
-    full_ckv: torch.Tensor,
-    dram_tables: torch.Tensor,
-    *,
-    q_norm_eps: float,
-    n_head: int,
-    head_dim: int,
-    rope_dim: int,
-    score_scale: float,
-    sparse_count: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return _dsa_indexer_pipeline_with_qc_functional(
-        hidden_states,
-        cos,
-        sin,
-        q_a_weight,
-        q_norm_weight,
-        wq_b_weight,
-        weights_proj_weight,
-        q_index_out,
-        index_weights_out,
-        index_cache,
-        candidate_query_lens,
-        candidate_lens,
-        index_tables,
-        selection_kpe,
-        selection_ckv,
-        selection_block_table,
-        gather_selection_status,
-        req_pool_entries,
-        full_kpe,
-        full_ckv,
-        dram_tables,
-        q_norm_eps=float(q_norm_eps),
-        n_head=int(n_head),
-        head_dim=int(head_dim),
-        rope_dim=int(rope_dim),
-        score_scale=float(score_scale),
-        sparse_count=int(sparse_count),
-    )
-
-
 def dsa_indexer_pipeline_with_qc_full_graph(
     hidden_states: torch.Tensor,
     cos: torch.Tensor,
@@ -940,127 +748,6 @@ def dsa_indexer_pipeline_with_qc_full_graph(
     )
 
 
-def dsa_indexer_pipeline_with_qc_torchair(
-    hidden_states: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    q_a_weight: torch.Tensor,
-    q_norm_weight: torch.Tensor,
-    wq_b_weight: torch.Tensor,
-    weights_proj_weight: torch.Tensor,
-    q_index_out: torch.Tensor,
-    index_weights_out: torch.Tensor,
-    index_cache: torch.Tensor,
-    candidate_query_lens: torch.Tensor,
-    candidate_lens: torch.Tensor,
-    index_tables: torch.Tensor,
-    selection_kpe: torch.Tensor,
-    selection_ckv: torch.Tensor,
-    selection_block_table: torch.Tensor,
-    gather_selection_status: torch.Tensor,
-    req_pool_entries: torch.Tensor,
-    full_kpe: torch.Tensor,
-    full_ckv: torch.Tensor,
-    dram_tables: torch.Tensor,
-    *,
-    q_norm_eps: float,
-    n_head: int,
-    head_dim: int,
-    rope_dim: int,
-    score_scale: float,
-    sparse_count: int,
-    detail: dict[str, float] | None = None,
-    sync_detail: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if q_index_out.shape != (hidden_states.shape[0], n_head, head_dim):
-        raise ValueError(f"q_index_out shape must be {(hidden_states.shape[0], n_head, head_dim)}, got {tuple(q_index_out.shape)}")
-    if index_weights_out.shape != (hidden_states.shape[0], n_head):
-        raise ValueError(f"index_weights_out shape must be {(hidden_states.shape[0], n_head)}, got {tuple(index_weights_out.shape)}")
-    if _GRAPH_LIGHTNING_INDEXER is None or _GRAPH_GATHER_SELECTION_KV_CACHE is None:
-        raise RuntimeError("TorchAir DSA pipeline requires C++ torch.ops.nanovllm_dsa lightning_indexer/gather_selection registrations. Rebuild with `bash scripts/build_nanovllm_ops.sh`.") from _GRAPH_CUSTOM_OP_ERROR
-
-    start = _timer_start(detail, sync_detail, hidden_states.device)
-    compiled, _ = _DSA_PIPELINE_TORCHAIR_CACHE.compile_dsa_pipeline_with_qc(
-        hidden_states,
-        q_a_weight,
-        index_cache,
-        selection_kpe,
-        selection_ckv,
-        selection_block_table,
-        gather_selection_status,
-        full_kpe,
-        full_ckv,
-        dram_tables,
-        q_norm_eps=float(q_norm_eps),
-        n_head=int(n_head),
-        head_dim=int(head_dim),
-        rope_dim=int(rope_dim),
-        score_scale=float(score_scale),
-        sparse_count=int(sparse_count),
-    )
-    try:
-        with torch.inference_mode():
-            (
-                q_index_out,
-                index_weights_out,
-                topk_indices,
-                _selection_kpe_out,
-                _selection_ckv_out,
-                _selection_block_table_out,
-                _gather_selection_status_out,
-            ) = compiled(
-                hidden_states,
-                cos,
-                sin,
-                q_a_weight,
-                q_norm_weight,
-                wq_b_weight,
-                weights_proj_weight,
-                q_index_out,
-                index_weights_out,
-                index_cache,
-                candidate_query_lens,
-                candidate_lens,
-                index_tables,
-                selection_kpe,
-                selection_ckv,
-                selection_block_table,
-                gather_selection_status,
-                req_pool_entries,
-                full_kpe,
-                full_ckv,
-                dram_tables,
-            )
-        _timer_end(detail, "dsa_pipeline", start, sync_detail, hidden_states.device)
-        return q_index_out, index_weights_out, topk_indices
-    except Exception as exc:  # pragma: no cover - depends on Ascend/TorchAir runtime.
-        key = (
-            "dsa_pipeline_with_qc",
-            int(hidden_states.shape[0]),
-            int(hidden_states.shape[1]),
-            int(q_a_weight.shape[0]),
-            str(hidden_states.dtype),
-            str(hidden_states.device),
-            int(n_head),
-            int(head_dim),
-            int(rope_dim),
-            float(q_norm_eps),
-            float(score_scale),
-            int(sparse_count),
-            tuple(index_cache.shape),
-            tuple(selection_kpe.shape),
-            tuple(selection_ckv.shape),
-            int(selection_block_table.shape[1]),
-            int(gather_selection_status.shape[-1]),
-            tuple(full_kpe.shape),
-            tuple(full_ckv.shape),
-            int(dram_tables.shape[1]),
-        )
-        _DSA_PIPELINE_TORCHAIR_CACHE.disable(key, f"run_failed:{type(exc).__name__}")
-        _timer_end(detail, "dsa_pipeline", start, sync_detail, hidden_states.device)
-        raise RuntimeError("TorchAir DSA pipeline run failed; no fallback is used for this path.") from exc
-
-
 __all__ = [
     "dsa_indexer_project",
     "dsa_indexer_project_post_availability_error",
@@ -1071,8 +758,6 @@ __all__ = [
     "dsa_indexer_project_post_real_out",
     "dsa_indexer_project_q_path",
     "dsa_indexer_project_query_only",
-    "dsa_indexer_pipeline_with_qc_eager",
     "dsa_indexer_pipeline_with_qc_full_graph",
-    "dsa_indexer_pipeline_with_qc_torchair",
     "dsa_indexer_project_torch",
 ]
