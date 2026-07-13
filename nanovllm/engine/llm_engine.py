@@ -7,8 +7,9 @@ import os
 from dataclasses import fields
 from time import perf_counter
 
-from transformers import LlamaTokenizerFast, PreTrainedTokenizerFast
+import torch
 import torch.multiprocessing as mp
+from transformers import LlamaTokenizerFast, PreTrainedTokenizerFast
 
 from nanovllm.config import Config
 from nanovllm.sampling_params import SamplingParams
@@ -76,6 +77,14 @@ class LLMEngine:
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
         self._last_prefill_chunk_progress = None
+        # Profiling is created lazily in the rank-0 engine immediately before
+        # its first decode forward. Worker ranks only run ModelRunner.loop(),
+        # so they never create a profiler or emit profile data.
+        self._decode_profile_output = os.environ.get(
+            "NANOVLLM_PROFILE_DECODE_OUTPUT",
+            "",
+        ).strip()
+        self._decode_profiler = None
         atexit.register(self.exit)
 
     @staticmethod
@@ -161,7 +170,53 @@ class LLMEngine:
             .replace("Ġ", " ")
         )
 
+    def _start_decode_profiler(self) -> None:
+        if not self._decode_profile_output or self._decode_profiler is not None:
+            return
+
+        import torch_npu
+
+        output_dir = os.path.abspath(self._decode_profile_output)
+        experimental_config = torch_npu.profiler._ExperimentalConfig(
+            profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+            aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
+            data_simplification=False,
+        )
+        self._decode_profiler = torch_npu.profiler.profile(
+            activities=[
+                torch_npu.profiler.ProfilerActivity.CPU,
+                torch_npu.profiler.ProfilerActivity.NPU,
+            ],
+            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
+                output_dir
+            ),
+            record_shapes=False,
+            profile_memory=False,
+            with_stack=False,
+            with_modules=False,
+            with_flops=False,
+            experimental_config=experimental_config,
+        )
+        logger.info(
+            "Starting TP rank-0 profiler before the first decode step: %s",
+            output_dir,
+        )
+        self._decode_profiler.start()
+
+    def _stop_decode_profiler(self) -> None:
+        profiler = self._decode_profiler
+        if profiler is None:
+            return
+        self._decode_profiler = None
+        torch.npu.synchronize()
+        profiler.stop()
+        logger.info(
+            "Stopped TP rank-0 decode profiler; profile data: %s",
+            os.path.abspath(self._decode_profile_output),
+        )
+
     def exit(self):
+        self._stop_decode_profiler()
         self.model_runner.call("exit")
         del self.model_runner
         for p in self.ps:
@@ -196,6 +251,8 @@ class LLMEngine:
             is_final_prefill_step = progress == len(seq)
         else:
             num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
+        if not is_prefill:
+            self._start_decode_profiler()
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         if is_final_prefill_step:
             self.scheduler.release_prefill_hbm_blocks(seqs)
@@ -288,6 +345,7 @@ class LLMEngine:
                 total_input_tokens += prompt_len
                 total_output_tokens += len(token_ids)
 
+        self._stop_decode_profiler()
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
         outputs = [{"text": self._decode_token_ids(token_ids), "token_ids": token_ids, "prompt_len": prompt_len,
                     "cache_tokens": cache_tokens} for

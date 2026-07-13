@@ -78,6 +78,26 @@ DSA FULL_DECODE_ONLY proof: capture_sizes=[2], captures=1, replays=14, eager_fir
 
 　
 
+## 只采集 TP rank 0 的 decode profile
+
+保留前面的模型和并行环境变量，直接运行 Python，不要再套 `msprof`：
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH \
+NANOVLLM_PROFILE_DECODE_OUTPUT=./profile_rank0_decode \
+NANOVLLM_IGNORE_EOS=1 \
+NANOVLLM_MAX_GEN_TOKENS=6 \
+NANOVLLM_PROMPT_LENGTHS=30000,30001 \
+python3 example/test.py
+```
+
+Profiler 在 rank 0 第一次 decode forward 之前启动，在 `generate()` 完成后停止。
+Prefill 和 TP rank 1–15 均不采集。结果写入 `profile_rank0_decode`，可用
+MindStudio Insight 打开。`MAX_GEN_TOKENS=6` 会采集 1 个 eager decode 和
+4 个 full-decode graph replay，通常已包含至少 3 个稳定 decode step。
+
+　
+
 ## eager 对照
 
 保留其他环境变量不变，仅执行：
@@ -102,6 +122,7 @@ PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_PREFILL_CHUNK_SIZE=1024 NANOVLLM_MAX_GEN_TO
 | `NANOVLLM_PREFILL_CHUNK_SIZE` | 仅允许 `0` 或 `1024`；`0` 为整段 prefill，`1024` 为单请求 chunk prefill |
 | `NANOVLLM_PROMPT_LENGTHS` | 精确 prompt token 长度，逗号分隔；条目数就是测试 batch size |
 | `NANOVLLM_MAX_GEN_TOKENS` | 每个请求生成 token 数，默认 16 |
+| `NANOVLLM_PROFILE_DECODE_OUTPUT` | 非空时仅在 TP rank 0 采集从首次 decode 到生成结束的 profile，并写入该目录 |
 
 　
 
@@ -128,8 +149,6 @@ DeepSeek-V3.2-REAP-345B-A37B-BF16 模型，TP16+EP16，序列长度 30k
 | nanovllm (不卸载)       | 700           | 700              | 2      | 58 ms        | 34 TPS     | 
 | nanovllm (卸载, GS算子) | 350           | 1500             | 2      | 79 ms        | 25 TPS     | 
 | nanovllm (卸载, GS算子) | 350           | 1500             | 6      | 97 ms        | 61 TPS     | 
-
-
 
 
 
