@@ -79,6 +79,19 @@ std::tuple<at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &>
         enable_inner_out.has_value()
             ? enable_inner_out.value()
             : false;
+    if (enableInnerOut) {
+        TORCH_CHECK(hiddenState.scalar_type() == at::kBFloat16,
+                    "mla_preprocess inner_out currently supports BF16 hidden states only");
+        TORCH_CHECK(inner_out.dim() == 2 && inner_out.size(0) == hiddenState.size(0) &&
+                        inner_out.size(1) == gamma1.numel(),
+                    "mla_preprocess inner_out must have shape [", hiddenState.size(0), ", ",
+                    gamma1.numel(), "], got ", inner_out.sizes());
+        TORCH_CHECK(inner_out.scalar_type() == hiddenState.scalar_type(),
+                    "mla_preprocess inner_out dtype must match hidden states");
+        TORCH_CHECK(inner_out.device() == hiddenState.device(),
+                    "mla_preprocess inner_out device must match hidden states");
+        TORCH_CHECK(inner_out.is_contiguous(), "mla_preprocess inner_out must be contiguous");
+    }
     
     auto [workspace_tensor, tiling, block_dim] = mlapo::mla_preprocess_tiling(
         hiddenState,

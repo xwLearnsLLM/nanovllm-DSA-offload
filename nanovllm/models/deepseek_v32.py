@@ -763,6 +763,7 @@ class DeepseekV32DSAAttention(nn.Module):
     def _run_dsa_pipeline_with_qc_full_graph(
         self,
         hidden_states: torch.Tensor,
+        q_c: torch.Tensor,
         positions: torch.Tensor,
         batch_size: int,
     ) -> None:
@@ -772,11 +773,10 @@ class DeepseekV32DSAAttention(nn.Module):
                 "The graph-visible DSA pipeline only supports an exact-size "
                 "FULL_DECODE_ONLY batch in which every row is offloaded."
             )
-        q_a_weight = None if self.wd_qkv is None else self.wd_qkv[: self.q_lora_rank]
-        if q_a_weight is None:
+        if q_c.shape != (batch_size, self.q_lora_rank):
             raise RuntimeError(
-                "DSA FULL_DECODE_ONLY requires fused q_a weight, but wd_qkv "
-                "is not prepared."
+                "DSA FULL_DECODE_ONLY requires MLAPO q_c with shape "
+                f"{(batch_size, self.q_lora_rank)}, got {tuple(q_c.shape)}."
             )
         required_context = {
             "candidate_lens": context.candidate_lens,
@@ -801,10 +801,9 @@ class DeepseekV32DSAAttention(nn.Module):
         q_index, _, index_weights = self.indexer._get_output_buffers(hidden_states)
         dsa_indexer_pipeline_with_qc_full_graph(
             hidden_states,
+            q_c,
             cos,
             sin,
-            q_a_weight,
-            self.q_a_layernorm.weight,
             self.indexer.wq_b.weight,
             self.indexer._query_only_weights_proj_weight(hidden_states.dtype, hidden_states.device),
             q_index,
@@ -821,7 +820,6 @@ class DeepseekV32DSAAttention(nn.Module):
             self.dram_kpe_cache.squeeze(2),
             self.dram_ckv_cache.squeeze(2),
             context.dram_block_tables[:active_batch],
-            q_norm_eps=float(self.q_a_layernorm.eps),
             n_head=self.indexer.n_head,
             head_dim=self.indexer.head_dim,
             rope_dim=self.indexer.rope_dim,
@@ -867,28 +865,23 @@ class DeepseekV32DSAAttention(nn.Module):
         context.scratch[cache_key] = (cos, sin)
         return cos, sin
 
-    def _decode_mlapo_buffers(self, num_tokens: int, dtype: torch.dtype, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _decode_mlapo_buffers(
+        self,
+        num_tokens: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        need_inner_out: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         ql_shape = (num_tokens, self.num_local_heads, self.kv_lora_rank)
         qpe_shape = (num_tokens, self.num_local_heads, self.qk_rope_head_dim)
+        inner_shape = (num_tokens, self.q_lora_rank) if need_inner_out else (0,)
         if self._decode_mlapo_ql_nope is None or tuple(self._decode_mlapo_ql_nope.shape) != ql_shape or self._decode_mlapo_ql_nope.dtype != dtype or self._decode_mlapo_ql_nope.device != device:
             self._decode_mlapo_ql_nope = torch.empty(ql_shape, dtype=dtype, device=device)
         if self._decode_mlapo_q_pe is None or tuple(self._decode_mlapo_q_pe.shape) != qpe_shape or self._decode_mlapo_q_pe.dtype != dtype or self._decode_mlapo_q_pe.device != device:
             self._decode_mlapo_q_pe = torch.empty(qpe_shape, dtype=dtype, device=device)
-        if self._decode_mlapo_inner_out is None or tuple(self._decode_mlapo_inner_out.shape) != (0,) or self._decode_mlapo_inner_out.dtype != dtype or self._decode_mlapo_inner_out.device != device:
-            # The CANN enable_inner_out branch is not numerically aligned yet
-            # (probe_mla_preprocess sees NaNs / wrong cache writes). Keep MLAPO
-            # on the stable non-inner branch and recompute q_c separately when
-            # DSA needs it.
-            self._decode_mlapo_inner_out = torch.empty(0, dtype=dtype, device=device)
+        if self._decode_mlapo_inner_out is None or tuple(self._decode_mlapo_inner_out.shape) != inner_shape or self._decode_mlapo_inner_out.dtype != dtype or self._decode_mlapo_inner_out.device != device:
+            self._decode_mlapo_inner_out = torch.empty(inner_shape, dtype=dtype, device=device)
         return self._decode_mlapo_ql_nope, self._decode_mlapo_q_pe, self._decode_mlapo_inner_out
-
-    # Temporary q_c fallback for DSA decode. Remove this once mla_preprocess
-    # enable_inner_out=True is fixed and matches the torch reference.
-    def _decode_mlapo_q_c_fallback(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.wd_qkv is None:
-            raise RuntimeError("Fused qkv_a weight is not prepared.")
-        q_c = F.linear(hidden_states, self.wd_qkv[: self.q_lora_rank])
-        return self.q_a_layernorm(q_c)
 
     def _decode_mlapo_preprocess(
         self,
@@ -902,7 +895,12 @@ class DeepseekV32DSAAttention(nn.Module):
             raise RuntimeError("Decode MLAPO weights are not prepared.")
 
         num_tokens = int(hidden_states.shape[0])
-        ql_nope, q_pe, inner_out = self._decode_mlapo_buffers(num_tokens, dtype=hidden_states.dtype, device=hidden_states.device)
+        ql_nope, q_pe, inner_out = self._decode_mlapo_buffers(
+            num_tokens,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+            need_inner_out=need_inner_out,
+        )
         cos, sin = self._mlapo_cos_sin(positions, hidden_states.dtype)
         context = get_context()
         slotmapping = context.flat_slot_mapping_i32 if context.flat_slot_mapping_i32 is not None else self._flat_slots().to(torch.int32)
@@ -929,10 +927,8 @@ class DeepseekV32DSAAttention(nn.Module):
             inner_out=inner_out,
             cache_mode="krope_ctkv",
             quant_mode="no_quant",
-            enable_inner_out=False,
+            enable_inner_out=need_inner_out,
         )
-        if need_inner_out:
-            inner_out = self._decode_mlapo_q_c_fallback(hidden_states)
         return ql_nope, q_pe, inner_out
 
     @property
@@ -1311,25 +1307,23 @@ class DeepseekV32DSAAttention(nn.Module):
         use_decode_mlapo = not context.is_prefill and not context.has_first_decode
         needs_decode_dsa_update = bool(context.needs_dsa_update)
         if use_decode_mlapo:
-            use_full_graph_dsa = needs_decode_dsa_update and context.full_decode_graph
             ql_nope, q_pe, q_c = self._decode_mlapo_preprocess(
                 positions,
                 hidden_states,
-                need_inner_out=needs_decode_dsa_update and not use_full_graph_dsa,
+                need_inner_out=needs_decode_dsa_update,
             )
             q_index = index_k = weights = None
             dsa_updated = False
             if needs_decode_dsa_update:
-                if use_full_graph_dsa:
+                if context.full_decode_graph:
                     self._run_dsa_pipeline_with_qc_full_graph(
                         hidden_states,
+                        q_c,
                         positions,
                         int(hidden_states.shape[0]),
                     )
                     dsa_updated = True
                 else:
-                    if q_c is None or q_c.numel() == 0:
-                        q_c = self._decode_mlapo_q_c_fallback(hidden_states)
                     q_index, index_k, weights = self._run_indexer(
                         hidden_states,
                         q_c,

@@ -248,6 +248,24 @@ extern "C" __global__ __aicore__ void mla_preprocess(
             }
             break;
         }
+        case KEY_BF16_CACHEMODE_1_QUANTMODE_3_INNER: {
+            MLAPO_BF16_NQ::MLAOperation<__bf16, 1, DataFormat::NZ, DataFormat::NZ, DataFormat::ND>
+                opBf16Cm1Qm0Inner(mlaTilingData, tiling);
+            // The no-quant kernel stores normalized q_c in s1 before mm2.
+            // Use the caller-owned innerOut buffer as s1 so q_c is exposed
+            // without an extra device-to-device copy.
+            opBf16Cm1Qm0Inner.Init(hiddenState, wdqkv, gamma2, beta2,
+                                   gamma3, sin1, cos1, sin2, cos2, keycache, slotMapping, wuq,
+                                   wuk, q, keycacheOut, q2, keycacheOut2,
+                                   innerOut, s2, s3);
+            if ASCEND_IS_AIC {
+                opBf16Cm1Qm0Inner.ProcessCube();
+            }
+            if ASCEND_IS_AIV {
+                opBf16Cm1Qm0Inner.ProcessVector();
+            }
+            break;
+        }
         case KEY_BF16_CACHEMODE_0_QUANTMODE_0_INNER: {
             MLAPO_BF16_INNER::MLAOperation<__bf16, 0, DataFormat::NZ, DataFormat::NZ, DataFormat::ND,
                                      QuantMode::PER_TENSOR_ASYMM_QUANT>

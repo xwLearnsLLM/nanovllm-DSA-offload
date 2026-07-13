@@ -200,13 +200,6 @@ def _apply_query_rope_like_runtime(x: torch.Tensor, cos: torch.Tensor, sin: torc
     return _apply_rope_neox_reference(x, cos, sin, int(rope_dim))
 
 
-def _rms_norm_reference(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    orig_dtype = x.dtype
-    x_float = x.float()
-    var = x_float.pow(2).mean(dim=-1, keepdim=True)
-    return (x_float * torch.rsqrt(var + float(eps))).to(orig_dtype) * weight
-
-
 def _query_only_weights_proj(
     hidden_states: torch.Tensor,
     weights_proj_weight: torch.Tensor,
@@ -253,43 +246,11 @@ def _dsa_indexer_project_query_only_pure(
     return torch.cat((q_pe, q_nope), dim=-1), index_weights
 
 
-def _dsa_indexer_project_query_only_with_qc_pure(
-    hidden_states: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    q_a_weight: torch.Tensor,
-    q_norm_weight: torch.Tensor,
-    wq_b_weight: torch.Tensor,
-    weights_proj_weight: torch.Tensor,
-    *,
-    q_norm_eps: float,
-    n_head: int,
-    head_dim: int,
-    rope_dim: int,
-    score_scale: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    q_c = F.linear(hidden_states, q_a_weight)
-    q_c = _rms_norm_reference(q_c, q_norm_weight, float(q_norm_eps))
-    return _dsa_indexer_project_query_only_pure(
-        hidden_states,
-        q_c,
-        cos,
-        sin,
-        wq_b_weight,
-        weights_proj_weight,
-        n_head=int(n_head),
-        head_dim=int(head_dim),
-        rope_dim=int(rope_dim),
-        score_scale=float(score_scale),
-    )
-
-
 def _dsa_indexer_pipeline_with_qc_functional(
     hidden_states: torch.Tensor,
+    q_c: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
-    q_a_weight: torch.Tensor,
-    q_norm_weight: torch.Tensor,
     wq_b_weight: torch.Tensor,
     weights_proj_weight: torch.Tensor,
     q_index_out: torch.Tensor,
@@ -307,7 +268,6 @@ def _dsa_indexer_pipeline_with_qc_functional(
     full_ckv: torch.Tensor,
     dram_tables: torch.Tensor,
     *,
-    q_norm_eps: float,
     n_head: int,
     head_dim: int,
     rope_dim: int,
@@ -317,15 +277,13 @@ def _dsa_indexer_pipeline_with_qc_functional(
 ) -> tuple[torch.Tensor, ...]:
     if ascend_ops is None:
         raise RuntimeError("nanovllm Ascend ops are unavailable; rebuild with `bash scripts/build_nanovllm_ops.sh`.") from ascend_ops_import_error
-    q_index, index_weights = _dsa_indexer_project_query_only_with_qc_pure(
+    q_index, index_weights = _dsa_indexer_project_query_only_pure(
         hidden_states,
+        q_c,
         cos,
         sin,
-        q_a_weight,
-        q_norm_weight,
         wq_b_weight,
         weights_proj_weight,
-        q_norm_eps=float(q_norm_eps),
         n_head=int(n_head),
         head_dim=int(head_dim),
         rope_dim=int(rope_dim),
@@ -676,10 +634,9 @@ def dsa_indexer_project_query_only(
 
 def dsa_indexer_pipeline_with_qc_full_graph(
     hidden_states: torch.Tensor,
+    q_c: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
-    q_a_weight: torch.Tensor,
-    q_norm_weight: torch.Tensor,
     wq_b_weight: torch.Tensor,
     weights_proj_weight: torch.Tensor,
     q_index_out: torch.Tensor,
@@ -697,7 +654,6 @@ def dsa_indexer_pipeline_with_qc_full_graph(
     full_ckv: torch.Tensor,
     dram_tables: torch.Tensor,
     *,
-    q_norm_eps: float,
     n_head: int,
     head_dim: int,
     rope_dim: int,
@@ -718,10 +674,9 @@ def dsa_indexer_pipeline_with_qc_full_graph(
         ) from _GRAPH_CUSTOM_OP_ERROR
     return _dsa_indexer_pipeline_with_qc_functional(
         hidden_states,
+        q_c,
         cos,
         sin,
-        q_a_weight,
-        q_norm_weight,
         wq_b_weight,
         weights_proj_weight,
         q_index_out,
@@ -738,7 +693,6 @@ def dsa_indexer_pipeline_with_qc_full_graph(
         full_kpe,
         full_ckv,
         dram_tables,
-        q_norm_eps=float(q_norm_eps),
         n_head=int(n_head),
         head_dim=int(head_dim),
         rope_dim=int(rope_dim),
