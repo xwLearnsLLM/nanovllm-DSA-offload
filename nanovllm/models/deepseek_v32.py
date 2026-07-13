@@ -13,6 +13,11 @@ import torch.nn.functional as F
 from transformers import PretrainedConfig
 
 import nanovllm.ops as ascend_ops
+from nanovllm.engine.dsa_offload import (
+    DSA_SELECTION_TOPK_TOKENS,
+    compute_gs_miss_counts,
+    parse_gs_miss_rate_layers,
+)
 from nanovllm.engine.full_decode_graph import (
     MLAGraphTask,
     is_full_decode_graph_capturing,
@@ -38,7 +43,7 @@ from nanovllm.utils.context import get_context
 ACL_FORMAT_FRACTAL_NZ = 29
 _NPU_MLA_ATTENTION_MASK_CACHE: dict[tuple[str, int], torch.Tensor] = {}
 _NPU_MLA_V2_WORKSPACE_CACHE: dict[tuple, torch.Tensor] = {}
-_DSA_GATHER_TOPK = 2048
+_DSA_GATHER_TOPK = DSA_SELECTION_TOPK_TOKENS
 _NPU_MOE_SHARED_STREAM = None
 
 
@@ -634,6 +639,23 @@ class DeepseekV32DSAAttention(nn.Module):
         tp_size = dist.get_world_size()
         if config.num_attention_heads % tp_size != 0:
             raise ValueError("num_attention_heads must be divisible by TP size.")
+        self.layer_idx = int(layer_idx)
+        gs_miss_rate_layers = parse_gs_miss_rate_layers(
+            os.environ.get("NANOVLLM_GS_MISS_RATE_ON_LAYERS"),
+            int(config.num_hidden_layers),
+        )
+        tp_rank = dist.get_rank()
+        self._gs_miss_rate_enabled = (
+            tp_rank == 0 and self.layer_idx in gs_miss_rate_layers
+        )
+        self._gs_miss_rate_decode_step = 0
+        if tp_rank == 0 and self.layer_idx == 0 and gs_miss_rate_layers:
+            print(
+                "GS_MISS_RATE enabled eager-only layers="
+                f"{sorted(gs_miss_rate_layers)}",
+                flush=True,
+            )
+
         self.hidden_size = int(config.hidden_size)
         self.total_num_heads = int(config.num_attention_heads)
         self.num_local_heads = self.total_num_heads // tp_size
@@ -1128,6 +1150,53 @@ class DeepseekV32DSAAttention(nn.Module):
         latent = mla_result[0] if isinstance(mla_result, (tuple, list)) else mla_result
         return torch_npu.npu_transpose_batchmatmul(latent.transpose(0, 1).contiguous(), self.w_uv, perm_y=(1, 0, 2)).reshape(latent.shape[0], -1)
 
+    @torch.compiler.disable
+    def _print_gs_miss_rate(
+        self,
+        topk_indices: torch.Tensor,
+        req_pool_entries: torch.Tensor,
+        batch_size: int,
+        active_rows: torch.Tensor | None,
+    ) -> None:
+        if not self._gs_miss_rate_enabled:
+            return
+
+        topk = self.gather_selection_topk
+        topk_flat = topk_indices.reshape(-1, topk)
+        status_rows = self.gather_selection_status.index_select(
+            0,
+            req_pool_entries.to(dtype=torch.int64),
+        ).reshape(-1, topk + 1)[:, :topk]
+        snapshot = torch.cat((topk_flat, status_rows), dim=1).detach().cpu()
+        active_miss_counts = compute_gs_miss_counts(
+            snapshot[:, :topk].tolist(),
+            snapshot[:, topk:].tolist(),
+        )
+
+        if active_rows is None:
+            row_indices = list(range(batch_size))
+        else:
+            row_indices = [int(row) for row in active_rows.detach().cpu().tolist()]
+        miss_counts = [0] * batch_size
+        for row, miss_count in zip(row_indices, active_miss_counts):
+            miss_counts[row] = miss_count
+        miss_rates = [
+            miss_count / DSA_SELECTION_TOPK_TOKENS
+            for miss_count in miss_counts
+        ]
+        mean_miss_rate = sum(miss_rates) / max(len(miss_rates), 1)
+        self._gs_miss_rate_decode_step += 1
+        rates_text = ", ".join(f"{rate:.6f}" for rate in miss_rates)
+        print(
+            "GS_MISS_RATE "
+            f"decode_step={self._gs_miss_rate_decode_step} "
+            f"layer={self.layer_idx} batch_size={batch_size} "
+            f"request_miss_tokens={miss_counts} "
+            f"request_miss_rate=[{rates_text}] "
+            f"mean_miss_rate={mean_miss_rate:.6f}",
+            flush=True,
+        )
+
     def _dsa_offload_update(self, q_index: torch.Tensor, weights: torch.Tensor, batch_size: int) -> None:
         context = get_context()
         if not context.needs_dsa_update:
@@ -1153,6 +1222,7 @@ class DeepseekV32DSAAttention(nn.Module):
             selection_block_table = context.selection_block_tables[:batch_size]
             candidate_lens = context.candidate_lens[:batch_size]
             req_pool_entries = context.req_pool_entries[:batch_size]
+            active_rows = None
         else:
             rows = context.dsa_offload_rows
             if rows is None or rows.numel() == 0:
@@ -1165,6 +1235,7 @@ class DeepseekV32DSAAttention(nn.Module):
             selection_block_table = context.selection_block_tables.index_select(0, rows)
             candidate_lens = context.candidate_lens.index_select(0, rows)
             req_pool_entries = context.req_pool_entries.index_select(0, rows)
+            active_rows = rows
         candidate_query_lens = context.candidate_query_lens[:active_batch]
 
         topk_indices = ascend_ops.npu_lightning_indexer(
@@ -1178,6 +1249,13 @@ class DeepseekV32DSAAttention(nn.Module):
             layout_key="PA_BSND",
             sparse_count=self.gather_selection_topk,
             sparse_mode=3,
+        )
+
+        self._print_gs_miss_rate(
+            topk_indices,
+            req_pool_entries,
+            batch_size,
+            active_rows,
         )
 
         # gather_selection_status is a request pool; req_pool_entries maps active rows to persistent status rows.

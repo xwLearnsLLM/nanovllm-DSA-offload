@@ -108,6 +108,34 @@ PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_PREFILL_CHUNK_SIZE=1024 NANOVLLM_MAX_GEN_TO
 
 　
 
+## GatherSelectionKVCache miss rate 调试
+
+该功能只支持 eager 路径，并且只由 TP rank 0 打印。示例：
+
+```bash
+PYTHONPATH=$PWD:$PYTHONPATH \
+NANOVLLM_ENFORCE_EAGER=1 \
+NANOVLLM_GS_MISS_RATE_ON_LAYERS=0,30,60 \
+NANOVLLM_PREFILL_CHUNK_SIZE=1024 \
+NANOVLLM_IGNORE_EOS=1 \
+NANOVLLM_MAX_GEN_TOKENS=6 \
+NANOVLLM_PROMPT_LENGTHS=30000,30001 \
+python3 example/test.py
+```
+
+每个配置层在每个 decode step 的 gather 之前打印当前 batch 各请求的
+`|topk - selection| / 2048`、平均 miss rate 和对应的 miss token 数。例如：
+
+```text
+GS_MISS_RATE decode_step=2 layer=30 batch_size=2 request_miss_tokens=[512, 480] request_miss_rate=[0.250000, 0.234375] mean_miss_rate=0.242188
+```
+
+该调试会执行 NPU 到 CPU 同步，不能用开启该开关后的 TPOT 作为性能数据。
+在 full-decode-only 模式下只可能看到 eager first-decode 的输出；若要观察每个
+decode step，必须设置 `NANOVLLM_ENFORCE_EAGER=1`。
+
+　
+
 ## 主要 bash 参数
 
 | 参数 | 说明 |
@@ -123,6 +151,7 @@ PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_PREFILL_CHUNK_SIZE=1024 NANOVLLM_MAX_GEN_TO
 | `NANOVLLM_PROMPT_LENGTHS` | 精确 prompt token 长度，逗号分隔；条目数就是测试 batch size |
 | `NANOVLLM_MAX_GEN_TOKENS` | 每个请求生成 token 数，默认 16 |
 | `NANOVLLM_PROFILE_DECODE_OUTPUT` | 非空时仅在 TP rank 0 采集从首次 decode 到生成结束的 profile，并写入该目录 |
+| `NANOVLLM_GS_MISS_RATE_ON_LAYERS` | eager-only；逗号分隔的层号，例如 `0,30,60`，在 gather 前打印当前 batch 的 miss rate |
 
 　
 
@@ -149,7 +178,6 @@ DeepSeek-V3.2-REAP-345B-A37B-BF16 模型，TP16+EP16，序列长度 30k
 | nanovllm (不卸载)       | 700           | 700              | 2      | 58 ms        | 34 TPS     | 
 | nanovllm (卸载, GS算子) | 350           | 1500             | 2      | 79 ms        | 25 TPS     | 
 | nanovllm (卸载, GS算子) | 350           | 1500             | 6      | 97 ms        | 61 TPS     | 
-
 
 
 

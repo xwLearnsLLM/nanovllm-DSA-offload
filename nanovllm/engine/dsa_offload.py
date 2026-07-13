@@ -6,6 +6,52 @@ from collections import deque
 DSA_SELECTION_TOPK_TOKENS = 2048
 
 
+def parse_gs_miss_rate_layers(
+    value: str | None,
+    num_hidden_layers: int,
+) -> frozenset[int]:
+    if value is None or not value.strip():
+        return frozenset()
+    parts = value.split(",")
+    if any(not part.strip() for part in parts):
+        raise ValueError(
+            "NANOVLLM_GS_MISS_RATE_ON_LAYERS must be a comma-separated "
+            "list such as 0,30,60."
+        )
+    try:
+        layers = frozenset(int(part.strip()) for part in parts)
+    except ValueError as exc:
+        raise ValueError(
+            "NANOVLLM_GS_MISS_RATE_ON_LAYERS must contain integers."
+        ) from exc
+    invalid = sorted(
+        layer for layer in layers if layer < 0 or layer >= num_hidden_layers
+    )
+    if invalid:
+        raise ValueError(
+            "NANOVLLM_GS_MISS_RATE_ON_LAYERS contains out-of-range layers "
+            f"{invalid}; valid range is [0, {num_hidden_layers - 1}]."
+        )
+    return layers
+
+
+def compute_gs_miss_counts(
+    topk_rows: list[list[int]],
+    selection_rows: list[list[int]],
+) -> list[int]:
+    """Return |topk - selection| for each request, ignoring invalid -1 IDs."""
+    if len(topk_rows) != len(selection_rows):
+        raise ValueError("topk and selection row counts must match.")
+    miss_counts = []
+    for topk, selection in zip(topk_rows, selection_rows):
+        topk_set = {int(token_id) for token_id in topk if int(token_id) >= 0}
+        selection_set = {
+            int(token_id) for token_id in selection if int(token_id) >= 0
+        }
+        miss_counts.append(len(topk_set - selection_set))
+    return miss_counts
+
+
 def compute_sparse_blocks(num_prefill_full_blocks: int, block_size: int = 128) -> int:
     """Only sparse-offload full prefill blocks when they exceed the 2048-token budget."""
     n = int(num_prefill_full_blocks)
