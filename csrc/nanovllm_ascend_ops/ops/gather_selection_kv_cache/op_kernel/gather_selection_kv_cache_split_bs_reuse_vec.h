@@ -150,11 +150,11 @@ private:
             int64_t curBatchSize = (blkIdx_ * tiling_->mainCoreBsLoopNum + bsIdx) / rawSeq_;
             int64_t curSeq = (blkIdx_ * tiling_->mainCoreBsLoopNum + bsIdx) % rawSeq_;
             int64_t offset = (rawSeq_ - 1) - (blkIdx_ * tiling_->mainCoreBsLoopNum + bsIdx) % rawSeq_;
-            if constexpr (PARALLEL_COPY) {
-                copyCountsGm_.SetValue(GlobalRow(bsIdx), 0);
-            }
             curFullKvSeqLen = fullKvActualSeqGm_.GetValue(curBatchSize);
             if (curFullKvSeqLen <= tiling_->topk) {
+                if constexpr (PARALLEL_COPY) {
+                    PublishCopyCount(GlobalRow(bsIdx), 0);
+                }
                 continue;
             }
             int32_t poolEntry = reqPoolEntriesGm_.GetValue(curBatchSize);
@@ -204,6 +204,23 @@ private:
         return blkIdx_ * tiling_->mainCoreBsLoopNum + bsIdx;
     }
 
+    __aicore__ inline int64_t CopyCountOffset(int64_t row) const
+    {
+        return row * COPY_COUNT_CACHE_LINE_ELEMENTS;
+    }
+
+    __aicore__ inline void PublishCopyCount(int64_t row, int32_t copyCount)
+    {
+        const int64_t countOffset = CopyCountOffset(row);
+        copyCountsGm_.SetValue(countOffset, copyCount);
+        // SetValue only dirties this AIV's DCache.  Publish the one cache line
+        // owned by this row before other AIVs pass the cross-core barrier.
+        __asm__ __volatile__("");
+        DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(
+            copyCountsGm_[countOffset]);
+        __asm__ __volatile__("");
+    }
+
     __aicore__ inline void PublishCopyPairs(int64_t bsIdx, int32_t copyCount,
         LocalTensor<int32_t>& copySrcLocal, LocalTensor<int32_t>& copyDstLocal)
     {
@@ -218,47 +235,66 @@ private:
             DataCopyPad(copyDstSlotIdsGm_[row * tiling_->topk], copyDstLocal, copyParams);
             SetWaitFlag<HardEvent::MTE3_S>(HardEvent::MTE3_S);
         }
-        copyCountsGm_.SetValue(row, copyCount);
+        PublishCopyCount(row, copyCount);
     }
 
-    __aicore__ inline int64_t FirstFlatPairAtOrAfter(int64_t start)
+    __aicore__ inline int32_t LoadCopyCount(int64_t row)
     {
-        if (start <= blkIdx_) {
-            return blkIdx_;
-        }
-        const int64_t steps = CeilDiv(start - static_cast<int64_t>(blkIdx_), tiling_->usedCoreNum);
-        return static_cast<int64_t>(blkIdx_) + steps * tiling_->usedCoreNum;
+        const int64_t countOffset = CopyCountOffset(row);
+        // The row owner changed this address since the preceding decode step.
+        __asm__ __volatile__("");
+        DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(
+            copyCountsGm_[countOffset]);
+        __asm__ __volatile__("");
+        return copyCountsGm_.GetValue(countOffset);
     }
 
     __aicore__ inline void ProcessParallelCopies()
     {
-        const int64_t totalPairSlots = tiling_->batchsize * tiling_->topk;
-        int64_t rowCached = -1;
-        int32_t copyCountCached = 0;
-        int64_t flatPairIdx = blkIdx_;
-        while (flatPairIdx < totalPairSlots) {
-            const int64_t row = flatPairIdx / tiling_->topk;
-            const int32_t copyIdx = static_cast<int32_t>(flatPairIdx - row * tiling_->topk);
-            if (row != rowCached) {
-                copyCountCached = copyCountsGm_.GetValue(row);
-                ASSERT_MSG(copyCountCached >= 0 && copyCountCached <= tiling_->topk,
-                    "copy count must be in [0, topk].");
-                rowCached = row;
-            }
-            if (copyIdx >= copyCountCached) {
-                flatPairIdx = FirstFlatPairAtOrAfter((row + 1) * tiling_->topk);
+        // Split every row into contiguous ranges.  MTE2 stages each range in
+        // UB, avoiding stale scalar DCache reads of the reused pair workspace.
+        LocalTensor<int32_t> copySrcLocal = workBuf_.Get<int32_t>();
+        const int64_t maxPairsPerCore = CeilDiv(tiling_->topk, tiling_->usedCoreNum);
+        const int64_t pairLocalStride = CeilAlign(
+            maxPairsPerCore, static_cast<int64_t>(BLOCK_BYTES / sizeof(int32_t)));
+        LocalTensor<int32_t> copyDstLocal = copySrcLocal[pairLocalStride];
+        DataCopyPadExtParams<int32_t> padParams{false, 0, 0, 0};
+
+        for (int64_t row = 0; row < tiling_->batchsize; ++row) {
+            const int32_t copyCount = LoadCopyCount(row);
+            ASSERT_MSG(copyCount >= 0 && copyCount <= tiling_->topk,
+                "copy count:%d for row:%ld must be in [0, topk:%ld].",
+                copyCount, row, tiling_->topk);
+            if (copyCount == 0) {
                 continue;
             }
-            CopyOneParallelPair(row, copyIdx);
-            flatPairIdx += tiling_->usedCoreNum;
+
+            const int64_t pairsPerCore = CeilDiv(
+                static_cast<int64_t>(copyCount), tiling_->usedCoreNum);
+            const int64_t pairBegin = static_cast<int64_t>(blkIdx_) * pairsPerCore;
+            if (pairBegin >= copyCount) {
+                continue;
+            }
+            const int64_t remainingPairs = static_cast<int64_t>(copyCount) - pairBegin;
+            const int32_t localPairCount = static_cast<int32_t>(
+                pairsPerCore < remainingPairs ? pairsPerCore : remainingPairs);
+            const int64_t pairOffset = row * tiling_->topk + pairBegin;
+            DataCopyExtParams copyParams{
+                static_cast<uint16_t>(1),
+                static_cast<uint32_t>(localPairCount * sizeof(int32_t)), 0, 0, 0};
+            DataCopyPad(copySrcLocal, copySrcTokenIdsGm_[pairOffset], copyParams, padParams);
+            DataCopyPad(copyDstLocal, copyDstSlotIdsGm_[pairOffset], copyParams, padParams);
+            SetWaitFlag<HardEvent::MTE2_S>(HardEvent::MTE2_S);
+
+            for (int32_t localIdx = 0; localIdx < localPairCount; ++localIdx) {
+                CopyOneParallelPair(
+                    row, copySrcLocal.GetValue(localIdx), copyDstLocal.GetValue(localIdx));
+            }
         }
     }
 
-    __aicore__ inline void CopyOneParallelPair(int64_t row, int32_t copyIdx)
+    __aicore__ inline void CopyOneParallelPair(int64_t row, int32_t srcTokenId, int32_t dstSlotId)
     {
-        const int64_t pairOffset = row * tiling_->topk + copyIdx;
-        const int32_t srcTokenId = copySrcTokenIdsGm_.GetValue(pairOffset);
-        const int32_t dstSlotId = copyDstSlotIdsGm_.GetValue(pairOffset);
         ASSERT_MSG(srcTokenId >= 0 && dstSlotId >= 0, "copy pair indices must be non-negative.");
 
         const int64_t srcBlockCol = srcTokenId / tiling_->fullKvBlockSize;
@@ -868,6 +904,7 @@ private:
     int32_t selKvActSeqUb_ = 0;
 
     constexpr static int32_t BLOCK_BYTES = 32;
+    constexpr static int32_t COPY_COUNT_CACHE_LINE_ELEMENTS = 64 / sizeof(int32_t);
 
     GlobalTensor<T> selKRopeGm_;
     GlobalTensor<T> selKvCacheGm_;

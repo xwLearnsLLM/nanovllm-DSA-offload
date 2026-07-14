@@ -53,6 +53,10 @@ constexpr int64_t PARALLEL_COPY_TOPK = 2048;
 constexpr int64_t PARALLEL_COPY_BLOCK_SIZE = 128;
 constexpr int64_t PARALLEL_COPY_K_ROPE_DIM = 64;
 constexpr int64_t PARALLEL_COPY_KV_CACHE_DIM = 512;
+// GlobalTensor::SetValue writes through the per-core DCache.  Give every row
+// its own cache line so row owners cannot overwrite each other's count when
+// the lines are cleaned before the cross-core barrier.
+constexpr int64_t PARALLEL_COPY_COUNT_BYTES_PER_ROW = 64;
 
 template <typename T>
 static inline T CeilDiv(T num, T rnd)
@@ -623,8 +627,8 @@ ge::graphStatus GatherSelectionKvCacheTiling::DoOpTiling()
         tilingData_.set_usedCoreNum(coreNum_);
         const int64_t pairSlots = batchSize_ * topk_;
         const int64_t pairBytes = pairSlots * static_cast<int64_t>(sizeof(int32_t));
-        const int64_t countBytes = batchSize_ * static_cast<int64_t>(sizeof(int32_t));
-        const int64_t userWorkspaceSize = CeilAlign(pairBytes * 2 + countBytes, static_cast<int64_t>(32));
+        const int64_t countBytes = batchSize_ * PARALLEL_COPY_COUNT_BYTES_PER_ROW;
+        const int64_t userWorkspaceSize = CeilAlign(pairBytes * 2 + countBytes, static_cast<int64_t>(64));
         workspaceSize_ = libApiWorkspaceSize_ + userWorkspaceSize;
     } else if (topk_ <= TOPK_SPLIT_NUM) {
         tilingKey_ = 1; // 1:reuse
