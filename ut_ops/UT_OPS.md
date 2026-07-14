@@ -30,9 +30,10 @@ python3 ut_ops/moe/probe_grouped.py
 ## GatherSelection all-core copy tiling
 
 `test_parallel_copy.py` runs the legacy row-core tiling and the new all-core
-copy tiling in separate processes.  Both implementations must pass four
-stateful top-k transitions with exact BF16 cache equality plus a short-row
-no-op check that catches stale workspace pairs.  The timed section
+copy tiling in separate processes.  Both implementations must pass five
+stateful top-k transitions with exact BF16 cache equality, including repeated
+long rows with zero misses, plus a short-row no-op check that catches stale
+workspace pairs.  The timed section
 alternates two top-k sets so every invocation has the configured miss rate.
 The full KV source uses `empty_with_swapped_memory`, matching the offload path.
 

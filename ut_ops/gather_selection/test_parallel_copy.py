@@ -329,6 +329,76 @@ def _validate_short_row_skip(args: argparse.Namespace, inputs: dict[str, Any]) -
     )
 
 
+def _validate_long_row_zero_miss(
+    args: argparse.Namespace,
+    inputs: dict[str, Any],
+    topk_indices: Any,
+    expected_topk_cpu: Any,
+    previous_topk_cpu: Any | None,
+    step: int,
+) -> None:
+    """Poison a prior miss destination and prove a zero-miss step does not copy it."""
+    import torch
+
+    row = 0
+    pool_entry = int(inputs["req_pool_entries_cpu"][row])
+    status_before = inputs["selection_kv_block_status_pool"][pool_entry].clone()
+    status_cpu = status_before.detach().cpu()[0, 0, : args.topk].to(torch.int64)
+
+    slot = 0
+    if previous_topk_cpu is not None:
+        previous = set(
+            int(token)
+            for token in previous_topk_cpu[row, 0, 0].to(torch.int64).tolist()
+        )
+        slot = next(
+            (
+                index
+                for index, token in enumerate(status_cpu.tolist())
+                if int(token) not in previous
+            ),
+            -1,
+        )
+        if slot < 0:
+            raise AssertionError("zero-miss check could not find a previous miss destination")
+
+    dst_block = int(
+        inputs["selection_kv_block_table_cpu"][row, slot // args.block_size]
+    )
+    dst_offset = slot % args.block_size
+    rope_view = inputs["selection_k_rope"][dst_block, dst_offset]
+    kv_view = inputs["selection_kv_cache"][dst_block, dst_offset]
+    rope_before = rope_view.clone()
+    kv_before = kv_view.clone()
+    rope_view.fill_(17.0)
+    kv_view.fill_(-23.0)
+    poisoned_rope = rope_view.clone()
+    poisoned_kv = kv_view.clone()
+
+    _call_op(inputs, topk_indices)
+    torch.npu.synchronize()
+    if not torch.equal(rope_view, poisoned_rope):
+        raise AssertionError(
+            f"step={step} row={row} zero-miss step replayed a stale K-RoPE copy"
+        )
+    if not torch.equal(kv_view, poisoned_kv):
+        raise AssertionError(
+            f"step={step} row={row} zero-miss step replayed a stale latent-KV copy"
+        )
+    if not torch.equal(
+        inputs["selection_kv_block_status_pool"][pool_entry], status_before
+    ):
+        raise AssertionError(f"step={step} row={row} zero-miss step changed cache status")
+
+    rope_view.copy_(rope_before)
+    kv_view.copy_(kv_before)
+    _validate_step(args, inputs, expected_topk_cpu, step)
+    print(
+        "GSKV_PARALLEL_ZERO_MISS_CHECK "
+        f"implementation={args.implementation} step={step} row={row} slot={slot} ok=1"
+    )
+
+
 def _run_worker(args: argparse.Namespace) -> None:
     if args.implementation not in ("legacy", "parallel"):
         raise ValueError("worker requires --implementation legacy or parallel")
@@ -370,23 +440,28 @@ def _run_worker(args: argparse.Namespace) -> None:
     )
     inputs = _make_inputs(args, device)
 
-    steps = (
+    _call_op(inputs, inputs["old_topk"])
+    _validate_step(args, inputs, inputs["old_topk_cpu"], 0)
+    _validate_long_row_zero_miss(
+        args,
+        inputs,
         inputs["old_topk"],
-        inputs["new_topk"],
-        inputs["old_topk"],
-        inputs["new_topk"],
-    )
-    expected_steps = (
         inputs["old_topk_cpu"],
+        None,
+        1,
+    )
+    _call_op(inputs, inputs["new_topk"])
+    _validate_step(args, inputs, inputs["new_topk_cpu"], 2)
+    _validate_long_row_zero_miss(
+        args,
+        inputs,
+        inputs["new_topk"],
         inputs["new_topk_cpu"],
         inputs["old_topk_cpu"],
-        inputs["new_topk_cpu"],
+        3,
     )
-    for step, (topk_indices, expected_cpu) in enumerate(
-        zip(steps, expected_steps, strict=True)
-    ):
-        _call_op(inputs, topk_indices)
-        _validate_step(args, inputs, expected_cpu, step)
+    _call_op(inputs, inputs["old_topk"])
+    _validate_step(args, inputs, inputs["old_topk_cpu"], 4)
     _validate_short_row_skip(args, inputs)
 
     for _ in range(args.warmup):
