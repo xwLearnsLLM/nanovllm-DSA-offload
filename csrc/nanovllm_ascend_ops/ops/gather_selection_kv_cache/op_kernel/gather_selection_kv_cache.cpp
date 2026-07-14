@@ -51,7 +51,14 @@ extern "C" __global__ __aicore__ void gather_selection_kv_cache(
         op.Init(
             selection_k_rope, selection_kv_cache, selection_kv_block_table, selection_kv_block_status,
             req_pool_entries, selection_topk_indices, full_k_rope, full_kv_cache, full_kv_block_table,
-            full_kv_actual_seq);
+            full_kv_actual_seq, workspace);
+        op.Process();
+    } else if (TILING_KEY_IS(3)) {
+        GatherSelectionKvCacheSplitBsReuseVec<DTYPE_FULL_K_ROPE, true> op(&pipe, &tilingData);
+        op.Init(
+            selection_k_rope, selection_kv_cache, selection_kv_block_table, selection_kv_block_status,
+            req_pool_entries, selection_topk_indices, full_k_rope, full_kv_cache, full_kv_block_table,
+            full_kv_actual_seq, GetUserWorkspace(workspace));
         op.Process();
     }
 }

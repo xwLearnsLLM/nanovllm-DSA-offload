@@ -32,6 +32,7 @@
 namespace optiling {
 BEGIN_TILING_DATA_DEF(GatherSelectionKvCacheTilingData)
 TILING_DATA_FIELD_DEF(int64_t, usedCoreNum);
+TILING_DATA_FIELD_DEF(int64_t, rowCoreNum);
 TILING_DATA_FIELD_DEF(int64_t, mainCoreBsLoopNum);
 TILING_DATA_FIELD_DEF(int64_t, tailCoreBsLoopNum);
 TILING_DATA_FIELD_DEF(int64_t, selTopKBlockSize);
@@ -110,6 +111,8 @@ private:
     DataLayout topKLayout_ = DataLayout::BSND;
 
     ge::DataType selKRopeDtype_;
+    int64_t libApiWorkspaceSize_ = 0;
+    int64_t workspaceSize_ = 0;
 
     gert::TilingContext *context_ = nullptr;
     uint64_t tilingKey_{0};

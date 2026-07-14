@@ -34,7 +34,7 @@ constexpr int32_t SORT_OFFSET = 4;
 constexpr int32_t SORTED_STAT_TOPK_IDX_OFFSET = 3;
 constexpr int32_t SORTED_STAT_TOPK_OFFSET = 2;
 
-template <typename T>
+template <typename T, bool PARALLEL_COPY = false>
 class GatherSelectionKvCacheSplitBsReuseVec {
 public:
     __aicore__ inline GatherSelectionKvCacheSplitBsReuseVec(TPipe* pipe, const GatherSelectionKvCacheTilingData* tiling)
@@ -44,7 +44,8 @@ public:
     __aicore__ inline void Init(
         GM_ADDR selection_k_rope, GM_ADDR selection_kv_cache, GM_ADDR selection_kv_block_table,
         GM_ADDR selection_kv_block_status, GM_ADDR req_pool_entries, GM_ADDR selection_topk_indices,
-        GM_ADDR full_k_rope, GM_ADDR full_kv_cache, GM_ADDR full_kv_block_table, GM_ADDR full_kv_actual_seq)
+        GM_ADDR full_k_rope, GM_ADDR full_kv_cache, GM_ADDR full_kv_block_table, GM_ADDR full_kv_actual_seq,
+        GM_ADDR user_workspace)
     {
         blkIdx_ = GetBlockIdx();
         if (blkIdx_ >= tiling_->usedCoreNum) {
@@ -76,7 +77,10 @@ public:
         pipe_->InitBuffer(workBuf_, selKvBlockTableUb_ + selKvActSeqUb_ + selBlockStatUb_ +
                           topkSortAlign_ * sizeof(int32_t) * TOPK_NUMS);
 
-        bsLoopNum_ = (blkIdx_ == tiling_->usedCoreNum - 1) ? tiling_->tailCoreBsLoopNum : tiling_->mainCoreBsLoopNum;
+        if (blkIdx_ < tiling_->rowCoreNum) {
+            bsLoopNum_ = (blkIdx_ == tiling_->rowCoreNum - 1) ?
+                tiling_->tailCoreBsLoopNum : tiling_->mainCoreBsLoopNum;
+        }
 
         int64_t BsiSH = tiling_->mainCoreBsLoopNum * SH;
         // [s_block_num, block_size, k_rope] // 64
@@ -98,12 +102,33 @@ public:
         fullKvBlockTableGm_.SetGlobalBuffer((__gm__ int32_t*)full_kv_block_table);
         // [batchsize] 每个batch实际的seq长度
         fullKvActualSeqGm_.SetGlobalBuffer((__gm__ int32_t*)full_kv_actual_seq);
+        if constexpr (PARALLEL_COPY) {
+            const int64_t totalPairSlots = tiling_->batchsize * tiling_->topk;
+            copySrcTokenIdsGm_.SetGlobalBuffer((__gm__ int32_t*)user_workspace);
+            copyDstSlotIdsGm_.SetGlobalBuffer((__gm__ int32_t*)user_workspace + totalPairSlots);
+            copyCountsGm_.SetGlobalBuffer((__gm__ int32_t*)user_workspace + totalPairSlots * 2);
+        }
         // [batchsize] 每个batch实际的seq长度   用来算MTP场景不同T下面的kv_actual_seq
     }
 
     __aicore__ inline void Process()
     {
-        if (blkIdx_ >= tiling_->usedCoreNum) {
+        if constexpr (PARALLEL_COPY) {
+            // Row owners update the resident-set state and publish compact miss pairs.
+            ProcessRows();
+            PipeBarrier<PIPE_ALL>();
+            SyncAll<true>();
+            // All vector cores then share the host-DRAM -> HBM copies.
+            ProcessParallelCopies();
+        } else {
+            ProcessRows();
+        }
+    }
+
+private:
+    __aicore__ inline void ProcessRows()
+    {
+        if (blkIdx_ >= tiling_->rowCoreNum) {
             return;
         }
 
@@ -125,6 +150,9 @@ public:
             int64_t curBatchSize = (blkIdx_ * tiling_->mainCoreBsLoopNum + bsIdx) / rawSeq_;
             int64_t curSeq = (blkIdx_ * tiling_->mainCoreBsLoopNum + bsIdx) % rawSeq_;
             int64_t offset = (rawSeq_ - 1) - (blkIdx_ * tiling_->mainCoreBsLoopNum + bsIdx) % rawSeq_;
+            if constexpr (PARALLEL_COPY) {
+                copyCountsGm_.SetValue(GlobalRow(bsIdx), 0);
+            }
             curFullKvSeqLen = fullKvActualSeqGm_.GetValue(curBatchSize);
             if (curFullKvSeqLen <= tiling_->topk) {
                 continue;
@@ -163,13 +191,106 @@ public:
         }
     }
 
-private:
     template <HardEvent event>
     __aicore__ inline void SetWaitFlag(HardEvent evt)
     {
         event_t eventId = static_cast<event_t>(GetTPipePtr()->FetchEventID(evt));
         SetFlag<event>(eventId);
         WaitFlag<event>(eventId);
+    }
+
+    __aicore__ inline int64_t GlobalRow(int64_t bsIdx) const
+    {
+        return blkIdx_ * tiling_->mainCoreBsLoopNum + bsIdx;
+    }
+
+    __aicore__ inline void PublishCopyPairs(int64_t bsIdx, int32_t copyCount,
+        LocalTensor<int32_t>& copySrcLocal, LocalTensor<int32_t>& copyDstLocal)
+    {
+        ASSERT_MSG(copyCount >= 0 && copyCount <= tiling_->topk,
+            "copyCount must be in [0, topk].");
+        const int64_t row = GlobalRow(bsIdx);
+        if (copyCount > 0) {
+            SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
+            DataCopyExtParams copyParams{
+                static_cast<uint16_t>(1), static_cast<uint32_t>(copyCount * sizeof(int32_t)), 0, 0, 0};
+            DataCopyPad(copySrcTokenIdsGm_[row * tiling_->topk], copySrcLocal, copyParams);
+            DataCopyPad(copyDstSlotIdsGm_[row * tiling_->topk], copyDstLocal, copyParams);
+            SetWaitFlag<HardEvent::MTE3_S>(HardEvent::MTE3_S);
+        }
+        copyCountsGm_.SetValue(row, copyCount);
+    }
+
+    __aicore__ inline int64_t FirstFlatPairAtOrAfter(int64_t start)
+    {
+        if (start <= blkIdx_) {
+            return blkIdx_;
+        }
+        const int64_t steps = CeilDiv(start - static_cast<int64_t>(blkIdx_), tiling_->usedCoreNum);
+        return static_cast<int64_t>(blkIdx_) + steps * tiling_->usedCoreNum;
+    }
+
+    __aicore__ inline void ProcessParallelCopies()
+    {
+        const int64_t totalPairSlots = tiling_->batchsize * tiling_->topk;
+        int64_t rowCached = -1;
+        int32_t copyCountCached = 0;
+        int64_t flatPairIdx = blkIdx_;
+        while (flatPairIdx < totalPairSlots) {
+            const int64_t row = flatPairIdx / tiling_->topk;
+            const int32_t copyIdx = static_cast<int32_t>(flatPairIdx - row * tiling_->topk);
+            if (row != rowCached) {
+                copyCountCached = copyCountsGm_.GetValue(row);
+                ASSERT_MSG(copyCountCached >= 0 && copyCountCached <= tiling_->topk,
+                    "copy count must be in [0, topk].");
+                rowCached = row;
+            }
+            if (copyIdx >= copyCountCached) {
+                flatPairIdx = FirstFlatPairAtOrAfter((row + 1) * tiling_->topk);
+                continue;
+            }
+            CopyOneParallelPair(row, copyIdx);
+            flatPairIdx += tiling_->usedCoreNum;
+        }
+    }
+
+    __aicore__ inline void CopyOneParallelPair(int64_t row, int32_t copyIdx)
+    {
+        const int64_t pairOffset = row * tiling_->topk + copyIdx;
+        const int32_t srcTokenId = copySrcTokenIdsGm_.GetValue(pairOffset);
+        const int32_t dstSlotId = copyDstSlotIdsGm_.GetValue(pairOffset);
+        ASSERT_MSG(srcTokenId >= 0 && dstSlotId >= 0, "copy pair indices must be non-negative.");
+
+        const int64_t srcBlockCol = srcTokenId / tiling_->fullKvBlockSize;
+        const int64_t srcBlockOffset = srcTokenId - srcBlockCol * tiling_->fullKvBlockSize;
+        const int64_t dstBlockCol = dstSlotId / tiling_->selKvBlockSize;
+        const int64_t dstBlockOffset = dstSlotId - dstBlockCol * tiling_->selKvBlockSize;
+        const int32_t srcBlock = fullKvBlockTableGm_.GetValue(row * tiling_->fullMaxBlockNum + srcBlockCol);
+        const int32_t dstBlock = selKvBlockTableGm_.GetValue(row * tiling_->selMaxBlockNum + dstBlockCol);
+        ASSERT_MSG(srcBlock >= 0 && dstBlock >= 0, "copy pair block-table entries must be non-negative.");
+
+        const int64_t srcKvAddr = srcBlock * tiling_->fullKvBlockSize * tiling_->kvCacheDim +
+            srcBlockOffset * tiling_->kvCacheDim;
+        const int64_t srcRopeAddr = srcBlock * tiling_->fullKvBlockSize * tiling_->kRopeDim +
+            srcBlockOffset * tiling_->kRopeDim;
+        const int64_t dstKvAddr = dstBlock * tiling_->selKvBlockSize * tiling_->kvCacheDim +
+            dstBlockOffset * tiling_->kvCacheDim;
+        const int64_t dstRopeAddr = dstBlock * tiling_->selKvBlockSize * tiling_->kRopeDim +
+            dstBlockOffset * tiling_->kRopeDim;
+
+        LocalTensor<T> inTensor = kvCacheQue_.AllocTensor<T>();
+        DataCopyPadExtParams<T> padParams{false, 0, 0, 0};
+        DataCopyExtParams kvParams{
+            static_cast<uint16_t>(1), static_cast<uint32_t>(tiling_->kvCacheDim * sizeof(T)), 0, 0, 0};
+        DataCopyExtParams ropeParams{
+            static_cast<uint16_t>(1), static_cast<uint32_t>(tiling_->kRopeDim * sizeof(T)), 0, 0, 0};
+        DataCopyPad(inTensor, fullKvCacheGm_[srcKvAddr], kvParams, padParams);
+        DataCopyPad(inTensor[kRopeUbOffset_], fullKRopeGm_[srcRopeAddr], ropeParams, padParams);
+        kvCacheQue_.EnQue(inTensor);
+        inTensor = kvCacheQue_.DeQue<T>();
+        DataCopyPad(selKvCacheGm_[dstKvAddr], inTensor, kvParams);
+        DataCopyPad(selKRopeGm_[dstRopeAddr], inTensor[kRopeUbOffset_], ropeParams);
+        kvCacheQue_.FreeTensor(inTensor);
     }
 
     __aicore__ inline void CopyInTopKIndices(int64_t bsIdx)
@@ -474,12 +595,16 @@ private:
         int32_t maxTopkWritedIdx = -1; // 本seq命中,第一次遍历才会有值
         int32_t maxHitSameSeqIdx = -1; // 本seq中命中,在laststatus中的最大位置
         int32_t totalInsertIdx = 0;
+        int32_t copyCount = 0;
 
         AscendC::Duplicate(insertStatusSameSeqLocal_, -1, topkSortAlign_);
         AscendC::Duplicate(hitFromSrcSeqLocal_, -1, topkSortAlign_);
         PipeBarrier<PIPE_V>();
         GatherInfoGen(seqIdx, hnIdx, maxSelectionId, maxValidCacheId, selBlockStatLocal, selTopKIdxLocal,
             validTopkNum, maxTopkId, maxTopkWritedIdx, maxHitSameSeqIdx);
+
+        LocalTensor<int32_t> copySrcLocal = sortBuf_;
+        LocalTensor<int32_t> copyDstLocal = sortBuf_[topkSortAlign_];
 
         for (int64_t topKIdx = 0; topKIdx < validTopkNum; topKIdx++) {
             int32_t topKId = selTopKIdxLocal.GetValue(topKIdx);
@@ -515,7 +640,13 @@ private:
                                      selKvBlkSizeOffset * tiling_->kvCacheDim;
 
             if (hitFromSrcSeqLocal_.GetValue(topKIdx) == -1) {
-                CopyFromFullKv(bsIdx, topKId, gatherBlockSize, selKRopeAddr, selKvCacheAddr);
+                if constexpr (PARALLEL_COPY) {
+                    copySrcLocal.SetValue(copyCount, topKId);
+                    copyDstLocal.SetValue(copyCount, insertIdx);
+                    copyCount++;
+                } else {
+                    CopyFromFullKv(bsIdx, topKId, gatherBlockSize, selKRopeAddr, selKvCacheAddr);
+                }
             } else {
                 CopyFromSelKv(bsIdx, hitFromSrcSeqLocal_.GetValue(topKIdx), selKvBlockTableLocal, gatherBlockSize,
                     selKRopeAddr, selKvCacheAddr);
@@ -527,6 +658,10 @@ private:
             if (topKId == maxTopkId) {
                 maxTopkWritedIdx = insertIdx;
             }
+        }
+
+        if constexpr (PARALLEL_COPY) {
+            PublishCopyPairs(bsIdx, copyCount, copySrcLocal, copyDstLocal);
         }
 
         // 清理无效的block_status位置及设置seqlen
@@ -744,6 +879,9 @@ private:
     GlobalTensor<int32_t> fullKvBlockTableGm_;
     GlobalTensor<int32_t> fullKvActualSeqGm_;
     GlobalTensor<int32_t> reqPoolEntriesGm_;
+    GlobalTensor<int32_t> copySrcTokenIdsGm_;
+    GlobalTensor<int32_t> copyDstSlotIdsGm_;
+    GlobalTensor<int32_t> copyCountsGm_;
 
     LocalTensor<int32_t> topkIndicesLocal_;
     LocalTensor<int32_t> insertStatusSameSeqLocal_;

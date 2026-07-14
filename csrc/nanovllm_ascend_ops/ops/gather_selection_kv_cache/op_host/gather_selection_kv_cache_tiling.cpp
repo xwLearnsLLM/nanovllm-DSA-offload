@@ -21,6 +21,9 @@
 
 #include "gather_selection_kv_cache_tiling.h"
 
+#include <cstdlib>
+#include <cstring>
+
 namespace optiling {
 
 constexpr int32_t SEL_K_ROPE_IDX = 0;
@@ -46,6 +49,10 @@ constexpr int32_t MAX_KV_CACHE_DIM = 656;
 constexpr int32_t MAX_TOPK_NUM = 2048;
 constexpr int32_t TOPK_SPLIT_NUM = 32;
 constexpr int64_t DEFAULT_WORKSPACE_SIZE = 32;
+constexpr int64_t PARALLEL_COPY_TOPK = 2048;
+constexpr int64_t PARALLEL_COPY_BLOCK_SIZE = 128;
+constexpr int64_t PARALLEL_COPY_K_ROPE_DIM = 64;
+constexpr int64_t PARALLEL_COPY_KV_CACHE_DIM = 512;
 
 template <typename T>
 static inline T CeilDiv(T num, T rnd)
@@ -59,6 +66,29 @@ static inline T CeilAlign(T num, T rnd)
     return (((rnd) == 0) ? 0 : (((num) + (rnd) - 1) / (rnd)) * (rnd));
 }
 
+enum class ParallelCopyMode : uint32_t {
+    AUTO = 0,
+    DISABLED = 1,
+    REQUIRED = 2,
+};
+
+static ParallelCopyMode GetParallelCopyMode()
+{
+    // Unset: select key3 when eligible; 0/legacy: key2; force: require key3 (used by the UT).
+    const char* value = std::getenv("NANOVLLM_GS_PARALLEL_COPY");
+    if (value == nullptr || value[0] == '\0') {
+        return ParallelCopyMode::AUTO;
+    }
+    if (std::strcmp(value, "0") == 0 || std::strcmp(value, "false") == 0 ||
+        std::strcmp(value, "legacy") == 0) {
+        return ParallelCopyMode::DISABLED;
+    }
+    if (std::strcmp(value, "force") == 0) {
+        return ParallelCopyMode::REQUIRED;
+    }
+    return ParallelCopyMode::AUTO;
+}
+
 ge::graphStatus GatherSelectionKvCacheTiling::GetPlatformInfo()
 {
     auto platformInfo = context_->GetPlatformInfo();
@@ -66,6 +96,7 @@ ge::graphStatus GatherSelectionKvCacheTiling::GetPlatformInfo()
         return ge::GRAPH_FAILED);
     auto ascendcPlatform = platform_ascendc::PlatformAscendC(platformInfo);
     coreNum_ = ascendcPlatform.GetCoreNumAiv();
+    libApiWorkspaceSize_ = static_cast<int64_t>(ascendcPlatform.GetLibApiWorkSpaceSize());
     OPS_ERR_IF(
         coreNum_ <= 0, OPS_LOG_E(context_->GetNodeName(), "coreNum must be greater than 0."),
         return ge::GRAPH_FAILED);
@@ -557,13 +588,15 @@ ge::graphStatus GatherSelectionKvCacheTiling::DoOpTiling()
 {
     if (batchSize_ == 0) {
         tilingData_.set_usedCoreNum(0);
+        tilingData_.set_rowCoreNum(0);
+        workspaceSize_ = DEFAULT_WORKSPACE_SIZE;
         context_->SetBlockDim(1);
         return ge::GRAPH_SUCCESS;
     }
 
     int64_t bsCoreFactor = CeilDiv(batchSize_, static_cast<int64_t>(coreNum_));
     int64_t bsCoreNum = CeilDiv(batchSize_, bsCoreFactor);
-    tilingData_.set_usedCoreNum(bsCoreNum);
+    tilingData_.set_rowCoreNum(bsCoreNum);
 
     bsCoreFactor = CeilDiv(batchSize_, bsCoreNum);
     int64_t tailCoreBsFactor = batchSize_ - (bsCoreNum - 1) * bsCoreFactor;
@@ -572,10 +605,35 @@ ge::graphStatus GatherSelectionKvCacheTiling::DoOpTiling()
     tilingData_.set_tailCoreBsLoopNum(tailCoreBsFactor);
 
     tilingKey_ = 0;
-    if (topk_ <= TOPK_SPLIT_NUM) {
+    const ParallelCopyMode parallelCopyMode = GetParallelCopyMode();
+    const bool parallelCopyEligible = topk_ == PARALLEL_COPY_TOPK &&
+        tilingData_.get_rawSeq() == 1 && headnum_ == 1 && selTopKBlockSize_ == 1 &&
+        tilingData_.get_fullKvBlockSize() == PARALLEL_COPY_BLOCK_SIZE &&
+        tilingData_.get_selKvBlockSize() == PARALLEL_COPY_BLOCK_SIZE &&
+        tilingData_.get_kRopeDim() == PARALLEL_COPY_K_ROPE_DIM &&
+        tilingData_.get_kvCacheDim() == PARALLEL_COPY_KV_CACHE_DIM &&
+        tilingData_.get_ifQuant() == 0 && selKRopeDtype_ == ge::DT_BF16;
+    OPS_ERR_IF(
+        parallelCopyMode == ParallelCopyMode::REQUIRED && !parallelCopyEligible,
+        OPS_LOG_E(context_->GetNodeName(), "NANOVLLM_GS_PARALLEL_COPY=force but input is not eligible."),
+        return ge::GRAPH_FAILED);
+    const bool useParallelCopy = parallelCopyMode != ParallelCopyMode::DISABLED && parallelCopyEligible;
+    if (useParallelCopy) {
+        tilingKey_ = 3; // 3: one row owner per request, all AIV cores copy misses
+        tilingData_.set_usedCoreNum(coreNum_);
+        const int64_t pairSlots = batchSize_ * topk_;
+        const int64_t pairBytes = pairSlots * static_cast<int64_t>(sizeof(int32_t));
+        const int64_t countBytes = batchSize_ * static_cast<int64_t>(sizeof(int32_t));
+        const int64_t userWorkspaceSize = CeilAlign(pairBytes * 2 + countBytes, static_cast<int64_t>(32));
+        workspaceSize_ = libApiWorkspaceSize_ + userWorkspaceSize;
+    } else if (topk_ <= TOPK_SPLIT_NUM) {
         tilingKey_ = 1; // 1:reuse
+        tilingData_.set_usedCoreNum(bsCoreNum);
+        workspaceSize_ = DEFAULT_WORKSPACE_SIZE;
     } else {
         tilingKey_ = 2; // 2:reuse vec
+        tilingData_.set_usedCoreNum(bsCoreNum);
+        workspaceSize_ = DEFAULT_WORKSPACE_SIZE;
     }
 
     int64_t kRopeUbV =
@@ -614,7 +672,7 @@ ge::graphStatus GatherSelectionKvCacheTiling::DoOpTiling()
     tilingData_.set_kRopeUbSize(kRopeUbSize);
     tilingData_.set_kvCacheUbSize(kvCacheUbSize);
 
-    context_->SetBlockDim(bsCoreNum);
+    context_->SetBlockDim(tilingData_.get_usedCoreNum());
 
     return ge::GRAPH_SUCCESS;
 }
@@ -628,18 +686,19 @@ void GatherSelectionKvCacheTiling::PrintTilingDatas()
 {
     OPS_LOG_I(
         context_->GetNodeName(),
-        "tilingData is coreNum:%ld ubSize:%ld usedCoreNum:%ld mainCoreBsLoopNum:%ld tailCoreBsLoopNum:%ld, \
+        "tilingData is coreNum:%ld ubSize:%ld usedCoreNum:%ld rowCoreNum:%ld mainCoreBsLoopNum:%ld tailCoreBsLoopNum:%ld, \
           selTopKBlockSize:%ld, fullKvBlockNum:%ld, fullKvBlockSize:%ld, kRopeDim:%ld, \
           kvCacheDim:%ld, selKvBlockNum:%ld, selKvBlockSize:%ld, fullMaxBlockNum:%ld, selMaxBlockNum:%ld, \
           batchsize:%ld, seq:%ld, headnum:%ld, topk:%ld, kRopeUbSize:%ld, kvCacheUbSize:%ld tilingKey_:%lu, \
-          layOut:%ld",
-        coreNum_, ubSize_, tilingData_.get_usedCoreNum(), tilingData_.get_mainCoreBsLoopNum(),
-        tilingData_.get_tailCoreBsLoopNum(), tilingData_.get_selTopKBlockSize(), tilingData_.get_fullKvBlockNum(),
+          layOut:%ld workspaceSize:%ld",
+        coreNum_, ubSize_, tilingData_.get_usedCoreNum(), tilingData_.get_rowCoreNum(),
+        tilingData_.get_mainCoreBsLoopNum(), tilingData_.get_tailCoreBsLoopNum(),
+        tilingData_.get_selTopKBlockSize(), tilingData_.get_fullKvBlockNum(),
         tilingData_.get_fullKvBlockSize(), tilingData_.get_kRopeDim(), tilingData_.get_kvCacheDim(),
         tilingData_.get_selKvBlockNum(), tilingData_.get_selKvBlockSize(), tilingData_.get_fullMaxBlockNum(),
         tilingData_.get_selMaxBlockNum(), tilingData_.get_batchsize(), tilingData_.get_seq(), tilingData_.get_headnum(),
         tilingData_.get_topk(), tilingData_.get_kRopeUbSize(), tilingData_.get_kvCacheUbSize(), tilingKey_,
-        tilingData_.get_layOut());
+        tilingData_.get_layOut(), workspaceSize_);
 }
 
 ge::graphStatus GatherSelectionKvCacheTiling::PostTiling()
@@ -649,7 +708,7 @@ ge::graphStatus GatherSelectionKvCacheTiling::PostTiling()
     size_t* workspaces = context_->GetWorkspaceSizes(1);
     OPS_ERR_IF(workspaces == nullptr, OPS_LOG_E(context_->GetNodeName(), "get workspaces nullptr."),
         return ge::GRAPH_FAILED);
-    workspaces[0] = static_cast<size_t>(DEFAULT_WORKSPACE_SIZE);
+    workspaces[0] = static_cast<size_t>(workspaceSize_);
     OPS_ERR_IF(context_->GetRawTilingData() == nullptr, OPS_LOG_E(context_->GetNodeName(), "get tilingdata nullptr."),
         return ge::GRAPH_FAILED);
     tilingData_.SaveToBuffer(context_->GetRawTilingData()->GetData(), context_->GetRawTilingData()->GetCapacity());
