@@ -104,8 +104,8 @@ public:
         fullKvActualSeqGm_.SetGlobalBuffer((__gm__ int32_t*)full_kv_actual_seq);
         if constexpr (PARALLEL_COPY) {
             const int64_t totalPairSlots = tiling_->batchsize * tiling_->topk;
-            copySrcPhysicalTokenIdsGm_.SetGlobalBuffer((__gm__ int32_t*)user_workspace);
-            copyDstPhysicalTokenIdsGm_.SetGlobalBuffer((__gm__ int32_t*)user_workspace + totalPairSlots);
+            copySrcTokenIdsGm_.SetGlobalBuffer((__gm__ int32_t*)user_workspace);
+            copyDstSlotIdsGm_.SetGlobalBuffer((__gm__ int32_t*)user_workspace + totalPairSlots);
             copyCountsGm_.SetGlobalBuffer((__gm__ int32_t*)user_workspace + totalPairSlots * 2);
         }
         // [batchsize] 每个batch实际的seq长度   用来算MTP场景不同T下面的kv_actual_seq
@@ -231,8 +231,8 @@ private:
             SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
             DataCopyExtParams copyParams{
                 static_cast<uint16_t>(1), static_cast<uint32_t>(copyCount * sizeof(int32_t)), 0, 0, 0};
-            DataCopyPad(copySrcPhysicalTokenIdsGm_[row * tiling_->topk], copySrcLocal, copyParams);
-            DataCopyPad(copyDstPhysicalTokenIdsGm_[row * tiling_->topk], copyDstLocal, copyParams);
+            DataCopyPad(copySrcTokenIdsGm_[row * tiling_->topk], copySrcLocal, copyParams);
+            DataCopyPad(copyDstSlotIdsGm_[row * tiling_->topk], copyDstLocal, copyParams);
             SetWaitFlag<HardEvent::MTE3_S>(HardEvent::MTE3_S);
         }
         // The pair MTE3 transfer has completed, so its first UB element can be
@@ -283,25 +283,37 @@ private:
             DataCopyExtParams copyParams{
                 static_cast<uint16_t>(1),
                 static_cast<uint32_t>(localPairCount * sizeof(int32_t)), 0, 0, 0};
-            DataCopyPad(copySrcLocal, copySrcPhysicalTokenIdsGm_[pairOffset], copyParams, padParams);
-            DataCopyPad(copyDstLocal, copyDstPhysicalTokenIdsGm_[pairOffset], copyParams, padParams);
+            DataCopyPad(copySrcLocal, copySrcTokenIdsGm_[pairOffset], copyParams, padParams);
+            DataCopyPad(copyDstLocal, copyDstSlotIdsGm_[pairOffset], copyParams, padParams);
             SetWaitFlag<HardEvent::MTE2_S>(HardEvent::MTE2_S);
 
             for (int32_t localIdx = 0; localIdx < localPairCount; ++localIdx) {
-                CopyOneParallelPair(copySrcLocal.GetValue(localIdx), copyDstLocal.GetValue(localIdx));
+                CopyOneParallelPair(
+                    row, copySrcLocal.GetValue(localIdx), copyDstLocal.GetValue(localIdx));
             }
         }
     }
 
-    __aicore__ inline void CopyOneParallelPair(int32_t srcPhysicalTokenId, int32_t dstPhysicalTokenId)
+    __aicore__ inline void CopyOneParallelPair(int64_t row, int32_t srcTokenId, int32_t dstSlotId)
     {
-        ASSERT_MSG(srcPhysicalTokenId >= 0 && dstPhysicalTokenId >= 0,
-            "physical copy token ids must be non-negative.");
+        ASSERT_MSG(srcTokenId >= 0 && dstSlotId >= 0, "copy pair indices must be non-negative.");
 
-        const int64_t srcKvAddr = static_cast<int64_t>(srcPhysicalTokenId) * tiling_->kvCacheDim;
-        const int64_t srcRopeAddr = static_cast<int64_t>(srcPhysicalTokenId) * tiling_->kRopeDim;
-        const int64_t dstKvAddr = static_cast<int64_t>(dstPhysicalTokenId) * tiling_->kvCacheDim;
-        const int64_t dstRopeAddr = static_cast<int64_t>(dstPhysicalTokenId) * tiling_->kRopeDim;
+        const int64_t srcBlockCol = srcTokenId / tiling_->fullKvBlockSize;
+        const int64_t srcBlockOffset = srcTokenId - srcBlockCol * tiling_->fullKvBlockSize;
+        const int64_t dstBlockCol = dstSlotId / tiling_->selKvBlockSize;
+        const int64_t dstBlockOffset = dstSlotId - dstBlockCol * tiling_->selKvBlockSize;
+        const int32_t srcBlock = fullKvBlockTableGm_.GetValue(row * tiling_->fullMaxBlockNum + srcBlockCol);
+        const int32_t dstBlock = selKvBlockTableGm_.GetValue(row * tiling_->selMaxBlockNum + dstBlockCol);
+        ASSERT_MSG(srcBlock >= 0 && dstBlock >= 0, "copy pair block-table entries must be non-negative.");
+
+        const int64_t srcKvAddr = srcBlock * tiling_->fullKvBlockSize * tiling_->kvCacheDim +
+            srcBlockOffset * tiling_->kvCacheDim;
+        const int64_t srcRopeAddr = srcBlock * tiling_->fullKvBlockSize * tiling_->kRopeDim +
+            srcBlockOffset * tiling_->kRopeDim;
+        const int64_t dstKvAddr = dstBlock * tiling_->selKvBlockSize * tiling_->kvCacheDim +
+            dstBlockOffset * tiling_->kvCacheDim;
+        const int64_t dstRopeAddr = dstBlock * tiling_->selKvBlockSize * tiling_->kRopeDim +
+            dstBlockOffset * tiling_->kRopeDim;
 
         LocalTensor<T> inTensor = kvCacheQue_.AllocTensor<T>();
         DataCopyPadExtParams<T> padParams{false, 0, 0, 0};
@@ -609,8 +621,6 @@ private:
         LocalTensor<int32_t>& selKvBlockTableLocal, LocalTensor<int32_t>& selKvActSeqLocal, int64_t curFullQSeqLen)
     {
         int32_t selActualSeqLen = 0;
-        const int64_t curBatchSize =
-            (blkIdx_ * tiling_->mainCoreBsLoopNum + bsIdx) / rawSeq_;
         int64_t selBlkTableOffsetLocal = hnIdx * tiling_->selMaxBlockNum; // ub localTensor中的第几行
         int32_t maxSelectionId = CeilDiv(curFullKvSeqModify, tiling_->selTopKBlockSize) - 1;
         int32_t curSeq = (blkIdx_ * tiling_->mainCoreBsLoopNum + bsIdx) % rawSeq_;
@@ -632,23 +642,6 @@ private:
 
         LocalTensor<int32_t> copySrcLocal = sortBuf_;
         LocalTensor<int32_t> copyDstLocal = sortBuf_[topkSortAlign_];
-        LocalTensor<int32_t> fullKvBlockTableLocal = sortBuf_[topkSortAlign_ * 2];
-        if constexpr (PARALLEL_COPY) {
-            // Resolve logical source tokens on the row owner so the 48 copy
-            // workers only consume physical addresses.  Stage the small,
-            // read-only block table in UB first; scalar GM lookups here would
-            // otherwise serialize the row-owner phase once per miss.
-            ASSERT_MSG(tiling_->fullMaxBlockNum <= topkSortAlign_ * (TOPK_NUMS - 2),
-                "full KV block table does not fit in the reserved UB scratch.");
-            DataCopyExtParams fullBlockTableParams{
-                static_cast<uint16_t>(1),
-                static_cast<uint32_t>(tiling_->fullMaxBlockNum * sizeof(int32_t)), 0, 0, 0};
-            DataCopyPadExtParams<int32_t> fullBlockTablePadParams{false, 0, 0, 0};
-            DataCopyPad(fullKvBlockTableLocal,
-                fullKvBlockTableGm_[curBatchSize * tiling_->fullMaxBlockNum],
-                fullBlockTableParams, fullBlockTablePadParams);
-            SetWaitFlag<HardEvent::MTE2_S>(HardEvent::MTE2_S);
-        }
 
         for (int64_t topKIdx = 0; topKIdx < validTopkNum; topKIdx++) {
             int32_t topKId = selTopKIdxLocal.GetValue(topKIdx);
@@ -685,18 +678,8 @@ private:
 
             if (hitFromSrcSeqLocal_.GetValue(topKIdx) == -1) {
                 if constexpr (PARALLEL_COPY) {
-                    const int64_t fullBlockCol = topKId / tiling_->fullKvBlockSize;
-                    const int64_t fullBlockOffset = topKId - fullBlockCol * tiling_->fullKvBlockSize;
-                    const int32_t fullBlock = fullKvBlockTableLocal.GetValue(fullBlockCol);
-                    ASSERT_MSG(fullBlock >= 0, "full KV block-table entry must be non-negative.");
-                    const int64_t srcPhysicalTokenId =
-                        static_cast<int64_t>(fullBlock) * tiling_->fullKvBlockSize + fullBlockOffset;
-                    const int64_t dstPhysicalTokenId =
-                        static_cast<int64_t>(selKvBlockNumIdx) * tiling_->selKvBlockSize + selKvBlkSizeOffset;
-                    ASSERT_MSG(srcPhysicalTokenId <= 0x7fffffffLL && dstPhysicalTokenId <= 0x7fffffffLL,
-                        "physical copy token id exceeds int32 range.");
-                    copySrcLocal.SetValue(copyCount, static_cast<int32_t>(srcPhysicalTokenId));
-                    copyDstLocal.SetValue(copyCount, static_cast<int32_t>(dstPhysicalTokenId));
+                    copySrcLocal.SetValue(copyCount, topKId);
+                    copyDstLocal.SetValue(copyCount, insertIdx);
                     copyCount++;
                 } else {
                     CopyFromFullKv(bsIdx, topKId, gatherBlockSize, selKRopeAddr, selKvCacheAddr);
@@ -934,8 +917,8 @@ private:
     GlobalTensor<int32_t> fullKvBlockTableGm_;
     GlobalTensor<int32_t> fullKvActualSeqGm_;
     GlobalTensor<int32_t> reqPoolEntriesGm_;
-    GlobalTensor<int32_t> copySrcPhysicalTokenIdsGm_;
-    GlobalTensor<int32_t> copyDstPhysicalTokenIdsGm_;
+    GlobalTensor<int32_t> copySrcTokenIdsGm_;
+    GlobalTensor<int32_t> copyDstSlotIdsGm_;
     GlobalTensor<int32_t> copyCountsGm_;
 
     LocalTensor<int32_t> topkIndicesLocal_;
