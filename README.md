@@ -43,15 +43,21 @@ export NANOVLLM_MODEL=/home/models/DeepSeek-V3.2-REAP-345B-A37B-BF16/
 export NANOVLLM_ENABLE_EXPERT_PARALLEL=1
 export NANOVLLM_ENFORCE_EAGER=0
 export NANOVLLM_KVCACHE_BLOCK_SIZE=128
-export NANOVLLM_HBM_NUM_BLOCKS=350
-export NANOVLLM_DRAM_NUM_BLOCKS=1500
-export NANOVLLM_PREFILL_CHUNK_SIZE=1024   # chunk-prefill模式，可避免激活爆显存
+export NANOVLLM_HBM_NUM_BLOCKS=450
+export NANOVLLM_DRAM_NUM_BLOCKS=2100
+export NANOVLLM_PREFILL_CHUNK_SIZE=1024   # chunk-prefill模式，可避免激活爆显存 
+export NANOVLLM_GS_PARALLEL_COPY=force    # 优化 GS 算子：强制 GS 使用新的“全 AIV 核并行搬运 miss KV” tiling（tiling key 3） 
 
 du -sh "$NANOVLLM_MODEL"    # 检查模型存在
 
+# bs=2, seqlen=30k
 PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_IGNORE_EOS=1 NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_PROMPT_LENGTHS=30000,30001 python3 example/test.py 
 
+# bs=6, seqlen=30k
 PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_IGNORE_EOS=1 NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_PROMPT_LENGTHS=30000,30001,30002,30003,30004,30005 python3 example/test.py
+
+# bs=16, seqlen=16k
+PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_IGNORE_EOS=1 NANOVLLM_MAX_GEN_TOKENS=16 NANOVLLM_PROMPT_LENGTHS=16000,16001,16002,16003,16004,16005,16006,16007,16008,16009,16010,16011,16012,16013,16014,16015 python3 example/test.py
 ```
 
 如果要进行 profiling 运行（采集数据用 mindstudio insight 来看），我们支持只采 decode step ：
@@ -96,12 +102,8 @@ DSA FULL_DECODE_ONLY proof: capture_sizes=[2], captures=1, replays=14, eager_fir
 保留前面的模型和并行环境变量，直接运行 Python，不要再套 `msprof`：
 
 ```bash
-PYTHONPATH=$PWD:$PYTHONPATH \
-NANOVLLM_PROFILE_DECODE_OUTPUT=./profile_rank0_decode \
-NANOVLLM_IGNORE_EOS=1 \
-NANOVLLM_MAX_GEN_TOKENS=6 \
-NANOVLLM_PROMPT_LENGTHS=30000,30001 \
-python3 example/test.py
+# 带上以下环境变量跑推理即可
+NANOVLLM_PROFILE_DECODE_OUTPUT=./profile_rank0_decode
 ```
 
 Profiler 在 rank 0 第一次 decode forward 之前启动，在 `generate()` 完成后停止。
