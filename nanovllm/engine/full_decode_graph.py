@@ -328,6 +328,7 @@ class FullDecodeOnlyGraphManager:
         block_size: int,
         device: str | torch.device,
         expected_mla_tasks: int,
+        enable_npugraph_ex: bool = True,
         log_enabled: bool = True,
     ) -> None:
         self.model = model
@@ -350,6 +351,7 @@ class FullDecodeOnlyGraphManager:
             )
         self.device = torch.device(device)
         self.expected_mla_tasks = int(expected_mla_tasks)
+        self.enable_npugraph_ex = bool(enable_npugraph_ex)
         self.log_enabled = bool(log_enabled)
         self._entries: dict[int, FullDecodeGraphEntry] = {}
         self._graph_pool = None
@@ -388,6 +390,20 @@ class FullDecodeOnlyGraphManager:
             )
 
     def _build_decode_callable(self, model: Callable) -> Callable:
+        torch.npu.set_compile_mode(jit_compile=False)
+        if not getattr(self, "enable_npugraph_ex", True):
+            # GLM-5.1 W4A8 + EP16 is not reliable in TorchAir's compiled
+            # warmup on CANN 8.5.1.  The raw callable is still captured by the
+            # outer NPUGraph below, including Indexer/Gather/FIA/MoE, so the
+            # steady-state boundary remains FULL_DECODE_ONLY.
+            if self.log_enabled:
+                logger.info(
+                    "DSA FULL_DECODE_ONLY: npugraph_ex FX optimization is "
+                    "disabled for this model; one raw outer ACLGraph still "
+                    "captures the complete decode forward."
+                )
+            return model
+
         if hasattr(torch, "_dynamo"):
             torch._dynamo.config.cache_size_limit = max(
                 int(torch._dynamo.config.cache_size_limit),
@@ -406,7 +422,6 @@ class FullDecodeOnlyGraphManager:
                 "FULL_DECODE_ONLY requires TorchAir's npugraph_ex backend."
             ) from exc
 
-        torch.npu.set_compile_mode(jit_compile=False)
         compiler_config = torchair.CompilerConfig()
         compiler_config.mode = "reduce-overhead"
         compiler_config.debug.run_eagerly = True
@@ -464,8 +479,14 @@ class FullDecodeOnlyGraphManager:
             self._update_stream = torch.npu.Stream()
 
         if self.log_enabled:
+            callable_description = (
+                "npugraph_ex-optimized DSA decode model"
+                if self.enable_npugraph_ex
+                else "raw DSA decode model in one outer ACLGraph"
+            )
             logger.info(
-                "DSA FULL_DECODE_ONLY: pre-capturing exact decode sizes=%s",
+                "DSA FULL_DECODE_ONLY: pre-capturing %s for exact sizes=%s",
+                callable_description,
                 self.capture_sizes,
             )
         try:
@@ -482,6 +503,26 @@ class FullDecodeOnlyGraphManager:
         dummy_seq_lens = [DSA_SELECTION_TOPK_TOKENS] * entry.batch_size
         self._set_capture_context(entry, dummy_seq_lens)
         capture_context = get_context()
+        model_warmup = getattr(
+            self.model, "full_decode_graph_eager_warmup", None
+        )
+        if callable(model_warmup):
+            if self.log_enabled:
+                logger.info(
+                    "DSA FULL_DECODE_ONLY: running model-specific balanced "
+                    "eager warmup for batch_size=%d.",
+                    entry.batch_size,
+                )
+            warmup_passes = model_warmup(
+                entry.input_ids, entry.positions
+            )
+            if self.log_enabled:
+                logger.info(
+                    "DSA FULL_DECODE_ONLY: balanced eager warmup completed "
+                    "in %d pass(es).",
+                    int(warmup_passes),
+                )
+
         capture_context.scratch.clear()
         self._callable(entry.input_ids, entry.positions)
         torch.npu.synchronize()
@@ -573,6 +614,7 @@ class FullDecodeOnlyGraphManager:
         return {
             "enabled": True,
             "mode": FULL_DECODE_ONLY,
+            "npugraph_ex": self.enable_npugraph_ex,
             "capture_sizes": list(self.capture_sizes),
             "exact_size_only": True,
             "captures": self.capture_count,

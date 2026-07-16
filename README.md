@@ -1,24 +1,30 @@
-# nano-vLLM Ascend DeepSeek V3.2 DSA offload
+# nano-vLLM Ascend DeepSeek V3.2 / GLM-5.1 DSA offload
 
-本分支在 nano-vLLM Ascend 的 DeepSeek V3.2 BF16 推理上增加 DSA decode KV cache 卸载。后续以 128 专家模型为主。运行时只保留两种模式：
+本分支支持 DeepSeek V3.2 BF16 和 GLM-5.1-w4a8 的 DSA decode KV cache 卸载。运行时只保留两种模式：
 
 | `NANOVLLM_ENFORCE_EAGER` | Prefill | 第一个 decode step | 稳定 decode |
 | --- | --- | --- | --- |
-| `0`（默认） | eager | eager | 满足 DSA 条件时使用 `FULL_DECODE_ONLY + npugraph_ex + ACLGraph` |
+| `0`（默认） | eager | eager | 满足 DSA 条件时使用 `FULL_DECODE_ONLY` |
 | `1` | eager | eager | eager |
 
 LM head 和 sampler 始终在整图之外。
 
 DSA 整图采用精确 batch size。只有 batch 内所有请求均已进入 DSA offload 的稳定 decode，才会 replay 整图；短请求、首个 decode、混合 batch 和未 capture 的 batch size 会明确走 eager，并在最终统计中分别计数。
 
+两种模型的稳定 decode 整图后端不同：
+
+- DeepSeek V3.2：`npugraph_ex + outer ACLGraph`。
+- GLM-5.1-w4a8：raw outer ACLGraph，最终 proof 中 `npugraph_ex=False` 是预期结果，不代表退化为 eager。
+
 　
 
 ## 准备模型
 
-当前这一版 nano-vllm-ascend 只支持 BF16 的 deepseek_v32 系列的模型。因为BF16非常占显存，所以不建议跑满血 256 专家的原版 DeepSeek-V3.2 ，而是跑 ：
+当前支持以下模型：
 
 - **32专家残障版 deepseek_v32** ：https://www.modelscope.cn/models/xwLearnsLLM/Deepseek-V3.2-Pruned-95B 。注意，需要先把模型下载下来，然后按照它的 README 的指示，把模型权重文件从 FP8 转成 BF16 。该模型在nanovllm上需要使用 4~8 张昇腾 910C 就能拉起（每张卡 64GB显存）。
 - **cerebras公司裁剪128专家版的 deepseek_v32** ： https://www.modelscope.cn/models/cerebras/DeepSeek-V3.2-REAP-345B-A37B 。注意，需要先把模型下载下来，然后借用 [这里](https://www.modelscope.cn/models/xwLearnsLLM/Deepseek-V3.2-Pruned-95B) 的python脚本来把模型权重文件从 FP8 转成 BF16。该模型在nanovllm上需要使用 16 张昇腾 910C 就能拉起（每张卡 64GB显存）。
+- **GLM-5.1-w4a8**：https://www.modelscope.cn/models/Eco-Tech/GLM-5.1-w4a8 。routed experts 保持 ModelSlim W4A8；Attention、dense/shared MLP 等 W8A8 权重在加载时反量化为模型参数 dtype。当前要求 `transformers==5.5.3`、TP16+EP16，MTP 不启用。
 
 　
 
@@ -28,9 +34,105 @@ DSA 整图采用精确 batch size。只有 batch 内所有请求均已进入 DSA
 NANOVLLM_CANN_BUILD_JOBS=64 SOC_VERSION=ascend910_9391 PYTHONPATH=$PWD:$PYTHONPATH bash scripts/build_nanovllm_ops.sh
 ```
 
+本次 GLM 接入没有修改 C++/AscendC，因此已有当前 DSA 分支的 `_C` 和 GatherSelection 编译产物时无需重新编译；首次部署该分支仍需执行上面的编译命令。
+
 　
 
-## 推荐验证命令（128 专家模型、TP16）
+## GLM-5.1-w4a8 DSA 验证
+
+GLM 的 learned indexer 是 32 heads，并使用 adjacent-pair/interleaved RoPE。它不能调用本仓库面向 DeepSeek 固定 64 heads 的自定义 LightningIndexer，因此 GLM 使用 `torch_npu.npu_lightning_indexer`；GatherSelectionKVCache 仍使用本仓库算子。
+
+先设置模型并运行两个单 NPU 单测：
+
+```bash
+export NANOVLLM_MODEL=/mnt/models/GLM-5.1-w4a8/
+
+# ModelSlim W4A8 routed expert
+ASCEND_RT_VISIBLE_DEVICES=4 PYTHONUNBUFFERED=1 PYTHONPATH=$PWD:$PYTHONPATH \
+python3 ut_ops/test_glm_w4a8_moe.py \
+  --model "$NANOVLLM_MODEL" --device npu:0 --layer 3 --expert 0 \
+  --tokens 2 --warmup 2 --iters 10
+
+# GLM 真实 32x128 Indexer、interleaved RoPE 和 torch-npu LightningIndexer
+ASCEND_RT_VISIBLE_DEVICES=4 PYTHONUNBUFFERED=1 PYTHONPATH=$PWD:$PYTHONPATH \
+python3 ut_ops/test_glm_dsa_indexer.py \
+  --device npu:0 --batch-size 2 --full-len 4096 \
+  --topk 2048 --block-size 128 --seed 7
+```
+
+成功标志分别是 `GLM_W4A8_MOE_UT_OK` 和 `GLM_DSA_INDEXER_UT_OK`。
+
+然后设置 TP16 的公共环境：
+
+```bash
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export ASCEND_LAUNCH_BLOCKING=0
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+export NANOVLLM_MODEL=/mnt/models/GLM-5.1-w4a8/
+export NANOVLLM_TP_SIZE=16
+export NANOVLLM_ENABLE_EXPERT_PARALLEL=1
+export NANOVLLM_KVCACHE_BLOCK_SIZE=128
+export NANOVLLM_GS_PARALLEL_COPY=force
+
+unset NANOVLLM_PROFILE_DECODE_OUTPUT
+unset NANOVLLM_GS_MISS_RATE_ON_LAYERS
+```
+
+先跑短序列 eager 语义 smoke；前两个答案应分别为“北京”和“14”。短请求不会触发 DSA 卸载，也不用于整图验收：
+
+```bash
+NANOVLLM_ENFORCE_EAGER=1 \
+NANOVLLM_PREFILL_CHUNK_SIZE=0 \
+NANOVLLM_HBM_NUM_BLOCKS=16 \
+NANOVLLM_DRAM_NUM_BLOCKS=16 \
+NANOVLLM_MAX_MODEL_LEN=512 \
+NANOVLLM_MAX_GEN_TOKENS=8 \
+PYTHONUNBUFFERED=1 PYTHONPATH=$PWD:$PYTHONPATH \
+python3 example/glm_short_prompts.py
+```
+
+再以 8200 token、eager 确认 Indexer 和 GatherSelection 真正运行：
+
+```bash
+NANOVLLM_ENFORCE_EAGER=1 \
+NANOVLLM_PREFILL_CHUNK_SIZE=1024 \
+NANOVLLM_HBM_NUM_BLOCKS=96 \
+NANOVLLM_DRAM_NUM_BLOCKS=128 \
+NANOVLLM_GS_MISS_RATE_ON_LAYERS=0 \
+NANOVLLM_MAX_GEN_TOKENS=8 \
+NANOVLLM_PROMPT_LENGTHS=8200 \
+PYTHONUNBUFFERED=1 PYTHONPATH=$PWD:$PYTHONPATH \
+python3 example/test.py
+```
+
+应看到 `full_blocks=64, sparse_blocks=16, release_blocks=48`，并在每个 eager decode step 看到 layer 0 的 `GS_MISS_RATE`。8200 token 会产生 `1024 x 8 + 8` 共 9 个 prefill chunk；prefill finalize 后单请求约保留 17 个 HBM KV blocks，同时持有 64 个 DRAM KV blocks 和 65 个 HBM Index blocks。
+
+最后关闭 miss-rate 同步打印，运行 GLM full-decode-only：
+
+```bash
+unset NANOVLLM_GS_MISS_RATE_ON_LAYERS
+
+NANOVLLM_ENFORCE_EAGER=0 \
+NANOVLLM_PREFILL_CHUNK_SIZE=1024 \
+NANOVLLM_HBM_NUM_BLOCKS=96 \
+NANOVLLM_DRAM_NUM_BLOCKS=128 \
+NANOVLLM_MAX_GEN_TOKENS=8 \
+NANOVLLM_PROMPT_LENGTHS=8200 \
+PYTHONUNBUFFERED=1 PYTHONPATH=$PWD:$PYTHONPATH \
+python3 example/test.py
+```
+
+结束时必须满足：
+
+```text
+DSA FULL_DECODE_ONLY proof: capture_sizes=[1], npugraph_ex=False, captures=1, replays>0, eager_first_decode=1, eager_no_dsa=0, eager_mixed_batch=0, eager_uncaptured_batch=0
+```
+
+保存 eager 与 full-decode-only 两次的 8 个生成 token ID，它们必须完全一致。`example/test.py` 适合精确长度、卸载、整图和性能验收，但它使用 DeepSeek 风格的字面 wrapper，不是 GLM chat template；严格语义 smoke 使用 `example/glm_short_prompts.py`。
+
+　
+
+## DeepSeek V3.2 推荐验证命令（128 专家模型、TP16）
 
 在仓库根目录执行：
 
@@ -83,7 +185,7 @@ NANOVLLM_ENFORCE_EAGER=1 NANOVLLM_GS_MISS_RATE_ON_LAYERS=0,30,60 PYTHONPATH=$PWD
 运行结束必须看到类似：
 
 ```text
-DSA FULL_DECODE_ONLY proof: capture_sizes=[2], captures=1, replays=14, eager_first_decode=1, eager_no_dsa=0, eager_mixed_batch=0, eager_uncaptured_batch=0
+DSA FULL_DECODE_ONLY proof: capture_sizes=[2], npugraph_ex=True, captures=1, replays=14, eager_first_decode=1, eager_no_dsa=0, eager_mixed_batch=0, eager_uncaptured_batch=0
 ```
 
 验收要求：
@@ -155,7 +257,7 @@ decode step，必须设置 `NANOVLLM_ENFORCE_EAGER=1`。
 
 | 参数 | 说明 |
 | --- | --- |
-| `NANOVLLM_MODEL` | BF16 模型目录 |
+| `NANOVLLM_MODEL` | DeepSeek BF16 或 GLM-5.1-w4a8 模型目录 |
 | `NANOVLLM_TP_SIZE` | TP 大小 |
 | `NANOVLLM_ENABLE_EXPERT_PARALLEL` | 是否启用 EP |
 | `NANOVLLM_ENFORCE_EAGER` | `0` 为 DSA full-decode-only，`1` 为 eager |
@@ -193,7 +295,5 @@ DeepSeek-V3.2-REAP-345B-A37B-BF16 模型，TP16+EP16，序列长度 30k
 | nanovllm (不卸载)       | 700           | 700              | 2      | 58 ms        | 34 TPS     | 
 | nanovllm (卸载, GS算子) | 350           | 1500             | 2      | 79 ms        | 25 TPS     | 
 | nanovllm (卸载, GS算子) | 350           | 1500             | 6      | 97 ms        | 61 TPS     | 
-
-
 
 

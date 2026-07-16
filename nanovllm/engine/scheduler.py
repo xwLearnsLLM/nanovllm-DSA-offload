@@ -20,7 +20,10 @@ class Scheduler:
         self.prefill_chunk_size = config.prefill_chunk_size
         self.max_num_decode_seqs_per_step = config.max_num_decode_seqs_per_step
         self.block_size = config.kvcache_block_size
-        self.eos = config.eos
+        eos = config.eos
+        if isinstance(eos, int):
+            eos = (eos,)
+        self.eos = frozenset(int(token_id) for token_id in eos)
         self.index_block_manager = SimpleBlockManager(
             config.num_dram_kvcache_blocks - 1,
             reserve_null_block=True,
@@ -288,11 +291,11 @@ class Scheduler:
         seq.append_token(token_id)
 
         is_max_model_len = (
-            self.max_model_len
-            == seq.num_prompt_tokens + seq.num_completion_tokens
+            seq.num_prompt_tokens + seq.num_completion_tokens
+            >= self.max_model_len
         )
-        is_max_tokens = seq.num_completion_tokens == seq.max_tokens
-        is_eos = not seq.ignore_eos and token_id == self.eos
+        is_max_tokens = seq.num_completion_tokens >= seq.max_tokens
+        is_eos = not seq.ignore_eos and token_id in self.eos
 
         if is_eos:
             self.free_seq(seq, FinishReason.EOS)

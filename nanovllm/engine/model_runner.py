@@ -21,6 +21,7 @@ from nanovllm.engine.full_decode_graph import FullDecodeOnlyGraphManager
 from nanovllm.engine.sequence import DecodeSequenceMetadata, Sequence
 from nanovllm.layers.sampler import Sampler
 from nanovllm.models.deepseek_v32 import DeepseekV32ForCausalLM
+from nanovllm.models.glm_moe_dsa import GlmMoeDsaForCausalLM
 from nanovllm.utils.context import set_context, reset_context
 from nanovllm.utils.loader import load_model
 from nanovllm.utils.logger import init_logger
@@ -144,6 +145,12 @@ class ModelRunner:
                 block_size=config.kvcache_block_size,
                 device=self.device,
                 expected_mla_tasks=int(text_config.num_hidden_layers),
+                # GLM W4A8 + EP16 is captured as one raw outer ACLGraph.
+                # TorchAir's optional FX lowering is left enabled for
+                # DeepSeek, where it is already validated and faster.
+                enable_npugraph_ex=not isinstance(
+                    self.model, GlmMoeDsaForCausalLM
+                ),
                 log_enabled=self.rank == 0,
             )
             if self.world_size > 1:
@@ -158,12 +165,44 @@ class ModelRunner:
 
     def _load_default_strategy(self):
         arch = (getattr(self.hf_config, "architectures", None) or [""])[0]
-        if arch not in ("DeepseekV32ForCausalLM", "DeepseekV3ForCausalLM", ""):
+        model_type = getattr(self.hf_config, "model_type", "")
+        if model_type == "glm_moe_dsa" or arch == "GlmMoeDsaForCausalLM":
+            model = GlmMoeDsaForCausalLM(self.hf_config)
+            if self.rank == 0:
+                quant_metadata = getattr(
+                    self.hf_config, "nanovllm_quant_metadata", {}
+                )
+                logger.info(
+                    "GLM-5.1 W4A8 DSA offload: %s decode, "
+                    "max_model_len=%d, indexer=(backend=torch_npu.native, "
+                    "heads=%d, dim=%d, topk=%d, rope=interleaved), "
+                    "EP%d (%d local experts/rank), "
+                    "ModelSlim version=%s group_size=%s; MTP is disabled.",
+                    (
+                        "eager"
+                        if self.config.enforce_eager
+                        else "FULL_DECODE_ONLY raw ACLGraph"
+                    ),
+                    self.config.max_model_len,
+                    int(self.hf_config.index_n_heads),
+                    int(self.hf_config.index_head_dim),
+                    int(self.hf_config.index_topk),
+                    self.world_size,
+                    int(self.hf_config.n_routed_experts) // self.world_size,
+                    quant_metadata.get("version"),
+                    quant_metadata.get("group_size"),
+                )
+        elif arch in (
+            "DeepseekV32ForCausalLM",
+            "DeepseekV3ForCausalLM",
+            "",
+        ):
+            model = DeepseekV32ForCausalLM(self.hf_config)
+        else:
             raise ValueError(
-                f"Unsupported architecture {arch!r}; nano-vllm-ascend now "
-                "only loads DeepSeek-V3.2 style models."
+                f"Unsupported architecture {arch!r}; expected DeepSeek-V3.2 "
+                "or GlmMoeDsaForCausalLM."
             )
-        model = DeepseekV32ForCausalLM(self.hf_config)
         load_model(
             model,
             self.config.model,
@@ -357,12 +396,12 @@ class ModelRunner:
         if self.rank == 0:
             logger.info(f"Single HBM KV Block Size: {hbm_kv_block_bytes / 1024 ** 2:.2f} MB")
             for name, shape in [
-                ("DeepSeek CKV cache", ckv_shape),
-                ("DeepSeek KPE cache", kpe_shape),
-                ("DeepSeek index cache", index_shape),
-                ("DeepSeek DRAM CKV cache", dram_ckv_shape),
-                ("DeepSeek DRAM KPE cache", dram_kpe_shape),
-                ("DeepSeek gather selection status", gather_status_shape),
+                ("DSA CKV cache", ckv_shape),
+                ("DSA KPE cache", kpe_shape),
+                ("DSA index cache", index_shape),
+                ("DSA DRAM CKV cache", dram_ckv_shape),
+                ("DSA DRAM KPE cache", dram_kpe_shape),
+                ("DSA gather selection status", gather_status_shape),
             ]:
                 logger.info(f"{name} shape: {shape}")
         layer_shapes = (

@@ -179,25 +179,63 @@ def _rotate_half_neox(x: torch.Tensor) -> torch.Tensor:
     return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
 
 
+def _rotate_half_interleaved(x: torch.Tensor) -> torch.Tensor:
+    even = x[..., ::2]
+    odd = x[..., 1::2]
+    return torch.stack((-odd, even), dim=-1).flatten(-2)
+
+
+def _normalize_rotary_mode(rotary_mode: str) -> str:
+    rotary_mode = str(rotary_mode)
+    if rotary_mode not in ("half", "interleave"):
+        raise ValueError(
+            "rotary_mode must be 'half' or 'interleave', got "
+            f"{rotary_mode!r}."
+        )
+    return rotary_mode
+
+
 def _cos_sin_2d(cos: torch.Tensor, sin: torch.Tensor, rope_dim: int) -> tuple[torch.Tensor, torch.Tensor]:
     cos = cos.reshape(cos.shape[0], -1)[..., :rope_dim]
     sin = sin.reshape(sin.shape[0], -1)[..., :rope_dim]
     return cos, sin
 
 
-def _apply_rope_neox_reference(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, rope_dim: int) -> torch.Tensor:
+def _apply_rope_reference(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    rope_dim: int,
+    rotary_mode: str,
+) -> torch.Tensor:
     cos, sin = _cos_sin_2d(cos, sin, rope_dim)
     view_shape = (cos.shape[0],) + (1,) * (x.dim() - 2) + (rope_dim,)
     cos = cos.view(view_shape)
     sin = sin.view(view_shape)
-    return (x * cos) + (_rotate_half_neox(x) * sin)
+    rotate = (
+        _rotate_half_neox
+        if _normalize_rotary_mode(rotary_mode) == "half"
+        else _rotate_half_interleaved
+    )
+    return (x * cos) + (rotate(x) * sin)
 
 
-def _apply_query_rope_like_runtime(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, rope_dim: int) -> torch.Tensor:
+def _apply_query_rope_like_runtime(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    rope_dim: int,
+    rotary_mode: str,
+) -> torch.Tensor:
     # The graph path must match runtime RoPE before lightning_indexer consumes q_index.
+    rotary_mode = _normalize_rotary_mode(rotary_mode)
     if x.device.type == "npu" and torch_npu is not None and x.dtype in (torch.float16, torch.bfloat16):
-        return torch_npu.npu_rotary_mul(x.unsqueeze(2), cos, sin).squeeze(2)
-    return _apply_rope_neox_reference(x, cos, sin, int(rope_dim))
+        return torch_npu.npu_rotary_mul(
+            x.unsqueeze(2), cos, sin, rotary_mode
+        ).squeeze(2)
+    return _apply_rope_reference(
+        x, cos, sin, int(rope_dim), rotary_mode
+    )
 
 
 def _query_only_weights_proj(
@@ -238,11 +276,14 @@ def _dsa_indexer_project_query_only_pure(
     head_dim: int,
     rope_dim: int,
     score_scale: float,
+    rotary_mode: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     q = F.linear(q_c, wq_b_weight).view(-1, int(n_head), int(head_dim))
     index_weights = _query_only_weights_proj_pure(hidden_states, weights_proj_weight, float(score_scale))
     q_pe, q_nope = torch.split(q, [int(rope_dim), int(head_dim) - int(rope_dim)], dim=-1)
-    q_pe = _apply_query_rope_like_runtime(q_pe, cos, sin, int(rope_dim))
+    q_pe = _apply_query_rope_like_runtime(
+        q_pe, cos, sin, int(rope_dim), rotary_mode
+    )
     return torch.cat((q_pe, q_nope), dim=-1), index_weights
 
 
@@ -273,6 +314,7 @@ def _dsa_indexer_pipeline_with_qc_functional(
     rope_dim: int,
     score_scale: float,
     sparse_count: int,
+    rotary_mode: str = "half",
     return_gather_outputs: bool = False,
 ) -> tuple[torch.Tensor, ...]:
     if ascend_ops is None:
@@ -288,6 +330,7 @@ def _dsa_indexer_pipeline_with_qc_functional(
         head_dim=int(head_dim),
         rope_dim=int(rope_dim),
         score_scale=float(score_scale),
+        rotary_mode=rotary_mode,
     )
     if _GRAPH_LIGHTNING_INDEXER is None or _GRAPH_GATHER_SELECTION_KV_CACHE is None:
         topk_indices = ascend_ops.npu_lightning_indexer(
@@ -411,8 +454,17 @@ def dsa_indexer_project_post_real_out(q_in, k_in, weights_in, cos, sin, q_out, k
     return q_out, k_out, weights_out
 
 
-def _can_use_post_op(q: torch.Tensor, k: torch.Tensor, weights: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> bool:
+def _can_use_post_op(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    weights: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    rotary_mode: str,
+) -> bool:
     return (
+        _normalize_rotary_mode(rotary_mode) == "half"
+        and
         dsa_indexer_project_post_available()
         and q.device.type == "npu"
         and q.dtype in (torch.float16, torch.bfloat16)
@@ -486,6 +538,7 @@ def dsa_indexer_project_torch(
     head_dim: int,
     rope_dim: int,
     score_scale: float,
+    rotary_mode: str = "half",
     wq_b_bmm_t: torch.Tensor | None = None,
     enable_q_bmm: bool = False,
     detail: dict[str, float] | None = None,
@@ -516,7 +569,8 @@ def dsa_indexer_project_torch(
     _timer_end(detail, "weights_proj", start, sync_detail, hidden_states.device)
 
     start = _timer_start(detail, sync_detail, q.device)
-    if _can_use_post_op(q, k, weights, cos, sin):
+    rotary_mode = _normalize_rotary_mode(rotary_mode)
+    if _can_use_post_op(q, k, weights, cos, sin, rotary_mode):
         # B-stage true AscendC sub-op: q/k RoPE + weights cast, writing final outputs in-place.
         # DeepSeek-V3.2 BF16 SFA in vllm-ascend feeds raw weights_proj(x) to
         # lightning_indexer, so callers pass score_scale=1.0 here.
@@ -527,11 +581,19 @@ def dsa_indexer_project_torch(
     q_pe, q_nope = torch.split(q, [int(rope_dim), int(head_dim) - int(rope_dim)], dim=-1)
     k_pe, k_nope = torch.split(k, [int(rope_dim), int(head_dim) - int(rope_dim)], dim=-1)
     if q.device.type == "npu" and torch_npu is not None and q.dtype in (torch.float16, torch.bfloat16):
-        q_pe = torch_npu.npu_rotary_mul(q_pe.unsqueeze(2), cos, sin).squeeze(2)
-        k_pe = torch_npu.npu_rotary_mul(k_pe.unsqueeze(1).unsqueeze(2), cos, sin).squeeze(2).squeeze(1)
+        q_pe = torch_npu.npu_rotary_mul(
+            q_pe.unsqueeze(2), cos, sin, rotary_mode
+        ).squeeze(2)
+        k_pe = torch_npu.npu_rotary_mul(
+            k_pe.unsqueeze(1).unsqueeze(2), cos, sin, rotary_mode
+        ).squeeze(2).squeeze(1)
     else:
-        q_pe = _apply_rope_neox_reference(q_pe, cos, sin, int(rope_dim))
-        k_pe = _apply_rope_neox_reference(k_pe.unsqueeze(1), cos, sin, int(rope_dim)).squeeze(1)
+        q_pe = _apply_rope_reference(
+            q_pe, cos, sin, int(rope_dim), rotary_mode
+        )
+        k_pe = _apply_rope_reference(
+            k_pe.unsqueeze(1), cos, sin, int(rope_dim), rotary_mode
+        ).squeeze(1)
     _timer_end(detail, "rope", start, sync_detail, q.device)
 
     q_index_out.copy_(torch.cat((q_pe, q_nope), dim=-1))
@@ -558,6 +620,7 @@ def dsa_indexer_project(
     head_dim: int,
     rope_dim: int,
     score_scale: float,
+    rotary_mode: str = "half",
     wq_b_bmm_t: torch.Tensor | None = None,
     enable_q_bmm: bool = False,
     detail: dict[str, float] | None = None,
@@ -580,6 +643,7 @@ def dsa_indexer_project(
         head_dim=head_dim,
         rope_dim=rope_dim,
         score_scale=score_scale,
+        rotary_mode=rotary_mode,
         wq_b_bmm_t=wq_b_bmm_t,
         enable_q_bmm=enable_q_bmm,
         detail=detail,
@@ -601,6 +665,7 @@ def dsa_indexer_project_query_only(
     head_dim: int,
     rope_dim: int,
     score_scale: float,
+    rotary_mode: str = "half",
     wq_b_bmm_t: torch.Tensor | None = None,
     enable_q_bmm: bool = False,
     detail: dict[str, float] | None = None,
@@ -625,7 +690,9 @@ def dsa_indexer_project_query_only(
 
     start = _timer_start(detail, sync_detail, q.device)
     q_pe, q_nope = torch.split(q, [int(rope_dim), int(head_dim) - int(rope_dim)], dim=-1)
-    q_pe = _apply_query_rope_like_runtime(q_pe, cos, sin, int(rope_dim))
+    q_pe = _apply_query_rope_like_runtime(
+        q_pe, cos, sin, int(rope_dim), rotary_mode
+    )
     q_index_out[..., : int(rope_dim)].copy_(q_pe)
     q_index_out[..., int(rope_dim) :].copy_(q_nope)
     _timer_end(detail, "rope", start, sync_detail, q.device)
@@ -659,6 +726,7 @@ def dsa_indexer_pipeline_with_qc_full_graph(
     rope_dim: int,
     score_scale: float,
     sparse_count: int,
+    rotary_mode: str = "half",
 ) -> tuple[torch.Tensor, ...]:
     """Graph-visible DSA projection, selection, and DRAM-to-HBM gather.
 
@@ -698,6 +766,7 @@ def dsa_indexer_pipeline_with_qc_full_graph(
         rope_dim=int(rope_dim),
         score_scale=float(score_scale),
         sparse_count=int(sparse_count),
+        rotary_mode=rotary_mode,
         return_gather_outputs=True,
     )
 

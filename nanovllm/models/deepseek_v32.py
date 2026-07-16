@@ -501,6 +501,11 @@ class DeepseekV32Indexer(nn.Module):
         self.rope_dim = int(config.qk_rope_head_dim)
         self.hidden_size = int(config.hidden_size)
         self.q_lora_rank = int(config.q_lora_rank)
+        self.rotary_mode = (
+            "interleave"
+            if bool(getattr(config, "indexer_rope_interleave", False))
+            else "half"
+        )
 
         self.wq_b = ReplicatedLinear(self.q_lora_rank, self.n_head * self.head_dim, bias=False)
         self.wk = ReplicatedLinear(self.hidden_size, self.head_dim, bias=False)
@@ -566,7 +571,13 @@ class DeepseekV32Indexer(nn.Module):
     # same positions, so this removes repeated tiny H2D/index_select overhead.
     def _rope_cos_sin(self, positions: torch.Tensor, rotary_emb: DeepseekScalingRotaryEmbedding, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
         context = get_context()
-        cache_key = ("indexer_rope_cos_sin", str(positions.device), dtype, self.rope_dim)
+        cache_key = (
+            "indexer_rope_cos_sin",
+            str(positions.device),
+            dtype,
+            self.rope_dim,
+            self.rotary_mode,
+        )
         cached = context.scratch.get(cache_key)
         if cached is not None:
             return cached
@@ -574,8 +585,14 @@ class DeepseekV32Indexer(nn.Module):
         positions = positions.to(torch.long)
         cos = rotary_emb.cos_cache.index_select(0, positions)
         sin = rotary_emb.sin_cache.index_select(0, positions)
-        cos = torch.cat((cos, cos), dim=-1).to(dtype).contiguous()
-        sin = torch.cat((sin, sin), dim=-1).to(dtype).contiguous()
+        if self.rotary_mode == "half":
+            cos = torch.cat((cos, cos), dim=-1)
+            sin = torch.cat((sin, sin), dim=-1)
+        else:
+            cos = cos.repeat_interleave(2, dim=-1)
+            sin = sin.repeat_interleave(2, dim=-1)
+        cos = cos.to(dtype).contiguous()
+        sin = sin.to(dtype).contiguous()
         cos = cos.view(cos.shape[0], 1, 1, self.rope_dim)
         sin = sin.view(sin.shape[0], 1, 1, self.rope_dim)
         context.scratch[cache_key] = (cos, sin)
@@ -601,6 +618,7 @@ class DeepseekV32Indexer(nn.Module):
                 head_dim=self.head_dim,
                 rope_dim=self.rope_dim,
                 score_scale=1.0,  # vllm-ascend BF16 lightning_indexer consumes raw weights_proj(x).
+                rotary_mode=self.rotary_mode,
                 wq_b_bmm_t=wq_b_bmm_t,
                 enable_q_bmm=wq_b_bmm_t is not None,
                 detail=detail,
@@ -626,6 +644,7 @@ class DeepseekV32Indexer(nn.Module):
             head_dim=self.head_dim,
             rope_dim=self.rope_dim,
             score_scale=1.0,  # Keep lightning_indexer inputs aligned with vllm-ascend BF16 SFA.
+            rotary_mode=self.rotary_mode,
             detail=detail,
             sync_detail=sync_detail,
         )
@@ -681,6 +700,12 @@ class DeepseekV32DSAAttention(nn.Module):
         self.rotary_emb = DeepseekScalingRotaryEmbedding(self.qk_rope_head_dim, max_position_embeddings=int(config.max_position_embeddings), rope_parameters=config.rope_parameters, is_neox_style=False)
         self.indexer_rotary_emb = DeepseekScalingRotaryEmbedding(self.qk_rope_head_dim, max_position_embeddings=int(config.max_position_embeddings), rope_parameters=config.rope_parameters, is_neox_style=not getattr(config, "indexer_rope_interleave", False))
         self.indexer = DeepseekV32Indexer(config)
+        # The bundled LightningIndexerVllm kernel is specialized for 64 query
+        # heads. GLM-5.1 has 32 indexer heads, and upstream vLLM-Ascend routes
+        # that architecture through torch-npu's native operator instead.
+        self.use_torch_npu_lightning_indexer = (
+            getattr(config, "model_type", "") == "glm_moe_dsa"
+        )
 
         self.ckv_cache = torch.tensor([])
         self.kpe_cache = torch.tensor([])
@@ -793,6 +818,36 @@ class DeepseekV32DSAAttention(nn.Module):
             )
 
         active_batch = int(batch_size)
+        if self.use_torch_npu_lightning_indexer:
+            # GLM uses a raw outer ACLGraph (no npugraph_ex). Keep its native
+            # 32-head LightningIndexer and mutable GatherSelection launches
+            # directly visible to that outer capture.
+            q_index, _, index_weights = self.indexer(
+                hidden_states,
+                q_c,
+                positions,
+                self.indexer_rotary_emb,
+                None,
+                False,
+                query_only=True,
+            )
+            topk_indices = self._run_lightning_indexer(
+                q_index,
+                index_weights,
+                context.candidate_query_lens[:active_batch],
+                context.candidate_lens[:active_batch],
+                context.index_block_tables[:active_batch],
+            )
+            self._gather_selected_kv(
+                topk_indices,
+                context.selection_block_tables[:active_batch],
+                context.req_pool_entries[:active_batch],
+                context.dram_block_tables[:active_batch],
+                context.candidate_lens[:active_batch],
+                active_batch,
+            )
+            return
+
         cos, sin = self.indexer._rope_cos_sin(
             positions,
             self.indexer_rotary_emb,
@@ -825,6 +880,7 @@ class DeepseekV32DSAAttention(nn.Module):
             rope_dim=self.indexer.rope_dim,
             score_scale=1.0,
             sparse_count=self.gather_selection_topk,
+            rotary_mode=self.indexer.rotary_mode,
         )
 
     def _prepare_decode_mlapo(self) -> None:
@@ -991,6 +1047,62 @@ class DeepseekV32DSAAttention(nn.Module):
             query_only=query_only,
         )
         return q_index, index_k, weights
+
+    def _run_lightning_indexer(
+        self,
+        query: torch.Tensor,
+        weights: torch.Tensor,
+        actual_seq_lengths_query: torch.Tensor,
+        actual_seq_lengths_key: torch.Tensor,
+        block_table: torch.Tensor,
+    ) -> torch.Tensor:
+        kwargs = dict(
+            query=query,
+            key=self.index_cache,
+            weights=weights,
+            actual_seq_lengths_query=actual_seq_lengths_query,
+            actual_seq_lengths_key=actual_seq_lengths_key,
+            block_table=block_table,
+            layout_query="TND",
+            layout_key="PA_BSND",
+            sparse_count=self.gather_selection_topk,
+            sparse_mode=3,
+        )
+        if self.use_torch_npu_lightning_indexer:
+            result = torch_npu.npu_lightning_indexer(**kwargs)
+            topk_indices = result[0] if isinstance(result, (tuple, list)) else result
+        else:
+            topk_indices = ascend_ops.npu_lightning_indexer(**kwargs)
+        if not isinstance(topk_indices, torch.Tensor):
+            raise TypeError(
+                "LightningIndexer must return a Tensor or a tuple whose first "
+                f"item is a Tensor, got {type(topk_indices).__name__}."
+            )
+        return topk_indices
+
+    def _gather_selected_kv(
+        self,
+        topk_indices: torch.Tensor,
+        selection_block_table: torch.Tensor,
+        req_pool_entries: torch.Tensor,
+        dram_tables: torch.Tensor,
+        candidate_lens: torch.Tensor,
+        active_batch: int,
+    ) -> None:
+        ascend_ops.npu_gather_selection_kv_cache(
+            self.kpe_cache.squeeze(2),
+            self.ckv_cache.squeeze(2),
+            selection_block_table,
+            self.gather_selection_status,
+            req_pool_entries,
+            topk_indices.view(
+                active_batch, 1, 1, self.gather_selection_topk
+            ),
+            self.dram_kpe_cache.squeeze(2),
+            self.dram_ckv_cache.squeeze(2),
+            dram_tables,
+            candidate_lens,
+        )
 
     def _q_nope_up_proj(self, q_nope: torch.Tensor) -> torch.Tensor:
         num_tokens = q_nope.shape[0]
@@ -1234,17 +1346,12 @@ class DeepseekV32DSAAttention(nn.Module):
             active_rows = rows
         candidate_query_lens = context.candidate_query_lens[:active_batch]
 
-        topk_indices = ascend_ops.npu_lightning_indexer(
-            query=q_index_active,
-            key=self.index_cache,
-            weights=weights_active,
-            actual_seq_lengths_query=candidate_query_lens,
-            actual_seq_lengths_key=candidate_lens,
-            block_table=index_tables,
-            layout_query="TND",
-            layout_key="PA_BSND",
-            sparse_count=self.gather_selection_topk,
-            sparse_mode=3,
+        topk_indices = self._run_lightning_indexer(
+            q_index_active,
+            weights_active,
+            candidate_query_lens,
+            candidate_lens,
+            index_tables,
         )
 
         self._print_gs_miss_rate(
@@ -1256,17 +1363,13 @@ class DeepseekV32DSAAttention(nn.Module):
 
         # gather_selection_status is a request pool; req_pool_entries maps active rows to persistent status rows.
         # selection_block_table is per-batch because it is rebuilt in prepare_decode like hbm_block_tables.
-        ascend_ops.npu_gather_selection_kv_cache(
-            self.kpe_cache.squeeze(2),
-            self.ckv_cache.squeeze(2),
+        self._gather_selected_kv(
+            topk_indices,
             selection_block_table,
-            self.gather_selection_status,
             req_pool_entries,
-            topk_indices.view(active_batch, 1, 1, self.gather_selection_topk),
-            self.dram_kpe_cache.squeeze(2),
-            self.dram_ckv_cache.squeeze(2),
             dram_tables,
             candidate_lens,
+            active_batch,
         )
 
     def _decode_forward_mla(

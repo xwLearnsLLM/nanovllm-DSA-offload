@@ -337,3 +337,24 @@ def test_decode_callable_uses_npugraph_ex(monkeypatch):
             "dynamic": False,
         },
     )
+
+
+def test_disabled_npugraph_ex_returns_raw_model(monkeypatch):
+    model = object()
+    manager = object.__new__(FullDecodeOnlyGraphManager)
+    manager.enable_npugraph_ex = False
+    manager.log_enabled = False
+    calls = {}
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        SimpleNamespace(
+            set_compile_mode=lambda **kwargs: calls.setdefault(
+                "compile_mode", kwargs
+            )
+        ),
+        raising=False,
+    )
+
+    assert manager._build_decode_callable(model) is model
+    assert calls["compile_mode"] == {"jit_compile": False}

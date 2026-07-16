@@ -5,17 +5,21 @@
 import atexit
 import os
 from dataclasses import fields
-from time import perf_counter
+from time import monotonic, perf_counter
 
 import torch
 import torch.multiprocessing as mp
-from transformers import LlamaTokenizerFast, PreTrainedTokenizerFast
+from transformers import AutoTokenizer
 
-from nanovllm.config import Config
+from nanovllm.config import Config, merge_eos_token_ids
 from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
+from nanovllm.utils.glm_tokenizer import (
+    load_glm_tokenizer,
+    normalize_token_ids,
+)
 from nanovllm.utils.logger import init_logger
 
 logger = init_logger(__name__)
@@ -61,31 +65,90 @@ class LLMEngine:
         logger.info(
             "execution mode: prefill=eager, first_decode=eager, "
             "stable_decode=%s",
-            "eager" if config.enforce_eager else "full_decode_only+npugraph_ex",
+            "eager" if config.enforce_eager else "full_decode_only",
+        )
+        # Fail fast on tokenizer/version problems before all TP ranks load the
+        # 400+ GB GLM checkpoint.
+        self.tokenizer = self._load_tokenizer(config)
+        config.eos = merge_eos_token_ids(
+            config.eos, self.tokenizer.eos_token_id
         )
         self.ps = []
         self.events = []
-        ctx = mp.get_context("spawn")
-        for i in range(1, config.tensor_parallel_size):
-            event = ctx.Event()
-            process = ctx.Process(target=ModelRunner, args=(config, i, event))
-            process.start()
-            self.ps.append(process)
-            self.events.append(event)
-        self.model_runner = ModelRunner(config, 0, self.events)
-        self.tokenizer = self._load_tokenizer(config)
-        config.eos = self.tokenizer.eos_token_id
-        self.scheduler = Scheduler(config)
-        self._last_prefill_chunk_progress = None
-        # Profiling is created lazily in the rank-0 engine immediately before
-        # its first decode forward. Worker ranks only run ModelRunner.loop(),
-        # so they never create a profiler or emit profile data.
-        self._decode_profile_output = os.environ.get(
-            "NANOVLLM_PROFILE_DECODE_OUTPUT",
-            "",
-        ).strip()
-        self._decode_profiler = None
+        try:
+            ctx = mp.get_context("spawn")
+            for i in range(1, config.tensor_parallel_size):
+                event = ctx.Event()
+                process = ctx.Process(
+                    target=ModelRunner,
+                    args=(config, i, event),
+                )
+                process.start()
+                self.ps.append(process)
+                self.events.append(event)
+            self.model_runner = ModelRunner(config, 0, self.events)
+            self.scheduler = Scheduler(config)
+            self._last_prefill_chunk_progress = None
+            # Profiling is created lazily in the rank-0 engine immediately
+            # before its first decode forward. Worker ranks only run
+            # ModelRunner.loop(), so they never create a profiler.
+            self._decode_profile_output = os.environ.get(
+                "NANOVLLM_PROFILE_DECODE_OUTPUT",
+                "",
+            ).strip()
+            self._decode_profiler = None
+        except BaseException:
+            self._cleanup_failed_initialization()
+            raise
         atexit.register(self.exit)
+
+    def _cleanup_failed_initialization(self) -> None:
+        """Best-effort cleanup for errors after TP workers have started."""
+
+        logger.error(
+            "LLM initialization failed; terminating %d TP worker(s).",
+            len(self.ps),
+        )
+        for process in self.ps:
+            try:
+                if process.is_alive():
+                    process.terminate()
+            except Exception:
+                logger.exception("Failed to terminate a TP worker.")
+        terminate_deadline = monotonic() + 5.0
+        for process in self.ps:
+            try:
+                process.join(
+                    timeout=max(0.0, terminate_deadline - monotonic())
+                )
+            except Exception:
+                logger.exception("Failed to join a TP worker.")
+        for process in self.ps:
+            try:
+                if process.is_alive():
+                    process.kill()
+            except Exception:
+                logger.exception("Failed to kill a TP worker.")
+        kill_deadline = monotonic() + 2.0
+        for process in self.ps:
+            try:
+                process.join(timeout=max(0.0, kill_deadline - monotonic()))
+            except Exception:
+                logger.exception("Failed to reap a TP worker.")
+
+        runner = getattr(self, "model_runner", None)
+        shm = getattr(runner, "shm", None)
+        if shm is not None:
+            try:
+                shm.close()
+            except Exception:
+                logger.exception("Failed to close TP shared memory.")
+            try:
+                shm.unlink()
+            except FileNotFoundError:
+                pass
+            except Exception:
+                logger.exception("Failed to unlink TP shared memory.")
 
     @staticmethod
     def _is_true_env(name: str, default: bool = False) -> bool:
@@ -106,9 +169,11 @@ class LLMEngine:
             False,
         )
         formatted_prompt = self._format_deepseek_prompt(prompt, use_chat_template)
-        token_ids = self.tokenizer.encode(
-            formatted_prompt,
-            add_special_tokens=False,
+        token_ids = normalize_token_ids(
+            self.tokenizer.encode(
+                formatted_prompt,
+                add_special_tokens=False,
+            )
         )
         add_bos = self._is_true_env(
             "NANOVLLM_ADD_BOS",
@@ -121,23 +186,32 @@ class LLMEngine:
 
     @staticmethod
     def _load_tokenizer(config: Config):
-        try:
-            tokenizer = PreTrainedTokenizerFast.from_pretrained(
+        is_glm = getattr(config.hf_config, "model_type", "") == "glm_moe_dsa"
+        if is_glm:
+            tokenizer = load_glm_tokenizer(
+                config.model,
+                trust_remote_code=config.trust_remote_code,
+            )
+        else:
+            tokenizer = AutoTokenizer.from_pretrained(
                 config.model,
                 trust_remote_code=config.trust_remote_code,
                 fix_mistral_regex=False,
             )
-        except Exception:
-            logger.warning(
-                "Falling back to LlamaTokenizerFast for deepseek_v32 export."
-            )
-            tokenizer = LlamaTokenizerFast.from_pretrained(
-                config.model,
-                legacy=True,
-                fix_mistral_regex=False,
-            )
         if not getattr(tokenizer, "chat_template", None):
-            tokenizer.chat_template = DEEPSEEK_V32_CHAT_TEMPLATE
+            if is_glm:
+                template_path = os.path.join(
+                    config.model, "chat_template.jinja"
+                )
+                if not os.path.isfile(template_path):
+                    raise ValueError(
+                        "GLM tokenizer has no embedded chat template and "
+                        "chat_template.jinja is missing from the model directory."
+                    )
+                with open(template_path, "r", encoding="utf-8") as file:
+                    tokenizer.chat_template = file.read()
+            else:
+                tokenizer.chat_template = DEEPSEEK_V32_CHAT_TEMPLATE
         return tokenizer
 
     def _decode_token_ids(self, token_ids: list[int]) -> str:
@@ -394,6 +468,7 @@ class LLMEngine:
             print(
                 "    DSA FULL_DECODE_ONLY proof: "
                 f"capture_sizes={graph_stats['capture_sizes']}, "
+                f"npugraph_ex={graph_stats['npugraph_ex']}, "
                 f"captures={graph_stats['captures']}, "
                 f"replays={graph_stats['replays']}, "
                 f"eager_first_decode={graph_stats['eager_first_decode']}, "

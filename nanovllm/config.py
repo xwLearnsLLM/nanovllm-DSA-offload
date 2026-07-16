@@ -9,6 +9,32 @@ from nanovllm.engine.dsa_offload import DSA_SELECTION_TOPK_TOKENS
 from nanovllm.engine.full_decode_graph import normalize_capture_sizes
 
 
+def normalize_eos_token_ids(value: Any) -> tuple[int, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, int):
+        return (int(value),)
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return tuple(dict.fromkeys(int(token_id) for token_id in value))
+    raise TypeError(
+        "eos_token_id must be an int or a sequence of ints, got "
+        f"{type(value).__name__}."
+    )
+
+
+def merge_eos_token_ids(*values: Any) -> tuple[int, ...]:
+    merged = tuple(
+        dict.fromkeys(
+            token_id
+            for value in values
+            for token_id in normalize_eos_token_ids(value)
+        )
+    )
+    if len(merged) > 1 and -1 in merged:
+        merged = tuple(token_id for token_id in merged if token_id != -1)
+    return merged or (-1,)
+
+
 @dataclass
 class Config:
     model: str
@@ -20,7 +46,7 @@ class Config:
     enforce_eager: bool = False
     decode_graph_capture_sizes: tuple[int, ...] | list[int] | None = None
     hf_config: Any = field(init=False)
-    eos: int = field(init=False, default=-1)
+    eos: tuple[int, ...] = field(init=False, default=(-1,))
     kvcache_block_size: int = 256
     num_hbm_kvcache_blocks: int = -1
     num_dram_kvcache_blocks: int = -1
@@ -73,9 +99,10 @@ class Config:
                 max_position_embeddings,
             )
 
+        self._validate_glm_dsa_offload()
         eos_token_id = getattr(text_config, "eos_token_id", None)
         if eos_token_id is not None:
-            self.eos = eos_token_id
+            self.eos = normalize_eos_token_ids(eos_token_id)
         self._configure_decode_graph()
 
     @staticmethod
@@ -129,6 +156,49 @@ class Config:
             )
 
     def _validate_model_format(self):
+        if getattr(self.hf_config, "model_type", "") == "glm_moe_dsa":
+            description_path = os.path.join(
+                self.model, "quant_model_description.json"
+            )
+            if not os.path.isfile(description_path):
+                raise ValueError(
+                    "GLM-5.1-W4A8 requires quant_model_description.json "
+                    "from the ModelSlim checkpoint."
+                )
+            with open(description_path, "r", encoding="utf-8") as file:
+                description = json.load(file)
+            metadata = {
+                key: description.get(key)
+                for key in (
+                    "version",
+                    "model_quant_type",
+                    "group_size",
+                    "is_rot_used",
+                    "optional",
+                )
+            }
+            if metadata["version"] != "1.0.0":
+                raise ValueError(
+                    "GLM DSA offload supports ModelSlim quant version 1.0.0 "
+                    f"only, got {metadata['version']!r}."
+                )
+            if metadata["model_quant_type"] != "W8A8_DYNAMIC":
+                raise ValueError(
+                    "GLM DSA offload expects model_quant_type="
+                    f"'W8A8_DYNAMIC', got {metadata['model_quant_type']!r}."
+                )
+            if metadata["group_size"] != 0:
+                raise ValueError(
+                    "GLM DSA offload supports per-channel W4A8 only "
+                    f"(group_size=0), got {metadata['group_size']!r}."
+                )
+            setattr(
+                self.hf_config,
+                "nanovllm_quant_metadata",
+                metadata,
+            )
+            return
+
         quantization_config = getattr(
             self.hf_config,
             "quantization_config",
@@ -148,14 +218,58 @@ class Config:
             "BF16 output directory."
         )
 
-    def _load_hf_config(self):
-        from nanovllm.models.deepseek_v32 import DeepseekV32Config
+    def _validate_glm_dsa_offload(self) -> None:
+        if getattr(self.hf_config, "model_type", "") != "glm_moe_dsa":
+            return
+        if not self.enable_expert_parallel:
+            raise ValueError(
+                "GLM-5.1-W4A8 DSA offload requires expert parallel; set "
+                "enable_expert_parallel=True / "
+                "NANOVLLM_ENABLE_EXPERT_PARALLEL=1."
+            )
+        index_topk = int(
+            getattr(self.hf_config, "index_topk", DSA_SELECTION_TOPK_TOKENS)
+        )
+        if index_topk != DSA_SELECTION_TOPK_TOKENS:
+            raise ValueError(
+                "GLM DSA offload currently requires index_topk=2048, got "
+                f"{index_topk}."
+            )
+        if int(getattr(self.hf_config, "index_head_dim", 0)) <= 0:
+            raise ValueError("GLM DSA offload requires a positive index_head_dim.")
+        if int(getattr(self.hf_config, "index_n_heads", 0)) <= 0:
+            raise ValueError("GLM DSA offload requires a positive index_n_heads.")
+        if not bool(
+            getattr(self.hf_config, "indexer_rope_interleave", True)
+        ):
+            raise ValueError(
+                "GLM DSA offload expects indexer_rope_interleave=true."
+            )
+        # Rotary caches are owned by every attention layer.  Limit them to the
+        # configured runtime context instead of GLM's full 202K checkpoint cap.
+        setattr(
+            self.hf_config,
+            "nanovllm_original_max_position_embeddings",
+            int(self.hf_config.max_position_embeddings),
+        )
+        self.hf_config.max_position_embeddings = self.max_model_len
 
+    def _load_hf_config(self):
         config_path = os.path.join(self.model, "config.json")
         raw_config = {}
         if os.path.isfile(config_path):
             with open(config_path, "r", encoding="utf-8") as file:
                 raw_config = json.load(file)
+
+        glm_moe_dsa_like = (
+            raw_config.get("model_type") == "glm_moe_dsa"
+            or "GlmMoeDsaForCausalLM"
+            in (raw_config.get("architectures") or [])
+        )
+        if glm_moe_dsa_like:
+            from nanovllm.models.glm_moe_dsa_config import GlmMoeDsaConfig
+
+            return GlmMoeDsaConfig.from_pretrained(self.model)
 
         deepseek_v32_like = (
             raw_config.get("model_type") == "deepseek_v32"
@@ -172,13 +286,13 @@ class Config:
             )
         )
         if deepseek_v32_like:
+            from nanovllm.models.deepseek_v32 import DeepseekV32Config
+
             return DeepseekV32Config.from_pretrained(self.model)
 
         raise ValueError(
-            "nano-vllm-ascend only supports DeepSeek-V3.2 style model "
-            "directories. Expected config.json model_type='deepseek_v32', "
-            "DeepseekV32ForCausalLM architecture, or DeepSeek V3.2 fields "
-            "such as first_k_dense_replace/q_lora_rank/kv_lora_rank/index_topk."
+            "nano-vllm-ascend DSA offload supports DeepSeek-V3.2 and "
+            "GLM-5.1-W4A8. The model config did not match either architecture."
         )
 
     def __repr__(self):
