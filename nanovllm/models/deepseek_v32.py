@@ -17,7 +17,11 @@ from nanovllm.engine.dsa_offload import (
     DSA_SELECTION_TOPK_TOKENS,
     build_dsa_debug_selection,
     compute_gs_miss_counts,
+    dsa_debug_prints_native_stats,
+    dsa_debug_rotary_mode,
+    dsa_debug_uses_native_selection,
     parse_gs_miss_rate_layers,
+    summarize_dsa_native_selection,
 )
 from nanovllm.engine.full_decode_graph import (
     MLAGraphTask,
@@ -672,6 +676,16 @@ class DeepseekV32DSAAttention(nn.Module):
         self.dsa_debug_selection = str(
             getattr(config, "nanovllm_dsa_debug_selection", "native")
         )
+        default_stats_layers = frozenset(
+            {0, int(config.num_hidden_layers) // 2, int(config.num_hidden_layers) - 1}
+        )
+        native_stats_layers = gs_miss_rate_layers or default_stats_layers
+        self._dsa_native_stats_enabled = (
+            dsa_debug_prints_native_stats(self.dsa_debug_selection)
+            and tp_rank == 0
+            and self.layer_idx in native_stats_layers
+        )
+        self._dsa_native_stats_decode_step = 0
         if tp_rank == 0 and self.layer_idx == 0 and gs_miss_rate_layers:
             print(
                 "GS_MISS_RATE enabled eager-only layers="
@@ -714,6 +728,10 @@ class DeepseekV32DSAAttention(nn.Module):
         self.rotary_emb = DeepseekScalingRotaryEmbedding(self.qk_rope_head_dim, max_position_embeddings=int(config.max_position_embeddings), rope_parameters=config.rope_parameters, is_neox_style=False)
         self.indexer_rotary_emb = DeepseekScalingRotaryEmbedding(self.qk_rope_head_dim, max_position_embeddings=int(config.max_position_embeddings), rope_parameters=config.rope_parameters, is_neox_style=not getattr(config, "indexer_rope_interleave", False))
         self.indexer = DeepseekV32Indexer(config)
+        self.indexer.rotary_mode = dsa_debug_rotary_mode(
+            self.dsa_debug_selection,
+            self.indexer.rotary_mode,
+        )
         # The bundled LightningIndexerVllm kernel is specialized for 64 query
         # heads. GLM-5.1 has 32 indexer heads, and upstream vLLM-Ascend routes
         # that architecture through torch-npu's native operator instead.
@@ -1302,7 +1320,6 @@ class DeepseekV32DSAAttention(nn.Module):
             snapshot[:, :topk].tolist(),
             snapshot[:, topk:].tolist(),
         )
-
         if active_rows is None:
             row_indices = list(range(batch_size))
         else:
@@ -1326,6 +1343,35 @@ class DeepseekV32DSAAttention(nn.Module):
             f"mean_miss_rate={mean_miss_rate:.6f}",
             flush=True,
         )
+
+    @torch.compiler.disable
+    def _print_dsa_native_selection_stats(
+        self,
+        topk_indices: torch.Tensor,
+        candidate_lens: torch.Tensor,
+    ) -> None:
+        if not self._dsa_native_stats_enabled:
+            return
+        self._dsa_native_stats_decode_step += 1
+        for stats in summarize_dsa_native_selection(
+            topk_indices,
+            candidate_lens,
+        ):
+            print(
+                "DSA_NATIVE_SELECTION_STATS "
+                f"decode_step={self._dsa_native_stats_decode_step} "
+                f"layer={self.layer_idx} rope={self.indexer.rotary_mode} "
+                f"row={stats.row} candidate_len={stats.candidate_len} "
+                f"valid={stats.valid_count} unique={stats.unique_count} "
+                f"invalid={stats.invalid_count} "
+                f"duplicates={stats.duplicate_count} "
+                f"min={stats.min_index} max={stats.max_index} "
+                f"retained_overlap={stats.retained_overlap}/2048 "
+                f"last2048_overlap={stats.last2048_overlap}/2048 "
+                f"tail128={stats.tail128_count} "
+                f"quartiles={list(stats.quartile_counts)}",
+                flush=True,
+            )
 
     def _dsa_offload_update(self, q_index: torch.Tensor, weights: torch.Tensor, batch_size: int) -> None:
         context = get_context()
@@ -1386,6 +1432,18 @@ class DeepseekV32DSAAttention(nn.Module):
                 candidate_query_lens,
                 candidate_lens,
                 index_tables,
+            )
+        elif dsa_debug_uses_native_selection(self.dsa_debug_selection):
+            topk_indices = self._run_lightning_indexer(
+                q_index_active,
+                weights_active,
+                candidate_query_lens,
+                candidate_lens,
+                index_tables,
+            )
+            self._print_dsa_native_selection_stats(
+                topk_indices,
+                candidate_lens,
             )
         else:
             topk_indices = build_dsa_debug_selection(

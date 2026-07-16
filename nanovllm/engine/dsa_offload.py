@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import dataclass
 
 import torch
 
@@ -10,11 +11,36 @@ DSA_DEBUG_RETAINED_PREFIX_TOKENS = 128
 DSA_DEBUG_SELECTION_MODES = frozenset(
     {
         "native",
+        "native_interleave_stats",
+        "native_half_stats",
         "retained_skip_gs",
         "retained_gs",
         "last2048_gs",
     }
 )
+DSA_DEBUG_NATIVE_SELECTION_MODES = frozenset(
+    {
+        "native",
+        "native_interleave_stats",
+        "native_half_stats",
+    }
+)
+
+
+@dataclass(frozen=True)
+class DSANativeSelectionStats:
+    row: int
+    candidate_len: int
+    valid_count: int
+    unique_count: int
+    invalid_count: int
+    duplicate_count: int
+    min_index: int
+    max_index: int
+    retained_overlap: int
+    last2048_overlap: int
+    tail128_count: int
+    quartile_counts: tuple[int, int, int, int]
 
 
 def parse_dsa_debug_selection(value: str | None) -> str:
@@ -28,6 +54,33 @@ def parse_dsa_debug_selection(value: str | None) -> str:
             f"{choices}, got {mode!r}."
         )
     return mode
+
+
+def dsa_debug_uses_native_selection(mode: str) -> bool:
+    """Whether ``mode`` consumes the LightningIndexer top-k output."""
+
+    return parse_dsa_debug_selection(mode) in DSA_DEBUG_NATIVE_SELECTION_MODES
+
+
+def dsa_debug_rotary_mode(mode: str, configured_mode: str) -> str:
+    """Resolve the Indexer RoPE variant selected by an eager diagnostic."""
+
+    mode = parse_dsa_debug_selection(mode)
+    if configured_mode not in ("half", "interleave"):
+        raise ValueError(
+            "configured Indexer rotary mode must be 'half' or 'interleave', "
+            f"got {configured_mode!r}."
+        )
+    if mode == "native_half_stats":
+        return "half"
+    if mode == "native_interleave_stats":
+        return "interleave"
+    return configured_mode
+
+
+def dsa_debug_prints_native_stats(mode: str) -> bool:
+    mode = parse_dsa_debug_selection(mode)
+    return mode in ("native_interleave_stats", "native_half_stats")
 
 
 def validate_dsa_debug_selection(
@@ -65,7 +118,7 @@ def build_dsa_debug_selection(
     """
 
     mode = parse_dsa_debug_selection(mode)
-    if mode == "native":
+    if dsa_debug_uses_native_selection(mode):
         return None
     if candidate_lens.ndim != 1:
         raise ValueError(
@@ -111,6 +164,89 @@ def build_dsa_debug_selection(
         ).view(1, -1)
         selected = candidate_lens - DSA_SELECTION_TOPK_TOKENS + offsets
     return selected.unsqueeze(1).contiguous()
+
+
+def summarize_dsa_native_selection(
+    topk_indices: torch.Tensor,
+    candidate_lens: torch.Tensor,
+) -> list[DSANativeSelectionStats]:
+    """Summarize native logical top-k IDs for the eager GLM diagnostic.
+
+    The retained set is the selection present after prefill finalization:
+    logical tokens ``[0, 128)`` plus the final 1920 candidate tokens.  Counts
+    use unique valid IDs so a malformed duplicate cannot inflate overlap.
+    Calling this helper synchronizes/copies its inputs to CPU; production
+    ``native`` mode never calls it.
+    """
+
+    if candidate_lens.ndim != 1:
+        raise ValueError(
+            "candidate_lens must be one-dimensional, got shape="
+            f"{tuple(candidate_lens.shape)}."
+        )
+    batch_size = int(candidate_lens.numel())
+    if batch_size == 0:
+        if topk_indices.numel() != 0:
+            raise ValueError("topk_indices must be empty for an empty batch.")
+        return []
+    if topk_indices.numel() % batch_size:
+        raise ValueError(
+            "topk_indices cannot be reshaped into candidate_lens rows: "
+            f"topk_numel={topk_indices.numel()}, batch={batch_size}."
+        )
+
+    topk_rows = topk_indices.detach().reshape(batch_size, -1).cpu().tolist()
+    lens = candidate_lens.detach().reshape(-1).cpu().tolist()
+    summaries: list[DSANativeSelectionStats] = []
+    for row, (raw_ids, raw_candidate_len) in enumerate(zip(topk_rows, lens)):
+        candidate_len = int(raw_candidate_len)
+        if candidate_len <= DSA_SELECTION_TOPK_TOKENS:
+            raise ValueError(
+                "native selection stats require every candidate length to "
+                f"exceed {DSA_SELECTION_TOPK_TOKENS}, got {candidate_len}."
+            )
+        valid_ids = [
+            int(token_id)
+            for token_id in raw_ids
+            if 0 <= int(token_id) < candidate_len
+        ]
+        unique_ids = set(valid_ids)
+        retained_suffix_start = candidate_len - (
+            DSA_SELECTION_TOPK_TOKENS - DSA_DEBUG_RETAINED_PREFIX_TOKENS
+        )
+        last2048_start = candidate_len - DSA_SELECTION_TOPK_TOKENS
+        retained_overlap = sum(
+            token_id < DSA_DEBUG_RETAINED_PREFIX_TOKENS
+            or token_id >= retained_suffix_start
+            for token_id in unique_ids
+        )
+        last2048_overlap = sum(
+            token_id >= last2048_start for token_id in unique_ids
+        )
+        tail128_count = sum(
+            token_id >= candidate_len - DSA_DEBUG_RETAINED_PREFIX_TOKENS
+            for token_id in unique_ids
+        )
+        quartiles = [0, 0, 0, 0]
+        for token_id in unique_ids:
+            quartiles[min((token_id * 4) // candidate_len, 3)] += 1
+        summaries.append(
+            DSANativeSelectionStats(
+                row=row,
+                candidate_len=candidate_len,
+                valid_count=len(valid_ids),
+                unique_count=len(unique_ids),
+                invalid_count=len(raw_ids) - len(valid_ids),
+                duplicate_count=len(valid_ids) - len(unique_ids),
+                min_index=min(unique_ids) if unique_ids else -1,
+                max_index=max(unique_ids) if unique_ids else -1,
+                retained_overlap=retained_overlap,
+                last2048_overlap=last2048_overlap,
+                tail128_count=tail128_count,
+                quartile_counts=tuple(quartiles),
+            )
+        )
+    return summaries
 
 
 def parse_gs_miss_rate_layers(
