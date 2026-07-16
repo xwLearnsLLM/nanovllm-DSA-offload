@@ -332,6 +332,13 @@ def _dsa_indexer_pipeline_with_qc_functional(
         score_scale=float(score_scale),
         rotary_mode=rotary_mode,
     )
+    # GatherSelection interprets full_kv_actual_seq as the full sequence seen
+    # by the current query and internally excludes that newest token from the
+    # reusable source range.  Nano's DRAM source contains only the completed
+    # full-block candidate prefix, so pass candidate_len + the one decode
+    # query.  Passing candidate_lens directly incorrectly drops candidate
+    # token candidate_len - 1 on every decode step.
+    gather_full_kv_lens = candidate_lens + 1
     if _GRAPH_LIGHTNING_INDEXER is None or _GRAPH_GATHER_SELECTION_KV_CACHE is None:
         topk_indices = ascend_ops.npu_lightning_indexer(
             query=q_index,
@@ -355,7 +362,7 @@ def _dsa_indexer_pipeline_with_qc_functional(
             full_kpe,
             full_ckv,
             dram_tables,
-            candidate_lens,
+            gather_full_kv_lens,
         )
         if return_gather_outputs:
             return q_index, index_weights, topk_indices, selection_kpe, selection_ckv, selection_block_table, gather_selection_status
@@ -389,7 +396,7 @@ def _dsa_indexer_pipeline_with_qc_functional(
         full_kpe,
         full_ckv,
         dram_tables,
-        candidate_lens,
+        gather_full_kv_lens,
     )
     if return_gather_outputs:
         return q_index, index_weights, topk_indices, selection_kpe_out, selection_ckv_out, selection_block_table_out, gather_selection_status_out

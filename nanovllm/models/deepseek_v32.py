@@ -15,6 +15,7 @@ from transformers import PretrainedConfig
 import nanovllm.ops as ascend_ops
 from nanovllm.engine.dsa_offload import (
     DSA_SELECTION_TOPK_TOKENS,
+    build_dsa_debug_selection,
     compute_gs_miss_counts,
     parse_gs_miss_rate_layers,
 )
@@ -668,10 +669,23 @@ class DeepseekV32DSAAttention(nn.Module):
             tp_rank == 0 and self.layer_idx in gs_miss_rate_layers
         )
         self._gs_miss_rate_decode_step = 0
+        self.dsa_debug_selection = str(
+            getattr(config, "nanovllm_dsa_debug_selection", "native")
+        )
         if tp_rank == 0 and self.layer_idx == 0 and gs_miss_rate_layers:
             print(
                 "GS_MISS_RATE enabled eager-only layers="
                 f"{sorted(gs_miss_rate_layers)}",
+                flush=True,
+            )
+        if (
+            tp_rank == 0
+            and self.layer_idx == 0
+            and self.dsa_debug_selection != "native"
+        ):
+            print(
+                "DSA_DEBUG_SELECTION eager-only mode="
+                f"{self.dsa_debug_selection}",
                 flush=True,
             )
 
@@ -793,6 +807,10 @@ class DeepseekV32DSAAttention(nn.Module):
         batch_size: int,
     ) -> None:
         context = get_context()
+        if self.dsa_debug_selection != "native":
+            raise RuntimeError(
+                "Non-native NANOVLLM_DSA_DEBUG_SELECTION modes are eager-only."
+            )
         if not context.full_decode_graph or not context.dsa_offload_all_rows:
             raise RuntimeError(
                 "The graph-visible DSA pipeline only supports an exact-size "
@@ -1089,6 +1107,10 @@ class DeepseekV32DSAAttention(nn.Module):
         candidate_lens: torch.Tensor,
         active_batch: int,
     ) -> None:
+        # The GatherSelection kernel's length includes the current query and
+        # then excludes that newest token from the reusable source range.  Our
+        # DRAM source is the candidate prefix only, hence candidate_len + 1.
+        gather_full_kv_lens = candidate_lens + 1
         ascend_ops.npu_gather_selection_kv_cache(
             self.kpe_cache.squeeze(2),
             self.ckv_cache.squeeze(2),
@@ -1101,7 +1123,7 @@ class DeepseekV32DSAAttention(nn.Module):
             self.dram_kpe_cache.squeeze(2),
             self.dram_ckv_cache.squeeze(2),
             dram_tables,
-            candidate_lens,
+            gather_full_kv_lens,
         )
 
     def _q_nope_up_proj(self, q_nope: torch.Tensor) -> torch.Tensor:
@@ -1309,6 +1331,10 @@ class DeepseekV32DSAAttention(nn.Module):
         context = get_context()
         if not context.needs_dsa_update:
             return
+        if self.dsa_debug_selection != "native" and context.full_decode_graph:
+            raise RuntimeError(
+                "Non-native NANOVLLM_DSA_DEBUG_SELECTION modes are eager-only."
+            )
         required_context = {
             "candidate_lens": context.candidate_lens,
             "req_pool_entries": context.req_pool_entries,
@@ -1346,13 +1372,30 @@ class DeepseekV32DSAAttention(nn.Module):
             active_rows = rows
         candidate_query_lens = context.candidate_query_lens[:active_batch]
 
-        topk_indices = self._run_lightning_indexer(
-            q_index_active,
-            weights_active,
-            candidate_query_lens,
-            candidate_lens,
-            index_tables,
-        )
+        if self.dsa_debug_selection == "retained_skip_gs":
+            # Prefill finalization already left this exact logical selection in
+            # the first 16 compact HBM blocks: token IDs [0, 128) followed by
+            # the final 1920 full-block candidate tokens.  Skipping both LI and
+            # Gather isolates the compact FIA metadata/data path.
+            return
+
+        if self.dsa_debug_selection == "native":
+            topk_indices = self._run_lightning_indexer(
+                q_index_active,
+                weights_active,
+                candidate_query_lens,
+                candidate_lens,
+                index_tables,
+            )
+        else:
+            topk_indices = build_dsa_debug_selection(
+                candidate_lens,
+                self.dsa_debug_selection,
+            )
+            if topk_indices is None:
+                raise RuntimeError(
+                    "Non-native DSA debug selection did not build top-k IDs."
+                )
 
         self._print_gs_miss_rate(
             topk_indices,

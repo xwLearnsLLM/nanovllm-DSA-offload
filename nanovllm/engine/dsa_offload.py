@@ -2,8 +2,115 @@ from __future__ import annotations
 
 from collections import deque
 
+import torch
+
 
 DSA_SELECTION_TOPK_TOKENS = 2048
+DSA_DEBUG_RETAINED_PREFIX_TOKENS = 128
+DSA_DEBUG_SELECTION_MODES = frozenset(
+    {
+        "native",
+        "retained_skip_gs",
+        "retained_gs",
+        "last2048_gs",
+    }
+)
+
+
+def parse_dsa_debug_selection(value: str | None) -> str:
+    """Parse the eager-only DSA selection diagnostic mode."""
+
+    mode = "native" if value is None or not value.strip() else value.strip()
+    if mode not in DSA_DEBUG_SELECTION_MODES:
+        choices = ", ".join(sorted(DSA_DEBUG_SELECTION_MODES))
+        raise ValueError(
+            "NANOVLLM_DSA_DEBUG_SELECTION must be one of "
+            f"{choices}, got {mode!r}."
+        )
+    return mode
+
+
+def validate_dsa_debug_selection(
+    value: str | None,
+    *,
+    enforce_eager: bool,
+    block_size: int,
+) -> str:
+    mode = parse_dsa_debug_selection(value)
+    if mode == "native":
+        return mode
+    if not enforce_eager:
+        raise ValueError(
+            "NANOVLLM_DSA_DEBUG_SELECTION is eager-only when it is not "
+            "'native'; set NANOVLLM_ENFORCE_EAGER=1."
+        )
+    if int(block_size) != DSA_DEBUG_RETAINED_PREFIX_TOKENS:
+        raise ValueError(
+            "Non-native NANOVLLM_DSA_DEBUG_SELECTION modes require "
+            "NANOVLLM_KVCACHE_BLOCK_SIZE=128 so the retained selection is "
+            "exactly the first 128 tokens plus the last 1920 tokens."
+        )
+    return mode
+
+
+def build_dsa_debug_selection(
+    candidate_lens: torch.Tensor,
+    mode: str,
+) -> torch.Tensor | None:
+    """Build deterministic logical token IDs for DSA selection diagnostics.
+
+    ``retained_*`` matches the exact logical order already present in the
+    compact HBM selection blocks after prefill finalization: the first
+    128-token block followed by the final 1920 candidate tokens.
+    """
+
+    mode = parse_dsa_debug_selection(mode)
+    if mode == "native":
+        return None
+    if candidate_lens.ndim != 1:
+        raise ValueError(
+            "candidate_lens must be one-dimensional, got shape="
+            f"{tuple(candidate_lens.shape)}."
+        )
+    if candidate_lens.dtype not in (torch.int32, torch.int64):
+        raise TypeError(
+            "candidate_lens must use int32 or int64, got "
+            f"{candidate_lens.dtype}."
+        )
+    if candidate_lens.numel() == 0:
+        return candidate_lens.new_empty((0, 1, DSA_SELECTION_TOPK_TOKENS))
+    if bool(torch.any(candidate_lens <= DSA_SELECTION_TOPK_TOKENS).item()):
+        raise ValueError(
+            "DSA debug selection requires every candidate length to exceed "
+            f"{DSA_SELECTION_TOPK_TOKENS}."
+        )
+
+    batch_size = int(candidate_lens.numel())
+    candidate_lens = candidate_lens.reshape(batch_size, 1)
+    if mode in ("retained_skip_gs", "retained_gs"):
+        prefix = torch.arange(
+            DSA_DEBUG_RETAINED_PREFIX_TOKENS,
+            dtype=candidate_lens.dtype,
+            device=candidate_lens.device,
+        ).view(1, -1).expand(batch_size, -1)
+        suffix_tokens = (
+            DSA_SELECTION_TOPK_TOKENS - DSA_DEBUG_RETAINED_PREFIX_TOKENS
+        )
+        suffix_offsets = torch.arange(
+            suffix_tokens,
+            dtype=candidate_lens.dtype,
+            device=candidate_lens.device,
+        ).view(1, -1)
+        suffix = candidate_lens - suffix_tokens + suffix_offsets
+        selected = torch.cat((prefix, suffix), dim=1)
+    else:
+        offsets = torch.arange(
+            DSA_SELECTION_TOPK_TOKENS,
+            dtype=candidate_lens.dtype,
+            device=candidate_lens.device,
+        ).view(1, -1)
+        selected = candidate_lens - DSA_SELECTION_TOPK_TOKENS + offsets
+    return selected.unsqueeze(1).contiguous()
 
 
 def parse_gs_miss_rate_layers(

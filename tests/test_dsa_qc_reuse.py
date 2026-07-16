@@ -45,6 +45,7 @@ def test_full_graph_pipeline_consumes_mlapo_q_c(monkeypatch):
 
     def fake_gather_selection(*args):
         observed["gather_called"] = True
+        observed["gather_full_kv_lens"] = args[-1].clone()
 
     monkeypatch.setattr(project, "_GRAPH_LIGHTNING_INDEXER", None)
     monkeypatch.setattr(project, "_GRAPH_GATHER_SELECTION_KV_CACHE", None)
@@ -93,3 +94,6 @@ def test_full_graph_pipeline_consumes_mlapo_q_c(monkeypatch):
     assert torch.equal(q_index, expected)
     assert torch.equal(observed["query"], expected)
     assert observed["gather_called"] is True
+    # GatherSelection excludes the current query internally, so its full-KV
+    # length must be one larger than the prefix-only LightningIndexer length.
+    assert observed["gather_full_kv_lens"].tolist() == [9, 9]

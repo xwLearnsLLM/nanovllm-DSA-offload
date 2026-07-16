@@ -5,7 +5,10 @@ import os
 from dataclasses import dataclass, field
 from typing import Any
 
-from nanovllm.engine.dsa_offload import DSA_SELECTION_TOPK_TOKENS
+from nanovllm.engine.dsa_offload import (
+    DSA_SELECTION_TOPK_TOKENS,
+    validate_dsa_debug_selection,
+)
 from nanovllm.engine.full_decode_graph import normalize_capture_sizes
 
 
@@ -124,6 +127,16 @@ class Config:
         # always eager; enforce_eager controls steady-state decode.
         if not isinstance(self.enforce_eager, bool):
             raise TypeError("enforce_eager must be a bool.")
+        debug_selection = validate_dsa_debug_selection(
+            os.environ.get("NANOVLLM_DSA_DEBUG_SELECTION"),
+            enforce_eager=self.enforce_eager,
+            block_size=self.kvcache_block_size,
+        )
+        setattr(
+            self.hf_config,
+            "nanovllm_dsa_debug_selection",
+            debug_selection,
+        )
         if self.enforce_eager:
             self.decode_graph_capture_sizes = ()
             return

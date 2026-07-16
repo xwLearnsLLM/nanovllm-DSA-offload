@@ -18,7 +18,11 @@ import math
 import torch
 import torch_npu  # type: ignore
 
-from nanovllm.models.dsa_indexer_project import dsa_indexer_project_torch
+from nanovllm.models.dsa_indexer_project import (
+    dsa_indexer_project_q_path,
+    dsa_indexer_project_query_only,
+    dsa_indexer_project_torch,
+)
 
 
 GLM_HIDDEN_SIZE = 6144
@@ -394,6 +398,114 @@ def main() -> None:
         "GLM_DSA_INDEXER_PROJECT_CHECK ok=1 "
         f"q_max_abs={q_diff:.6g} k_max_abs={k_diff:.6g} "
         f"weights_max_abs={weights_diff:.6g}",
+        flush=True,
+    )
+
+    # Steady-state decode uses the query-only BMM-transpose path for batches
+    # up to 64.  GLM's K=2048 and 32 index heads differ from the DeepSeek
+    # shape that originally introduced this optimization, so compare the
+    # actual hot path with its F.linear fallback before testing selection.
+    bmm_batch = min(args.batch_size, 64)
+    hidden_bmm = hidden_states[:bmm_batch]
+    q_c_bmm = q_c[:bmm_batch]
+    cos_bmm = cos[:bmm_batch]
+    sin_bmm = sin[:bmm_batch]
+    wq_b_bmm_t = (
+        wq_b.view(
+            GLM_INDEX_HEADS,
+            GLM_INDEX_HEAD_DIM,
+            GLM_Q_LORA_RANK,
+        )
+        .transpose(1, 2)
+        .contiguous()
+    )
+    weights_proj_bf16 = weights_proj.to(dtype)
+    q_linear = torch.empty(
+        bmm_batch,
+        GLM_INDEX_HEADS,
+        GLM_INDEX_HEAD_DIM,
+        dtype=dtype,
+        device=device,
+    )
+    weights_linear = torch.empty(
+        bmm_batch,
+        GLM_INDEX_HEADS,
+        dtype=dtype,
+        device=device,
+    )
+    q_bmm = torch.empty_like(q_linear)
+    weights_bmm = torch.empty_like(weights_linear)
+    dsa_indexer_project_query_only(
+        hidden_bmm,
+        q_c_bmm,
+        cos_bmm,
+        sin_bmm,
+        wq_b,
+        weights_proj_bf16,
+        q_linear,
+        weights_linear,
+        n_head=GLM_INDEX_HEADS,
+        head_dim=GLM_INDEX_HEAD_DIM,
+        rope_dim=GLM_INDEX_ROPE_DIM,
+        score_scale=1.0,
+        rotary_mode="interleave",
+        enable_q_bmm=False,
+    )
+    dsa_indexer_project_query_only(
+        hidden_bmm,
+        q_c_bmm,
+        cos_bmm,
+        sin_bmm,
+        wq_b,
+        weights_proj_bf16,
+        q_bmm,
+        weights_bmm,
+        n_head=GLM_INDEX_HEADS,
+        head_dim=GLM_INDEX_HEAD_DIM,
+        rope_dim=GLM_INDEX_ROPE_DIM,
+        score_scale=1.0,
+        rotary_mode="interleave",
+        wq_b_bmm_t=wq_b_bmm_t,
+        enable_q_bmm=True,
+    )
+    selected_q_path = dsa_indexer_project_q_path(
+        q_c_bmm,
+        wq_b_bmm_t,
+        enable_q_bmm=True,
+    )
+    if selected_q_path != "dsa_indexer_project_bmm_transpose":
+        raise AssertionError(
+            "GLM query-only A/B did not select the BMM-transpose hot path: "
+            f"selected={selected_q_path}."
+        )
+
+    torch.npu.synchronize()
+    q_bmm_diff = assert_close(
+        "query_only_bmm_q_index",
+        q_bmm,
+        q_linear,
+        atol=0.04,
+        rtol=0.02,
+    )
+    weights_bmm_diff = assert_close(
+        "query_only_bmm_weights",
+        weights_bmm,
+        weights_linear,
+        atol=0.01,
+        rtol=0.01,
+    )
+    cosine = torch.nn.functional.cosine_similarity(
+        q_bmm.float().reshape(bmm_batch, -1),
+        q_linear.float().reshape(bmm_batch, -1),
+        dim=-1,
+    )
+    min_cosine = float(cosine.min().item())
+    print(
+        "GLM_DSA_QUERY_ONLY_BMM_CHECK ok=1 "
+        f"batch={bmm_batch} path={selected_q_path} "
+        f"q_max_abs={q_bmm_diff:.6g} "
+        f"weights_max_abs={weights_bmm_diff:.6g} "
+        f"q_min_cosine={min_cosine:.9f}",
         flush=True,
     )
 
