@@ -6,14 +6,68 @@ import torch
 from nanovllm.config import Config
 from nanovllm.engine.dsa_offload import (
     DSANativeSelectionStats,
+    DSANumericTensorStats,
     build_dsa_debug_selection,
+    default_dsa_native_stats_layers,
+    dsa_effective_index_cache_row,
     dsa_debug_prints_native_stats,
     dsa_debug_rotary_mode,
     dsa_debug_uses_native_selection,
     parse_dsa_debug_selection,
     summarize_dsa_native_selection,
+    summarize_dsa_numeric_tensor,
     validate_dsa_debug_selection,
 )
+
+
+def test_default_dsa_native_stats_layers_cover_glm_progression():
+    assert default_dsa_native_stats_layers(78) == frozenset(
+        {0, 1, 2, 4, 8, 16, 24, 32, 39, 48, 64, 77}
+    )
+    assert default_dsa_native_stats_layers(3) == frozenset({0, 1, 2})
+    with pytest.raises(ValueError, match="must be positive"):
+        default_dsa_native_stats_layers(0)
+
+
+def test_summarize_dsa_numeric_tensor_reports_nonfinite_and_scale():
+    tensor = torch.tensor(
+        [0.0, 3.0, 4.0, float("nan"), float("inf")],
+        dtype=torch.float32,
+    )
+
+    assert summarize_dsa_numeric_tensor(tensor) == DSANumericTensorStats(
+        numel=5,
+        finite_count=3,
+        nonzero_count=2,
+        abs_max=4.0,
+        l2_norm=5.0,
+    )
+
+
+def test_dsa_effective_index_cache_row_follows_block_table_and_tail_length():
+    cache = torch.arange(4 * 4 * 2, dtype=torch.float32).view(4, 4, 1, 2)
+
+    effective = dsa_effective_index_cache_row(
+        cache,
+        torch.tensor([2, 0, 3], dtype=torch.int32),
+        candidate_len=6,
+        block_size=4,
+    )
+
+    expected = torch.cat((cache[2], cache[0]), dim=0)[:6]
+    assert torch.equal(effective, expected)
+    assert effective.shape == (6, 1, 2)
+
+
+def test_dsa_effective_index_cache_row_validates_metadata():
+    cache = torch.zeros((2, 4, 1, 2))
+    with pytest.raises(ValueError, match="too short"):
+        dsa_effective_index_cache_row(
+            cache,
+            torch.tensor([0], dtype=torch.int32),
+            candidate_len=8,
+            block_size=4,
+        )
 
 
 def test_dsa_debug_selection_defaults_to_native():

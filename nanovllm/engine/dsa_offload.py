@@ -27,6 +27,24 @@ DSA_DEBUG_NATIVE_SELECTION_MODES = frozenset(
 )
 
 
+def default_dsa_native_stats_layers(
+    num_hidden_layers: int,
+) -> frozenset[int]:
+    """Layers sampled by the eager native-Indexer diagnostic by default."""
+
+    num_hidden_layers = int(num_hidden_layers)
+    if num_hidden_layers <= 0:
+        raise ValueError(
+            "num_hidden_layers must be positive, got "
+            f"{num_hidden_layers}."
+        )
+    probes = (0, 1, 2, 4, 8, 16, 24, 32, 39, 48, 64)
+    return frozenset(
+        {layer for layer in probes if layer < num_hidden_layers}
+        | {num_hidden_layers - 1}
+    )
+
+
 @dataclass(frozen=True)
 class DSANativeSelectionStats:
     row: int
@@ -41,6 +59,91 @@ class DSANativeSelectionStats:
     last2048_overlap: int
     tail128_count: int
     quartile_counts: tuple[int, int, int, int]
+
+
+@dataclass(frozen=True)
+class DSANumericTensorStats:
+    """Small eager-diagnostic summary for an Indexer input tensor."""
+
+    numel: int
+    finite_count: int
+    nonzero_count: int
+    abs_max: float
+    l2_norm: float
+
+
+def summarize_dsa_numeric_tensor(tensor: torch.Tensor) -> DSANumericTensorStats:
+    """Reduce a tensor to scalar health statistics without copying it whole.
+
+    NaN/Inf entries are reported by ``finite_count`` and excluded from the
+    nonzero, max and norm reductions.  On NPU this performs one small D2H copy;
+    callers must therefore keep it behind an explicit eager diagnostic mode.
+    """
+
+    numel = int(tensor.numel())
+    if numel == 0:
+        return DSANumericTensorStats(0, 0, 0, 0.0, 0.0)
+
+    values = tensor.detach().to(dtype=torch.float32)
+    finite = torch.isfinite(values)
+    safe_values = torch.where(finite, values, torch.zeros_like(values))
+    metrics = torch.stack(
+        (
+            finite.sum(dtype=torch.float32),
+            torch.count_nonzero(finite & (safe_values != 0)).to(torch.float32),
+            safe_values.abs().amax(),
+            torch.sqrt(torch.sum(safe_values * safe_values)),
+        )
+    ).cpu().tolist()
+    return DSANumericTensorStats(
+        numel=numel,
+        finite_count=int(metrics[0]),
+        nonzero_count=int(metrics[1]),
+        abs_max=float(metrics[2]),
+        l2_norm=float(metrics[3]),
+    )
+
+
+def dsa_effective_index_cache_row(
+    index_cache: torch.Tensor,
+    block_table_row: torch.Tensor,
+    candidate_len: int,
+    block_size: int,
+) -> torch.Tensor:
+    """Resolve the logical candidate prefix consumed by LightningIndexer."""
+
+    candidate_len = int(candidate_len)
+    block_size = int(block_size)
+    if candidate_len < 0:
+        raise ValueError(f"candidate_len must be non-negative, got {candidate_len}.")
+    if block_size <= 0:
+        raise ValueError(f"block_size must be positive, got {block_size}.")
+    if index_cache.ndim < 2 or int(index_cache.shape[1]) != block_size:
+        raise ValueError(
+            "index_cache must have shape [num_blocks, block_size, ...], "
+            f"got {tuple(index_cache.shape)} for block_size={block_size}."
+        )
+    if block_table_row.ndim != 1:
+        raise ValueError(
+            "block_table_row must be one-dimensional, got shape="
+            f"{tuple(block_table_row.shape)}."
+        )
+
+    num_blocks = (candidate_len + block_size - 1) // block_size
+    if num_blocks > int(block_table_row.numel()):
+        raise ValueError(
+            "block table is too short for the candidate prefix: "
+            f"need={num_blocks}, have={block_table_row.numel()}."
+        )
+    tail_shape = tuple(index_cache.shape[2:])
+    if num_blocks == 0:
+        return index_cache.new_empty((0, *tail_shape))
+    physical_blocks = block_table_row[:num_blocks].to(
+        device=index_cache.device,
+        dtype=torch.int64,
+    )
+    cache = index_cache.index_select(0, physical_blocks)
+    return cache.reshape(num_blocks * block_size, *tail_shape)[:candidate_len]
 
 
 def parse_dsa_debug_selection(value: str | None) -> str:

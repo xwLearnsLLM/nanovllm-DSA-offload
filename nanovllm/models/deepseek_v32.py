@@ -17,10 +17,13 @@ from nanovllm.engine.dsa_offload import (
     DSA_SELECTION_TOPK_TOKENS,
     build_dsa_debug_selection,
     compute_gs_miss_counts,
+    default_dsa_native_stats_layers,
+    dsa_effective_index_cache_row,
     dsa_debug_prints_native_stats,
     dsa_debug_rotary_mode,
     dsa_debug_uses_native_selection,
     parse_gs_miss_rate_layers,
+    summarize_dsa_numeric_tensor,
     summarize_dsa_native_selection,
 )
 from nanovllm.engine.full_decode_graph import (
@@ -676,8 +679,8 @@ class DeepseekV32DSAAttention(nn.Module):
         self.dsa_debug_selection = str(
             getattr(config, "nanovllm_dsa_debug_selection", "native")
         )
-        default_stats_layers = frozenset(
-            {0, int(config.num_hidden_layers) // 2, int(config.num_hidden_layers) - 1}
+        default_stats_layers = default_dsa_native_stats_layers(
+            int(config.num_hidden_layers)
         )
         native_stats_layers = gs_miss_rate_layers or default_stats_layers
         self._dsa_native_stats_enabled = (
@@ -686,6 +689,8 @@ class DeepseekV32DSAAttention(nn.Module):
             and self.layer_idx in native_stats_layers
         )
         self._dsa_native_stats_decode_step = 0
+        self._dsa_native_inputs_printed = False
+        self._dsa_native_prefill_store_printed = False
         if tp_rank == 0 and self.layer_idx == 0 and gs_miss_rate_layers:
             print(
                 "GS_MISS_RATE enabled eager-only layers="
@@ -1064,7 +1069,32 @@ class DeepseekV32DSAAttention(nn.Module):
             return
         context = get_context()
         index_slots = context.flat_index_slot_mapping if context.flat_index_slot_mapping is not None else self._flat_slots()
-        self.index_cache.view(-1, self.indexer.head_dim).index_copy_(0, index_slots, index_k)
+        flat_cache = self.index_cache.view(-1, self.indexer.head_dim)
+        print_store_stats = (
+            context.is_prefill
+            and self._dsa_native_stats_enabled
+            and not self._dsa_native_prefill_store_printed
+        )
+        flat_cache.index_copy_(0, index_slots, index_k)
+        if print_store_stats:
+            stored_index_k = flat_cache.index_select(0, index_slots)
+            for name, tensor in (
+                ("index_k_before_store", index_k),
+                ("index_cache_after_store", stored_index_k),
+                ("store_abs_diff", stored_index_k.float() - index_k.float()),
+            ):
+                stats = summarize_dsa_numeric_tensor(tensor)
+                print(
+                    "DSA_NATIVE_PREFILL_INDEX_STATS "
+                    f"layer={self.layer_idx} rope={self.indexer.rotary_mode} "
+                    f"tensor={name} shape={list(tensor.shape)} "
+                    f"dtype={tensor.dtype} numel={stats.numel} "
+                    f"finite={stats.finite_count}/{stats.numel} "
+                    f"nonzero={stats.nonzero_count}/{stats.numel} "
+                    f"absmax={stats.abs_max:.9g} l2={stats.l2_norm:.9g}",
+                    flush=True,
+                )
+            self._dsa_native_prefill_store_printed = True
 
     def _run_indexer(
         self,
@@ -1345,6 +1375,67 @@ class DeepseekV32DSAAttention(nn.Module):
         )
 
     @torch.compiler.disable
+    def _print_dsa_native_input_stats(
+        self,
+        q_index: torch.Tensor,
+        index_weights: torch.Tensor,
+        index_block_tables: torch.Tensor,
+        candidate_lens: torch.Tensor,
+    ) -> None:
+        """Print the exact first-decode inputs seen by LightningIndexer."""
+
+        if (
+            not self._dsa_native_stats_enabled
+            or self._dsa_native_inputs_printed
+        ):
+            return
+        self._dsa_native_inputs_printed = True
+        for name, tensor in (
+            ("wq_b_weight", self.indexer.wq_b.weight),
+            ("wk_weight", self.indexer.wk.weight),
+            ("weights_proj_weight", self.indexer.weights_proj.weight),
+        ):
+            stats = summarize_dsa_numeric_tensor(tensor)
+            print(
+                "DSA_NATIVE_INPUT_STATS "
+                "decode_step=1 "
+                f"layer={self.layer_idx} rope={self.indexer.rotary_mode} "
+                f"row=static tensor={name} shape={list(tensor.shape)} "
+                f"dtype={tensor.dtype} numel={stats.numel} "
+                f"finite={stats.finite_count}/{stats.numel} "
+                f"nonzero={stats.nonzero_count}/{stats.numel} "
+                f"absmax={stats.abs_max:.9g} l2={stats.l2_norm:.9g}",
+                flush=True,
+            )
+        lens = candidate_lens.detach().reshape(-1).cpu().tolist()
+        for row, raw_candidate_len in enumerate(lens):
+            candidate_len = int(raw_candidate_len)
+            effective_cache = dsa_effective_index_cache_row(
+                self.index_cache,
+                index_block_tables[row],
+                candidate_len,
+                self.block_size,
+            )
+            tensors = (
+                ("q_index", q_index[row]),
+                ("index_weights", index_weights[row]),
+                ("index_cache", effective_cache),
+            )
+            for name, tensor in tensors:
+                stats = summarize_dsa_numeric_tensor(tensor)
+                print(
+                    "DSA_NATIVE_INPUT_STATS "
+                    "decode_step=1 "
+                    f"layer={self.layer_idx} rope={self.indexer.rotary_mode} "
+                    f"row={row} tensor={name} shape={list(tensor.shape)} "
+                    f"dtype={tensor.dtype} numel={stats.numel} "
+                    f"finite={stats.finite_count}/{stats.numel} "
+                    f"nonzero={stats.nonzero_count}/{stats.numel} "
+                    f"absmax={stats.abs_max:.9g} l2={stats.l2_norm:.9g}",
+                    flush=True,
+                )
+
+    @torch.compiler.disable
     def _print_dsa_native_selection_stats(
         self,
         topk_indices: torch.Tensor,
@@ -1434,6 +1525,12 @@ class DeepseekV32DSAAttention(nn.Module):
                 index_tables,
             )
         elif dsa_debug_uses_native_selection(self.dsa_debug_selection):
+            self._print_dsa_native_input_stats(
+                q_index_active,
+                weights_active,
+                index_tables,
+                candidate_lens,
+            )
             topk_indices = self._run_lightning_indexer(
                 q_index_active,
                 weights_active,
