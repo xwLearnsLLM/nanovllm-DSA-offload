@@ -684,22 +684,27 @@ class DeepseekV32DSAAttention(nn.Module):
             int(config.num_hidden_layers)
         )
         native_stats_layers = gs_miss_rate_layers or default_stats_layers
+        # Keep the expensive all-rank pipeline and CPU-golden Gather checks
+        # focused on one layer by default.  For a targeted diagnostic run,
+        # NANOVLLM_GS_MISS_RATE_ON_LAYERS also selects the layers inspected by
+        # these checks (for example, "2,3").
+        pipeline_stats_layers = gs_miss_rate_layers or frozenset({0})
         self._dsa_native_stats_enabled = (
             dsa_debug_prints_native_stats(self.dsa_debug_selection)
             and tp_rank == 0
             and self.layer_idx in native_stats_layers
         )
-        # Layer-0 attention is TP-sharded.  A NaN on any rank can contaminate
-        # the following all-reduce, so the explicit diagnostic prints this
-        # small pipeline summary on every rank rather than rank 0 only.
+        # Attention is TP-sharded.  A NaN on any rank can contaminate the
+        # following all-reduce, so the explicit diagnostic prints the selected
+        # layers on every rank rather than rank 0 only.
         self._dsa_native_pipeline_enabled = (
             dsa_debug_prints_native_stats(self.dsa_debug_selection)
-            and self.layer_idx == 0
+            and self.layer_idx in pipeline_stats_layers
         )
         self._dsa_native_gather_stats_enabled = (
             dsa_debug_prints_native_stats(self.dsa_debug_selection)
             and tp_rank == 0
-            and self.layer_idx == 0
+            and self.layer_idx in pipeline_stats_layers
         )
         self._dsa_native_stats_decode_step = 0
         self._dsa_native_inputs_printed = False
@@ -1508,7 +1513,7 @@ class DeepseekV32DSAAttention(nn.Module):
         stage: str,
         tensor: torch.Tensor,
     ) -> None:
-        """Print one first-decode health summary for the layer-0 pipeline."""
+        """Print one first-decode health summary for a selected layer."""
 
         context = get_context()
         if (
@@ -1521,7 +1526,7 @@ class DeepseekV32DSAAttention(nn.Module):
         stats = summarize_dsa_numeric_tensor(tensor)
         print(
             "DSA_NATIVE_PIPELINE_STATS "
-            f"decode_step=1 layer=0 rank={dist.get_rank()} "
+            f"decode_step=1 layer={self.layer_idx} rank={dist.get_rank()} "
             f"stage={stage} shape={list(tensor.shape)} dtype={tensor.dtype} "
             f"numel={stats.numel} finite={stats.finite_count}/{stats.numel} "
             f"nonzero={stats.nonzero_count}/{stats.numel} "
@@ -1579,7 +1584,7 @@ class DeepseekV32DSAAttention(nn.Module):
                 npu_format = f"error:{type(exc).__name__}"
             print(
                 "DSA_NATIVE_GATHER_MAPPING "
-                "decode_step=1 layer=0 "
+                f"decode_step=1 layer={self.layer_idx} "
                 f"row={row} topk_dtype={topk_indices.dtype} "
                 f"topk_contiguous={int(topk_indices.is_contiguous())} "
                 f"topk_stride={list(topk_indices.stride())} "
@@ -1591,7 +1596,8 @@ class DeepseekV32DSAAttention(nn.Module):
             )
             if status_actual != topk or status_valid != topk or status_unique != topk:
                 print(
-                    "DSA_NATIVE_GATHER_STATS decode_step=1 layer=0 "
+                    "DSA_NATIVE_GATHER_STATS "
+                    f"decode_step=1 layer={self.layer_idx} "
                     f"row={row} skipped=invalid_status",
                     flush=True,
                 )
@@ -1601,7 +1607,8 @@ class DeepseekV32DSAAttention(nn.Module):
             source_pair = self._dsa_native_prefill_cache_cpu.get(pool_entry)
             if source_pair is None:
                 print(
-                    "DSA_NATIVE_GATHER_STATS decode_step=1 layer=0 "
+                    "DSA_NATIVE_GATHER_STATS "
+                    f"decode_step=1 layer={self.layer_idx} "
                     f"row={row} skipped=missing_prefill_cpu_golden",
                     flush=True,
                 )
@@ -1638,7 +1645,7 @@ class DeepseekV32DSAAttention(nn.Module):
                     stats = summarize_dsa_numeric_tensor(tensor)
                     print(
                         "DSA_NATIVE_GATHER_STATS "
-                        "decode_step=1 layer=0 "
+                        f"decode_step=1 layer={self.layer_idx} "
                         f"row={row} tensor={name} shape={list(tensor.shape)} "
                         f"dtype={tensor.dtype} numel={stats.numel} "
                         f"finite={stats.finite_count}/{stats.numel} "
