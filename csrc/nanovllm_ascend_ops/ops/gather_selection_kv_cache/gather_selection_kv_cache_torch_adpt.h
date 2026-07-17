@@ -35,8 +35,20 @@ inline void npu_gather_selection_kv_cache(
     TORCH_CHECK(selection_kv_block_table.size(0) == req_pool_entries.size(0), "selection_kv_block_table batch must equal req_pool_entries.");
     TORCH_CHECK(selection_topk_indices.size(0) == req_pool_entries.size(0), "selection_topk_indices batch must equal req_pool_entries.");
 
-    EXEC_NPU_CMD(
+    auto tensor_keepalive = std::make_tuple(
+        selection_k_rope,
+        selection_kv_cache,
+        selection_kv_block_table,
+        selection_kv_block_status,
+        req_pool_entries,
+        selection_topk_indices,
+        full_k_rope,
+        full_kv_cache,
+        full_kv_block_table,
+        full_kv_actual_seq);
+    EXEC_NPU_CMD_ORDERED(
         aclnnGatherSelectionKvCache,
+        tensor_keepalive,
         selection_k_rope,
         selection_kv_cache,
         selection_kv_block_table,
