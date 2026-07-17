@@ -210,7 +210,15 @@ def test_non_native_debug_selection_requires_eager_and_block128():
 
 @pytest.mark.parametrize(
     "mode",
-    ("none", "project_sync", "li_clone", "li_sync", "gs_sync", "all_sync"),
+    (
+        "none",
+        "project_sync",
+        "li_clone",
+        "li_sync",
+        "gs_dispatch",
+        "gs_sync",
+        "all_sync",
+    ),
 )
 def test_dsa_boundary_probe_modes_are_eager_only(mode):
     assert validate_dsa_boundary_probe(mode, enforce_eager=True) == mode

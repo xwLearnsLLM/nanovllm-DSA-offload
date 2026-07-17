@@ -131,6 +131,44 @@ def _register_nanovllm_dsa_torchair_converters() -> None:
 
 _register_nanovllm_dsa_torchair_converters()
 
+
+def gather_selection_kv_cache_eager_dispatch(
+    selection_kpe: torch.Tensor,
+    selection_ckv: torch.Tensor,
+    selection_block_table: torch.Tensor,
+    gather_selection_status: torch.Tensor,
+    req_pool_entries: torch.Tensor,
+    topk_indices: torch.Tensor,
+    full_kpe: torch.Tensor,
+    full_ckv: torch.Tensor,
+    dram_tables: torch.Tensor,
+    gather_full_kv_lens: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Launch GatherSelection through the PyTorch dispatcher in eager mode.
+
+    GLM uses torch-npu's native LightningIndexer.  Keeping its consumer in the
+    dispatcher makes the producer/consumer tensor edge visible to torch-npu;
+    the legacy pybind entry point bypasses that edge completely.
+    """
+
+    if _GRAPH_GATHER_SELECTION_KV_CACHE is None:
+        raise RuntimeError(
+            "The dispatcher GatherSelection registration is unavailable; "
+            "rebuild with `bash scripts/build_nanovllm_ops.sh`."
+        ) from _GRAPH_CUSTOM_OP_ERROR
+    return _GRAPH_GATHER_SELECTION_KV_CACHE(
+        selection_kpe,
+        selection_ckv,
+        selection_block_table,
+        gather_selection_status,
+        req_pool_entries,
+        topk_indices,
+        full_kpe,
+        full_ckv,
+        dram_tables,
+        gather_full_kv_lens,
+    )
+
 _POST_OPS = None
 _POST_IMPORT_ERROR: Exception | None = None
 _EXPECTED_POST_BINDING_VERSION = "dsa_indexer_project_post_csrc_v1"
@@ -790,4 +828,5 @@ __all__ = [
     "dsa_indexer_project_query_only",
     "dsa_indexer_pipeline_with_qc_full_graph",
     "dsa_indexer_project_torch",
+    "gather_selection_kv_cache_eager_dispatch",
 ]

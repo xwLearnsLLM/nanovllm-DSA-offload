@@ -36,6 +36,7 @@ from nanovllm.models.dsa_indexer_project import (
     dsa_indexer_project,
     dsa_indexer_project_query_only,
     dsa_indexer_pipeline_with_qc_full_graph,
+    gather_selection_kv_cache_eager_dispatch,
 )
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
@@ -1213,15 +1214,30 @@ class DeepseekV32DSAAttention(nn.Module):
         # then excludes that newest token from the reusable source range.  Our
         # DRAM source is the candidate prefix only, hence candidate_len + 1.
         gather_full_kv_lens = candidate_lens + 1
+        topk_indices = topk_indices.view(
+            active_batch, 1, 1, self.gather_selection_topk
+        )
+        if self.dsa_boundary_probe == "gs_dispatch":
+            gather_selection_kv_cache_eager_dispatch(
+                self.kpe_cache.squeeze(2),
+                self.ckv_cache.squeeze(2),
+                selection_block_table,
+                self.gather_selection_status,
+                req_pool_entries,
+                topk_indices,
+                self.dram_kpe_cache.squeeze(2),
+                self.dram_ckv_cache.squeeze(2),
+                dram_tables,
+                gather_full_kv_lens,
+            )
+            return
         ascend_ops.npu_gather_selection_kv_cache(
             self.kpe_cache.squeeze(2),
             self.ckv_cache.squeeze(2),
             selection_block_table,
             self.gather_selection_status,
             req_pool_entries,
-            topk_indices.view(
-                active_batch, 1, 1, self.gather_selection_topk
-            ),
+            topk_indices,
             self.dram_kpe_cache.squeeze(2),
             self.dram_ckv_cache.squeeze(2),
             dram_tables,

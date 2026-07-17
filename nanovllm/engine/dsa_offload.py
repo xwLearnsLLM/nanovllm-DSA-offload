@@ -31,6 +31,7 @@ DSA_BOUNDARY_PROBE_MODES = frozenset(
         "project_sync",
         "li_clone",
         "li_sync",
+        "gs_dispatch",
         "gs_sync",
         "all_sync",
     }
