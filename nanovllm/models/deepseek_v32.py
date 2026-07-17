@@ -680,6 +680,9 @@ class DeepseekV32DSAAttention(nn.Module):
         self.dsa_debug_selection = str(
             getattr(config, "nanovllm_dsa_debug_selection", "native")
         )
+        self.dsa_boundary_probe = str(
+            getattr(config, "nanovllm_dsa_boundary_probe", "none")
+        )
         default_stats_layers = default_dsa_native_stats_layers(
             int(config.num_hidden_layers)
         )
@@ -711,6 +714,7 @@ class DeepseekV32DSAAttention(nn.Module):
         self._dsa_native_prefill_store_printed = False
         self._dsa_native_gather_printed = False
         self._dsa_native_pipeline_stages_printed: set[str] = set()
+        self._dsa_li_gs_topk_keepalive: torch.Tensor | None = None
         self._dsa_native_prefill_cache_cpu: dict[
             int,
             tuple[torch.Tensor, torch.Tensor],
@@ -729,6 +733,16 @@ class DeepseekV32DSAAttention(nn.Module):
             print(
                 "DSA_DEBUG_SELECTION eager-only mode="
                 f"{self.dsa_debug_selection}",
+                flush=True,
+            )
+        if (
+            tp_rank == 0
+            and self.layer_idx == 0
+            and self.dsa_boundary_probe != "none"
+        ):
+            print(
+                "DSA_BOUNDARY_PROBE eager-only mode="
+                f"{self.dsa_boundary_probe}",
                 flush=True,
             )
 
@@ -1699,6 +1713,15 @@ class DeepseekV32DSAAttention(nn.Module):
             active_rows = rows
         candidate_query_lens = context.candidate_query_lens[:active_batch]
 
+        uses_native_selection = dsa_debug_uses_native_selection(
+            self.dsa_debug_selection
+        )
+        if uses_native_selection and self.dsa_boundary_probe in (
+            "project_sync",
+            "all_sync",
+        ):
+            _synchronize_device(q_index_active.device)
+
         if self.dsa_debug_selection == "retained_skip_gs":
             # Prefill finalization already left this exact logical selection in
             # the first 16 compact HBM blocks: token IDs [0, 128) followed by
@@ -1742,6 +1765,17 @@ class DeepseekV32DSAAttention(nn.Module):
                     "Non-native DSA debug selection did not build top-k IDs."
                 )
 
+        if uses_native_selection:
+            if self.dsa_boundary_probe == "li_clone":
+                # Force an owned framework tensor between torch-npu's native
+                # LightningIndexer result and the pybind GatherSelection op.
+                # Retain it on the layer until the next decode so the caching
+                # allocator cannot recycle the storage while GS is in flight.
+                self._dsa_li_gs_topk_keepalive = topk_indices.clone()
+                topk_indices = self._dsa_li_gs_topk_keepalive
+            elif self.dsa_boundary_probe in ("li_sync", "all_sync"):
+                _synchronize_device(topk_indices.device)
+
         self._print_gs_miss_rate(
             topk_indices,
             req_pool_entries,
@@ -1759,6 +1793,8 @@ class DeepseekV32DSAAttention(nn.Module):
             candidate_lens,
             active_batch,
         )
+        if self.dsa_boundary_probe in ("gs_sync", "all_sync"):
+            _synchronize_device(self.ckv_cache.device)
         if self._dsa_native_gather_stats_enabled:
             self._print_dsa_native_gather_stats(
                 topk_indices,

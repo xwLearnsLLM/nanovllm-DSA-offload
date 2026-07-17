@@ -25,6 +25,16 @@ DSA_DEBUG_NATIVE_SELECTION_MODES = frozenset(
         "native_half_stats",
     }
 )
+DSA_BOUNDARY_PROBE_MODES = frozenset(
+    {
+        "none",
+        "project_sync",
+        "li_clone",
+        "li_sync",
+        "gs_sync",
+        "all_sync",
+    }
+)
 
 
 def default_dsa_native_stats_layers(
@@ -213,6 +223,28 @@ def parse_dsa_debug_selection(value: str | None) -> str:
         raise ValueError(
             "NANOVLLM_DSA_DEBUG_SELECTION must be one of "
             f"{choices}, got {mode!r}."
+        )
+    return mode
+
+
+def validate_dsa_boundary_probe(
+    value: str | None,
+    *,
+    enforce_eager: bool,
+) -> str:
+    """Validate a temporary eager-only DSA producer/consumer probe."""
+
+    mode = "none" if value is None or not value.strip() else value.strip()
+    if mode not in DSA_BOUNDARY_PROBE_MODES:
+        choices = ", ".join(sorted(DSA_BOUNDARY_PROBE_MODES))
+        raise ValueError(
+            "NANOVLLM_DSA_BOUNDARY_PROBE must be one of "
+            f"{choices}, got {mode!r}."
+        )
+    if mode != "none" and not enforce_eager:
+        raise ValueError(
+            "NANOVLLM_DSA_BOUNDARY_PROBE is eager-only; set "
+            "NANOVLLM_ENFORCE_EAGER=1."
         )
     return mode
 

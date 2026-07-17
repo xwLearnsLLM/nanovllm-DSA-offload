@@ -18,6 +18,7 @@ from nanovllm.engine.dsa_offload import (
     summarize_dsa_native_selection,
     summarize_dsa_numeric_tensor,
     validate_dsa_debug_selection,
+    validate_dsa_boundary_probe,
 )
 
 
@@ -209,6 +210,24 @@ def test_non_native_debug_selection_requires_eager_and_block128():
 
 @pytest.mark.parametrize(
     "mode",
+    ("none", "project_sync", "li_clone", "li_sync", "gs_sync", "all_sync"),
+)
+def test_dsa_boundary_probe_modes_are_eager_only(mode):
+    assert validate_dsa_boundary_probe(mode, enforce_eager=True) == mode
+    if mode == "none":
+        assert validate_dsa_boundary_probe(mode, enforce_eager=False) == mode
+    else:
+        with pytest.raises(ValueError, match="eager-only"):
+            validate_dsa_boundary_probe(mode, enforce_eager=False)
+
+
+def test_dsa_boundary_probe_rejects_unknown_mode():
+    with pytest.raises(ValueError, match="NANOVLLM_DSA_BOUNDARY_PROBE"):
+        validate_dsa_boundary_probe("li_event", enforce_eager=True)
+
+
+@pytest.mark.parametrize(
+    "mode",
     ("native_interleave_stats", "native_half_stats"),
 )
 def test_native_stats_diagnostics_require_eager_and_block128(mode):
@@ -246,6 +265,31 @@ def test_config_propagates_eager_debug_selection(monkeypatch):
 
     assert config.decode_graph_capture_sizes == ()
     assert config.hf_config.nanovllm_dsa_debug_selection == "retained_gs"
+
+
+def test_config_propagates_eager_dsa_boundary_probe(monkeypatch):
+    monkeypatch.setenv("NANOVLLM_DSA_BOUNDARY_PROBE", "li_clone")
+    config = object.__new__(Config)
+    config.enforce_eager = True
+    config.kvcache_block_size = 128
+    config.decode_graph_capture_sizes = (1,)
+    config.hf_config = SimpleNamespace()
+
+    config._configure_decode_graph()
+
+    assert config.decode_graph_capture_sizes == ()
+    assert config.hf_config.nanovllm_dsa_boundary_probe == "li_clone"
+
+
+def test_config_rejects_dsa_boundary_probe_with_full_graph(monkeypatch):
+    monkeypatch.setenv("NANOVLLM_DSA_BOUNDARY_PROBE", "li_sync")
+    config = object.__new__(Config)
+    config.enforce_eager = False
+    config.kvcache_block_size = 128
+    config.hf_config = SimpleNamespace()
+
+    with pytest.raises(ValueError, match="NANOVLLM_DSA_BOUNDARY_PROBE"):
+        config._configure_decode_graph()
 
 
 def test_config_rejects_non_native_selection_with_full_graph(monkeypatch):
