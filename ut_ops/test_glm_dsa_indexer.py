@@ -8,6 +8,9 @@ checked against an independent adjacent-pair (interleaved) implementation.
 After the projection check, the test runs torch-npu's native
 ``npu_lightning_indexer`` and validates its public TND output contract.  It
 does not compare top-k values with another invocation of the same operator.
+Finally it feeds that native output directly to the custom GatherSelection op
+and validates status plus every gathered CKV/KPE slot, covering the producer /
+consumer tensor-format boundary used by GLM decode.
 """
 
 from __future__ import annotations
@@ -18,6 +21,7 @@ import math
 import torch
 import torch_npu  # type: ignore
 
+import nanovllm.ops as ascend_ops
 from nanovllm.models.dsa_indexer_project import (
     dsa_indexer_project_q_path,
     dsa_indexer_project_query_only,
@@ -252,6 +256,176 @@ def make_paged_index_cache(
         .contiguous()
     )
     return key, block_table
+
+
+def swapped_from_cpu(
+    cpu_tensor: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor:
+    swapped = torch_npu.empty_with_swapped_memory(
+        cpu_tensor.shape,
+        dtype=cpu_tensor.dtype,
+        device=device,
+    )
+    # This is the same initialization pattern used by the standalone GS UT.
+    swapped.fill_(0)
+    swapped.add_(cpu_tensor.to(device))
+    return swapped
+
+
+def validate_native_li_to_gather_selection(
+    *,
+    topk_indices: torch.Tensor,
+    topk_cpu: torch.Tensor,
+    full_block_table: torch.Tensor,
+    args: argparse.Namespace,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> None:
+    """Test the native-LI storage/format boundary consumed by custom GS."""
+
+    blocks_per_row = math.ceil(args.full_len / args.block_size)
+    num_full_blocks = 1 + args.batch_size * blocks_per_row
+    generator = torch.Generator().manual_seed(args.seed + 101)
+    full_kpe_cpu = torch.randn(
+        num_full_blocks,
+        args.block_size,
+        GLM_INDEX_ROPE_DIM,
+        generator=generator,
+        dtype=torch.float32,
+    ).to(dtype).contiguous()
+    full_ckv_cpu = torch.randn(
+        num_full_blocks,
+        args.block_size,
+        512,
+        generator=generator,
+        dtype=torch.float32,
+    ).to(dtype).contiguous()
+    full_kpe_cpu[0].zero_()
+    full_ckv_cpu[0].zero_()
+    full_kpe = swapped_from_cpu(full_kpe_cpu, device)
+    full_ckv = swapped_from_cpu(full_ckv_cpu, device)
+
+    selection_blocks_per_row = math.ceil(args.topk / args.block_size)
+    num_selection_blocks = args.batch_size * selection_blocks_per_row
+    selection_table_cpu = torch.arange(
+        num_selection_blocks,
+        dtype=torch.int32,
+    ).view(args.batch_size, selection_blocks_per_row)
+    selection_table = selection_table_cpu.to(device)
+    selection_kpe = torch.zeros(
+        num_selection_blocks,
+        args.block_size,
+        GLM_INDEX_ROPE_DIM,
+        dtype=dtype,
+        device=device,
+    )
+    selection_ckv = torch.zeros(
+        num_selection_blocks,
+        args.block_size,
+        512,
+        dtype=dtype,
+        device=device,
+    )
+    status = torch.full(
+        (args.batch_size, 1, 1, args.topk + 1),
+        -1,
+        dtype=torch.int32,
+        device=device,
+    )
+    req_pool_entries = torch.arange(
+        args.batch_size,
+        dtype=torch.int32,
+        device=device,
+    )
+    # GS excludes the newest token from its reusable source.  The synthetic
+    # full cache contains logical IDs [0, full_len), hence full_len + 1 here.
+    full_actual_seq = torch.full(
+        (args.batch_size,),
+        args.full_len + 1,
+        dtype=torch.int32,
+        device=device,
+    )
+
+    # Preserve the native LI tensor and its storage format exactly as the
+    # production path does: this is a metadata-only view, with no CPU rebuild,
+    # sort, cast, or explicit format conversion in between.
+    gather_topk = topk_indices.view(
+        args.batch_size,
+        1,
+        1,
+        args.topk,
+    )
+    ascend_ops.npu_gather_selection_kv_cache(
+        selection_kpe,
+        selection_ckv,
+        selection_table,
+        status,
+        req_pool_entries,
+        gather_topk,
+        full_kpe,
+        full_ckv,
+        full_block_table,
+        full_actual_seq,
+    )
+    torch.npu.synchronize()
+
+    status_cpu = status.cpu()
+    selection_kpe_cpu = selection_kpe.cpu()
+    selection_ckv_cpu = selection_ckv.cpu()
+    full_table_cpu = full_block_table.cpu()
+    positions = torch.arange(args.topk, dtype=torch.int64)
+    for row in range(args.batch_size):
+        selected = status_cpu[row, 0, 0, : args.topk].to(torch.int64)
+        actual = int(status_cpu[row, 0, 0, args.topk].item())
+        if actual != args.topk:
+            raise AssertionError(
+                f"LI->GS row={row} status length={actual}, expected={args.topk}."
+            )
+        expected_set = topk_cpu[row].to(torch.int64)
+        if not torch.equal(
+            torch.sort(selected).values,
+            torch.sort(expected_set).values,
+        ):
+            raise AssertionError(
+                f"LI->GS row={row} status set differs from native LI output."
+            )
+
+        dst_blocks = selection_table_cpu[row].to(torch.int64)[
+            positions // args.block_size
+        ]
+        dst_offsets = positions % args.block_size
+        src_blocks = full_table_cpu[row].to(torch.int64)[
+            selected // args.block_size
+        ]
+        src_offsets = selected % args.block_size
+        if not torch.equal(
+            selection_kpe_cpu[dst_blocks, dst_offsets],
+            full_kpe_cpu[src_blocks, src_offsets],
+        ):
+            raise AssertionError(f"LI->GS row={row} gathered KPE mismatch.")
+        if not torch.equal(
+            selection_ckv_cpu[dst_blocks, dst_offsets],
+            full_ckv_cpu[src_blocks, src_offsets],
+        ):
+            raise AssertionError(f"LI->GS row={row} gathered CKV mismatch.")
+
+    get_npu_format = getattr(torch_npu, "get_npu_format", None)
+    try:
+        npu_format = (
+            get_npu_format(topk_indices)
+            if callable(get_npu_format)
+            else "unavailable"
+        )
+    except Exception as exc:
+        npu_format = f"error:{type(exc).__name__}"
+    print(
+        "GLM_DSA_LI_GS_CHECK ok=1 "
+        f"batch={args.batch_size} topk={args.topk} "
+        f"dtype={topk_indices.dtype} contiguous={int(topk_indices.is_contiguous())} "
+        f"stride={list(topk_indices.stride())} npu_format={npu_format}",
+        flush=True,
+    )
 
 
 @torch.inference_mode()
@@ -577,6 +751,14 @@ def main() -> None:
         f"min={minimum} max={maximum} "
         f"unique_per_row={unique_per_row}",
         flush=True,
+    )
+    validate_native_li_to_gather_selection(
+        topk_indices=topk_indices,
+        topk_cpu=topk_cpu,
+        full_block_table=block_table,
+        args=args,
+        dtype=dtype,
+        device=device,
     )
     print(
         "GLM_DSA_INDEXER_UT_OK "

@@ -19,6 +19,7 @@ from nanovllm.engine.dsa_offload import (
     compute_gs_miss_counts,
     default_dsa_native_stats_layers,
     dsa_effective_index_cache_row,
+    dsa_paged_cache_tokens,
     dsa_debug_prints_native_stats,
     dsa_debug_rotary_mode,
     dsa_debug_uses_native_selection,
@@ -688,9 +689,27 @@ class DeepseekV32DSAAttention(nn.Module):
             and tp_rank == 0
             and self.layer_idx in native_stats_layers
         )
+        # Layer-0 attention is TP-sharded.  A NaN on any rank can contaminate
+        # the following all-reduce, so the explicit diagnostic prints this
+        # small pipeline summary on every rank rather than rank 0 only.
+        self._dsa_native_pipeline_enabled = (
+            dsa_debug_prints_native_stats(self.dsa_debug_selection)
+            and self.layer_idx == 0
+        )
+        self._dsa_native_gather_stats_enabled = (
+            dsa_debug_prints_native_stats(self.dsa_debug_selection)
+            and tp_rank == 0
+            and self.layer_idx == 0
+        )
         self._dsa_native_stats_decode_step = 0
         self._dsa_native_inputs_printed = False
         self._dsa_native_prefill_store_printed = False
+        self._dsa_native_gather_printed = False
+        self._dsa_native_pipeline_stages_printed: set[str] = set()
+        self._dsa_native_prefill_cache_cpu: dict[
+            int,
+            tuple[torch.Tensor, torch.Tensor],
+        ] = {}
         if tp_rank == 0 and self.layer_idx == 0 and gs_miss_rate_layers:
             print(
                 "GS_MISS_RATE enabled eager-only layers="
@@ -1063,6 +1082,22 @@ class DeepseekV32DSAAttention(nn.Module):
             self.dram_kpe_cache[dram_block].copy_(self.kpe_cache[hbm_block].to(device=self.dram_kpe_cache.device, non_blocking=False))
         # Ensure DRAM source KV is ready before later decode promote copies.
         _synchronize_device(self.ckv_cache.device)
+        if self._dsa_native_gather_stats_enabled:
+            # Keep a small diagnostic-only CPU golden before the scheduler
+            # releases the middle HBM blocks.  Reading arbitrary entries from
+            # empty_with_swapped_memory via generic torch ops is not a runtime
+            # contract, so post-GS validation compares against this known HBM
+            # source rather than index_select-ing the swapped DRAM tensor.
+            physical_blocks = torch.tensor(
+                old_hbm_block_table[:num_full_blocks],
+                dtype=torch.int64,
+                device=self.ckv_cache.device,
+            )
+            pool_entry = int(seq.hbm_cached_tokens_pool_entry)
+            self._dsa_native_prefill_cache_cpu[pool_entry] = (
+                self.ckv_cache.index_select(0, physical_blocks).detach().cpu(),
+                self.kpe_cache.index_select(0, physical_blocks).detach().cpu(),
+            )
 
     def _store_index_cache(self, index_k: torch.Tensor | None) -> None:
         if index_k is None:
@@ -1288,6 +1323,9 @@ class DeepseekV32DSAAttention(nn.Module):
                 workspace=workspace,
                 out=[out, lse],
             )
+        if self._dsa_native_pipeline_enabled:
+            self._print_dsa_native_pipeline_tensor("fia_latent", out)
+            self._print_dsa_native_pipeline_tensor("fia_lse", lse)
         # FIA v2 writes NBSD-like output [heads, tokens, 1, dim], matching
         # vllm-ascend's trick to feed v-up without a transpose/copy round trip.
         return out
@@ -1464,6 +1502,151 @@ class DeepseekV32DSAAttention(nn.Module):
                 flush=True,
             )
 
+    @torch.compiler.disable
+    def _print_dsa_native_pipeline_tensor(
+        self,
+        stage: str,
+        tensor: torch.Tensor,
+    ) -> None:
+        """Print one first-decode health summary for the layer-0 pipeline."""
+
+        context = get_context()
+        if (
+            context.is_prefill
+            or not self._dsa_native_pipeline_enabled
+            or stage in self._dsa_native_pipeline_stages_printed
+        ):
+            return
+        self._dsa_native_pipeline_stages_printed.add(stage)
+        stats = summarize_dsa_numeric_tensor(tensor)
+        print(
+            "DSA_NATIVE_PIPELINE_STATS "
+            f"decode_step=1 layer=0 rank={dist.get_rank()} "
+            f"stage={stage} shape={list(tensor.shape)} dtype={tensor.dtype} "
+            f"numel={stats.numel} finite={stats.finite_count}/{stats.numel} "
+            f"nonzero={stats.nonzero_count}/{stats.numel} "
+            f"absmax={stats.abs_max:.9g} l2={stats.l2_norm:.9g}",
+            flush=True,
+        )
+
+    @torch.compiler.disable
+    def _print_dsa_native_gather_stats(
+        self,
+        topk_indices: torch.Tensor,
+        selection_block_table: torch.Tensor,
+        req_pool_entries: torch.Tensor,
+        candidate_lens: torch.Tensor,
+        active_batch: int,
+    ) -> None:
+        """Validate real DRAM -> compact HBM GatherSelection materialization."""
+
+        if (
+            not self._dsa_native_gather_stats_enabled
+            or self._dsa_native_gather_printed
+        ):
+            return
+        self._dsa_native_gather_printed = True
+        topk = int(self.gather_selection_topk)
+        topk_rows = topk_indices.reshape(active_batch, -1)[:, :topk]
+        pool_rows = req_pool_entries.to(dtype=torch.int64)
+        status_rows = self.gather_selection_status.index_select(
+            0,
+            pool_rows,
+        ).reshape(active_batch, -1)
+
+        for row in range(active_batch):
+            status_actual = int(status_rows[row, topk].item())
+            status_ids = status_rows[row, :topk]
+            status_cpu = status_ids.detach().to(dtype=torch.int64).cpu()
+            topk_cpu = topk_rows[row].detach().to(dtype=torch.int64).cpu()
+            status_valid = int(((status_cpu >= 0) & (status_cpu < int(candidate_lens[row].item()))).sum().item())
+            status_unique = int(torch.unique(status_cpu[status_cpu >= 0]).numel())
+            set_match = bool(
+                status_valid == topk
+                and torch.equal(
+                    torch.sort(status_cpu).values,
+                    torch.sort(topk_cpu).values,
+                )
+            )
+            get_npu_format = getattr(torch_npu, "get_npu_format", None)
+            try:
+                npu_format = (
+                    get_npu_format(topk_indices)
+                    if callable(get_npu_format)
+                    else "unavailable"
+                )
+            except Exception as exc:
+                npu_format = f"error:{type(exc).__name__}"
+            print(
+                "DSA_NATIVE_GATHER_MAPPING "
+                "decode_step=1 layer=0 "
+                f"row={row} topk_dtype={topk_indices.dtype} "
+                f"topk_contiguous={int(topk_indices.is_contiguous())} "
+                f"topk_stride={list(topk_indices.stride())} "
+                f"topk_npu_format={npu_format} "
+                f"status_actual={status_actual} status_valid={status_valid}/{topk} "
+                f"status_unique={status_unique}/{topk} "
+                f"status_matches_topk_set={int(set_match)}",
+                flush=True,
+            )
+            if status_actual != topk or status_valid != topk or status_unique != topk:
+                print(
+                    "DSA_NATIVE_GATHER_STATS decode_step=1 layer=0 "
+                    f"row={row} skipped=invalid_status",
+                    flush=True,
+                )
+                continue
+
+            pool_entry = int(req_pool_entries[row].item())
+            source_pair = self._dsa_native_prefill_cache_cpu.get(pool_entry)
+            if source_pair is None:
+                print(
+                    "DSA_NATIVE_GATHER_STATS decode_step=1 layer=0 "
+                    f"row={row} skipped=missing_prefill_cpu_golden",
+                    flush=True,
+                )
+                continue
+
+            resident_ids = torch.arange(
+                topk,
+                dtype=torch.int64,
+                device=self.ckv_cache.device,
+            )
+            for cache_name, resident_cache, full_cache_cpu in (
+                ("ckv", self.ckv_cache, source_pair[0]),
+                ("kpe", self.kpe_cache, source_pair[1]),
+            ):
+                resident = dsa_paged_cache_tokens(
+                    resident_cache,
+                    selection_block_table[row],
+                    resident_ids,
+                    self.block_size,
+                ).detach().cpu()
+                source = full_cache_cpu.reshape(
+                    -1,
+                    *tuple(full_cache_cpu.shape[2:]),
+                ).index_select(0, status_cpu)
+                tensors = (
+                    (f"prefill_source_{cache_name}_selected", source),
+                    (f"hbm_{cache_name}_resident", resident),
+                    (
+                        f"{cache_name}_copy_abs_diff",
+                        resident.float().sub(source.float()).abs(),
+                    ),
+                )
+                for name, tensor in tensors:
+                    stats = summarize_dsa_numeric_tensor(tensor)
+                    print(
+                        "DSA_NATIVE_GATHER_STATS "
+                        "decode_step=1 layer=0 "
+                        f"row={row} tensor={name} shape={list(tensor.shape)} "
+                        f"dtype={tensor.dtype} numel={stats.numel} "
+                        f"finite={stats.finite_count}/{stats.numel} "
+                        f"nonzero={stats.nonzero_count}/{stats.numel} "
+                        f"absmax={stats.abs_max:.9g} l2={stats.l2_norm:.9g}",
+                        flush=True,
+                    )
+
     def _dsa_offload_update(self, q_index: torch.Tensor, weights: torch.Tensor, batch_size: int) -> None:
         context = get_context()
         if not context.needs_dsa_update:
@@ -1569,6 +1752,14 @@ class DeepseekV32DSAAttention(nn.Module):
             candidate_lens,
             active_batch,
         )
+        if self._dsa_native_gather_stats_enabled:
+            self._print_dsa_native_gather_stats(
+                topk_indices,
+                selection_block_table,
+                req_pool_entries,
+                candidate_lens,
+                active_batch,
+            )
 
     def _decode_forward_mla(
         self,
@@ -1581,6 +1772,9 @@ class DeepseekV32DSAAttention(nn.Module):
         context = get_context()
         batch_size = int(ql_nope.shape[0])
         assert context.actual_seq_lengths_kv is not None
+        if self._dsa_native_pipeline_enabled:
+            self._print_dsa_native_pipeline_tensor("ql_nope", ql_nope)
+            self._print_dsa_native_pipeline_tensor("q_pe", q_pe)
         if context.needs_dsa_update and not dsa_updated:
             if q_index is None or weights is None:
                 raise RuntimeError("DSA offload decode requires indexer outputs.")
@@ -1592,6 +1786,8 @@ class DeepseekV32DSAAttention(nn.Module):
             context.actual_seq_lengths_kv,
         )
         output = torch_npu.npu_transpose_batchmatmul(latent.view(self.num_local_heads, batch_size, self.kv_lora_rank), self.w_uv, perm_y=(1, 0, 2)).reshape(batch_size, -1)
+        if self._dsa_native_pipeline_enabled:
+            self._print_dsa_native_pipeline_tensor("v_up_output", output)
         return output
 
     def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor, skip_o_proj: bool = False) -> torch.Tensor:

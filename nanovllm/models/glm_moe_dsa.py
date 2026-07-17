@@ -469,6 +469,14 @@ class GlmMoeDsaDecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual
             )
+        pipeline_stats = self.self_attn._dsa_native_pipeline_enabled
+        if pipeline_stats:
+            self.self_attn._print_dsa_native_pipeline_tensor(
+                "decoder_attn_input", hidden_states
+            )
+            self.self_attn._print_dsa_native_pipeline_tensor(
+                "decoder_residual_input", residual
+            )
         context = get_context()
         fuse_o_proj_norm = (
             not context.is_prefill
@@ -477,6 +485,10 @@ class GlmMoeDsaDecoderLayer(nn.Module):
         hidden_states = self.self_attn(
             positions, hidden_states, skip_o_proj=fuse_o_proj_norm
         )
+        if pipeline_stats:
+            self.self_attn._print_dsa_native_pipeline_tensor(
+                "decoder_attn_output", hidden_states
+            )
         if fuse_o_proj_norm:
             hidden_states, residual = self.self_attn.o_proj_add_rms_norm(
                 hidden_states, residual, self.post_attention_layernorm
@@ -485,7 +497,19 @@ class GlmMoeDsaDecoderLayer(nn.Module):
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual
             )
-        return self.mlp(hidden_states), residual
+        if pipeline_stats:
+            self.self_attn._print_dsa_native_pipeline_tensor(
+                "decoder_post_attn_norm", hidden_states
+            )
+            self.self_attn._print_dsa_native_pipeline_tensor(
+                "decoder_residual_after_attn", residual
+            )
+        mlp_output = self.mlp(hidden_states)
+        if pipeline_stats:
+            self.self_attn._print_dsa_native_pipeline_tensor(
+                "decoder_mlp_output", mlp_output
+            )
+        return mlp_output, residual
 
 
 class GlmMoeDsaModel(nn.Module):

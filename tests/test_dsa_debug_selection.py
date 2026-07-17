@@ -10,6 +10,7 @@ from nanovllm.engine.dsa_offload import (
     build_dsa_debug_selection,
     default_dsa_native_stats_layers,
     dsa_effective_index_cache_row,
+    dsa_paged_cache_tokens,
     dsa_debug_prints_native_stats,
     dsa_debug_rotary_mode,
     dsa_debug_uses_native_selection,
@@ -68,6 +69,31 @@ def test_dsa_effective_index_cache_row_validates_metadata():
             candidate_len=8,
             block_size=4,
         )
+
+
+def test_dsa_paged_cache_tokens_follows_arbitrary_logical_ids():
+    cache = torch.arange(5 * 4 * 2, dtype=torch.float32).view(5, 4, 1, 2)
+    block_table = torch.tensor([3, 0, 4], dtype=torch.int32)
+    token_ids = torch.tensor([9, 0, 7, 4], dtype=torch.int32)
+
+    selected = dsa_paged_cache_tokens(
+        cache,
+        block_table,
+        token_ids,
+        block_size=4,
+    )
+
+    expected = torch.stack((cache[4, 1], cache[3, 0], cache[0, 3], cache[0, 0]))
+    assert torch.equal(selected, expected)
+
+
+def test_dsa_paged_cache_tokens_validates_ids():
+    cache = torch.zeros((2, 4, 1, 2))
+    table = torch.tensor([0], dtype=torch.int32)
+    with pytest.raises(ValueError, match="non-negative"):
+        dsa_paged_cache_tokens(cache, table, torch.tensor([-1]), 4)
+    with pytest.raises(ValueError, match="exceeds"):
+        dsa_paged_cache_tokens(cache, table, torch.tensor([4]), 4)
 
 
 def test_dsa_debug_selection_defaults_to_native():

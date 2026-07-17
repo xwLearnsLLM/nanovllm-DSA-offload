@@ -146,6 +146,64 @@ def dsa_effective_index_cache_row(
     return cache.reshape(num_blocks * block_size, *tail_shape)[:candidate_len]
 
 
+def dsa_paged_cache_tokens(
+    cache: torch.Tensor,
+    block_table_row: torch.Tensor,
+    logical_token_ids: torch.Tensor,
+    block_size: int,
+) -> torch.Tensor:
+    """Resolve arbitrary logical token IDs from one paged-cache row.
+
+    This helper is intentionally used only by eager diagnostics.  It makes the
+    GatherSelection copy contract explicit: destination resident slot ``i``
+    must equal the full-cache token named by status slot ``i``.
+    """
+
+    block_size = int(block_size)
+    if block_size <= 0:
+        raise ValueError(f"block_size must be positive, got {block_size}.")
+    if cache.ndim < 2 or int(cache.shape[1]) != block_size:
+        raise ValueError(
+            "cache must have shape [num_blocks, block_size, ...], "
+            f"got {tuple(cache.shape)} for block_size={block_size}."
+        )
+    if block_table_row.ndim != 1:
+        raise ValueError(
+            "block_table_row must be one-dimensional, got shape="
+            f"{tuple(block_table_row.shape)}."
+        )
+
+    token_ids = logical_token_ids.detach().reshape(-1).to(
+        device=cache.device,
+        dtype=torch.int64,
+    )
+    if token_ids.numel() == 0:
+        return cache.new_empty((0, *tuple(cache.shape[2:])))
+    min_id = int(token_ids.amin().item())
+    max_id = int(token_ids.amax().item())
+    if min_id < 0:
+        raise ValueError(f"logical token IDs must be non-negative, got {min_id}.")
+    max_logical_tokens = int(block_table_row.numel()) * block_size
+    if max_id >= max_logical_tokens:
+        raise ValueError(
+            "logical token ID exceeds the block table: "
+            f"max_id={max_id}, capacity={max_logical_tokens}."
+        )
+
+    logical_blocks = torch.div(token_ids, block_size, rounding_mode="floor")
+    offsets = torch.remainder(token_ids, block_size)
+    physical_blocks = block_table_row.to(
+        device=cache.device,
+        dtype=torch.int64,
+    ).index_select(0, logical_blocks)
+    physical_slots = physical_blocks * block_size + offsets
+    flat_cache = cache.reshape(
+        int(cache.shape[0]) * block_size,
+        *tuple(cache.shape[2:]),
+    )
+    return flat_cache.index_select(0, physical_slots)
+
+
 def parse_dsa_debug_selection(value: str | None) -> str:
     """Parse the eager-only DSA selection diagnostic mode."""
 
