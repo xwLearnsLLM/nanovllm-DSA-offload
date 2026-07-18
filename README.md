@@ -56,8 +56,6 @@ LIDU 与 SCATTER 的 host、tiling、AscendC kernel、ACLNN adapter、`torch.lib
 新增了 Ascend 自定义算子，更新代码后必须重新编译：
 
 ```bash
-cd /home/w00916487/nanovllm-dsa_offload
-
 export PYTHONUNBUFFERED=1
 export PYTHONPATH=$PWD:$PYTHONPATH
 export NANOVLLM_CANN_BUILD_JOBS=64
@@ -69,11 +67,9 @@ ls -lh nanovllm/_C*.so nanovllm/libnanovllm_ascend_kernels.so
 
 ## 先运行 LIDU + SCATTER 单卡 UT
 
-必须先通过算子语义测试，再运行 nano-vLLM 推理。该 UT 覆盖 32/64 heads、所有 C 档位、C=0、乱序 request-pool entries、随机 block tables、初始化 C-copy、稳定 miss-copy、重复零 miss，以及同输入 GS/LIDU 链路时延。
+必须先通过算子语义测试，再运行 nano-vLLM 推理。该 UT 覆盖 32/64 heads、所有 C 档位、C=0、乱序 request-pool entries、随机 block tables、初始化 C-copy、稳定 miss-copy、重复零 miss，以及 capture 时零 miss、replay 时非零 miss 的 LIDU→SCATTER raw NPUGraph 链。
 
 ```bash
-cd /home/w00916487/nanovllm-dsa_offload
-
 unset NANOVLLM_GS_MISS_RATE_ON_LAYERS
 unset NANOVLLM_PROFILE_DECODE_OUTPUT
 
@@ -88,16 +84,15 @@ python3 ut_ops/test_lidu_scatter.py \
   --heads 32,64 \
   --seed 7 \
   --warmup 2 \
-  --iters 10
+  --iters 10 \
+  --graph-replays 3
 ```
 
-最终成功标志是 `LIDU_SCATTER_UT_OK`。`LIDU_GS_COMPARE` 只报告时延，不把 LIDU 必须快于 GS 设为正确性条件。
+必须先看到 `LIDU_SCATTER_GRAPH_CHECK ... ok=1`，最终成功标志是 `LIDU_SCATTER_UT_OK`。`LIDU_GS_COMPARE` 只报告时延，不把 LIDU 必须快于 GS 设为正确性条件。
 
 CPU 状态机测试：
 
 ```bash
-cd /home/w00916487/nanovllm-dsa_offload
-
 export PYTHONUNBUFFERED=1
 export PYTHONPATH=$PWD:$PYTHONPATH
 
@@ -113,8 +108,6 @@ python3 -m pytest -q \
 以下是 TP16+EP16、batch 6、约 30K token 的完整命令：
 
 ```bash
-cd /home/w00916487/nanovllm-dsa_offload
-
 unset NANOVLLM_GS_MISS_RATE_ON_LAYERS
 unset NANOVLLM_PROFILE_DECODE_OUTPUT
 
@@ -145,8 +138,6 @@ python3 example/test.py
 ## DeepSeek V3.2：GS 整图对照
 
 ```bash
-cd /home/w00916487/nanovllm-dsa_offload
-
 unset NANOVLLM_GS_MISS_RATE_ON_LAYERS
 unset NANOVLLM_PROFILE_DECODE_OUTPUT
 
@@ -177,8 +168,6 @@ python3 example/test.py
 不卸载模式必须给完整 prompt KV 留出足够 HBM blocks：
 
 ```bash
-cd /home/w00916487/nanovllm-dsa_offload
-
 unset NANOVLLM_GS_MISS_RATE_ON_LAYERS
 unset NANOVLLM_PROFILE_DECODE_OUTPUT
 unset NANOVLLM_DRAM_NUM_BLOCKS
@@ -207,8 +196,6 @@ python3 example/test.py
 ## GLM-5.1-w4a8：LIDU 长序列整图
 
 ```bash
-cd /home/w00916487/nanovllm-dsa_offload
-
 unset NANOVLLM_GS_MISS_RATE_ON_LAYERS
 unset NANOVLLM_PROFILE_DECODE_OUTPUT
 
@@ -241,8 +228,6 @@ GLM 结束 proof 应满足 `offload_mode=lidu`、`npugraph_ex=False`、`captures
 `example/short_prompts.py` 同时支持 DeepSeek 和 GLM。以下 GLM 命令使用默认的非卸载 eager 路径：
 
 ```bash
-cd /home/w00916487/nanovllm-dsa_offload
-
 unset NANOVLLM_GS_MISS_RATE_ON_LAYERS
 unset NANOVLLM_PROFILE_DECODE_OUTPUT
 unset NANOVLLM_DRAM_NUM_BLOCKS

@@ -66,6 +66,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument(
+        "--graph-replays",
+        type=int,
+        default=3,
+        help="Replay a persistent-output LIDU->SCATTER NPUGraph this many times.",
+    )
+    parser.add_argument(
         "--skip-gs-compare",
         action="store_true",
         help="Skip the same-input LightningIndexer+GatherSelection timing.",
@@ -288,6 +294,34 @@ def call_lidu(case: Case):
     )
 
 
+def call_lidu_out(
+    case: Case,
+    *,
+    query: torch.Tensor,
+    weights: torch.Tensor,
+    req_entries: torch.Tensor,
+    cache_tokens: torch.Tensor,
+    candidate_lens: torch.Tensor,
+    index_block_table: torch.Tensor,
+    source_ids: torch.Tensor,
+    destination_slots: torch.Tensor,
+    miss_counts: torch.Tensor,
+):
+    return torch.ops.nanovllm_dsa.lidu_decode_update_out.default(
+        query,
+        case.index_cache,
+        weights,
+        req_entries,
+        case.cache_slots,
+        cache_tokens,
+        candidate_lens,
+        index_block_table,
+        source_ids,
+        destination_slots,
+        miss_counts,
+    )
+
+
 def validate_cache_data(case: Case, row: int, sources: torch.Tensor) -> None:
     if sources.numel() == 0:
         return
@@ -426,6 +460,119 @@ def run_case(case: Case, warmup: int, iters: int) -> None:
     )
 
 
+def run_graph_case(case: Case, replays: int) -> None:
+    """Capture with zero misses, then replay with changing nonzero misses."""
+
+    if replays <= 0:
+        return
+    row = 2  # candidate_len=8192, C=3072: the GLM 8.2K inference tier.
+    query = case.query[row : row + 1].clone().contiguous()
+    weights = case.weights[row : row + 1].contiguous()
+    req_entries = case.req_entries[row : row + 1].contiguous()
+    cache_tokens = case.cache_tokens[row : row + 1].contiguous()
+    candidate_lens = case.candidate_lens[row : row + 1].contiguous()
+    index_table = case.index_block_table[row : row + 1].contiguous()
+    hbm_table = case.hbm_block_table[row : row + 1].contiguous()
+    dram_table = case.dram_block_table[row : row + 1].contiguous()
+    source_ids = torch.zeros(
+        (1, 1, TOPK), dtype=torch.int32, device=case.device
+    )
+    destination_slots = torch.zeros_like(source_ids)
+    miss_counts = torch.zeros((1,), dtype=torch.int32, device=case.device)
+
+    def chain():
+        outputs = call_lidu_out(
+            case,
+            query=query,
+            weights=weights,
+            req_entries=req_entries,
+            cache_tokens=cache_tokens,
+            candidate_lens=candidate_lens,
+            index_block_table=index_table,
+            source_ids=source_ids,
+            destination_slots=destination_slots,
+            miss_counts=miss_counts,
+        )
+        torch.ops.nanovllm_dsa.scatter_copy.default(
+            case.hbm_kpe,
+            case.hbm_ckv,
+            case.dram_kpe,
+            case.dram_ckv,
+            hbm_table,
+            dram_table,
+            outputs[0].view(1, TOPK),
+            outputs[1].view(1, TOPK),
+            outputs[2],
+        )
+        return outputs
+
+    # The preceding semantic test leaves this row at its high-token top-2048,
+    # so capture follows the same zero-miss path as startup pre-capture.
+    chain()
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    pool = torch.npu.graph_pool_handle()
+    with torch.npu.graph(graph, pool=pool):
+        graph_outputs = chain()
+    torch.npu.synchronize()
+    if any(
+        output.data_ptr() != expected.data_ptr()
+        for output, expected in zip(
+            graph_outputs[:3],
+            (source_ids, destination_slots, miss_counts),
+        )
+    ):
+        raise AssertionError("graph LIDU outputs do not alias persistent buffers")
+    if int(graph_outputs[2].cpu()[0]) != 0:
+        raise AssertionError("graph capture precondition must be zero miss")
+
+    candidate_len = CANDIDATE_LENS[row]
+    expected_sets = (
+        torch.arange(0, TOPK, dtype=torch.int64),
+        torch.arange(candidate_len - TOPK, candidate_len, dtype=torch.int64),
+    )
+    for replay in range(replays):
+        select_low = replay % 2 == 0
+        query.zero_()
+        query[:, 0, 0] = -256 if select_low else 256
+        query[:, 0, 1] = -1 if select_low else 1
+        torch.npu.current_stream().synchronize()
+        graph.replay()
+        torch.npu.synchronize()
+
+        count = int(graph_outputs[2].cpu()[0])
+        if count < 0 or count > TOPK:
+            raise AssertionError(f"graph replay={replay} invalid miss_count={count}")
+        active_sources = graph_outputs[0].view(-1)[:count].cpu()
+        active_slots = graph_outputs[1].view(-1)[:count].cpu()
+        if bool((active_sources < 0).any()) or bool(
+            (active_sources >= candidate_len).any()
+        ):
+            raise AssertionError(
+                f"graph replay={replay} source token exceeds candidate range"
+            )
+        cache_budget = CACHE_TIERS[row]
+        if bool((active_slots < 0).any()) or bool(
+            (active_slots >= cache_budget).any()
+        ):
+            raise AssertionError(
+                f"graph replay={replay} destination slot exceeds cache budget"
+            )
+
+        expected = expected_sets[0 if select_low else 1]
+        pool_row = int(case.req_entries_cpu[row])
+        state = case.cache_slots[pool_row].cpu()
+        if bool((state[expected] < 0).any()):
+            raise AssertionError(
+                f"graph replay={replay} dropped a true top-2048 token"
+            )
+        validate_cache_data(case, row, expected)
+    print(
+        f"LIDU_SCATTER_GRAPH_CHECK heads={case.heads} replays={replays} "
+        "capture_zero_miss=1 replay_nonzero_miss=1 ok=1"
+    )
+
+
 def compare_with_gs(case: Case, warmup: int, iters: int) -> None:
     """Time both stable chains on the same five offloaded request rows."""
 
@@ -556,8 +703,10 @@ def compare_with_gs(case: Case, warmup: int, iters: int) -> None:
 
 def main() -> None:
     args = parse_args()
-    if args.warmup < 0 or args.iters <= 0:
-        raise ValueError("--warmup must be >=0 and --iters must be >0.")
+    if args.warmup < 0 or args.iters <= 0 or args.graph_replays < 0:
+        raise ValueError(
+            "--warmup and --graph-replays must be >=0; --iters must be >0."
+        )
     device = torch.device(args.device)
     if device.type != "npu":
         raise ValueError("--device must select one NPU, for example npu:0.")
@@ -579,6 +728,7 @@ def main() -> None:
     for head_count in heads:
         case = make_case(head_count, device, args.seed)
         run_case(case, args.warmup, args.iters)
+        run_graph_case(case, args.graph_replays)
         if not args.skip_gs_compare:
             compare_with_gs(case, args.warmup, args.iters)
         del case

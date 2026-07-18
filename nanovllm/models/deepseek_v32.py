@@ -31,8 +31,10 @@ from nanovllm.models.dsa_indexer_project import (
     dsa_indexer_pipeline_with_qc_full_graph,
 )
 from nanovllm.models.lidu import (
+    LIDU_TOPK,
     initialize_lidu_row,
     lidu_decode_update,
+    lidu_decode_update_out,
     scatter_copy,
 )
 from nanovllm.layers.activation import SiluAndMul
@@ -759,6 +761,15 @@ class DeepseekV32MLAAttention(nn.Module):
         self.use_torch_npu_lightning_indexer = self.offload_mode == OFFLOAD_GS and (
             getattr(config, "model_type", "") == "glm_moe_dsa"
         )
+        # GLM captures this module directly in a raw outer NPUGraph. Keep the
+        # LIDU->SCATTER intermediates alive at fixed addresses across replay.
+        self._use_persistent_lidu_raw_graph_outputs = (
+            self.offload_mode == OFFLOAD_LIDU
+            and getattr(config, "model_type", "") == "glm_moe_dsa"
+        )
+        self._lidu_raw_graph_outputs: dict[
+            int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = {}
 
         self.ckv_cache = torch.tensor([])
         self.kpe_cache = torch.tensor([])
@@ -1486,7 +1497,7 @@ class DeepseekV32MLAAttention(nn.Module):
                     block_size=self.block_size,
                 )
 
-        source_ids, destination_slots, miss_counts, _ = lidu_decode_update(
+        lidu_args = (
             q_index[:batch_size],
             self.index_cache,
             weights[:batch_size],
@@ -1496,6 +1507,26 @@ class DeepseekV32MLAAttention(nn.Module):
             context.candidate_lens[:batch_size],
             context.index_block_tables[:batch_size],
         )
+        if context.full_decode_graph and self._use_persistent_lidu_raw_graph_outputs:
+            buffers = self._lidu_raw_graph_outputs.get(batch_size)
+            if buffers is None:
+                options = dict(
+                    dtype=torch.int32,
+                    device=q_index.device,
+                )
+                buffers = (
+                    torch.zeros((batch_size, 1, LIDU_TOPK), **options),
+                    torch.zeros((batch_size, 1, LIDU_TOPK), **options),
+                    torch.zeros((batch_size,), **options),
+                )
+                self._lidu_raw_graph_outputs[batch_size] = buffers
+            source_ids, destination_slots, miss_counts, _ = (
+                lidu_decode_update_out(*lidu_args, *buffers)
+            )
+        else:
+            source_ids, destination_slots, miss_counts, _ = (
+                lidu_decode_update(*lidu_args)
+            )
         if self._lidu_miss_count_enabled:
             self._print_lidu_miss_counts(miss_counts, batch_size)
         return scatter_copy(

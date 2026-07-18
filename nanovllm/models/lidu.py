@@ -36,6 +36,36 @@ def lidu_decode_update(
     )
 
 
+def lidu_decode_update_out(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    weights: torch.Tensor,
+    req_pool_entries: torch.Tensor,
+    cache_slots_pool: torch.Tensor,
+    cache_tokens: torch.Tensor,
+    candidate_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    source_ids: torch.Tensor,
+    destination_slots: torch.Tensor,
+    miss_counts: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run LIDU into graph-stable, caller-owned output buffers."""
+
+    return torch.ops.nanovllm_dsa.lidu_decode_update_out.default(
+        query,
+        key,
+        weights,
+        req_pool_entries,
+        cache_slots_pool,
+        cache_tokens,
+        candidate_lens,
+        block_table,
+        source_ids,
+        destination_slots,
+        miss_counts,
+    )
+
+
 def scatter_copy(
     hbm_kpe: torch.Tensor,
     hbm_ckv: torch.Tensor,
