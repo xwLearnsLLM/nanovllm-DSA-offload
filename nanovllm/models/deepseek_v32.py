@@ -532,6 +532,20 @@ class DeepseekV32Indexer(nn.Module):
             == "q_linear"
         )
 
+    def post_load_prepare(self) -> None:
+        """Materialize decode-only projection weights before graph capture.
+
+        The transformed BMM weight is large and its creation is asynchronous on
+        NPU.  Building it lazily in the first decode step lets the custom BMM
+        consume a just-created tensor.  Startup latency is irrelevant here, so
+        prepare both decode-only caches once and synchronize them with the rest
+        of model post-load preparation.
+        """
+
+        weight = self.wq_b.weight
+        self._query_only_weights_proj_weight(weight.dtype, weight.device)
+        self._query_only_wq_b_bmm_t(weight.dtype, weight.device)
+
     # Output tensors are owned by this layer and reused only in decode. Prefill may have
     # thousands of tokens, so caching those temporary outputs would pin huge per-layer tensors.
     def _get_output_buffers(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -618,9 +632,18 @@ class DeepseekV32Indexer(nn.Module):
         if query_only:
             # Decode DSA only scores prefill candidates. The decode token key is already in the MLA tail budget, so skip index_k projection/cache.
             weights_proj_weight = self._query_only_weights_proj_weight(hidden_states.dtype, hidden_states.device)
+            # Correctness and stable-decode throughput have different needs.
+            # The first decode is already eager and may pay for F.linear; keep
+            # the custom BMM exclusively on the steady-state path captured by
+            # FULL_DECODE_ONLY.  q_linear remains an eager diagnostic that
+            # forces the fallback for every decode step.
+            use_query_bmm = (
+                not self._force_query_only_linear
+                and not get_context().has_first_decode
+            )
             wq_b_bmm_t = (
                 None
-                if self._force_query_only_linear
+                if not use_query_bmm
                 else self._query_only_wq_b_bmm_t(q_c.dtype, q_c.device)
             )
             dsa_indexer_project_query_only(
@@ -868,6 +891,7 @@ class DeepseekV32DSAAttention(nn.Module):
                 torch.npu.empty_cache()
 
         self._prepare_decode_mlapo()
+        self.indexer.post_load_prepare()
 
     def _run_dsa_pipeline_with_qc_full_graph(
         self,
@@ -2024,6 +2048,10 @@ class DeepseekV32Model(nn.Module):
             layer.self_attn.post_load_prepare()
             if isinstance(layer.mlp, DeepseekV32SparseMoeBlock):
                 layer.mlp.post_load_prepare()
+        if self.layers:
+            _synchronize_device(
+                self.layers[0].self_attn.indexer.wq_b.weight.device
+            )
 
 
 class DeepseekV32ForCausalLM(nn.Module):
