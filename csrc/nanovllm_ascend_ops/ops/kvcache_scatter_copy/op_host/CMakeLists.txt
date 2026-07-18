@@ -6,8 +6,9 @@ add_ops_compile_options(
                 --op_relocatable_kernel_binary=true
 )
 
+# CANN derives aclnn_nanovllm_kvcache_scatter_copy.cpp from this stem.
 target_sources(op_host_aclnn PRIVATE
-        kvcache_scatter_copy_def.cpp
+        nanovllm_kvcache_scatter_copy_def.cpp
 )
 
 target_sources(optiling PRIVATE

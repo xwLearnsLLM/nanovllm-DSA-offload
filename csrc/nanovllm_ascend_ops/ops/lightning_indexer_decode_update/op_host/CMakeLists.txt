@@ -7,8 +7,9 @@ add_ops_compile_options(
                 --op_relocatable_kernel_binary=true
 )
 
+# CANN derives aclnnInner_nanovllm_lidu_decode_update.cpp from this stem.
 target_sources(op_host_aclnnInner PRIVATE
-        lightning_indexer_decode_update_def.cpp
+        nanovllm_lidu_decode_update_def.cpp
 )
 
 target_sources(optiling PRIVATE
