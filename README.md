@@ -74,7 +74,9 @@ DSA FULL_DECODE_ONLY proof: capture_sizes=[6], npugraph_ex=True, captures=1, rep
 
 只需把 `NANOVLLM_ENFORCE_EAGER=1` 即可做同配置 eager 对照。`example/test.py` 会把 `max_model_len` 设置为最长 prompt 加生成长度，并把 prompt 条数同时作为 decode batch 上限和唯一 capture size。
 
-## GLM-5.1-w4a8：短序列 eager smoke
+## 通用短序列 eager smoke
+
+`example/short_prompts.py` 同时支持 DeepSeek V3.2 BF16 和 GLM-5.1-w4a8，并对两种模型使用相同 prompt。下面以 GLM 为例：
 
 ```bash
 cd /home/w00916487/nanovllm-dsa_offload
@@ -99,7 +101,7 @@ export NANOVLLM_MAX_MODEL_LEN=512
 export NANOVLLM_MAX_GEN_TOKENS=8
 export NANOVLLM_IGNORE_EOS=0
 
-python3 example/glm_short_prompts.py
+python3 example/short_prompts.py
 ```
 
 前两个回答应分别为“北京”和“14”。短序列不触发 DSA offload，也不用于整图验收。
