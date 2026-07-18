@@ -36,17 +36,31 @@ void batch_matmul_transpose(const at::Tensor &tensor_a, const at::Tensor &tensor
     void *gm_c = tensor_c.data_ptr();
     void *gm_tiling_data = tiling_tensor.data_ptr();
 
-    aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
-    at_npu::native::OpCommand cmd;
-    cmd.Name("batch_matmul_transpose");
-
-    cmd.SetCustomHandler([stream, gm_a, gm_b, gm_c, gm_tiling_data,
-                          block_dim]() -> int {
+    // GLM feeds this custom kernel's output directly to torch-npu native RoPE
+    // and LightningIndexer operators.  Submit through the task-queue aware
+    // API so the custom producer stays ordered with those native consumers.
+    // Keep every tensor alive until the queued callback has launched; in
+    // particular, gm_tiling_data belongs to the temporary tiling tensor.
+    aclrtStream stream = c10_npu::getCurrentNPUStream().stream(false);
+    UseStreamResIfNeeded(stream, true);
+    auto tensor_keepalive = std::make_tuple(
+        tensor_a,
+        tensor_b,
+        tensor_c,
+        tiling_tensor
+    );
+    auto acl_call = [stream, gm_a, gm_b, gm_c, gm_tiling_data, block_dim,
+                     tensor_keepalive]() -> int {
+        (void)tensor_keepalive;
+        UseStreamResIfNeeded(stream, false);
         batch_matmul_transpose_impl(stream, gm_a, gm_b, gm_c, gm_tiling_data,
-                            block_dim);
-        return 0;
-    });
-    cmd.Run();
+                                    block_dim);
+        return ACL_SUCCESS;
+    };
+    at_npu::native::OpCommand::RunOpApiV2(
+        "batch_matmul_transpose",
+        acl_call
+    );
     return;
 }
 
