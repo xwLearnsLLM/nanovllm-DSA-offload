@@ -4,9 +4,12 @@ from collections import deque
 from typing import TYPE_CHECKING
 
 from nanovllm.engine.dsa_offload import (
+    OFFLOAD_LIDU,
+    OFFLOAD_NONE,
     PoolEntryManager,
     SimpleBlockManager,
     compute_sparse_blocks,
+    lidu_cache_tokens,
 )
 from nanovllm.engine.sequence import FinishReason, Sequence, SequenceStatus
 
@@ -20,9 +23,8 @@ class Scheduler:
         self.prefill_chunk_size = config.prefill_chunk_size
         self.max_num_decode_seqs_per_step = config.max_num_decode_seqs_per_step
         self.block_size = config.kvcache_block_size
-        self.enable_dsa_offload = bool(
-            getattr(config, "enable_dsa_offload", True)
-        )
+        self.offload_mode = config.offload_mode
+        self.uses_offload = self.offload_mode != OFFLOAD_NONE
         eos = config.eos
         if isinstance(eos, int):
             eos = (eos,)
@@ -34,7 +36,7 @@ class Scheduler:
         self.index_block_manager = None
         self.dram_block_manager = None
         self.pool_entry_manager = None
-        if self.enable_dsa_offload:
+        if self.uses_offload:
             self.index_block_manager = SimpleBlockManager(
                 config.num_dram_kvcache_blocks - 1,
                 reserve_null_block=True,
@@ -51,11 +53,11 @@ class Scheduler:
         self.prefilling: Sequence | None = None
         self.max_model_len = config.max_model_len
         self.num_index_blocks = (
-            config.num_dram_kvcache_blocks if self.enable_dsa_offload else 0
+            config.num_dram_kvcache_blocks if self.uses_offload else 0
         )
         self.num_hbm_blocks = config.num_hbm_kvcache_blocks
         self.num_dram_blocks = (
-            config.num_dram_kvcache_blocks if self.enable_dsa_offload else 0
+            config.num_dram_kvcache_blocks if self.uses_offload else 0
         )
 
     def is_finished(self):
@@ -83,14 +85,27 @@ class Scheduler:
 
     def _prepare_prefill_metadata(self, seq: Sequence) -> None:
         num_prefill_blocks = seq.num_blocks
-        num_prefill_full_blocks = len(seq) // seq.block_size
+        # The offload source is permanently bounded by the original prompt's
+        # complete blocks.  If decode preemption triggers recomputation, the
+        # already-generated tokens stay in the dense tail and never become
+        # LIDU/GS candidates.
+        num_prefill_full_blocks = seq.num_prompt_tokens // seq.block_size
         prefill_tail_len = len(seq) - num_prefill_full_blocks * seq.block_size
         num_prefill_tail_blocks = num_prefill_blocks - num_prefill_full_blocks
-        num_sparse_blocks = (
-            compute_sparse_blocks(num_prefill_full_blocks, seq.block_size)
-            if self.enable_dsa_offload
-            else num_prefill_full_blocks
-        )
+        lidu_tokens = 0
+        if self.offload_mode == OFFLOAD_LIDU:
+            lidu_tokens = lidu_cache_tokens(seq.num_prompt_tokens)
+            num_sparse_blocks = (
+                lidu_tokens // seq.block_size
+                if lidu_tokens
+                else num_prefill_full_blocks
+            )
+        elif self.uses_offload:
+            num_sparse_blocks = compute_sparse_blocks(
+                num_prefill_full_blocks, seq.block_size
+            )
+        else:
+            num_sparse_blocks = num_prefill_full_blocks
 
         seq.num_prefill_blocks = num_prefill_blocks
         seq.num_prefill_full_blocks = num_prefill_full_blocks
@@ -98,6 +113,8 @@ class Scheduler:
         seq.prefill_tail_len = prefill_tail_len
         seq.num_sparse_blocks = num_sparse_blocks
         seq.num_sparse_tokens = num_sparse_blocks * seq.block_size
+        seq.lidu_cache_tokens = lidu_tokens
+        seq.lidu_cache_initialized = not lidu_tokens
         seq.num_prefix_cached_blocks = 0
         seq.offload_finalized = False
 
@@ -107,8 +124,10 @@ class Scheduler:
             seq.num_prefill_blocks
         ):
             return False
-        if not self.enable_dsa_offload:
+        if not self.uses_offload:
             return True
+        if self.offload_mode == OFFLOAD_LIDU and seq.lidu_cache_tokens == 0:
+            return self.pool_entry_manager.can_allocate()
         return (
             self.index_block_manager.can_allocate_blocks(seq.num_prefill_blocks)
             and self.dram_block_manager.can_allocate_blocks(
@@ -125,14 +144,18 @@ class Scheduler:
             seq.num_prefill_blocks,
         )
         seq.block_table = seq.hbm_block_table
-        if self.enable_dsa_offload:
-            seq.index_block_table = self.index_block_manager.allocate_blocks(
-                seq.num_prefill_blocks,
-            )
-            seq.dram_block_table = self.dram_block_manager.allocate_blocks(
-                seq.num_prefill_full_blocks,
-            )
-            seq.hbm_cached_tokens_pool_entry = self.pool_entry_manager.allocate()
+        if self.uses_offload:
+            seq.offload_pool_entry = self.pool_entry_manager.allocate()
+            if not (
+                self.offload_mode == OFFLOAD_LIDU
+                and seq.lidu_cache_tokens == 0
+            ):
+                seq.index_block_table = self.index_block_manager.allocate_blocks(
+                    seq.num_prefill_blocks,
+                )
+                seq.dram_block_table = self.dram_block_manager.allocate_blocks(
+                    seq.num_prefill_full_blocks,
+                )
         seq.bump_decode_metadata_version()
 
     def schedule(self) -> tuple[list[Sequence], bool]:
@@ -214,18 +237,13 @@ class Scheduler:
             return True
         if not self.hbm_block_manager.can_allocate_blocks(1):
             return False
-        return (
-            not self.enable_dsa_offload
-            or self.index_block_manager.can_allocate_blocks(1)
-        )
+        return True
 
     def may_append(self, seq: Sequence) -> None:
         if len(seq) % self.block_size != 1:
             return
-        if self.enable_dsa_offload:
-            seq.index_block_table.extend(
-                self.index_block_manager.allocate_blocks(1),
-            )
+        # Decode tokens never participate in sparse selection, so growing a
+        # request must not consume IndexCache blocks.
         seq.hbm_block_table.extend(
             self.hbm_block_manager.allocate_blocks(1),
         )
@@ -233,7 +251,7 @@ class Scheduler:
         seq.bump_decode_metadata_version()
 
     def release_prefill_hbm_blocks(self, seqs: list[Sequence]) -> None:
-        if not self.enable_dsa_offload:
+        if not self.uses_offload:
             return
         for seq in seqs:
             if not seq.hbm_blocks_to_release:
@@ -249,15 +267,16 @@ class Scheduler:
         if self.dram_block_manager is not None:
             self.dram_block_manager.free_blocks(seq.dram_block_table)
         if self.pool_entry_manager is not None:
-            self.pool_entry_manager.free(seq.hbm_cached_tokens_pool_entry)
+            self.pool_entry_manager.free(seq.offload_pool_entry)
 
         seq.index_block_table.clear()
         seq.hbm_block_table.clear()
         seq.block_table = seq.hbm_block_table
         seq.dram_block_table.clear()
         seq.hbm_blocks_to_release.clear()
-        seq.hbm_cached_tokens_pool_entry = -1
+        seq.offload_pool_entry = -1
         seq.offload_finalized = False
+        seq.lidu_cache_initialized = not seq.lidu_cache_tokens
         seq.bump_decode_metadata_version()
 
     def preempt(self, seq: Sequence):

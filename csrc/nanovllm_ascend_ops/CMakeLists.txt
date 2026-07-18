@@ -106,6 +106,8 @@ target_include_directories(_C BEFORE PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/cann_ops
   ${CMAKE_CURRENT_SOURCE_DIR}/ops/lightning_indexer
   ${CMAKE_CURRENT_SOURCE_DIR}/ops/gather_selection_kv_cache
+  ${CMAKE_CURRENT_SOURCE_DIR}/ops/lightning_indexer_decode_update
+  ${CMAKE_CURRENT_SOURCE_DIR}/ops/kvcache_scatter_copy
   ${CMAKE_CURRENT_SOURCE_DIR}/ops/matmul_allreduce_add_rmsnorm
   ${CMAKE_CURRENT_SOURCE_DIR}/ops/moe_gating_top_k)
 

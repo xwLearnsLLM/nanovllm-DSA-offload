@@ -9,7 +9,14 @@ from typing import Any
 
 import torch
 
-from nanovllm.engine.dsa_offload import DSA_SELECTION_TOPK_TOKENS
+from nanovllm.engine.dsa_offload import (
+    DSA_SELECTION_TOPK_TOKENS,
+    OFFLOAD_GS,
+    OFFLOAD_LIDU,
+    OFFLOAD_NONE,
+    max_lidu_cache_tokens,
+    normalize_offload_mode,
+)
 from nanovllm.utils.context import Context, get_context, reset_context, set_context
 from nanovllm.utils.logger import init_logger
 
@@ -139,6 +146,7 @@ class FullDecodeGraphEntry:
     req_pool_entries: torch.Tensor
     candidate_lens: torch.Tensor
     candidate_query_lens: torch.Tensor
+    lidu_cache_tokens: torch.Tensor
     graph: Any | None = None
     output: torch.Tensor | None = None
     mla_tasks: list[MLAGraphTask] = field(default_factory=list)
@@ -208,6 +216,9 @@ class FullDecodeGraphEntry:
                 device=device,
             ),
             candidate_query_lens=candidate_query_lens,
+            lidu_cache_tokens=torch.zeros(
+                batch_size, dtype=torch.int32, device=device
+            ),
         )
 
     @staticmethod
@@ -240,7 +251,7 @@ class FullDecodeGraphEntry:
         positions: torch.Tensor,
         context: Context,
         *,
-        enable_dsa_offload: bool = True,
+        offload_mode: str = OFFLOAD_NONE,
     ) -> list[int]:
         if input_ids.ndim != 1 or positions.ndim != 1:
             raise ValueError(
@@ -249,7 +260,8 @@ class FullDecodeGraphEntry:
                 f"positions.shape={tuple(positions.shape)}."
             )
         runtime_batch_size = int(input_ids.shape[0])
-        if enable_dsa_offload and runtime_batch_size != self.batch_size:
+        stateful_offload = offload_mode != OFFLOAD_NONE
+        if stateful_offload and runtime_batch_size != self.batch_size:
             raise ValueError(
                 "DSA FULL_DECODE_ONLY uses exact capture sizes because padding "
                 "would mutate another request's persistent gather status: "
@@ -269,7 +281,7 @@ class FullDecodeGraphEntry:
             "flat_slot_mapping_i32": context.flat_slot_mapping_i32,
             "block_tables": context.block_tables,
         }
-        if enable_dsa_offload:
+        if stateful_offload:
             required_metadata.update(
                 index_block_tables=context.index_block_tables,
                 dram_block_tables=context.dram_block_tables,
@@ -278,6 +290,10 @@ class FullDecodeGraphEntry:
                 candidate_lens=context.candidate_lens,
                 candidate_query_lens=context.candidate_query_lens,
             )
+            if offload_mode == OFFLOAD_LIDU:
+                required_metadata["lidu_cache_tokens"] = (
+                    context.lidu_cache_tokens
+                )
         missing = [name for name, value in required_metadata.items() if value is None]
         if missing:
             raise RuntimeError(
@@ -292,7 +308,7 @@ class FullDecodeGraphEntry:
                 f"graph={self.max_block_columns}."
             )
 
-        if not enable_dsa_offload and runtime_batch_size < self.batch_size:
+        if not stateful_offload and runtime_batch_size < self.batch_size:
             padded = slice(runtime_batch_size, self.batch_size)
             self.input_ids[padded].zero_()
             self.positions[padded].zero_()
@@ -305,7 +321,7 @@ class FullDecodeGraphEntry:
                 )
             )
 
-        if not enable_dsa_offload:
+        if not stateful_offload:
             self.input_ids[:runtime_batch_size].copy_(input_ids)
             self.positions[:runtime_batch_size].copy_(positions)
             self.flat_slot_mapping_i32[:runtime_batch_size].copy_(
@@ -320,10 +336,12 @@ class FullDecodeGraphEntry:
             metadata_key is None or metadata_key != self.decode_metadata_key
         )
         if refresh_metadata:
-            if enable_dsa_offload:
+            if stateful_offload:
                 self.req_pool_entries.copy_(context.req_pool_entries)
                 self.candidate_lens.copy_(context.candidate_lens)
                 self.candidate_query_lens.copy_(context.candidate_query_lens)
+                if offload_mode == OFFLOAD_LIDU:
+                    self.lidu_cache_tokens.copy_(context.lidu_cache_tokens)
                 self._copy_table(
                     self.block_tables, context.block_tables, "block_tables"
                 )
@@ -359,7 +377,7 @@ class FullDecodeGraphEntry:
                 "Decode actual_seq_lengths_kv must have one value per request: "
                 f"got {len(seq_lens)} for batch {runtime_batch_size}."
             )
-        if enable_dsa_offload:
+        if stateful_offload:
             return seq_lens
         return seq_lens + [0] * (self.batch_size - runtime_batch_size)
 
@@ -381,16 +399,17 @@ class FullDecodeOnlyGraphManager:
         block_size: int,
         device: str | torch.device,
         expected_mla_tasks: int,
-        enable_dsa_offload: bool = True,
+        offload_mode: str = OFFLOAD_NONE,
         enable_npugraph_ex: bool = True,
         log_enabled: bool = True,
     ) -> None:
         self.model = model
         self.capture_sizes = tuple(int(size) for size in capture_sizes)
         self.block_size = int(block_size)
-        self.enable_dsa_offload = bool(enable_dsa_offload)
+        self.offload_mode = normalize_offload_mode(offload_mode)
+        self.stateful_offload = self.offload_mode != OFFLOAD_NONE
         if (
-            self.enable_dsa_offload
+            self.offload_mode == OFFLOAD_GS
             and DSA_SELECTION_TOPK_TOKENS % self.block_size != 0
         ):
             raise ValueError(
@@ -402,20 +421,31 @@ class FullDecodeOnlyGraphManager:
             int(max_model_len) + self.block_size - 1
         ) // self.block_size
         self.selection_block_columns = (
-            DSA_SELECTION_TOPK_TOKENS // self.block_size
-            if self.enable_dsa_offload
+            (
+                DSA_SELECTION_TOPK_TOKENS
+                if self.offload_mode == OFFLOAD_GS
+                else max_lidu_cache_tokens(max_model_len)
+            )
+            // self.block_size
+            if self.stateful_offload
             else 1
         )
+        self.selection_block_columns = max(1, self.selection_block_columns)
         if (
-            self.enable_dsa_offload
+            self.stateful_offload
             and self.max_block_columns < self.selection_block_columns
         ):
+            sparse_budget = (
+                DSA_SELECTION_TOPK_TOKENS
+                if self.offload_mode == OFFLOAD_GS
+                else max_lidu_cache_tokens(max_model_len)
+            )
             raise ValueError(
                 "DSA FULL_DECODE_ONLY requires max_model_len to cover the "
-                f"{DSA_SELECTION_TOPK_TOKENS}-token sparse budget."
+                f"{sparse_budget}-token sparse budget."
             )
         if (
-            not self.enable_dsa_offload
+            not self.stateful_offload
             and max(self.capture_sizes) > self.block_size
         ):
             raise ValueError(
@@ -437,6 +467,7 @@ class FullDecodeOnlyGraphManager:
         self.eager_first_decode_count = 0
         self.eager_no_dsa_count = 0
         self.eager_mixed_batch_count = 0
+        self.eager_lidu_uninitialized_count = 0
         self.eager_uncaptured_batch_count = 0
 
         self._validate_runtime()
@@ -530,7 +561,7 @@ class FullDecodeOnlyGraphManager:
         actual_seq_kvlen: list[int],
     ) -> None:
         kwargs = {}
-        if self.enable_dsa_offload:
+        if self.stateful_offload:
             kwargs.update(
                 index_block_tables=entry.index_block_tables,
                 dram_block_tables=entry.dram_block_tables,
@@ -542,6 +573,11 @@ class FullDecodeOnlyGraphManager:
                 dsa_offload_all_rows=True,
                 full_decode_graph=True,
             )
+            if self.offload_mode == OFFLOAD_LIDU:
+                kwargs.update(
+                    lidu_cache_tokens=entry.lidu_cache_tokens,
+                    lidu_all_rows_ready=True,
+                )
         set_context(
             False,
             flat_slot_mapping_i32=entry.flat_slot_mapping_i32,
@@ -565,10 +601,10 @@ class FullDecodeOnlyGraphManager:
             )
             logger.info(
                 "FULL_DECODE_ONLY: pre-capturing %s for sizes=%s, "
-                "dsa_offload=%s",
+                "offload_mode=%s",
                 callable_description,
                 self.capture_sizes,
-                self.enable_dsa_offload,
+                self.offload_mode,
             )
         try:
             with torch.inference_mode():
@@ -582,7 +618,9 @@ class FullDecodeOnlyGraphManager:
 
     def _capture(self, entry: FullDecodeGraphEntry) -> None:
         dummy_kv_len = (
-            DSA_SELECTION_TOPK_TOKENS if self.enable_dsa_offload else 1
+            DSA_SELECTION_TOPK_TOKENS
+            if self.offload_mode == OFFLOAD_GS
+            else 1
         )
         dummy_seq_lens = [dummy_kv_len] * entry.batch_size
         self._set_capture_context(entry, dummy_seq_lens)
@@ -658,12 +696,22 @@ class FullDecodeOnlyGraphManager:
             self.eager_first_decode_count += 1
             return self._run_eager(input_ids, positions)
         batch_size = int(input_ids.shape[0])
-        if self.enable_dsa_offload:
+        if self.offload_mode == OFFLOAD_GS:
             if not runtime_context.needs_dsa_update:
                 self.eager_no_dsa_count += 1
                 return self._run_eager(input_ids, positions)
             if not runtime_context.dsa_offload_all_rows:
                 self.eager_mixed_batch_count += 1
+                return self._run_eager(input_ids, positions)
+            graph_batch_size = (
+                batch_size if batch_size in self.capture_sizes else None
+            )
+        elif self.offload_mode == OFFLOAD_LIDU:
+            if not runtime_context.needs_dsa_update:
+                self.eager_no_dsa_count += 1
+                return self._run_eager(input_ids, positions)
+            if not runtime_context.lidu_all_rows_ready:
+                self.eager_lidu_uninitialized_count += 1
                 return self._run_eager(input_ids, positions)
             graph_batch_size = (
                 batch_size if batch_size in self.capture_sizes else None
@@ -686,7 +734,7 @@ class FullDecodeOnlyGraphManager:
             input_ids,
             positions,
             runtime_context,
-            enable_dsa_offload=self.enable_dsa_offload,
+            offload_mode=self.offload_mode,
         )
 
         # Wait for H2D metadata staging and the previous replay before changing
@@ -700,10 +748,10 @@ class FullDecodeOnlyGraphManager:
         if self.log_enabled and self.replay_count == 0:
             logger.info(
                 "FULL_DECODE_ONLY: first complete graph replay entered for "
-                "runtime_batch=%d, graph_batch=%d, dsa_offload=%s.",
+                "runtime_batch=%d, graph_batch=%d, offload_mode=%s.",
                 batch_size,
                 graph_batch_size,
-                self.enable_dsa_offload,
+                self.offload_mode,
             )
         self.replay_count += 1
         return entry.output[:batch_size]
@@ -714,14 +762,15 @@ class FullDecodeOnlyGraphManager:
             "mode": FULL_DECODE_ONLY,
             "npugraph_ex": self.enable_npugraph_ex,
             "capture_sizes": list(self.capture_sizes),
-            "dsa_offload": self.enable_dsa_offload,
-            "exact_size_only": self.enable_dsa_offload,
+            "offload_mode": self.offload_mode,
+            "exact_size_only": self.stateful_offload,
             "captures": self.capture_count,
             "replays": self.replay_count,
             "eager_prefill": self.eager_prefill_count,
             "eager_first_decode": self.eager_first_decode_count,
             "eager_no_dsa": self.eager_no_dsa_count,
             "eager_mixed_batch": self.eager_mixed_batch_count,
+            "eager_lidu_uninitialized": self.eager_lidu_uninitialized_count,
             "eager_uncaptured_batch": self.eager_uncaptured_batch_count,
             "metadata_refreshes": sum(
                 entry.metadata_refresh_count for entry in self._entries.values()

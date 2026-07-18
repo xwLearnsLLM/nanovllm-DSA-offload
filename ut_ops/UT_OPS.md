@@ -1,12 +1,38 @@
 # Ascend 算子验收
 
-这里只保留三项与正式推理路径直接对应的 NPU 测试：
+这里只保留与正式推理路径直接对应的 NPU 测试：
 
+- LIDU + SCATTER 的全部缓存档位、request pool、精确搬运、重复更新和链路时延。
 - GatherSelectionKVCache 的状态迁移、精确搬运、短行跳过、零 miss 和性能。
 - GLM 32-head Indexer 投影、interleaved RoPE、LightningIndexer 到 GatherSelection 的组合语义。
 - GLM ModelSlim W4A8 routed expert。
 
 修改 C++/AscendC 算子后，先重新编译，再运行对应 UT，最后运行 nano-vLLM 推理。
+
+## LIDU + SCATTER
+
+```bash
+cd /home/w00916487/nanovllm-dsa_offload
+
+unset NANOVLLM_GS_MISS_RATE_ON_LAYERS
+unset NANOVLLM_PROFILE_DECODE_OUTPUT
+
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export ASCEND_LAUNCH_BLOCKING=0
+export ASCEND_RT_VISIBLE_DEVICES=4
+export PYTHONUNBUFFERED=1
+export PYTHONPATH=$PWD:$PYTHONPATH
+
+python3 ut_ops/test_lidu_scatter.py \
+  --device npu:0 \
+  --heads 32,64 \
+  --seed 7 \
+  --warmup 2 \
+  --iters 10
+```
+
+成功标志是 `LIDU_SCATTER_UT_OK`。必须先通过该测试，才运行
+`NANOVLLM_OFFLOAD_MODE=lidu` 的完整推理。
 
 ## GatherSelectionKVCache
 

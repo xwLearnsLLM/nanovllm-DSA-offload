@@ -49,7 +49,7 @@ def main() -> None:
         f"model_type={model_type}, batch={len(PROMPTS)}, "
         f"prompt_max={longest}, max_tokens={max_tokens}, "
         f"max_model_len={max_model_len}, "
-        f"dsa_offload={llm.config.enable_dsa_offload}, "
+        f"offload_mode={llm.config.offload_mode}, "
         f"mode={'eager' if enforce_eager else 'full_decode_only'}"
     )
     outputs = llm.generate(

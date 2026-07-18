@@ -5,7 +5,15 @@ import os
 from dataclasses import dataclass, field
 from typing import Any
 
-from nanovllm.engine.dsa_offload import DSA_SELECTION_TOPK_TOKENS
+from nanovllm.engine.dsa_offload import (
+    DSA_SELECTION_TOPK_TOKENS,
+    LIDU_CACHE_TOKEN_BUDGETS,
+    LIDU_MAX_SOURCE_TOKENS,
+    OFFLOAD_GS,
+    OFFLOAD_LIDU,
+    OFFLOAD_NONE,
+    normalize_offload_mode,
+)
 from nanovllm.engine.full_decode_graph import normalize_capture_sizes
 
 
@@ -43,7 +51,7 @@ class Config:
     max_model_len: int = 65536
     tensor_parallel_size: int = 1
     enable_expert_parallel: bool = False
-    enable_dsa_offload: bool = True
+    offload_mode: str = OFFLOAD_NONE
     enforce_eager: bool = False
     decode_graph_capture_sizes: tuple[int, ...] | list[int] | None = None
     hf_config: Any = field(init=False)
@@ -60,14 +68,13 @@ class Config:
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 16 == 0
         assert 1 <= self.tensor_parallel_size
-        if not isinstance(self.enable_dsa_offload, bool):
-            raise TypeError("enable_dsa_offload must be a bool.")
+        self.offload_mode = normalize_offload_mode(self.offload_mode)
         if self.num_hbm_kvcache_blocks <= 2:
             raise ValueError(
                 "num_hbm_kvcache_blocks must be > 2. The example scripts "
                 "read it from NANOVLLM_HBM_NUM_BLOCKS."
             )
-        if self.enable_dsa_offload and self.num_dram_kvcache_blocks <= 2:
+        if self.offload_mode != OFFLOAD_NONE and self.num_dram_kvcache_blocks <= 2:
             raise ValueError(
                 "DSA offload requires num_dram_kvcache_blocks > 2. The "
                 "example scripts read it from NANOVLLM_DRAM_NUM_BLOCKS."
@@ -90,8 +97,8 @@ class Config:
         )
         setattr(
             self.hf_config,
-            "nanovllm_enable_dsa_offload",
-            self.enable_dsa_offload,
+            "nanovllm_offload_mode",
+            self.offload_mode,
         )
         self._validate_model_format()
 
@@ -108,6 +115,7 @@ class Config:
             )
 
         self._configure_glm_runtime()
+        self._validate_lidu_runtime(text_config)
         eos_token_id = getattr(text_config, "eos_token_id", None)
         if eos_token_id is not None:
             self.eos = normalize_eos_token_ids(eos_token_id)
@@ -140,7 +148,7 @@ class Config:
                 "ASCEND_LAUNCH_BLOCKING=1 is incompatible with FULL_DECODE_ONLY."
             )
         if (
-            self.enable_dsa_offload
+            self.offload_mode == OFFLOAD_GS
             and self.max_model_len < DSA_SELECTION_TOPK_TOKENS
         ):
             raise ValueError(
@@ -148,7 +156,7 @@ class Config:
                 f"{DSA_SELECTION_TOPK_TOKENS}, got {self.max_model_len}."
             )
         if (
-            self.enable_dsa_offload
+            self.offload_mode == OFFLOAD_GS
             and DSA_SELECTION_TOPK_TOKENS % self.kvcache_block_size != 0
         ):
             raise ValueError(
@@ -169,7 +177,7 @@ class Config:
                 f"max={self.max_num_decode_seqs_per_step}."
             )
         if (
-            not self.enable_dsa_offload
+            self.offload_mode == OFFLOAD_NONE
             and self.decode_graph_capture_sizes[-1] > self.kvcache_block_size
         ):
             raise ValueError(
@@ -255,22 +263,22 @@ class Config:
         index_topk = int(
             getattr(self.hf_config, "index_topk", DSA_SELECTION_TOPK_TOKENS)
         )
-        if self.enable_dsa_offload and index_topk != DSA_SELECTION_TOPK_TOKENS:
+        if self.offload_mode != OFFLOAD_NONE and index_topk != DSA_SELECTION_TOPK_TOKENS:
             raise ValueError(
                 "GLM DSA offload currently requires index_topk=2048, got "
                 f"{index_topk}."
             )
         if (
-            self.enable_dsa_offload
+            self.offload_mode != OFFLOAD_NONE
             and int(getattr(self.hf_config, "index_head_dim", 0)) <= 0
         ):
             raise ValueError("GLM DSA offload requires a positive index_head_dim.")
         if (
-            self.enable_dsa_offload
+            self.offload_mode != OFFLOAD_NONE
             and int(getattr(self.hf_config, "index_n_heads", 0)) <= 0
         ):
             raise ValueError("GLM DSA offload requires a positive index_n_heads.")
-        if self.enable_dsa_offload and not bool(
+        if self.offload_mode != OFFLOAD_NONE and not bool(
             getattr(self.hf_config, "indexer_rope_interleave", True)
         ):
             raise ValueError(
@@ -284,6 +292,43 @@ class Config:
             int(self.hf_config.max_position_embeddings),
         )
         self.hf_config.max_position_embeddings = self.max_model_len
+
+    def _validate_lidu_runtime(self, text_config: Any) -> None:
+        if self.offload_mode != OFFLOAD_LIDU:
+            return
+        if self.kvcache_block_size != 128:
+            raise ValueError(
+                "LIDU offload currently requires kvcache_block_size=128, got "
+                f"{self.kvcache_block_size}."
+            )
+        if int(getattr(text_config, "kv_lora_rank", 0)) != 512:
+            raise ValueError("LIDU SCATTER currently requires kv_lora_rank=512.")
+        if int(getattr(text_config, "qk_rope_head_dim", 0)) != 64:
+            raise ValueError(
+                "LIDU SCATTER currently requires qk_rope_head_dim=64."
+            )
+        index_heads = int(getattr(text_config, "index_n_heads", 0))
+        index_dim = int(getattr(text_config, "index_head_dim", 0))
+        if index_heads not in (32, 64) or index_dim != 128:
+            raise ValueError(
+                "LIDU requires index_n_heads in (32, 64) and "
+                f"index_head_dim=128, got heads={index_heads}, dim={index_dim}."
+            )
+        max_source_tokens = (
+            self.max_model_len // self.kvcache_block_size
+        ) * self.kvcache_block_size
+        if max_source_tokens > LIDU_MAX_SOURCE_TOKENS:
+            raise ValueError(
+                "LIDU prefill-full-block source must contain fewer than 2^18 "
+                f"tokens, got {max_source_tokens}."
+            )
+        if any(
+            budget % self.kvcache_block_size
+            for budget in LIDU_CACHE_TOKEN_BUDGETS
+        ):
+            raise ValueError(
+                "Every LIDU cache budget must be divisible by the KV block size."
+            )
 
     def _load_hf_config(self):
         config_path = os.path.join(self.model, "config.json")

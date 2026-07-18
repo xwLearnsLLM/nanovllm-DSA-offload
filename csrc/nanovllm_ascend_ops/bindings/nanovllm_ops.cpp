@@ -60,6 +60,8 @@ extern void mla_preprocess_impl(
 #include "ops/batch_matmul_transpose/batch_matmul_transpose_torch_adpt.h"
 #include "ops/lightning_indexer/lightning_indexer_vllm_torch_adpt.h"
 #include "ops/gather_selection_kv_cache/gather_selection_kv_cache_torch_adpt.h"
+#include "ops/lightning_indexer_decode_update/lightning_indexer_decode_update_torch_adpt.h"
+#include "ops/kvcache_scatter_copy/kvcache_scatter_copy_torch_adpt.h"
 #include "ops/matmul_allreduce_add_rmsnorm/matmul_allreduce_add_rmsnorm_torch_adpt.h"
 #include "ops/moe_gating_top_k/moe_gating_top_k_torch_adpt.h"
 #include "ops/dsa_indexer_project/dsa_indexer_project_torch_adpt.h"
@@ -255,6 +257,84 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> gather_selection_kv_c
       at::empty_like(selection_kv_block_status));
 }
 
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+lidu_decode_update_torch_op(
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& weights,
+    const at::Tensor& req_pool_entries,
+    at::Tensor cache_slots,
+    const at::Tensor& cache_tokens,
+    const at::Tensor& candidate_lens,
+    const at::Tensor& block_table) {
+  auto outputs = vllm_ascend::npu_lightning_indexer_decode_update(
+      query, key, weights, req_pool_entries, cache_slots, cache_tokens,
+      candidate_lens, block_table);
+  return std::make_tuple(
+      std::get<0>(outputs), std::get<1>(outputs), std::get<2>(outputs),
+      cache_slots);
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+lidu_decode_update_meta(
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& weights,
+    const at::Tensor& req_pool_entries,
+    at::Tensor cache_slots,
+    const at::Tensor& cache_tokens,
+    const at::Tensor& candidate_lens,
+    const at::Tensor& block_table) {
+  (void)weights;
+  (void)req_pool_entries;
+  (void)cache_tokens;
+  (void)candidate_lens;
+  (void)block_table;
+  auto options = query.options().dtype(at::kInt);
+  auto source_ids = at::empty({query.size(0), key.size(2), 2048}, options);
+  auto destination_slots = at::empty_like(source_ids);
+  auto miss_counts = at::empty({query.size(0)}, options);
+  return std::make_tuple(
+      source_ids, destination_slots, miss_counts, cache_slots);
+}
+
+std::tuple<at::Tensor, at::Tensor> scatter_copy_torch_op(
+    at::Tensor hbm_k_rope,
+    at::Tensor hbm_kv_cache,
+    const at::Tensor& dram_k_rope,
+    const at::Tensor& dram_kv_cache,
+    const at::Tensor& hbm_block_table,
+    const at::Tensor& dram_block_table,
+    const at::Tensor& source_token_ids,
+    const at::Tensor& destination_slots,
+    const at::Tensor& copy_counts) {
+  vllm_ascend::npu_kvcache_scatter_copy(
+      hbm_k_rope, hbm_kv_cache, dram_k_rope, dram_kv_cache,
+      hbm_block_table, dram_block_table, source_token_ids,
+      destination_slots, copy_counts);
+  return std::make_tuple(hbm_k_rope, hbm_kv_cache);
+}
+
+std::tuple<at::Tensor, at::Tensor> scatter_copy_meta(
+    at::Tensor hbm_k_rope,
+    at::Tensor hbm_kv_cache,
+    const at::Tensor& dram_k_rope,
+    const at::Tensor& dram_kv_cache,
+    const at::Tensor& hbm_block_table,
+    const at::Tensor& dram_block_table,
+    const at::Tensor& source_token_ids,
+    const at::Tensor& destination_slots,
+    const at::Tensor& copy_counts) {
+  (void)dram_k_rope;
+  (void)dram_kv_cache;
+  (void)hbm_block_table;
+  (void)dram_block_table;
+  (void)source_token_ids;
+  (void)destination_slots;
+  (void)copy_counts;
+  return std::make_tuple(hbm_k_rope, hbm_kv_cache);
+}
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_gating_top_k_py(
     const at::Tensor& x,
     int64_t k,
@@ -414,16 +494,31 @@ TORCH_LIBRARY(nanovllm_dsa, ops) {
       " Tensor selection_topk_indices, Tensor full_k_rope, Tensor full_kv_cache,"
       " Tensor full_kv_block_table, Tensor full_kv_actual_seq)"
       " -> (Tensor, Tensor, Tensor, Tensor)");
+  ops.def(
+      "lidu_decode_update(Tensor query, Tensor key, Tensor weights,"
+      " Tensor req_pool_entries, Tensor(a!) cache_slots,"
+      " Tensor cache_tokens, Tensor candidate_lens, Tensor block_table)"
+      " -> (Tensor, Tensor, Tensor, Tensor(a!))");
+  ops.def(
+      "scatter_copy(Tensor(a!) hbm_k_rope, Tensor(b!) hbm_kv_cache,"
+      " Tensor dram_k_rope, Tensor dram_kv_cache, Tensor hbm_block_table,"
+      " Tensor dram_block_table, Tensor source_token_ids,"
+      " Tensor destination_slots, Tensor copy_counts)"
+      " -> (Tensor(a!), Tensor(b!))");
 }
 
 TORCH_LIBRARY_IMPL(nanovllm_dsa, PrivateUse1, ops) {
   ops.impl("lightning_indexer", &lightning_indexer_torch_op);
   ops.impl("gather_selection_kv_cache", &gather_selection_kv_cache_torch_op);
+  ops.impl("lidu_decode_update", &lidu_decode_update_torch_op);
+  ops.impl("scatter_copy", &scatter_copy_torch_op);
 }
 
 TORCH_LIBRARY_IMPL(nanovllm_dsa, Meta, ops) {
   ops.impl("lightning_indexer", &lightning_indexer_meta);
   ops.impl("gather_selection_kv_cache", &gather_selection_kv_cache_meta);
+  ops.impl("lidu_decode_update", &lidu_decode_update_meta);
+  ops.impl("scatter_copy", &scatter_copy_meta);
 }
 
 PYBIND11_MODULE(_C, m) {

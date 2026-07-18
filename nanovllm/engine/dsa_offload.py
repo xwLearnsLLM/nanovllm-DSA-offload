@@ -1,9 +1,49 @@
 from __future__ import annotations
 
 from collections import deque
+from typing import Final
 
 
 DSA_SELECTION_TOPK_TOKENS = 2048
+OFFLOAD_NONE: Final = "none"
+OFFLOAD_GS: Final = "gs"
+OFFLOAD_LIDU: Final = "lidu"
+OFFLOAD_MODES: Final = (OFFLOAD_NONE, OFFLOAD_GS, OFFLOAD_LIDU)
+LIDU_CACHE_TOKEN_BUDGETS: Final = (2048, 3072, 5120, 8192, 12288)
+LIDU_MAX_SOURCE_TOKENS: Final = (1 << 18) - 1
+
+
+def normalize_offload_mode(value: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError("offload_mode must be a string.")
+    mode = value.strip().lower()
+    if mode not in OFFLOAD_MODES:
+        raise ValueError(
+            "offload_mode must be one of "
+            f"{OFFLOAD_MODES}, got {value!r}."
+        )
+    return mode
+
+
+def lidu_cache_tokens(prompt_len: int) -> int:
+    """Return the fixed per-request LIDU HBM cache budget C."""
+
+    prompt_len = int(prompt_len)
+    if prompt_len <= DSA_SELECTION_TOPK_TOKENS:
+        return 0
+    if prompt_len <= 8192:
+        return 2048
+    if prompt_len <= 16384:
+        return 3072
+    if prompt_len <= 32768:
+        return 5120
+    if prompt_len <= 65536:
+        return 8192
+    return 12288
+
+
+def max_lidu_cache_tokens(max_model_len: int) -> int:
+    return lidu_cache_tokens(int(max_model_len))
 
 
 def compute_sparse_blocks(

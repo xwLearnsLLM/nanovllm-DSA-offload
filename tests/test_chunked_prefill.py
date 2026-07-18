@@ -21,7 +21,7 @@ def make_config(
     block_size: int = 128,
     num_hbm_blocks: int = 256,
     num_dram_blocks: int = 256,
-    enable_dsa_offload: bool = True,
+    offload_mode: str = "gs",
 ):
     return SimpleNamespace(
         max_num_prefill_seqs_per_step=max_num_prefill_seqs_per_step,
@@ -30,7 +30,7 @@ def make_config(
         eos=-1,
         num_hbm_kvcache_blocks=num_hbm_blocks,
         num_dram_kvcache_blocks=num_dram_blocks,
-        enable_dsa_offload=enable_dsa_offload,
+        offload_mode=offload_mode,
         kvcache_block_size=block_size,
         max_model_len=20_000,
     )
@@ -164,7 +164,7 @@ def test_decode_worker_snapshot_drops_full_token_history():
     seq.block_table = seq.hbm_block_table
     seq.index_block_table = list(range(100, 171))
     seq.dram_block_table = list(range(200, 270))
-    seq.hbm_cached_tokens_pool_entry = 3
+    seq.offload_pool_entry = 3
     seq.num_prefill_full_blocks = 70
     seq.num_sparse_blocks = 16
     seq.num_sparse_tokens = 2048
@@ -308,7 +308,7 @@ def test_prefill_chunk_size_zero_preserves_batched_prefill_behavior():
 def test_dense_mla_mode_allocates_only_full_hbm_cache():
     scheduler = Scheduler(
         make_config(
-            enable_dsa_offload=False,
+            offload_mode="none",
             num_dram_blocks=-1,
         )
     )
@@ -322,7 +322,7 @@ def test_dense_mla_mode_allocates_only_full_hbm_cache():
     assert len(seq.hbm_block_table) == seq.num_blocks
     assert seq.index_block_table == []
     assert seq.dram_block_table == []
-    assert seq.hbm_cached_tokens_pool_entry == -1
+    assert seq.offload_pool_entry == -1
     assert seq.num_sparse_blocks == seq.num_prefill_full_blocks
     assert seq.num_sparse_tokens == 9984
     assert scheduler.index_block_manager is None

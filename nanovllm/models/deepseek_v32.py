@@ -13,7 +13,12 @@ import torch.nn.functional as F
 from transformers import PretrainedConfig
 
 import nanovllm.ops as ascend_ops
-from nanovllm.engine.dsa_offload import DSA_SELECTION_TOPK_TOKENS
+from nanovllm.engine.dsa_offload import (
+    DSA_SELECTION_TOPK_TOKENS,
+    OFFLOAD_GS,
+    OFFLOAD_LIDU,
+    OFFLOAD_NONE,
+)
 from nanovllm.engine.full_decode_graph import (
     MLAGraphTask,
     is_full_decode_graph_capturing,
@@ -23,6 +28,11 @@ from nanovllm.models.dsa_indexer_project import (
     dsa_indexer_project,
     dsa_indexer_project_query_only,
     dsa_indexer_pipeline_with_qc_full_graph,
+)
+from nanovllm.models.lidu import (
+    initialize_lidu_row,
+    lidu_decode_update,
+    scatter_copy,
 )
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
@@ -680,9 +690,10 @@ class DeepseekV32MLAAttention(nn.Module):
         if config.num_attention_heads % tp_size != 0:
             raise ValueError("num_attention_heads must be divisible by TP size.")
         self.layer_idx = int(layer_idx)
-        self.enable_dsa_offload = bool(
-            getattr(config, "nanovllm_enable_dsa_offload", True)
+        self.offload_mode = getattr(
+            config, "nanovllm_offload_mode", OFFLOAD_NONE
         )
+        self.uses_offload = self.offload_mode != OFFLOAD_NONE
 
         self.hidden_size = int(config.hidden_size)
         self.total_num_heads = int(config.num_attention_heads)
@@ -709,7 +720,7 @@ class DeepseekV32MLAAttention(nn.Module):
         self.rotary_emb = DeepseekScalingRotaryEmbedding(self.qk_rope_head_dim, max_position_embeddings=int(config.max_position_embeddings), rope_parameters=config.rope_parameters, is_neox_style=False)
         self.indexer_rotary_emb = None
         self.indexer = None
-        if self.enable_dsa_offload:
+        if self.uses_offload:
             self.indexer_rotary_emb = DeepseekScalingRotaryEmbedding(
                 self.qk_rope_head_dim,
                 max_position_embeddings=int(config.max_position_embeddings),
@@ -722,7 +733,7 @@ class DeepseekV32MLAAttention(nn.Module):
         # The bundled LightningIndexerVllm kernel is specialized for 64 query
         # heads. GLM-5.1 has 32 indexer heads, and upstream vLLM-Ascend routes
         # that architecture through torch-npu's native operator instead.
-        self.use_torch_npu_lightning_indexer = self.enable_dsa_offload and (
+        self.use_torch_npu_lightning_indexer = self.offload_mode == OFFLOAD_GS and (
             getattr(config, "model_type", "") == "glm_moe_dsa"
         )
 
@@ -732,6 +743,7 @@ class DeepseekV32MLAAttention(nn.Module):
         self.dram_ckv_cache = torch.tensor([])
         self.dram_kpe_cache = torch.tensor([])
         self.gather_selection_status = torch.tensor([])
+        self.lidu_cache_slots = torch.tensor([])
         self.gather_selection_topk = _DSA_GATHER_TOPK
         self.register_parameter("wd_qkv", None)
         self.w_uk_t = None
@@ -764,15 +776,22 @@ class DeepseekV32MLAAttention(nn.Module):
         index_cache: torch.Tensor,
         dram_ckv_cache: torch.Tensor,
         dram_kpe_cache: torch.Tensor,
-        gather_selection_status: torch.Tensor,
+        gather_selection_status: torch.Tensor | None,
+        lidu_cache_slots: torch.Tensor | None,
     ) -> None:
         self.ckv_cache = ckv_cache
         self.kpe_cache = kpe_cache
         self.index_cache = index_cache
         self.dram_ckv_cache = dram_ckv_cache
         self.dram_kpe_cache = dram_kpe_cache
-        self.gather_selection_status = gather_selection_status
-        self.gather_selection_topk = min(_DSA_GATHER_TOPK, int(gather_selection_status.shape[-1]) - 1)
+        if gather_selection_status is not None:
+            self.gather_selection_status = gather_selection_status
+            self.gather_selection_topk = min(
+                _DSA_GATHER_TOPK,
+                int(gather_selection_status.shape[-1]) - 1,
+            )
+        if lidu_cache_slots is not None:
+            self.lidu_cache_slots = lidu_cache_slots
 
     def assign_mla_cache(
         self,
@@ -820,7 +839,7 @@ class DeepseekV32MLAAttention(nn.Module):
         q_c: torch.Tensor,
         positions: torch.Tensor,
         batch_size: int,
-    ) -> None:
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
         if self.indexer is None or self.indexer_rotary_emb is None:
             raise RuntimeError("DSA indexer is disabled for this engine.")
         context = get_context()
@@ -849,6 +868,19 @@ class DeepseekV32MLAAttention(nn.Module):
             )
 
         active_batch = int(batch_size)
+        if self.offload_mode == OFFLOAD_LIDU:
+            q_index, _, index_weights = self.indexer(
+                hidden_states,
+                q_c,
+                positions,
+                self.indexer_rotary_emb,
+                query_only=True,
+            )
+            return self._lidu_update(
+                q_index,
+                index_weights,
+                active_batch,
+            )
         if self.use_torch_npu_lightning_indexer:
             # GLM uses a raw outer ACLGraph (no npugraph_ex). Keep its native
             # 32-head LightningIndexer and mutable GatherSelection launches
@@ -875,7 +907,7 @@ class DeepseekV32MLAAttention(nn.Module):
                 context.candidate_lens[:active_batch],
                 active_batch,
             )
-            return
+            return None
 
         cos, sin = self.indexer._rope_cos_sin(
             positions,
@@ -911,6 +943,7 @@ class DeepseekV32MLAAttention(nn.Module):
             sparse_count=self.gather_selection_topk,
             rotary_mode=self.indexer.rotary_mode,
         )
+        return None
 
     def _prepare_decode_mlapo(self) -> None:
         if self.mlapo_wd_qkv is not None and self.mlapo_wu_q is not None:
@@ -1035,11 +1068,28 @@ class DeepseekV32MLAAttention(nn.Module):
     ) -> None:
         num_full_blocks = int(seq.num_prefill_full_blocks)
         num_sparse_blocks = int(seq.num_sparse_blocks)
-        self.gather_selection_status[int(seq.hbm_cached_tokens_pool_entry)].fill_(-1)  # Reset per-request selection state before decode.
+        pool_entry = int(seq.offload_pool_entry)
+        if self.offload_mode == OFFLOAD_GS:
+            self.gather_selection_status[pool_entry].fill_(-1)
+        elif self.offload_mode == OFFLOAD_LIDU:
+            self.lidu_cache_slots[pool_entry].fill_(-1)
 
         if num_sparse_blocks >= num_full_blocks:
             # Dense/short requests keep every full prefill block in HBM, so their
             # decode path stays aligned with baseline and no DRAM copy is needed.
+            if (
+                self.offload_mode == OFFLOAD_LIDU
+                and int(seq.lidu_cache_tokens) > 0
+                and num_full_blocks > 0
+            ):
+                source_tokens = num_full_blocks * self.block_size
+                self.lidu_cache_slots[pool_entry, :source_tokens].copy_(
+                    torch.arange(
+                        source_tokens,
+                        dtype=torch.int32,
+                        device=self.lidu_cache_slots.device,
+                    )
+                )
             return
 
         # Long requests keep only the first prefix block plus suffix blocks in HBM.
@@ -1178,6 +1228,8 @@ class DeepseekV32MLAAttention(nn.Module):
         q_pe: torch.Tensor,
         block_table: torch.Tensor,
         actual_seq_lengths_key: list[int],
+        ckv_cache: torch.Tensor | None = None,
+        kpe_cache: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch_size = int(ql_nope.shape[0])
         query = ql_nope.view(batch_size, self.num_local_heads, 1, self.kv_lora_rank).contiguous()
@@ -1186,8 +1238,12 @@ class DeepseekV32MLAAttention(nn.Module):
         # FIA v2 with BNSD_NBSD expects [blocks, kv_heads, block_size, dim].
         # DeepSeek MLA has kv_heads=1 here, so this is a metadata-only view,
         # not a big cache copy.
-        key_cache = self.ckv_cache.view(-1, 1, self.block_size, self.kv_lora_rank)
-        key_rope_cache = self.kpe_cache.view(
+        if ckv_cache is None:
+            ckv_cache = self.ckv_cache
+        if kpe_cache is None:
+            kpe_cache = self.kpe_cache
+        key_cache = ckv_cache.view(-1, 1, self.block_size, self.kv_lora_rank)
+        key_rope_cache = kpe_cache.view(
             -1,
             1,
             self.block_size,
@@ -1353,6 +1409,82 @@ class DeepseekV32MLAAttention(nn.Module):
             active_batch,
         )
 
+    def _lidu_update(
+        self,
+        q_index: torch.Tensor,
+        weights: torch.Tensor,
+        batch_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        context = get_context()
+        required = {
+            "req_pool_entries": context.req_pool_entries,
+            "lidu_cache_tokens": context.lidu_cache_tokens,
+            "candidate_lens": context.candidate_lens,
+            "index_block_tables": context.index_block_tables,
+            "block_tables": context.block_tables,
+            "dram_block_tables": context.dram_block_tables,
+        }
+        missing = [name for name, value in required.items() if value is None]
+        if missing:
+            raise RuntimeError(
+                "LIDU decode context is missing: " + ", ".join(missing)
+            )
+
+        hbm_kpe = self.kpe_cache.squeeze(2)
+        hbm_ckv = self.ckv_cache.squeeze(2)
+        dram_kpe = self.dram_kpe_cache.squeeze(2)
+        dram_ckv = self.dram_ckv_cache.squeeze(2)
+
+        init_rows = context.lidu_init_rows
+        if init_rows is not None and init_rows.numel() > 0:
+            if context.full_decode_graph:
+                raise RuntimeError("LIDU initialization must remain eager.")
+            # Initialization latency is intentionally excluded from the stable
+            # decode target.  Process rows independently to cap temporary HBM.
+            for row in init_rows.detach().cpu().tolist():
+                row = int(row)
+                pool_entry = int(context.req_pool_entries[row].item())
+                cache_tokens = int(context.lidu_cache_tokens[row].item())
+                candidate_len = int(context.candidate_lens[row].item())
+                hbm_kpe, hbm_ckv = initialize_lidu_row(
+                    query=q_index[row],
+                    weights=weights[row],
+                    index_cache=self.index_cache,
+                    index_block_table=context.index_block_tables[row],
+                    candidate_len=candidate_len,
+                    cache_tokens=cache_tokens,
+                    cache_slots_row=self.lidu_cache_slots[pool_entry],
+                    hbm_kpe=hbm_kpe,
+                    hbm_ckv=hbm_ckv,
+                    dram_kpe=dram_kpe,
+                    dram_ckv=dram_ckv,
+                    hbm_block_table=context.block_tables[row],
+                    dram_block_table=context.dram_block_tables[row],
+                    block_size=self.block_size,
+                )
+
+        source_ids, destination_slots, miss_counts, _ = lidu_decode_update(
+            q_index[:batch_size],
+            self.index_cache,
+            weights[:batch_size],
+            context.req_pool_entries[:batch_size],
+            self.lidu_cache_slots,
+            context.lidu_cache_tokens[:batch_size],
+            context.candidate_lens[:batch_size],
+            context.index_block_tables[:batch_size],
+        )
+        return scatter_copy(
+            hbm_kpe,
+            hbm_ckv,
+            dram_kpe,
+            dram_ckv,
+            context.block_tables[:batch_size],
+            context.dram_block_tables[:batch_size],
+            source_ids.view(batch_size, -1),
+            destination_slots.view(batch_size, -1),
+            miss_counts[:batch_size],
+        )
+
     def _decode_forward_mla(
         self,
         ql_nope: torch.Tensor,
@@ -1360,6 +1492,7 @@ class DeepseekV32MLAAttention(nn.Module):
         q_index: torch.Tensor | None,
         weights: torch.Tensor | None,
         dsa_updated: bool = False,
+        cache_aliases: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         context = get_context()
         batch_size = int(ql_nope.shape[0])
@@ -1367,12 +1500,20 @@ class DeepseekV32MLAAttention(nn.Module):
         if context.needs_dsa_update and not dsa_updated:
             if q_index is None or weights is None:
                 raise RuntimeError("DSA offload decode requires indexer outputs.")
-            self._dsa_offload_update(q_index, weights, batch_size)
+            if self.offload_mode == OFFLOAD_LIDU:
+                cache_aliases = self._lidu_update(q_index, weights, batch_size)
+            else:
+                self._dsa_offload_update(q_index, weights, batch_size)
+        kpe_cache = ckv_cache = None
+        if cache_aliases is not None:
+            kpe_cache, ckv_cache = cache_aliases
         latent = self._decode_forward_mla_v2(
             ql_nope,
             q_pe,
             context.block_tables[:batch_size],
             context.actual_seq_lengths_kv,
+            ckv_cache=ckv_cache,
+            kpe_cache=kpe_cache,
         )
         output = torch_npu.npu_transpose_batchmatmul(latent.view(self.num_local_heads, batch_size, self.kv_lora_rank), self.w_uv, perm_y=(1, 0, 2)).reshape(batch_size, -1)
         return output
@@ -1398,9 +1539,10 @@ class DeepseekV32MLAAttention(nn.Module):
             )
             q_index = index_k = weights = None
             dsa_updated = False
+            cache_aliases = None
             if needs_decode_dsa_update:
                 if context.full_decode_graph:
-                    self._run_dsa_pipeline_with_qc_full_graph(
+                    cache_aliases = self._run_dsa_pipeline_with_qc_full_graph(
                         hidden_states,
                         q_c,
                         positions,
@@ -1423,6 +1565,7 @@ class DeepseekV32MLAAttention(nn.Module):
                 q_index,
                 weights,
                 dsa_updated=dsa_updated,
+                cache_aliases=cache_aliases,
             )
             return attn_output if skip_o_proj else self.o_proj(attn_output)
 
@@ -1564,8 +1707,8 @@ class DeepseekV32ForCausalLM(nn.Module):
                 "whose config keeps n_routed_experts > 0."
             )
         self.model = DeepseekV32Model(config)
-        self.enable_dsa_offload = bool(
-            getattr(config, "nanovllm_enable_dsa_offload", True)
+        self.offload_mode = getattr(
+            config, "nanovllm_offload_mode", OFFLOAD_NONE
         )
         self.lm_head = ParallelLMHead(
             int(config.vocab_size),
@@ -1592,7 +1735,7 @@ class DeepseekV32ForCausalLM(nn.Module):
 
     def weight_name_mapping(self, weight_name: str) -> str | None:
         if (
-            not self.enable_dsa_offload
+            self.offload_mode == OFFLOAD_NONE
             and ".self_attn.indexer." in weight_name
         ):
             return None

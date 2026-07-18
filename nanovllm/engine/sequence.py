@@ -43,8 +43,10 @@ class Sequence:
         self.index_block_table = []
         self.hbm_block_table = self.block_table
         self.dram_block_table = []
-        self.hbm_cached_tokens_pool_entry = -1
+        self.offload_pool_entry = -1
         self.offload_finalized = False
+        self.lidu_cache_tokens = 0
+        self.lidu_cache_initialized = False
         self.num_prefill_blocks = 0
         self.num_prefill_full_blocks = 0
         self.num_prefill_tail_blocks = 0
@@ -178,8 +180,10 @@ class Sequence:
             "index_block_table": self.index_block_table,
             "hbm_block_table": self.hbm_block_table,
             "dram_block_table": self.dram_block_table,
-            "hbm_cached_tokens_pool_entry": self.hbm_cached_tokens_pool_entry,
+            "offload_pool_entry": self.offload_pool_entry,
             "offload_finalized": self.offload_finalized,
+            "lidu_cache_tokens": self.lidu_cache_tokens,
+            "lidu_cache_initialized": self.lidu_cache_initialized,
             "num_prefill_blocks": self.num_prefill_blocks,
             "num_prefill_full_blocks": self.num_prefill_full_blocks,
             "num_prefill_tail_blocks": self.num_prefill_tail_blocks,
@@ -212,11 +216,12 @@ class Sequence:
         self.index_block_table = state.get("index_block_table", self.block_table)
         self.hbm_block_table = state.get("hbm_block_table", self.block_table)
         self.dram_block_table = state.get("dram_block_table", [])
-        self.hbm_cached_tokens_pool_entry = state.get(
-            "hbm_cached_tokens_pool_entry",
-            -1,
-        )
+        self.offload_pool_entry = state.get("offload_pool_entry", -1)
         self.offload_finalized = state.get("offload_finalized", False)
+        self.lidu_cache_tokens = state.get("lidu_cache_tokens", 0)
+        self.lidu_cache_initialized = state.get(
+            "lidu_cache_initialized", False
+        )
         self.num_prefill_blocks = state.get("num_prefill_blocks", 0)
         self.num_prefill_full_blocks = state.get("num_prefill_full_blocks", 0)
         self.num_prefill_tail_blocks = state.get("num_prefill_tail_blocks", 0)
@@ -257,7 +262,9 @@ class DecodeSequenceMetadata:
     hbm_block_table: list[int]
     index_block_table: list[int]
     dram_block_table: list[int]
-    hbm_cached_tokens_pool_entry: int
+    offload_pool_entry: int
+    lidu_cache_tokens: int
+    lidu_cache_initialized: bool
     num_prefill_full_blocks: int
     num_sparse_blocks: int
     num_sparse_tokens: int
@@ -276,7 +283,9 @@ class DecodeSequenceMetadata:
             hbm_block_table=list(seq.hbm_block_table),
             index_block_table=list(seq.index_block_table),
             dram_block_table=list(seq.dram_block_table),
-            hbm_cached_tokens_pool_entry=seq.hbm_cached_tokens_pool_entry,
+            offload_pool_entry=seq.offload_pool_entry,
+            lidu_cache_tokens=seq.lidu_cache_tokens,
+            lidu_cache_initialized=seq.lidu_cache_initialized,
             num_prefill_full_blocks=seq.num_prefill_full_blocks,
             num_sparse_blocks=seq.num_sparse_blocks,
             num_sparse_tokens=seq.num_sparse_tokens,

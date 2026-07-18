@@ -40,8 +40,13 @@ def _decode_context(
         req_pool_entries=torch.arange(batch_size, dtype=torch.int32),
         candidate_lens=torch.arange(4096, 4096 + batch_size, dtype=torch.int32),
         candidate_query_lens=torch.arange(1, batch_size + 1, dtype=torch.int32),
+        lidu_cache_tokens=torch.tensor(
+            [0 if row == 0 else 3072 for row in range(batch_size)],
+            dtype=torch.int32,
+        ),
         needs_dsa_update=True,
         dsa_offload_all_rows=True,
+        lidu_all_rows_ready=True,
         decode_metadata_key=metadata_key,
     )
 
@@ -64,6 +69,7 @@ def test_static_entry_copies_all_dsa_metadata():
         torch.tensor([11, 12], dtype=torch.int64),
         torch.tensor([2199, 2200], dtype=torch.int64),
         context,
+        offload_mode="gs",
     )
 
     assert seq_lens == [2200, 2201]
@@ -79,6 +85,20 @@ def test_static_entry_copies_all_dsa_metadata():
     assert entry.candidate_lens.tolist() == [4096, 4097]
 
 
+def test_static_entry_copies_lidu_tiers_for_mixed_batch():
+    entry = FullDecodeGraphEntry.allocate(2, 4, 2, torch.device("cpu"))
+    context = _decode_context()
+
+    entry.copy_runtime_inputs(
+        torch.tensor([11, 12], dtype=torch.int64),
+        torch.tensor([2199, 2200], dtype=torch.int64),
+        context,
+        offload_mode="lidu",
+    )
+
+    assert entry.lidu_cache_tokens.tolist() == [0, 3072]
+
+
 def test_static_entry_reuses_unchanged_decode_metadata():
     entry = FullDecodeGraphEntry.allocate(2, 4, 2, torch.device("cpu"))
     key = ((10, 3), (11, 7))
@@ -87,6 +107,7 @@ def test_static_entry_reuses_unchanged_decode_metadata():
         torch.tensor([11, 12], dtype=torch.int64),
         torch.tensor([2199, 2200], dtype=torch.int64),
         first,
+        offload_mode="gs",
     )
     original_tables = entry.block_tables.clone()
 
@@ -96,6 +117,7 @@ def test_static_entry_reuses_unchanged_decode_metadata():
         torch.tensor([21, 22], dtype=torch.int64),
         torch.tensor([2200, 2201], dtype=torch.int64),
         same_revision,
+        offload_mode="gs",
     )
 
     assert entry.input_ids.tolist() == [21, 22]
@@ -110,6 +132,7 @@ def test_static_entry_reuses_unchanged_decode_metadata():
         torch.tensor([31, 32], dtype=torch.int64),
         torch.tensor([2201, 2202], dtype=torch.int64),
         next_revision,
+        offload_mode="gs",
     )
     assert entry.block_tables[:, :3].equal(next_revision.block_tables)
     assert entry.metadata_refresh_count == 2
@@ -122,6 +145,7 @@ def test_static_entry_rejects_bucket_padding():
             torch.tensor([11, 12], dtype=torch.int64),
             torch.tensor([100, 200], dtype=torch.int64),
             _decode_context(),
+            offload_mode="gs",
         )
 
 
@@ -178,7 +202,9 @@ def test_ineligible_decode_paths_stay_eager():
     manager.eager_uncaptured_batch_count = 0
     manager.log_enabled = False
     manager.capture_sizes = (16,)
-    manager.enable_dsa_offload = True
+    manager.offload_mode = "gs"
+    manager.stateful_offload = True
+    manager.eager_lidu_uninitialized_count = 0
 
     set_context(False, has_first_decode=True)
     try:
@@ -209,7 +235,39 @@ def test_ineligible_decode_paths_stay_eager():
     assert manager.eager_uncaptured_batch_count == 1
 
 
-def test_exact_eligible_batch_replays_graph(monkeypatch):
+def test_lidu_noop_and_uninitialized_batches_stay_eager():
+    manager = object.__new__(FullDecodeOnlyGraphManager)
+    manager.model = lambda input_ids, positions: input_ids + positions
+    manager.capture_sizes = (2,)
+    manager.offload_mode = "lidu"
+    manager.stateful_offload = True
+    manager.eager_prefill_count = 0
+    manager.eager_first_decode_count = 0
+    manager.eager_no_dsa_count = 0
+    manager.eager_mixed_batch_count = 0
+    manager.eager_lidu_uninitialized_count = 0
+    manager.eager_uncaptured_batch_count = 0
+    manager.log_enabled = False
+
+    set_context(False, needs_dsa_update=False, lidu_all_rows_ready=True)
+    try:
+        output = manager.run(torch.tensor([2, 3]), torch.tensor([4, 5]))
+    finally:
+        reset_context()
+    assert output.tolist() == [6, 8]
+    assert manager.eager_no_dsa_count == 1
+
+    set_context(False, needs_dsa_update=True, lidu_all_rows_ready=False)
+    try:
+        output = manager.run(torch.tensor([2, 3]), torch.tensor([4, 5]))
+    finally:
+        reset_context()
+    assert output.tolist() == [6, 8]
+    assert manager.eager_lidu_uninitialized_count == 1
+
+
+@pytest.mark.parametrize("offload_mode", ["gs", "lidu"])
+def test_exact_eligible_batch_replays_graph(monkeypatch, offload_mode):
     calls = []
 
     class FakeGraph:
@@ -251,7 +309,9 @@ def test_exact_eligible_batch_replays_graph(monkeypatch):
     manager.eager_mixed_batch_count = 0
     manager.eager_uncaptured_batch_count = 0
     manager.log_enabled = False
-    manager.enable_dsa_offload = True
+    manager.offload_mode = offload_mode
+    manager.stateful_offload = True
+    manager.eager_lidu_uninitialized_count = 0
 
     context = _decode_context()
     set_context(
@@ -265,8 +325,10 @@ def test_exact_eligible_batch_replays_graph(monkeypatch):
         req_pool_entries=context.req_pool_entries,
         candidate_lens=context.candidate_lens,
         candidate_query_lens=context.candidate_query_lens,
+        lidu_cache_tokens=context.lidu_cache_tokens,
         needs_dsa_update=True,
         dsa_offload_all_rows=True,
+        lidu_all_rows_ready=True,
     )
     try:
         output = manager.run(torch.tensor([7, 8]), torch.tensor([99, 199]))
@@ -311,7 +373,9 @@ def test_dense_mla_graph_pads_to_the_smallest_capture(monkeypatch):
     manager = object.__new__(FullDecodeOnlyGraphManager)
     manager.model = lambda input_ids, positions: input_ids + positions
     manager.capture_sizes = (4,)
-    manager.enable_dsa_offload = False
+    manager.offload_mode = "none"
+    manager.stateful_offload = False
+    manager.eager_lidu_uninitialized_count = 0
     manager._entries = {4: entry}
     manager._update_stream = object()
     manager.replay_count = 0

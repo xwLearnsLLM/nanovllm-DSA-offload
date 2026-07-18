@@ -6,12 +6,12 @@ class LLM(LLMEngine):
         self,
         model,
         prefill_chunk_size: int = 0,
-        enable_dsa_offload: bool = True,
+        offload_mode: str = "none",
         **kwargs,
     ):
         super().__init__(
             model,
             prefill_chunk_size=prefill_chunk_size,
-            enable_dsa_offload=enable_dsa_offload,
+            offload_mode=offload_mode,
             **kwargs,
         )

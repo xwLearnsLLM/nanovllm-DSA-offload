@@ -8,6 +8,7 @@ import torch_npu  # type: ignore
 from torch import nn
 
 import nanovllm.ops as ascend_ops
+from nanovllm.engine.dsa_offload import OFFLOAD_NONE
 from nanovllm.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
 from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import ReplicatedLinear
@@ -607,9 +608,9 @@ class GlmMoeDsaForCausalLM(nn.Module):
 
     def weight_name_mapping(self, weight_name: str) -> str | WeightTarget | None:
         if (
-            not bool(
-                getattr(self.config, "nanovllm_enable_dsa_offload", True)
-            )
+            getattr(
+                self.config, "nanovllm_offload_mode", OFFLOAD_NONE
+            ) == OFFLOAD_NONE
             and ".self_attn.indexer." in weight_name
         ):
             return None

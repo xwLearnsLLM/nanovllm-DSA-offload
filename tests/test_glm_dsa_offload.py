@@ -108,6 +108,7 @@ def _make_config(path, **overrides):
         max_model_len=2048,
         tensor_parallel_size=16,
         enable_expert_parallel=True,
+        offload_mode="gs",
         enforce_eager=True,
         num_hbm_kvcache_blocks=64,
         num_dram_kvcache_blocks=128,
@@ -166,18 +167,37 @@ def test_glm_dsa_offload_keeps_native_indexer_at_index_topk(tmp_path):
     assert config.hf_config.index_topk == 2048
 
 
+def test_glm_lidu_accepts_supported_cache_geometry(tmp_path):
+    _write_glm_config(
+        tmp_path,
+        q_lora_rank=2048,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+    )
+
+    config = _make_config(
+        tmp_path,
+        offload_mode="lidu",
+        max_model_len=16384,
+        kvcache_block_size=128,
+    )
+
+    assert config.offload_mode == "lidu"
+    assert config.hf_config.nanovllm_offload_mode == "lidu"
+
+
 def test_glm_dense_mla_mode_needs_no_dram_cache(tmp_path):
     _write_glm_config(tmp_path)
 
     config = _make_config(
         tmp_path,
-        enable_dsa_offload=False,
+        offload_mode="none",
         num_dram_kvcache_blocks=-1,
         max_model_len=16384,
     )
 
-    assert config.enable_dsa_offload is False
-    assert config.hf_config.nanovllm_enable_dsa_offload is False
+    assert config.offload_mode == "none"
+    assert config.hf_config.nanovllm_offload_mode == "none"
 
 
 def test_glm_dense_mla_full_decode_graph_allows_short_context(tmp_path, monkeypatch):
@@ -186,7 +206,7 @@ def test_glm_dense_mla_full_decode_graph_allows_short_context(tmp_path, monkeypa
 
     config = _make_config(
         tmp_path,
-        enable_dsa_offload=False,
+        offload_mode="none",
         num_dram_kvcache_blocks=-1,
         enforce_eager=False,
         max_model_len=512,
@@ -196,10 +216,10 @@ def test_glm_dense_mla_full_decode_graph_allows_short_context(tmp_path, monkeypa
     assert config.decode_graph_capture_sizes == (3,)
 
 
-def test_enable_dsa_offload_must_be_bool(tmp_path):
+def test_offload_mode_rejects_non_string(tmp_path):
     _write_glm_config(tmp_path)
-    with pytest.raises(TypeError, match="enable_dsa_offload must be a bool"):
-        _make_config(tmp_path, enable_dsa_offload=1)
+    with pytest.raises(TypeError, match="offload_mode must be a string"):
+        _make_config(tmp_path, offload_mode=1)
 
 
 def test_glm_enables_full_decode_only(tmp_path, monkeypatch):
@@ -260,6 +280,7 @@ def test_eos_normalization_accepts_all_glm_stop_tokens():
         eos=[154820, 154827, 154829],
         num_hbm_kvcache_blocks=8,
         num_dram_kvcache_blocks=8,
+        offload_mode="none",
         kvcache_block_size=16,
         max_model_len=64,
     )
@@ -284,6 +305,7 @@ def test_scheduler_stops_if_context_length_is_already_exceeded():
         eos=[154820, 154827, 154829],
         num_hbm_kvcache_blocks=8,
         num_dram_kvcache_blocks=8,
+        offload_mode="none",
         kvcache_block_size=16,
         max_model_len=4,
     )
@@ -306,6 +328,7 @@ def test_glm_8200_prompt_really_crosses_dsa_offload_boundary():
         eos=[154820, 154827, 154829],
         num_hbm_kvcache_blocks=96,
         num_dram_kvcache_blocks=128,
+        offload_mode="gs",
         kvcache_block_size=128,
         max_model_len=8224,
     )

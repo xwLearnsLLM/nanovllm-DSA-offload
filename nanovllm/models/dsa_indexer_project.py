@@ -20,6 +20,8 @@ else:
 
 _GRAPH_LIGHTNING_INDEXER = None
 _GRAPH_GATHER_SELECTION_KV_CACHE = None
+_GRAPH_LIDU_DECODE_UPDATE = None
+_GRAPH_SCATTER_COPY = None
 _GRAPH_CUSTOM_OP_ERROR: Exception | None = None
 if ascend_ops is not None:
     try:
@@ -36,10 +38,26 @@ if ascend_ops is not None:
         ):
             raise RuntimeError(f"torch.ops.nanovllm_dsa.gather_selection_kv_cache schema is stale: {gather_schema}; rebuild nanovllm ops.")
         _GRAPH_GATHER_SELECTION_KV_CACHE = graph_gather
+        graph_lidu = torch.ops.nanovllm_dsa.lidu_decode_update.default
+        if "Tensor(a!)" not in str(graph_lidu._schema):
+            raise RuntimeError(
+                "torch.ops.nanovllm_dsa.lidu_decode_update schema is stale; "
+                "rebuild nanovllm ops."
+            )
+        _GRAPH_LIDU_DECODE_UPDATE = graph_lidu
+        graph_scatter = torch.ops.nanovllm_dsa.scatter_copy.default
+        if str(graph_scatter._schema).count("!") < 4:
+            raise RuntimeError(
+                "torch.ops.nanovllm_dsa.scatter_copy schema is stale; "
+                "rebuild nanovllm ops."
+            )
+        _GRAPH_SCATTER_COPY = graph_scatter
     except Exception as exc:
         _GRAPH_CUSTOM_OP_ERROR = exc
         _GRAPH_LIGHTNING_INDEXER = None
         _GRAPH_GATHER_SELECTION_KV_CACHE = None
+        _GRAPH_LIDU_DECODE_UPDATE = None
+        _GRAPH_SCATTER_COPY = None
 
 try:
     import torchair  # type: ignore
@@ -125,6 +143,69 @@ def _register_nanovllm_dsa_torchair_converters() -> None:
             },
             attrs={},
             outputs=["selection_k_rope", "selection_kv_cache", "selection_kv_block_table", "selection_kv_block_status"],
+        )
+
+    @register_fx_node_ge_converter(torch.ops.nanovllm_dsa.lidu_decode_update.default)
+    def convert_nanovllm_lidu_decode_update(
+        query,
+        key,
+        weights,
+        req_pool_entries,
+        cache_slots,
+        cache_tokens,
+        candidate_lens,
+        block_table,
+        meta_outputs: Any = None,
+    ):
+        return torchair.ge.custom_op(
+            "LightningIndexerDecodeUpdate",
+            inputs={
+                "query": query,
+                "key": key,
+                "weights": weights,
+                "req_pool_entries": req_pool_entries,
+                "cache_slots": cache_slots,
+                "cache_tokens": cache_tokens,
+                "actual_seq_lengths_key": candidate_lens,
+                "block_table": block_table,
+            },
+            attrs={},
+            outputs=[
+                "topk_index",
+                "topk_slots",
+                "miss_count",
+                "cache_slots",
+            ],
+        )
+
+    @register_fx_node_ge_converter(torch.ops.nanovllm_dsa.scatter_copy.default)
+    def convert_nanovllm_scatter_copy(
+        hbm_k_rope,
+        hbm_kv_cache,
+        dram_k_rope,
+        dram_kv_cache,
+        hbm_block_table,
+        dram_block_table,
+        source_token_ids,
+        destination_slots,
+        copy_counts,
+        meta_outputs: Any = None,
+    ):
+        return torchair.ge.custom_op(
+            "KvcacheScatterCopy",
+            inputs={
+                "hbm_k_rope": hbm_k_rope,
+                "hbm_kv_cache": hbm_kv_cache,
+                "dram_k_rope": dram_k_rope,
+                "dram_kv_cache": dram_kv_cache,
+                "hbm_block_table": hbm_block_table,
+                "dram_block_table": dram_block_table,
+                "src_token_ids": source_token_ids,
+                "dst_slots": destination_slots,
+                "copy_counts": copy_counts,
+            },
+            attrs={},
+            outputs=["hbm_k_rope", "hbm_kv_cache"],
         )
 
 

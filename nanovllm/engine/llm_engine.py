@@ -16,6 +16,7 @@ from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
+from nanovllm.engine.dsa_offload import OFFLOAD_NONE
 from nanovllm.utils.glm_tokenizer import (
     load_glm_tokenizer,
     normalize_token_ids,
@@ -66,7 +67,7 @@ class LLMEngine:
             "execution mode: prefill=eager, first_decode=eager, "
             "stable_decode=%s, attention=%s",
             "eager" if config.enforce_eager else "full_decode_only",
-            "DSA offload" if config.enable_dsa_offload else "dense MLA",
+            config.offload_mode,
         )
         # Fail fast on tokenizer/version problems before all TP ranks load the
         # 400+ GB GLM checkpoint.
@@ -408,7 +409,7 @@ class LLMEngine:
                     index_total,
                 ) = self.scheduler.cache_block_usage()
                 cache_text = f"HBM_KV={hbm_used}/{hbm_total}, "
-                if self.config.enable_dsa_offload:
+                if self.config.offload_mode != OFFLOAD_NONE:
                     cache_text += (
                         f"DRAM_KV={dram_used}/{dram_total}, "
                         f"HBM_INDEX={index_used}/{index_total}, "
@@ -475,7 +476,7 @@ class LLMEngine:
         if graph_stats.get("enabled"):
             print(
                 "    FULL_DECODE_ONLY proof: "
-                f"dsa_offload={graph_stats['dsa_offload']}, "
+                f"offload_mode={graph_stats['offload_mode']}, "
                 f"capture_sizes={graph_stats['capture_sizes']}, "
                 f"npugraph_ex={graph_stats['npugraph_ex']}, "
                 f"captures={graph_stats['captures']}, "
@@ -483,6 +484,8 @@ class LLMEngine:
                 f"eager_first_decode={graph_stats['eager_first_decode']}, "
                 f"eager_no_dsa={graph_stats['eager_no_dsa']}, "
                 f"eager_mixed_batch={graph_stats['eager_mixed_batch']}, "
+                f"eager_lidu_uninitialized="
+                f"{graph_stats['eager_lidu_uninitialized']}, "
                 f"eager_uncaptured_batch={graph_stats['eager_uncaptured_batch']}"
             )
             print(
