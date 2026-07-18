@@ -17,7 +17,10 @@ torch.npu.config.allow_internal_format = True
 
 from nanovllm.config import Config
 from nanovllm.engine.dsa_offload import DSA_SELECTION_TOPK_TOKENS
-from nanovllm.engine.full_decode_graph import FullDecodeOnlyGraphManager
+from nanovllm.engine.full_decode_graph import (
+    FullDecodeOnlyGraphManager,
+    select_capture_size,
+)
 from nanovllm.engine.sequence import DecodeSequenceMetadata, Sequence
 from nanovllm.layers.sampler import Sampler
 from nanovllm.models.deepseek_v32 import DeepseekV32ForCausalLM
@@ -111,6 +114,7 @@ class ModelRunner:
         self.config = config
         self.hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
+        self.enable_dsa_offload = config.enable_dsa_offload
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
@@ -134,7 +138,7 @@ class ModelRunner:
         self._compact_decode_ipc_steps = 0
         self._compact_decode_ipc_bytes = 0
         torch.npu.empty_cache()
-        self._allocate_deepseek_dsa_cache()
+        self._allocate_mla_cache()
         self.decode_graph_manager = None
         if not config.enforce_eager:
             text_config = getattr(config.hf_config, "text_config", config.hf_config)
@@ -145,6 +149,7 @@ class ModelRunner:
                 block_size=config.kvcache_block_size,
                 device=self.device,
                 expected_mla_tasks=int(text_config.num_hidden_layers),
+                enable_dsa_offload=self.enable_dsa_offload,
                 # GLM W4A8 + EP16 is captured as one raw outer ACLGraph.
                 # TorchAir's optional FX lowering is left enabled for
                 # DeepSeek, where it is already validated and faster.
@@ -173,9 +178,8 @@ class ModelRunner:
                     self.hf_config, "nanovllm_quant_metadata", {}
                 )
                 logger.info(
-                    "GLM-5.1 W4A8 DSA offload: %s decode, "
-                    "max_model_len=%d, indexer=(backend=torch_npu.native, "
-                    "heads=%d, dim=%d, topk=%d, rope=interleaved), "
+                    "GLM-5.1 W4A8: %s decode, attention=%s, "
+                    "max_model_len=%d, "
                     "EP%d (%d local experts/rank), "
                     "ModelSlim version=%s group_size=%s; MTP is disabled.",
                     (
@@ -183,10 +187,12 @@ class ModelRunner:
                         if self.config.enforce_eager
                         else "FULL_DECODE_ONLY raw ACLGraph"
                     ),
+                    (
+                        "DSA offload (native indexer, topk=2048)"
+                        if self.enable_dsa_offload
+                        else "dense MLA (all KV)"
+                    ),
                     self.config.max_model_len,
-                    int(self.hf_config.index_n_heads),
-                    int(self.hf_config.index_head_dim),
-                    int(self.hf_config.index_topk),
                     self.world_size,
                     int(self.hf_config.n_routed_experts) // self.world_size,
                     quant_metadata.get("version"),
@@ -259,7 +265,7 @@ class ModelRunner:
     def exit(self):
         if self.rank == 0 and self.decode_graph_manager is not None:
             logger.info(
-                "DSA FULL_DECODE_ONLY final stats: %s",
+                "FULL_DECODE_ONLY final stats: %s",
                 self.decode_graph_manager.stats(),
             )
         if self.rank == 0:
@@ -362,7 +368,7 @@ class ModelRunner:
         method = getattr(self, method_name, None)
         return method(*args)
 
-    def _allocate_deepseek_dsa_cache(self):
+    def _allocate_mla_cache(self):
         config = self.config
         hf_config = config.hf_config
         text_config = getattr(hf_config, "text_config", hf_config)
@@ -370,8 +376,46 @@ class ModelRunner:
         num_layers = int(text_config.num_hidden_layers)
         kv_lora_rank = int(text_config.kv_lora_rank)
         rope_dim = int(text_config.qk_rope_head_dim)
-        index_dim = int(text_config.index_head_dim)
         hbm_kv_block_bytes = num_layers * self.block_size * (kv_lora_rank + rope_dim) * torch.empty((), dtype=cache_dtype).element_size()
+        ckv_shape = (
+            num_layers,
+            config.num_hbm_kvcache_blocks,
+            self.block_size,
+            1,
+            kv_lora_rank,
+        )
+        kpe_shape = (
+            num_layers,
+            config.num_hbm_kvcache_blocks,
+            self.block_size,
+            1,
+            rope_dim,
+        )
+        if not self.enable_dsa_offload:
+            if self.rank == 0:
+                logger.info(
+                    "Using dense MLA cache: hbm_blocks=%d, "
+                    "single_block=%.2f MB",
+                    config.num_hbm_kvcache_blocks,
+                    hbm_kv_block_bytes / 1024 ** 2,
+                )
+                logger.info("Dense MLA CKV cache shape: %s", ckv_shape)
+                logger.info("Dense MLA KPE cache shape: %s", kpe_shape)
+            for module in self.model.modules():
+                if not hasattr(module, "assign_mla_cache"):
+                    continue
+                ckv_cache = torch.empty(
+                    ckv_shape[1:], dtype=cache_dtype, device=self.device
+                )
+                kpe_cache = torch.empty(
+                    kpe_shape[1:], dtype=cache_dtype, device=self.device
+                )
+                ckv_cache.zero_()
+                kpe_cache.zero_()
+                module.assign_mla_cache(ckv_cache, kpe_cache)
+            return
+
+        index_dim = int(text_config.index_head_dim)
         if DSA_SELECTION_TOPK_TOKENS % self.block_size != 0:
             raise ValueError(
                 "DSA gather_selection path expects 2048 to be divisible by "
@@ -387,8 +431,6 @@ class ModelRunner:
                 DSA_SELECTION_TOPK_TOKENS,
             )
 
-        ckv_shape = (num_layers, config.num_hbm_kvcache_blocks, self.block_size, 1, kv_lora_rank)
-        kpe_shape = (num_layers, config.num_hbm_kvcache_blocks, self.block_size, 1, rope_dim)
         index_shape = (num_layers, config.num_dram_kvcache_blocks, self.block_size, 1, index_dim)
         dram_ckv_shape = (num_layers, config.num_dram_kvcache_blocks, self.block_size, 1, kv_lora_rank)
         dram_kpe_shape = (num_layers, config.num_dram_kvcache_blocks, self.block_size, 1, rope_dim)
@@ -548,11 +590,14 @@ class ModelRunner:
             input_ids.extend(chunk_input_ids)
             positions.extend(chunk_positions)
             flat_slot_mapping.extend(chunk_slot_mapping)
-            flat_index_slot_mapping.extend(chunk_index_slot_mapping)
+            if self.enable_dsa_offload:
+                flat_index_slot_mapping.extend(chunk_index_slot_mapping)
             cu_seqlens_q.append(len(chunk_input_ids))
             actual_seq_lengths_kv = [chunk_end]
             candidate_len = seqs[0].num_prefill_full_blocks * self.block_size
-            needs_dsa_update = candidate_len > seqs[0].num_sparse_tokens > 0
+            needs_dsa_update = self.enable_dsa_offload and (
+                candidate_len > seqs[0].num_sparse_tokens > 0
+            )
         else:
             for seq in seqs:
                 input_ids.extend(seq[:])
@@ -563,12 +608,16 @@ class ModelRunner:
                     flat_slot_mapping.extend(
                         self._sequence_slots(seq.hbm_block_table, seqlen)
                     )
-                    flat_index_slot_mapping.extend(
-                        self._sequence_slots(seq.index_block_table, seqlen)
-                    )
+                    if self.enable_dsa_offload:
+                        flat_index_slot_mapping.extend(
+                            self._sequence_slots(
+                                seq.index_block_table, seqlen
+                            )
+                        )
                 candidate_len = seq.num_prefill_full_blocks * self.block_size
                 needs_dsa_update = needs_dsa_update or (
-                    candidate_len > seq.num_sparse_tokens > 0
+                    self.enable_dsa_offload
+                    and candidate_len > seq.num_sparse_tokens > 0
                 )
 
         input_ids = torch.tensor(input_ids, dtype=torch.int64).to(self.device)
@@ -622,7 +671,9 @@ class ModelRunner:
             candidate_len = seq.num_prefill_full_blocks * self.block_size
             sparse_selected_len = seq.num_sparse_tokens
             sparse_kv_len = sparse_selected_len + seq.prefill_tail_len + decode_len
-            row_needs_offload = candidate_len > sparse_selected_len > 0
+            row_needs_offload = self.enable_dsa_offload and (
+                candidate_len > sparse_selected_len > 0
+            )
             needs_dsa_update = needs_dsa_update or row_needs_offload
             if row_needs_offload:
                 offload_rows.append(row)
@@ -634,8 +685,17 @@ class ModelRunner:
         use_persistent_decode_buffers = (
             self.decode_graph_manager is not None
             and not has_first_decode
-            and dsa_offload_all_rows
-            and len(seqs) in self.decode_graph_manager.capture_sizes
+            and (
+                (
+                    dsa_offload_all_rows
+                    and len(seqs) in self.decode_graph_manager.capture_sizes
+                )
+                if self.enable_dsa_offload
+                else select_capture_size(
+                    len(seqs), self.decode_graph_manager.capture_sizes
+                )
+                is not None
+            )
         )
         if use_persistent_decode_buffers:
             # FULL_DECODE_ONLY synchronizes the current stream before replay,
@@ -703,6 +763,8 @@ class ModelRunner:
 
     @torch.inference_mode()
     def finalize_prefill_offload(self, seqs: list[Sequence]) -> None:
+        if not self.enable_dsa_offload:
+            return
         for seq in seqs:
             if seq.offload_finalized:
                 continue

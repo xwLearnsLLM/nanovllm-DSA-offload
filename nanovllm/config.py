@@ -43,6 +43,7 @@ class Config:
     max_model_len: int = 65536
     tensor_parallel_size: int = 1
     enable_expert_parallel: bool = False
+    enable_dsa_offload: bool = True
     enforce_eager: bool = False
     decode_graph_capture_sizes: tuple[int, ...] | list[int] | None = None
     hf_config: Any = field(init=False)
@@ -59,15 +60,17 @@ class Config:
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 16 == 0
         assert 1 <= self.tensor_parallel_size
+        if not isinstance(self.enable_dsa_offload, bool):
+            raise TypeError("enable_dsa_offload must be a bool.")
         if self.num_hbm_kvcache_blocks <= 2:
             raise ValueError(
                 "num_hbm_kvcache_blocks must be > 2. The example scripts "
                 "read it from NANOVLLM_HBM_NUM_BLOCKS."
             )
-        if self.num_dram_kvcache_blocks <= 2:
+        if self.enable_dsa_offload and self.num_dram_kvcache_blocks <= 2:
             raise ValueError(
-                "num_dram_kvcache_blocks must be > 2. The example scripts "
-                "read it from NANOVLLM_DRAM_NUM_BLOCKS."
+                "DSA offload requires num_dram_kvcache_blocks > 2. The "
+                "example scripts read it from NANOVLLM_DRAM_NUM_BLOCKS."
             )
         if self.max_num_prefill_seqs_per_step <= 0:
             raise ValueError("max_num_prefill_seqs_per_step must be > 0.")
@@ -85,6 +88,11 @@ class Config:
             "nanovllm_enable_expert_parallel",
             bool(self.enable_expert_parallel),
         )
+        setattr(
+            self.hf_config,
+            "nanovllm_enable_dsa_offload",
+            self.enable_dsa_offload,
+        )
         self._validate_model_format()
 
         text_config = getattr(self.hf_config, "text_config", self.hf_config)
@@ -99,7 +107,7 @@ class Config:
                 max_position_embeddings,
             )
 
-        self._validate_glm_dsa_offload()
+        self._configure_glm_runtime()
         eos_token_id = getattr(text_config, "eos_token_id", None)
         if eos_token_id is not None:
             self.eos = normalize_eos_token_ids(eos_token_id)
@@ -131,12 +139,18 @@ class Config:
             raise ValueError(
                 "ASCEND_LAUNCH_BLOCKING=1 is incompatible with FULL_DECODE_ONLY."
             )
-        if self.max_model_len < DSA_SELECTION_TOPK_TOKENS:
+        if (
+            self.enable_dsa_offload
+            and self.max_model_len < DSA_SELECTION_TOPK_TOKENS
+        ):
             raise ValueError(
                 "DSA FULL_DECODE_ONLY requires max_model_len >= "
                 f"{DSA_SELECTION_TOPK_TOKENS}, got {self.max_model_len}."
             )
-        if DSA_SELECTION_TOPK_TOKENS % self.kvcache_block_size != 0:
+        if (
+            self.enable_dsa_offload
+            and DSA_SELECTION_TOPK_TOKENS % self.kvcache_block_size != 0
+        ):
             raise ValueError(
                 "DSA FULL_DECODE_ONLY requires the 2048-token sparse budget "
                 "to be divisible by kvcache_block_size, got "
@@ -153,6 +167,17 @@ class Config:
                 "max_num_decode_seqs_per_step: "
                 f"sizes={self.decode_graph_capture_sizes}, "
                 f"max={self.max_num_decode_seqs_per_step}."
+            )
+        if (
+            not self.enable_dsa_offload
+            and self.decode_graph_capture_sizes[-1] > self.kvcache_block_size
+        ):
+            raise ValueError(
+                "Dense-MLA FULL_DECODE_ONLY requires capture sizes not to "
+                "exceed kvcache_block_size so padded rows can use distinct "
+                "null-block slots: "
+                f"sizes={self.decode_graph_capture_sizes}, "
+                f"block_size={self.kvcache_block_size}."
             )
 
     def _validate_model_format(self):
@@ -179,17 +204,17 @@ class Config:
             }
             if metadata["version"] != "1.0.0":
                 raise ValueError(
-                    "GLM DSA offload supports ModelSlim quant version 1.0.0 "
+                    "GLM-5.1 support requires ModelSlim quant version 1.0.0 "
                     f"only, got {metadata['version']!r}."
                 )
             if metadata["model_quant_type"] != "W8A8_DYNAMIC":
                 raise ValueError(
-                    "GLM DSA offload expects model_quant_type="
+                    "GLM-5.1 support expects model_quant_type="
                     f"'W8A8_DYNAMIC', got {metadata['model_quant_type']!r}."
                 )
             if metadata["group_size"] != 0:
                 raise ValueError(
-                    "GLM DSA offload supports per-channel W4A8 only "
+                    "GLM-5.1 support expects per-channel W4A8 "
                     f"(group_size=0), got {metadata['group_size']!r}."
                 )
             setattr(
@@ -218,28 +243,34 @@ class Config:
             "BF16 output directory."
         )
 
-    def _validate_glm_dsa_offload(self) -> None:
+    def _configure_glm_runtime(self) -> None:
         if getattr(self.hf_config, "model_type", "") != "glm_moe_dsa":
             return
         if not self.enable_expert_parallel:
             raise ValueError(
-                "GLM-5.1-W4A8 DSA offload requires expert parallel; set "
+                "GLM-5.1-W4A8 requires expert parallel; set "
                 "enable_expert_parallel=True / "
                 "NANOVLLM_ENABLE_EXPERT_PARALLEL=1."
             )
         index_topk = int(
             getattr(self.hf_config, "index_topk", DSA_SELECTION_TOPK_TOKENS)
         )
-        if index_topk != DSA_SELECTION_TOPK_TOKENS:
+        if self.enable_dsa_offload and index_topk != DSA_SELECTION_TOPK_TOKENS:
             raise ValueError(
                 "GLM DSA offload currently requires index_topk=2048, got "
                 f"{index_topk}."
             )
-        if int(getattr(self.hf_config, "index_head_dim", 0)) <= 0:
+        if (
+            self.enable_dsa_offload
+            and int(getattr(self.hf_config, "index_head_dim", 0)) <= 0
+        ):
             raise ValueError("GLM DSA offload requires a positive index_head_dim.")
-        if int(getattr(self.hf_config, "index_n_heads", 0)) <= 0:
+        if (
+            self.enable_dsa_offload
+            and int(getattr(self.hf_config, "index_n_heads", 0)) <= 0
+        ):
             raise ValueError("GLM DSA offload requires a positive index_n_heads.")
-        if not bool(
+        if self.enable_dsa_offload and not bool(
             getattr(self.hf_config, "indexer_rope_interleave", True)
         ):
             raise ValueError(
@@ -291,7 +322,7 @@ class Config:
             return DeepseekV32Config.from_pretrained(self.model)
 
         raise ValueError(
-            "nano-vllm-ascend DSA offload supports DeepSeek-V3.2 and "
+            "nano-vllm-ascend supports DeepSeek-V3.2 and "
             "GLM-5.1-W4A8. The model config did not match either architecture."
         )
 

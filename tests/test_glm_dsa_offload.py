@@ -166,6 +166,42 @@ def test_glm_dsa_offload_keeps_native_indexer_at_index_topk(tmp_path):
     assert config.hf_config.index_topk == 2048
 
 
+def test_glm_dense_mla_mode_needs_no_dram_cache(tmp_path):
+    _write_glm_config(tmp_path)
+
+    config = _make_config(
+        tmp_path,
+        enable_dsa_offload=False,
+        num_dram_kvcache_blocks=-1,
+        max_model_len=16384,
+    )
+
+    assert config.enable_dsa_offload is False
+    assert config.hf_config.nanovllm_enable_dsa_offload is False
+
+
+def test_glm_dense_mla_full_decode_graph_allows_short_context(tmp_path, monkeypatch):
+    monkeypatch.delenv("ASCEND_LAUNCH_BLOCKING", raising=False)
+    _write_glm_config(tmp_path)
+
+    config = _make_config(
+        tmp_path,
+        enable_dsa_offload=False,
+        num_dram_kvcache_blocks=-1,
+        enforce_eager=False,
+        max_model_len=512,
+        decode_graph_capture_sizes=(3,),
+    )
+
+    assert config.decode_graph_capture_sizes == (3,)
+
+
+def test_enable_dsa_offload_must_be_bool(tmp_path):
+    _write_glm_config(tmp_path)
+    with pytest.raises(TypeError, match="enable_dsa_offload must be a bool"):
+        _make_config(tmp_path, enable_dsa_offload=1)
+
+
 def test_glm_enables_full_decode_only(tmp_path, monkeypatch):
     monkeypatch.delenv("ASCEND_LAUNCH_BLOCKING", raising=False)
     _write_glm_config(tmp_path)

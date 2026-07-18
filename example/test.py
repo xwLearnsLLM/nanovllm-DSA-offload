@@ -139,16 +139,26 @@ def _decode_prompt_tail(tokenizer, token_ids: list[int], max_chars: int = 300) -
     return text[-max_chars:]
 
 
-def print_prompt_plan(lengths: list[int], block_size: int) -> None:
+def print_prompt_plan(
+    lengths: list[int],
+    block_size: int,
+    enable_dsa_offload: bool,
+) -> None:
     print("prompt plan:")
     for i, length in enumerate(lengths, 1):
         full_blocks = length // block_size
-        sparse_blocks = compute_sparse_blocks(full_blocks, block_size)
-        release_blocks = max(0, full_blocks - sparse_blocks)
+        if enable_dsa_offload:
+            sparse_blocks = compute_sparse_blocks(full_blocks, block_size)
+            release_blocks = max(0, full_blocks - sparse_blocks)
+            detail = (
+                f"sparse_blocks={sparse_blocks}, "
+                f"release_blocks={release_blocks}"
+            )
+        else:
+            detail = f"tail_tokens={length % block_size}"
         print(
             f"  prompt {i}: target_len={length}, "
-            f"full_blocks={full_blocks}, sparse_blocks={sparse_blocks}, "
-            f"release_blocks={release_blocks}"
+            f"full_blocks={full_blocks}, {detail}"
         )
 
 
@@ -188,10 +198,15 @@ def main() -> None:
         f"max_num_prefill_seqs_per_step={max_num_prefill_seqs_per_step}, "
         f"prefill_chunk_size={env_int('NANOVLLM_PREFILL_CHUNK_SIZE', 0)}, "
         f"max_num_decode_seqs_per_step={max_num_decode_seqs_per_step}, "
+        f"dsa_offload={llm.config.enable_dsa_offload}, "
         f"max_gen_tokens={max_gen_tokens}, "
         f"meaningful_base_tokens={len(base_ids)}"
     )
-    print_prompt_plan([len(ids) for ids in prompt_token_ids], block_size)
+    print_prompt_plan(
+        [len(ids) for ids in prompt_token_ids],
+        block_size,
+        llm.config.enable_dsa_offload,
+    )
     for i, ids in enumerate(prompt_token_ids, 1):
         print(f"prompt {i} token_len={len(ids)} first_ids={ids[:16]}")
 

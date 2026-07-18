@@ -21,6 +21,7 @@ def make_config(
     block_size: int = 128,
     num_hbm_blocks: int = 256,
     num_dram_blocks: int = 256,
+    enable_dsa_offload: bool = True,
 ):
     return SimpleNamespace(
         max_num_prefill_seqs_per_step=max_num_prefill_seqs_per_step,
@@ -29,6 +30,7 @@ def make_config(
         eos=-1,
         num_hbm_kvcache_blocks=num_hbm_blocks,
         num_dram_kvcache_blocks=num_dram_blocks,
+        enable_dsa_offload=enable_dsa_offload,
         kvcache_block_size=block_size,
         max_model_len=20_000,
     )
@@ -190,7 +192,7 @@ def test_abort_releases_all_partially_prefilled_dsa_resources():
     seqs, is_prefill = scheduler.schedule()
     scheduler.postprocess(seqs, None, is_prefill)
     assert seq.num_prefill_tokens_processed == 1024
-    assert all(used > 0 for used, _ in scheduler.dsa_block_usage())
+    assert all(used > 0 for used, _ in scheduler.cache_block_usage())
     assert scheduler.pool_entry_manager.used_entries
 
     scheduler.abort_seq_group("abort-me")
@@ -202,7 +204,7 @@ def test_abort_releases_all_partially_prefilled_dsa_resources():
     assert seq.hbm_block_table == []
     assert seq.index_block_table == []
     assert seq.dram_block_table == []
-    assert all(used == 0 for used, _ in scheduler.dsa_block_usage())
+    assert all(used == 0 for used, _ in scheduler.cache_block_usage())
     assert not scheduler.pool_entry_manager.used_entries
 
 
@@ -301,3 +303,35 @@ def test_prefill_chunk_size_zero_preserves_batched_prefill_behavior():
     scheduler.postprocess(decode_seqs, [103, 104], is_prefill)
     assert not seq1.is_first_decode_after_prefill
     assert not seq2.is_first_decode_after_prefill
+
+
+def test_dense_mla_mode_allocates_only_full_hbm_cache():
+    scheduler = Scheduler(
+        make_config(
+            enable_dsa_offload=False,
+            num_dram_blocks=-1,
+        )
+    )
+    seq = make_sequence(10_000)
+    scheduler.add(seq)
+
+    seqs, is_prefill = scheduler.schedule()
+
+    assert is_prefill
+    assert seqs == [seq]
+    assert len(seq.hbm_block_table) == seq.num_blocks
+    assert seq.index_block_table == []
+    assert seq.dram_block_table == []
+    assert seq.hbm_cached_tokens_pool_entry == -1
+    assert seq.num_sparse_blocks == seq.num_prefill_full_blocks
+    assert seq.num_sparse_tokens == 9984
+    assert scheduler.index_block_manager is None
+    assert scheduler.dram_block_manager is None
+    assert scheduler.pool_entry_manager is None
+    assert scheduler.cache_block_usage()[1:] == ((0, 0), (0, 0))
+
+    chunk = seq.scheduled_prefill_chunk()
+    assert chunk[3] == []
+
+    scheduler.abort_seq_group(seq.request_id)
+    assert scheduler.cache_block_usage()[0][0] == 0

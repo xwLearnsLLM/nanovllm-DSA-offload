@@ -158,7 +158,9 @@ class Sequence:
             self.token_ids[start:end],
             positions,
             slot_mapping(self.hbm_block_table),
-            slot_mapping(self.index_block_table),
+            slot_mapping(self.index_block_table)
+            if self.index_block_table
+            else [],
             end,
             end == len(self),
         )

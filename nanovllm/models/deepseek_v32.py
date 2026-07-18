@@ -672,7 +672,7 @@ class DeepseekV32Indexer(nn.Module):
         return q_index, index_k, index_weights
 
 
-class DeepseekV32DSAAttention(nn.Module):
+class DeepseekV32MLAAttention(nn.Module):
 
     def __init__(self, config: DeepseekV32Config, layer_idx: int) -> None:
         super().__init__()
@@ -680,6 +680,9 @@ class DeepseekV32DSAAttention(nn.Module):
         if config.num_attention_heads % tp_size != 0:
             raise ValueError("num_attention_heads must be divisible by TP size.")
         self.layer_idx = int(layer_idx)
+        self.enable_dsa_offload = bool(
+            getattr(config, "nanovllm_enable_dsa_offload", True)
+        )
 
         self.hidden_size = int(config.hidden_size)
         self.total_num_heads = int(config.num_attention_heads)
@@ -704,12 +707,22 @@ class DeepseekV32DSAAttention(nn.Module):
         self.o_proj = RowParallelLinear(self.total_num_heads * self.v_head_dim, self.hidden_size, bias=False)
         self._tp_hcomm_info = None
         self.rotary_emb = DeepseekScalingRotaryEmbedding(self.qk_rope_head_dim, max_position_embeddings=int(config.max_position_embeddings), rope_parameters=config.rope_parameters, is_neox_style=False)
-        self.indexer_rotary_emb = DeepseekScalingRotaryEmbedding(self.qk_rope_head_dim, max_position_embeddings=int(config.max_position_embeddings), rope_parameters=config.rope_parameters, is_neox_style=not getattr(config, "indexer_rope_interleave", False))
-        self.indexer = DeepseekV32Indexer(config)
+        self.indexer_rotary_emb = None
+        self.indexer = None
+        if self.enable_dsa_offload:
+            self.indexer_rotary_emb = DeepseekScalingRotaryEmbedding(
+                self.qk_rope_head_dim,
+                max_position_embeddings=int(config.max_position_embeddings),
+                rope_parameters=config.rope_parameters,
+                is_neox_style=not getattr(
+                    config, "indexer_rope_interleave", False
+                ),
+            )
+            self.indexer = DeepseekV32Indexer(config)
         # The bundled LightningIndexerVllm kernel is specialized for 64 query
         # heads. GLM-5.1 has 32 indexer heads, and upstream vLLM-Ascend routes
         # that architecture through torch-npu's native operator instead.
-        self.use_torch_npu_lightning_indexer = (
+        self.use_torch_npu_lightning_indexer = self.enable_dsa_offload and (
             getattr(config, "model_type", "") == "glm_moe_dsa"
         )
 
@@ -761,6 +774,14 @@ class DeepseekV32DSAAttention(nn.Module):
         self.gather_selection_status = gather_selection_status
         self.gather_selection_topk = min(_DSA_GATHER_TOPK, int(gather_selection_status.shape[-1]) - 1)
 
+    def assign_mla_cache(
+        self,
+        ckv_cache: torch.Tensor,
+        kpe_cache: torch.Tensor,
+    ) -> None:
+        self.ckv_cache = ckv_cache
+        self.kpe_cache = kpe_cache
+
     def post_load_prepare(self) -> None:
         if self.wd_qkv is None:
             q_weight = self.q_a_proj.weight.detach().cpu()
@@ -790,7 +811,8 @@ class DeepseekV32DSAAttention(nn.Module):
                 torch.npu.empty_cache()
 
         self._prepare_decode_mlapo()
-        self.indexer.post_load_prepare()
+        if self.indexer is not None:
+            self.indexer.post_load_prepare()
 
     def _run_dsa_pipeline_with_qc_full_graph(
         self,
@@ -799,6 +821,8 @@ class DeepseekV32DSAAttention(nn.Module):
         positions: torch.Tensor,
         batch_size: int,
     ) -> None:
+        if self.indexer is None or self.indexer_rotary_emb is None:
+            raise RuntimeError("DSA indexer is disabled for this engine.")
         context = get_context()
         if not context.full_decode_graph or not context.dsa_offload_all_rows:
             raise RuntimeError(
@@ -1031,6 +1055,8 @@ class DeepseekV32DSAAttention(nn.Module):
     def _store_index_cache(self, index_k: torch.Tensor | None) -> None:
         if index_k is None:
             return
+        if self.indexer is None:
+            raise RuntimeError("DSA indexer is disabled for this engine.")
         context = get_context()
         index_slots = context.flat_index_slot_mapping if context.flat_index_slot_mapping is not None else self._flat_slots()
         flat_cache = self.index_cache.view(-1, self.indexer.head_dim)
@@ -1043,6 +1069,8 @@ class DeepseekV32DSAAttention(nn.Module):
         positions: torch.Tensor,
         query_only: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+        if self.indexer is None or self.indexer_rotary_emb is None:
+            raise RuntimeError("DSA indexer is disabled for this engine.")
         q_index, index_k, weights = self.indexer(
             hidden_states,
             q_c,
@@ -1450,7 +1478,7 @@ class DeepseekV32DecoderLayer(nn.Module):
     def __init__(self, config: DeepseekV32Config, layer_idx: int) -> None:
         super().__init__()
         self.layer_idx = int(layer_idx)
-        self.self_attn = DeepseekV32DSAAttention(config, layer_idx)
+        self.self_attn = DeepseekV32MLAAttention(config, layer_idx)
         is_shared_only, keep_routed_experts = _resolve_export_mode(config)
         if layer_idx >= int(config.first_k_dense_replace) and is_shared_only:
             self.mlp = DeepseekV32MLP(hidden_size=int(config.hidden_size), intermediate_size=int(config.moe_intermediate_size) * int(getattr(config, "n_shared_experts", 1) or 1), hidden_act=str(config.hidden_act))
@@ -1517,9 +1545,7 @@ class DeepseekV32Model(nn.Module):
             if isinstance(layer.mlp, DeepseekV32SparseMoeBlock):
                 layer.mlp.post_load_prepare()
         if self.layers:
-            _synchronize_device(
-                self.layers[0].self_attn.indexer.wq_b.weight.device
-            )
+            _synchronize_device(self.layers[0].self_attn.wd_qkv.device)
 
 
 class DeepseekV32ForCausalLM(nn.Module):
@@ -1538,6 +1564,9 @@ class DeepseekV32ForCausalLM(nn.Module):
                 "whose config keeps n_routed_experts > 0."
             )
         self.model = DeepseekV32Model(config)
+        self.enable_dsa_offload = bool(
+            getattr(config, "nanovllm_enable_dsa_offload", True)
+        )
         self.lm_head = ParallelLMHead(
             int(config.vocab_size),
             int(config.hidden_size),
@@ -1562,6 +1591,11 @@ class DeepseekV32ForCausalLM(nn.Module):
         self.model.post_load_prepare()
 
     def weight_name_mapping(self, weight_name: str) -> str | None:
+        if (
+            not self.enable_dsa_offload
+            and ".self_attn.indexer." in weight_name
+        ):
+            return None
         if ".mlp.experts." not in weight_name:
             return weight_name
         parts = weight_name.split(".")

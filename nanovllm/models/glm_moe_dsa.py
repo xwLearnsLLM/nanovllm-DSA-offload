@@ -12,7 +12,7 @@ from nanovllm.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
 from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import ReplicatedLinear
 from nanovllm.models.deepseek_v32 import (
-    DeepseekV32DSAAttention,
+    DeepseekV32MLAAttention,
     DeepseekV32MLP,
 )
 from nanovllm.models.glm_moe_dsa_config import GlmMoeDsaConfig
@@ -440,7 +440,7 @@ class GlmW4A8SparseMoeBlock(nn.Module):
 class GlmMoeDsaDecoderLayer(nn.Module):
     def __init__(self, config: GlmMoeDsaConfig, layer_idx: int) -> None:
         super().__init__()
-        self.self_attn = DeepseekV32DSAAttention(config, layer_idx)
+        self.self_attn = DeepseekV32MLAAttention(config, layer_idx)
         if layer_idx < int(config.first_k_dense_replace):
             self.mlp = DeepseekV32MLP(
                 hidden_size=int(config.hidden_size),
@@ -606,9 +606,14 @@ class GlmMoeDsaForCausalLM(nn.Module):
         self.model.post_load_prepare()
 
     def weight_name_mapping(self, weight_name: str) -> str | WeightTarget | None:
-        # The offload branch loads the native GLM DSA indexer.  It excludes
-        # only the layer-78 MTP draft model/rotation, which nano-vLLM does not
-        # execute.
+        if (
+            not bool(
+                getattr(self.config, "nanovllm_enable_dsa_offload", True)
+            )
+            and ".self_attn.indexer." in weight_name
+        ):
+            return None
+        # MTP draft weights/rotation are never executed.
         if should_skip_glm_checkpoint_weight(weight_name):
             return None
 

@@ -64,8 +64,9 @@ class LLMEngine:
         logger.info(f"config: {config}")
         logger.info(
             "execution mode: prefill=eager, first_decode=eager, "
-            "stable_decode=%s",
+            "stable_decode=%s, attention=%s",
             "eager" if config.enforce_eager else "full_decode_only",
+            "DSA offload" if config.enable_dsa_offload else "dense MLA",
         )
         # Fail fast on tokenizer/version problems before all TP ranks load the
         # 400+ GB GLM checkpoint.
@@ -402,13 +403,20 @@ class LLMEngine:
                     progress_text = f", progress={progress}/{prompt_length}"
                 else:
                     latency_name = "TTFT" if is_prefill else "TPOT"
-                (hbm_used, hbm_total), (dram_used, dram_total), (index_used, index_total) = self.scheduler.dsa_block_usage()
+                (hbm_used, hbm_total), (dram_used, dram_total), (
+                    index_used,
+                    index_total,
+                ) = self.scheduler.cache_block_usage()
+                cache_text = f"HBM_KV={hbm_used}/{hbm_total}, "
+                if self.config.enable_dsa_offload:
+                    cache_text += (
+                        f"DRAM_KV={dram_used}/{dram_total}, "
+                        f"HBM_INDEX={index_used}/{index_total}, "
+                    )
                 print(
                     f"[step{i_step:4d} {'Prefill' if is_prefill else ' Decode'}] "
                     f"bsz={batch_size}, num_tokens={step_tokens}{progress_text}, "
-                    f"HBM_KV={hbm_used}/{hbm_total}, "
-                    f"DRAM_KV={dram_used}/{dram_total}, "
-                    f"HBM_INDEX={index_used}/{index_total}, "
+                    f"{cache_text}"
                     f"{latency_name}={step_elapsed:.4f} sec, "
                     f"TPS={step_tps:.2f} tok/s"
                 )
@@ -466,7 +474,8 @@ class LLMEngine:
         )
         if graph_stats.get("enabled"):
             print(
-                "    DSA FULL_DECODE_ONLY proof: "
+                "    FULL_DECODE_ONLY proof: "
+                f"dsa_offload={graph_stats['dsa_offload']}, "
                 f"capture_sizes={graph_stats['capture_sizes']}, "
                 f"npugraph_ex={graph_stats['npugraph_ex']}, "
                 f"captures={graph_stats['captures']}, "
@@ -477,7 +486,7 @@ class LLMEngine:
                 f"eager_uncaptured_batch={graph_stats['eager_uncaptured_batch']}"
             )
             print(
-                "    DSA decode hot path: "
+                "    Decode hot path: "
                 f"compact_ipc_steps={graph_stats['compact_ipc_steps']}, "
                 f"average_ipc_bytes={graph_stats['average_ipc_bytes']}, "
                 f"metadata_cache_hits={graph_stats['metadata_cache_hits']}, "

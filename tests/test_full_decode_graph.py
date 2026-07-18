@@ -178,6 +178,7 @@ def test_ineligible_decode_paths_stay_eager():
     manager.eager_uncaptured_batch_count = 0
     manager.log_enabled = False
     manager.capture_sizes = (16,)
+    manager.enable_dsa_offload = True
 
     set_context(False, has_first_decode=True)
     try:
@@ -250,6 +251,7 @@ def test_exact_eligible_batch_replays_graph(monkeypatch):
     manager.eager_mixed_batch_count = 0
     manager.eager_uncaptured_batch_count = 0
     manager.log_enabled = False
+    manager.enable_dsa_offload = True
 
     context = _decode_context()
     set_context(
@@ -274,6 +276,77 @@ def test_exact_eligible_batch_replays_graph(monkeypatch):
     assert output.tolist() == [[0, 1, 2], [3, 4, 5]]
     assert calls == ["synchronize", "replay", ("update", [2200, 2201])]
     assert manager.replay_count == 1
+
+
+def test_dense_mla_graph_pads_to_the_smallest_capture(monkeypatch):
+    calls = []
+
+    class FakeGraph:
+        def replay(self):
+            calls.append("replay")
+
+    class FakeStream:
+        def synchronize(self):
+            calls.append("synchronize")
+
+    class FakeTask:
+        def update(self, _stream, actual_seq_kvlen):
+            calls.append(("update", actual_seq_kvlen))
+
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        SimpleNamespace(
+            current_stream=lambda: FakeStream(),
+            stream=lambda _stream: nullcontext(),
+        ),
+        raising=False,
+    )
+
+    entry = FullDecodeGraphEntry.allocate(4, 4, 1, torch.device("cpu"))
+    entry.graph = FakeGraph()
+    entry.output = torch.arange(12).view(4, 3)
+    entry.mla_tasks = [FakeTask()]
+
+    manager = object.__new__(FullDecodeOnlyGraphManager)
+    manager.model = lambda input_ids, positions: input_ids + positions
+    manager.capture_sizes = (4,)
+    manager.enable_dsa_offload = False
+    manager._entries = {4: entry}
+    manager._update_stream = object()
+    manager.replay_count = 0
+    manager.eager_prefill_count = 0
+    manager.eager_first_decode_count = 0
+    manager.eager_no_dsa_count = 0
+    manager.eager_mixed_batch_count = 0
+    manager.eager_uncaptured_batch_count = 0
+    manager.log_enabled = False
+
+    context = _decode_context()
+    set_context(
+        False,
+        flat_slot_mapping_i32=context.flat_slot_mapping_i32,
+        actual_seq_lengths_kv=context.actual_seq_lengths_kv,
+        block_tables=context.block_tables,
+    )
+    try:
+        output = manager.run(
+            torch.tensor([7, 8]), torch.tensor([99, 199])
+        )
+    finally:
+        reset_context()
+
+    assert output.tolist() == [[0, 1, 2], [3, 4, 5]]
+    assert entry.input_ids.tolist() == [7, 8, 0, 0]
+    assert entry.positions.tolist() == [99, 199, 0, 0]
+    assert entry.flat_slot_mapping_i32.tolist() == [10, 11, 2, 3]
+    assert entry.block_tables[:2, :3].equal(context.block_tables)
+    assert entry.block_tables[2:].count_nonzero().item() == 0
+    assert calls == [
+        "synchronize",
+        "replay",
+        ("update", [2200, 2201, 0, 0]),
+    ]
 
 
 def test_decode_callable_uses_npugraph_ex(monkeypatch):

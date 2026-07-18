@@ -20,41 +20,62 @@ class Scheduler:
         self.prefill_chunk_size = config.prefill_chunk_size
         self.max_num_decode_seqs_per_step = config.max_num_decode_seqs_per_step
         self.block_size = config.kvcache_block_size
+        self.enable_dsa_offload = bool(
+            getattr(config, "enable_dsa_offload", True)
+        )
         eos = config.eos
         if isinstance(eos, int):
             eos = (eos,)
         self.eos = frozenset(int(token_id) for token_id in eos)
-        self.index_block_manager = SimpleBlockManager(
-            config.num_dram_kvcache_blocks - 1,
-            reserve_null_block=True,
-        )
         self.hbm_block_manager = SimpleBlockManager(
             config.num_hbm_kvcache_blocks - 1,
             reserve_null_block=True,
         )
-        self.dram_block_manager = SimpleBlockManager(
-            config.num_dram_kvcache_blocks,
-            reserve_null_block=True,
-        )
-        self.pool_entry_manager = PoolEntryManager(
-            config.max_num_decode_seqs_per_step
-        )
+        self.index_block_manager = None
+        self.dram_block_manager = None
+        self.pool_entry_manager = None
+        if self.enable_dsa_offload:
+            self.index_block_manager = SimpleBlockManager(
+                config.num_dram_kvcache_blocks - 1,
+                reserve_null_block=True,
+            )
+            self.dram_block_manager = SimpleBlockManager(
+                config.num_dram_kvcache_blocks,
+                reserve_null_block=True,
+            )
+            self.pool_entry_manager = PoolEntryManager(
+                config.max_num_decode_seqs_per_step
+            )
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
         self.prefilling: Sequence | None = None
         self.max_model_len = config.max_model_len
-        self.num_index_blocks = config.num_dram_kvcache_blocks
+        self.num_index_blocks = (
+            config.num_dram_kvcache_blocks if self.enable_dsa_offload else 0
+        )
         self.num_hbm_blocks = config.num_hbm_kvcache_blocks
-        self.num_dram_blocks = config.num_dram_kvcache_blocks
+        self.num_dram_blocks = (
+            config.num_dram_kvcache_blocks if self.enable_dsa_offload else 0
+        )
 
     def is_finished(self):
         return not self.waiting and not self.running and self.prefilling is None
 
-    def dsa_block_usage(self) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int]]:
+    def cache_block_usage(self) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int]]:
         # CPU-side counters only; printing them cannot disturb async NPU execution.
         hbm_kv = (len(self.hbm_block_manager.used_block_ids), self.num_hbm_blocks)
-        dram_kv = (len(self.dram_block_manager.used_block_ids), self.num_dram_blocks)
-        hbm_index = (len(self.index_block_manager.used_block_ids), self.num_index_blocks)
+        dram_kv = (
+            len(self.dram_block_manager.used_block_ids)
+            if self.dram_block_manager is not None
+            else 0,
+            self.num_dram_blocks,
+        )
+        hbm_index = (
+            len(self.index_block_manager.used_block_ids)
+            if self.index_block_manager is not None
+            else 0,
+            self.num_index_blocks,
+        )
         return hbm_kv, dram_kv, hbm_index
 
     def add(self, seq: Sequence):
@@ -65,7 +86,11 @@ class Scheduler:
         num_prefill_full_blocks = len(seq) // seq.block_size
         prefill_tail_len = len(seq) - num_prefill_full_blocks * seq.block_size
         num_prefill_tail_blocks = num_prefill_blocks - num_prefill_full_blocks
-        num_sparse_blocks = compute_sparse_blocks(num_prefill_full_blocks, seq.block_size)
+        num_sparse_blocks = (
+            compute_sparse_blocks(num_prefill_full_blocks, seq.block_size)
+            if self.enable_dsa_offload
+            else num_prefill_full_blocks
+        )
 
         seq.num_prefill_blocks = num_prefill_blocks
         seq.num_prefill_full_blocks = num_prefill_full_blocks
@@ -78,10 +103,17 @@ class Scheduler:
 
     def _can_allocate_prefill(self, seq: Sequence) -> bool:
         self._prepare_prefill_metadata(seq)
+        if not self.hbm_block_manager.can_allocate_blocks(
+            seq.num_prefill_blocks
+        ):
+            return False
+        if not self.enable_dsa_offload:
+            return True
         return (
             self.index_block_manager.can_allocate_blocks(seq.num_prefill_blocks)
-            and self.hbm_block_manager.can_allocate_blocks(seq.num_prefill_blocks)
-            and self.dram_block_manager.can_allocate_blocks(seq.num_prefill_full_blocks)
+            and self.dram_block_manager.can_allocate_blocks(
+                seq.num_prefill_full_blocks
+            )
             and self.pool_entry_manager.can_allocate()
         )
 
@@ -89,17 +121,18 @@ class Scheduler:
         assert not seq.index_block_table
         assert not seq.hbm_block_table
         assert not seq.dram_block_table
-        seq.index_block_table = self.index_block_manager.allocate_blocks(
-            seq.num_prefill_blocks,
-        )
         seq.hbm_block_table = self.hbm_block_manager.allocate_blocks(
             seq.num_prefill_blocks,
         )
         seq.block_table = seq.hbm_block_table
-        seq.dram_block_table = self.dram_block_manager.allocate_blocks(
-            seq.num_prefill_full_blocks,
-        )
-        seq.hbm_cached_tokens_pool_entry = self.pool_entry_manager.allocate()
+        if self.enable_dsa_offload:
+            seq.index_block_table = self.index_block_manager.allocate_blocks(
+                seq.num_prefill_blocks,
+            )
+            seq.dram_block_table = self.dram_block_manager.allocate_blocks(
+                seq.num_prefill_full_blocks,
+            )
+            seq.hbm_cached_tokens_pool_entry = self.pool_entry_manager.allocate()
         seq.bump_decode_metadata_version()
 
     def schedule(self) -> tuple[list[Sequence], bool]:
@@ -179,17 +212,20 @@ class Scheduler:
         need_new_block = len(seq) % self.block_size == 1
         if not need_new_block:
             return True
+        if not self.hbm_block_manager.can_allocate_blocks(1):
+            return False
         return (
-            self.index_block_manager.can_allocate_blocks(1)
-            and self.hbm_block_manager.can_allocate_blocks(1)
+            not self.enable_dsa_offload
+            or self.index_block_manager.can_allocate_blocks(1)
         )
 
     def may_append(self, seq: Sequence) -> None:
         if len(seq) % self.block_size != 1:
             return
-        seq.index_block_table.extend(
-            self.index_block_manager.allocate_blocks(1),
-        )
+        if self.enable_dsa_offload:
+            seq.index_block_table.extend(
+                self.index_block_manager.allocate_blocks(1),
+            )
         seq.hbm_block_table.extend(
             self.hbm_block_manager.allocate_blocks(1),
         )
@@ -197,6 +233,8 @@ class Scheduler:
         seq.bump_decode_metadata_version()
 
     def release_prefill_hbm_blocks(self, seqs: list[Sequence]) -> None:
+        if not self.enable_dsa_offload:
+            return
         for seq in seqs:
             if not seq.hbm_blocks_to_release:
                 continue
@@ -204,11 +242,14 @@ class Scheduler:
             seq.hbm_blocks_to_release.clear()
 
     def deallocate(self, seq: Sequence):
-        self.index_block_manager.free_blocks(seq.index_block_table)
+        if self.index_block_manager is not None:
+            self.index_block_manager.free_blocks(seq.index_block_table)
         self.hbm_block_manager.free_blocks(seq.hbm_block_table)
         self.hbm_block_manager.free_blocks(seq.hbm_blocks_to_release)
-        self.dram_block_manager.free_blocks(seq.dram_block_table)
-        self.pool_entry_manager.free(seq.hbm_cached_tokens_pool_entry)
+        if self.dram_block_manager is not None:
+            self.dram_block_manager.free_blocks(seq.dram_block_table)
+        if self.pool_entry_manager is not None:
+            self.pool_entry_manager.free(seq.hbm_cached_tokens_pool_entry)
 
         seq.index_block_table.clear()
         seq.hbm_block_table.clear()
