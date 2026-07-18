@@ -268,6 +268,14 @@ def main() -> None:
         dtype=torch.int32,
         device=device,
     )
+    captured_topk = torch.empty(
+        args.rounds,
+        args.batch_size,
+        1,
+        args.topk,
+        dtype=torch.int32,
+        device=device,
+    )
     req_pool_entries = torch.arange(
         args.batch_size,
         dtype=torch.int32,
@@ -332,6 +340,9 @@ def main() -> None:
             full_table,
             full_actual_seq,
         )
+        # This copy is deliberately after GS submission, so the tested
+        # producer -> consumer edge remains an immediate LI -> GS chain.
+        captured_topk[round_idx].copy_(topk_indices)
         del topk_indices
 
         poison = torch.empty(
@@ -349,23 +360,7 @@ def main() -> None:
     statuses_cpu = statuses.cpu()
     selection_kpe_cpu = selection_kpe.cpu()
     selection_ckv_cpu = selection_ckv.cpu()
-
-    # Build synchronized references only after the strict async test has ended,
-    # so reference launches cannot warm or perturb its allocator/queue state.
-    reference_topk_npu = [
-        run_native_li(
-            queries[round_idx],
-            weights[round_idx],
-            key_cache,
-            query_lens,
-            key_lens,
-            full_table,
-            args.topk,
-        )
-        for round_idx in range(args.rounds)
-    ]
-    torch.npu.synchronize()
-    reference_topk_cpu = [tensor.cpu() for tensor in reference_topk_npu]
+    captured_topk_cpu = captured_topk.cpu()
 
     positions = torch.arange(args.topk, dtype=torch.int64)
     for round_idx in range(args.rounds):
@@ -386,7 +381,7 @@ def main() -> None:
                 label=f"{label} GS",
             )
             reference_sorted = validate_topk_set(
-                reference_topk_cpu[round_idx][row],
+                captured_topk_cpu[round_idx, row],
                 full_len=args.full_len,
                 topk=args.topk,
                 label=f"{label} LI reference",

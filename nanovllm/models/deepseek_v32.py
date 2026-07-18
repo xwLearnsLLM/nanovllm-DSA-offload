@@ -527,6 +527,10 @@ class DeepseekV32Indexer(nn.Module):
         self._weights_proj_bf16 = None
         self._wq_b_bmm_t_key = None
         self._wq_b_bmm_t = None
+        self._force_query_only_linear = (
+            str(getattr(config, "nanovllm_dsa_boundary_probe", "none"))
+            == "q_linear"
+        )
 
     # Output tensors are owned by this layer and reused only in decode. Prefill may have
     # thousands of tokens, so caching those temporary outputs would pin huge per-layer tensors.
@@ -614,7 +618,11 @@ class DeepseekV32Indexer(nn.Module):
         if query_only:
             # Decode DSA only scores prefill candidates. The decode token key is already in the MLA tail budget, so skip index_k projection/cache.
             weights_proj_weight = self._query_only_weights_proj_weight(hidden_states.dtype, hidden_states.device)
-            wq_b_bmm_t = self._query_only_wq_b_bmm_t(q_c.dtype, q_c.device)
+            wq_b_bmm_t = (
+                None
+                if self._force_query_only_linear
+                else self._query_only_wq_b_bmm_t(q_c.dtype, q_c.device)
+            )
             dsa_indexer_project_query_only(
                 hidden_states,
                 q_c,

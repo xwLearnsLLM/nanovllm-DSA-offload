@@ -28,6 +28,7 @@ DSA_DEBUG_NATIVE_SELECTION_MODES = frozenset(
 DSA_BOUNDARY_PROBE_MODES = frozenset(
     {
         "none",
+        "q_linear",
         "project_sync",
         "li_clone",
         "li_sync",

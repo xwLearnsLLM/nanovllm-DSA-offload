@@ -212,6 +212,7 @@ def test_non_native_debug_selection_requires_eager_and_block128():
     "mode",
     (
         "none",
+        "q_linear",
         "project_sync",
         "li_clone",
         "li_sync",
