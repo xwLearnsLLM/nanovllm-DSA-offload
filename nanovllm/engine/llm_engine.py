@@ -198,7 +198,7 @@ class LLMEngine:
             tokenizer = AutoTokenizer.from_pretrained(
                 config.model,
                 config=config.hf_config,
-                tokenizer_type="llama",
+                tokenizer_type="deepseek_v3",
                 trust_remote_code=config.trust_remote_code,
                 fix_mistral_regex=False,
             )
