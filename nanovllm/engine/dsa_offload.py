@@ -13,6 +13,38 @@ LIDU_CACHE_TOKEN_BUDGETS: Final = (2048, 3072, 5120, 8192, 12288)
 LIDU_MAX_SOURCE_TOKENS: Final = (1 << 18) - 1
 
 
+def parse_gs_miss_rate_layers(
+    value: str | None,
+    num_hidden_layers: int,
+) -> frozenset[int]:
+    """Parse the historical eager-only miss-statistics layer switch."""
+
+    if value is None or not value.strip():
+        return frozenset()
+    parts = value.split(",")
+    if any(not part.strip() for part in parts):
+        raise ValueError(
+            "NANOVLLM_GS_MISS_RATE_ON_LAYERS must be a comma-separated "
+            "list such as 0,30,60."
+        )
+    try:
+        layers = frozenset(int(part.strip()) for part in parts)
+    except ValueError as exc:
+        raise ValueError(
+            "NANOVLLM_GS_MISS_RATE_ON_LAYERS must contain integers."
+        ) from exc
+    invalid = sorted(
+        layer for layer in layers
+        if layer < 0 or layer >= int(num_hidden_layers)
+    )
+    if invalid:
+        raise ValueError(
+            "NANOVLLM_GS_MISS_RATE_ON_LAYERS contains out-of-range layers "
+            f"{invalid}; valid range is [0, {int(num_hidden_layers) - 1}]."
+        )
+    return layers
+
+
 def normalize_offload_mode(value: str) -> str:
     if not isinstance(value, str):
         raise TypeError("offload_mode must be a string.")

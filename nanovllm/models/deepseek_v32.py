@@ -18,6 +18,7 @@ from nanovllm.engine.dsa_offload import (
     OFFLOAD_GS,
     OFFLOAD_LIDU,
     OFFLOAD_NONE,
+    parse_gs_miss_rate_layers,
 )
 from nanovllm.engine.full_decode_graph import (
     MLAGraphTask,
@@ -694,6 +695,28 @@ class DeepseekV32MLAAttention(nn.Module):
             config, "nanovllm_offload_mode", OFFLOAD_NONE
         )
         self.uses_offload = self.offload_mode != OFFLOAD_NONE
+        miss_rate_layers = parse_gs_miss_rate_layers(
+            os.environ.get("NANOVLLM_GS_MISS_RATE_ON_LAYERS"),
+            int(config.num_hidden_layers),
+        )
+        tp_rank = dist.get_rank()
+        self._lidu_miss_count_enabled = (
+            self.offload_mode == OFFLOAD_LIDU
+            and tp_rank == 0
+            and self.layer_idx in miss_rate_layers
+        )
+        self._lidu_miss_count_decode_step = 0
+        if (
+            self.offload_mode == OFFLOAD_LIDU
+            and tp_rank == 0
+            and self.layer_idx == 0
+            and miss_rate_layers
+        ):
+            print(
+                "LIDU_MISS_COUNT enabled eager-only layers="
+                f"{sorted(miss_rate_layers)}",
+                flush=True,
+            )
 
         self.hidden_size = int(config.hidden_size)
         self.total_num_heads = int(config.num_attention_heads)
@@ -1473,6 +1496,8 @@ class DeepseekV32MLAAttention(nn.Module):
             context.candidate_lens[:batch_size],
             context.index_block_tables[:batch_size],
         )
+        if self._lidu_miss_count_enabled:
+            self._print_lidu_miss_counts(miss_counts, batch_size)
         return scatter_copy(
             hbm_kpe,
             hbm_ckv,
@@ -1483,6 +1508,37 @@ class DeepseekV32MLAAttention(nn.Module):
             source_ids.view(batch_size, -1),
             destination_slots.view(batch_size, -1),
             miss_counts[:batch_size],
+        )
+
+    @torch.compiler.disable
+    def _print_lidu_miss_counts(
+        self,
+        miss_counts: torch.Tensor,
+        batch_size: int,
+    ) -> None:
+        if not self._lidu_miss_count_enabled:
+            return
+        values = [
+            int(value)
+            for value in miss_counts.reshape(-1)[:batch_size]
+            .detach()
+            .cpu()
+            .tolist()
+        ]
+        mean_count = sum(values) / max(len(values), 1)
+        rates = [value / DSA_SELECTION_TOPK_TOKENS for value in values]
+        mean_rate = sum(rates) / max(len(rates), 1)
+        self._lidu_miss_count_decode_step += 1
+        print(
+            "LIDU_MISS_COUNT "
+            f"decode_step={self._lidu_miss_count_decode_step} "
+            f"layer={self.layer_idx} batch_size={batch_size} "
+            f"request_miss_tokens={values} "
+            f"mean_miss_tokens={mean_count:.2f} "
+            "request_miss_rate=["
+            + ", ".join(f"{rate:.6f}" for rate in rates)
+            + f"] mean_miss_rate={mean_rate:.6f}",
+            flush=True,
         )
 
     def _decode_forward_mla(

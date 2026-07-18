@@ -140,6 +140,14 @@ class Config:
         # always eager; enforce_eager controls steady-state decode.
         if not isinstance(self.enforce_eager, bool):
             raise TypeError("enforce_eager must be a bool.")
+        if (
+            os.environ.get("NANOVLLM_GS_MISS_RATE_ON_LAYERS", "").strip()
+            and not self.enforce_eager
+        ):
+            raise ValueError(
+                "NANOVLLM_GS_MISS_RATE_ON_LAYERS is eager-only; set "
+                "enforce_eager=True / NANOVLLM_ENFORCE_EAGER=1."
+            )
         if self.enforce_eager:
             self.decode_graph_capture_sizes = ()
             return

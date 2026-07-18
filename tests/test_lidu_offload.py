@@ -7,6 +7,7 @@ from nanovllm.engine.dsa_offload import (
     OFFLOAD_MODES,
     lidu_cache_tokens,
     normalize_offload_mode,
+    parse_gs_miss_rate_layers,
 )
 from nanovllm.config import Config
 from nanovllm.engine.scheduler import Scheduler
@@ -72,6 +73,19 @@ def test_three_modes_and_default_public_api():
 )
 def test_lidu_cache_tiers_use_original_prompt_length(prompt_len, expected):
     assert lidu_cache_tokens(prompt_len) == expected
+
+
+def test_lidu_reuses_gs_miss_rate_layer_switch():
+    assert parse_gs_miss_rate_layers(None, 78) == frozenset()
+    assert parse_gs_miss_rate_layers("0, 30,77,30", 78) == frozenset(
+        {0, 30, 77}
+    )
+    for value in ("0,,30", "layer0", "-1", "78"):
+        with pytest.raises(
+            ValueError,
+            match="NANOVLLM_GS_MISS_RATE_ON_LAYERS",
+        ):
+            parse_gs_miss_rate_layers(value, 78)
 
 
 def test_mixed_short_and_long_requests_get_unique_persistent_pool_rows():

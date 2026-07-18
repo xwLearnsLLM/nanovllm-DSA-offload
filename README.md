@@ -280,5 +280,6 @@ python3 example/short_prompts.py
 | `NANOVLLM_PREFILL_CHUNK_SIZE` | 只允许 `0` 或 `1024`；不引入 prefill/decode 混合 forward |
 | `NANOVLLM_PROMPT_LENGTHS` | `example/test.py` 的精确 token 长度列表；条目数即 batch size |
 | `NANOVLLM_PROFILE_DECODE_OUTPUT` | 非空时只采集 TP rank 0、从首次 decode 到程序结束的 profile |
+| `NANOVLLM_GS_MISS_RATE_ON_LAYERS` | eager-only；LIDU 复用该历史开关，按指定层打印各请求的 miss count/rate，例如 `0,30,60` |
 
 Chunk prefill 只降低 prefill 激活峰值；不会减少完整请求所需的 KV/IndexCache 容量。其他正式算子 UT 见 `ut_ops/UT_OPS.md`。
