@@ -9,7 +9,7 @@
  */
 
 /*!
- * \file lightning_indexer_decode_update.cpp
+ * \file nanovllm_lidu_decode_update.cpp
  * \brief
  */
 
