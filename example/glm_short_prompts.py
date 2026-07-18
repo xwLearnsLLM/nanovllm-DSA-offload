@@ -1,6 +1,6 @@
 """Short-sequence eager smoke test for GLM-5.1-w4a8."""
 
-from _deepseek_example_utils import (
+from _example_utils import (
     env_bool,
     env_int,
     make_llm,

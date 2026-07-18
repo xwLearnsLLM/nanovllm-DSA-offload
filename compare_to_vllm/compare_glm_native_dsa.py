@@ -255,11 +255,9 @@ def main() -> None:
     print("token_ids :", output_ids)
 
     if output_ids[:2] == [39, 672]:
-        print("VLLM_GLM_DSA_RESULT=matches_dense_reference_[39,672]")
-    elif output_ids[:2] == [39, 0]:
-        print("VLLM_GLM_DSA_RESULT=matches_nanovllm_failure_[39,0]")
+        print("VLLM_GLM_DSA_RESULT=expected_prefix_[39,672]")
     else:
-        print(f"VLLM_GLM_DSA_RESULT=other_{output_ids[:2]}")
+        print(f"VLLM_GLM_DSA_RESULT=unexpected_prefix_{output_ids[:2]}")
 
 
 if __name__ == "__main__":

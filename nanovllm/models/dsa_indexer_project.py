@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from time import perf_counter
 from typing import Any
 
 import torch
@@ -131,44 +130,6 @@ def _register_nanovllm_dsa_torchair_converters() -> None:
 
 _register_nanovllm_dsa_torchair_converters()
 
-
-def gather_selection_kv_cache_eager_dispatch(
-    selection_kpe: torch.Tensor,
-    selection_ckv: torch.Tensor,
-    selection_block_table: torch.Tensor,
-    gather_selection_status: torch.Tensor,
-    req_pool_entries: torch.Tensor,
-    topk_indices: torch.Tensor,
-    full_kpe: torch.Tensor,
-    full_ckv: torch.Tensor,
-    dram_tables: torch.Tensor,
-    gather_full_kv_lens: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Launch GatherSelection through the PyTorch dispatcher in eager mode.
-
-    GLM uses torch-npu's native LightningIndexer.  Keeping its consumer in the
-    dispatcher makes the producer/consumer tensor edge visible to torch-npu;
-    the legacy pybind entry point bypasses that edge completely.
-    """
-
-    if _GRAPH_GATHER_SELECTION_KV_CACHE is None:
-        raise RuntimeError(
-            "The dispatcher GatherSelection registration is unavailable; "
-            "rebuild with `bash scripts/build_nanovllm_ops.sh`."
-        ) from _GRAPH_CUSTOM_OP_ERROR
-    return _GRAPH_GATHER_SELECTION_KV_CACHE(
-        selection_kpe,
-        selection_ckv,
-        selection_block_table,
-        gather_selection_status,
-        req_pool_entries,
-        topk_indices,
-        full_kpe,
-        full_ckv,
-        dram_tables,
-        gather_full_kv_lens,
-    )
-
 _POST_OPS = None
 _POST_IMPORT_ERROR: Exception | None = None
 _EXPECTED_POST_BINDING_VERSION = "dsa_indexer_project_post_csrc_v1"
@@ -187,29 +148,6 @@ else:
     except Exception as exc:  # pragma: no cover - depends on Ascend build env.
         _POST_IMPORT_ERROR = exc
         _POST_OPS = None
-
-
-def _profile_sync(device: torch.device) -> None:
-    if device.type == "npu" and torch_npu is not None:
-        torch.npu.synchronize()
-    elif device.type == "cuda":
-        torch.cuda.synchronize(device)
-
-
-def _timer_start(detail: dict[str, float] | None, sync: bool, device: torch.device) -> float | None:
-    if detail is None:
-        return None
-    if sync:
-        _profile_sync(device)
-    return perf_counter()
-
-
-def _timer_end(detail: dict[str, float] | None, name: str, start: float | None, sync: bool, device: torch.device) -> None:
-    if detail is None or start is None:
-        return
-    if sync:
-        _profile_sync(device)
-    detail[name] = detail.get(name, 0.0) + perf_counter() - start
 
 
 def _rotate_half_neox(x: torch.Tensor) -> torch.Tensor:
@@ -441,10 +379,14 @@ def _dsa_indexer_pipeline_with_qc_functional(
     return q_index, index_weights, topk_indices
 
 
-_Q_BMM_MAX_TOKENS = 64  # Keep larger decode batches on the q BMM path; tokens=128 was slower in probe.
+_Q_BMM_MAX_TOKENS = 64  # The measured 128-token path is slower than F.linear.
 
 
-def _can_use_q_bmm(q_c: torch.Tensor, wq_b_bmm_t: torch.Tensor | None, enable_q_bmm: bool) -> bool:
+def _can_use_q_bmm(
+    q_c: torch.Tensor,
+    wq_b_bmm_t: torch.Tensor | None,
+    enable_q_bmm: bool,
+) -> bool:
     return (
         enable_q_bmm
         and wq_b_bmm_t is not None
@@ -456,47 +398,35 @@ def _can_use_q_bmm(q_c: torch.Tensor, wq_b_bmm_t: torch.Tensor | None, enable_q_
     )
 
 
-def dsa_indexer_project_q_path(q_c: torch.Tensor, wq_b_bmm_t: torch.Tensor | None, enable_q_bmm: bool = False) -> str:
-    return "dsa_indexer_project_bmm_transpose" if _can_use_q_bmm(q_c, wq_b_bmm_t, enable_q_bmm) else "dsa_indexer_project_linear"
-
-
-def dsa_indexer_project_post_available() -> bool:
-    return _POST_OPS is not None
-
-
-def dsa_indexer_project_post_availability_error() -> Exception | None:
-    return _POST_IMPORT_ERROR
-
-
-def dsa_indexer_project_post_binding_version() -> str | None:
-    if _POST_OPS is None:
-        return None
-    return _POST_OPS.dsa_indexer_project_binding_version()
-
-
-def dsa_indexer_project_post_extension_path() -> str | None:
-    if _POST_OPS is None:
-        return None
-    return getattr(_POST_OPS, "__file__", None)
-
-
-def dsa_indexer_project_post_real(q_in, k_in, weights_in, cos, sin, score_scale: float, rope_dim: int):
+def _run_post_op(
+    q_in,
+    k_in,
+    weights_in,
+    cos,
+    sin,
+    q_out,
+    k_out,
+    weights_out,
+    score_scale: float,
+    rope_dim: int,
+) -> None:
     if _POST_OPS is None:
         raise RuntimeError(
             "dsa_indexer_project post op is not built into nanovllm.ops. Run "
             "`bash scripts/build_nanovllm_ops.sh` on the Ascend machine first."
         ) from _POST_IMPORT_ERROR
-    return _POST_OPS.dsa_indexer_project_post(q_in, k_in, weights_in, cos, sin, float(score_scale), int(rope_dim))
-
-
-def dsa_indexer_project_post_real_out(q_in, k_in, weights_in, cos, sin, q_out, k_out, weights_out, score_scale: float, rope_dim: int):
-    if _POST_OPS is None:
-        raise RuntimeError(
-            "dsa_indexer_project post op is not built into nanovllm.ops. Run "
-            "`bash scripts/build_nanovllm_ops.sh` on the Ascend machine first."
-        ) from _POST_IMPORT_ERROR
-    _POST_OPS.dsa_indexer_project_post_out(q_in, k_in, weights_in, cos, sin, q_out, k_out, weights_out, float(score_scale), int(rope_dim))
-    return q_out, k_out, weights_out
+    _POST_OPS.dsa_indexer_project_post_out(
+        q_in,
+        k_in,
+        weights_in,
+        cos,
+        sin,
+        q_out,
+        k_out,
+        weights_out,
+        float(score_scale),
+        int(rope_dim),
+    )
 
 
 def _can_use_post_op(
@@ -510,7 +440,7 @@ def _can_use_post_op(
     return (
         _normalize_rotary_mode(rotary_mode) == "half"
         and
-        dsa_indexer_project_post_available()
+        _POST_OPS is not None
         and q.device.type == "npu"
         and q.dtype in (torch.float16, torch.bfloat16)
         and k.dtype == q.dtype
@@ -565,88 +495,6 @@ def _q_project(
     return F.linear(q_c, wq_b_weight).view(-1, n_head, head_dim)
 
 
-def dsa_indexer_project_torch(
-    hidden_states: torch.Tensor,
-    q_c: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    wq_b_weight: torch.Tensor,
-    wk_weight: torch.Tensor,
-    k_norm_weight: torch.Tensor,
-    k_norm_bias: torch.Tensor | None,
-    weights_proj_weight: torch.Tensor,
-    q_index_out: torch.Tensor,
-    index_k_out: torch.Tensor,
-    index_weights_out: torch.Tensor,
-    *,
-    n_head: int,
-    head_dim: int,
-    rope_dim: int,
-    score_scale: float,
-    rotary_mode: str = "half",
-    wq_b_bmm_t: torch.Tensor | None = None,
-    enable_q_bmm: bool = False,
-    detail: dict[str, float] | None = None,
-    sync_detail: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """A/B implementation behind the final DSA indexer_project interface.
-
-    The public interface already takes final output tensors. Internally this
-    stage still computes q/k/weights projection with mature framework kernels,
-    then uses the AscendC post op to write RoPE/casted outputs directly into
-    q_index_out/index_k_out/index_weights_out when available.
-    """
-    _check_project_outputs(q_index_out, index_k_out, index_weights_out, num_tokens=int(hidden_states.shape[0]), n_head=int(n_head), head_dim=int(head_dim), dtype=hidden_states.dtype, device=hidden_states.device)
-    start = _timer_start(detail, sync_detail, q_c.device)
-    q = _q_project(q_c, wq_b_weight, wq_b_bmm_t, int(n_head), int(head_dim), bool(enable_q_bmm))
-    _timer_end(detail, "q_proj", start, sync_detail, q_c.device)
-
-    start = _timer_start(detail, sync_detail, hidden_states.device)
-    k = F.linear(hidden_states, wk_weight)
-    _timer_end(detail, "k_proj", start, sync_detail, hidden_states.device)
-
-    start = _timer_start(detail, sync_detail, k.device)
-    k = F.layer_norm(k, (int(head_dim),), k_norm_weight, k_norm_bias, eps=1e-6)
-    _timer_end(detail, "k_norm", start, sync_detail, k.device)
-
-    start = _timer_start(detail, sync_detail, hidden_states.device)
-    weights = F.linear(hidden_states.float(), weights_proj_weight.float()).contiguous()
-    _timer_end(detail, "weights_proj", start, sync_detail, hidden_states.device)
-
-    start = _timer_start(detail, sync_detail, q.device)
-    rotary_mode = _normalize_rotary_mode(rotary_mode)
-    if _can_use_post_op(q, k, weights, cos, sin, rotary_mode):
-        # B-stage true AscendC sub-op: q/k RoPE + weights cast, writing final outputs in-place.
-        # DeepSeek-V3.2 BF16 SFA in vllm-ascend feeds raw weights_proj(x) to
-        # lightning_indexer, so callers pass score_scale=1.0 here.
-        dsa_indexer_project_post_real_out(q, k, weights, cos, sin, q_index_out, index_k_out, index_weights_out, float(score_scale), int(rope_dim))
-        _timer_end(detail, "rope", start, sync_detail, q.device)
-        return q_index_out, index_k_out, index_weights_out
-
-    q_pe, q_nope = torch.split(q, [int(rope_dim), int(head_dim) - int(rope_dim)], dim=-1)
-    k_pe, k_nope = torch.split(k, [int(rope_dim), int(head_dim) - int(rope_dim)], dim=-1)
-    if q.device.type == "npu" and torch_npu is not None and q.dtype in (torch.float16, torch.bfloat16):
-        q_pe = torch_npu.npu_rotary_mul(
-            q_pe.unsqueeze(2), cos, sin, rotary_mode
-        ).squeeze(2)
-        k_pe = torch_npu.npu_rotary_mul(
-            k_pe.unsqueeze(1).unsqueeze(2), cos, sin, rotary_mode
-        ).squeeze(2).squeeze(1)
-    else:
-        q_pe = _apply_rope_reference(
-            q_pe, cos, sin, int(rope_dim), rotary_mode
-        )
-        k_pe = _apply_rope_reference(
-            k_pe.unsqueeze(1), cos, sin, int(rope_dim), rotary_mode
-        ).squeeze(1)
-    _timer_end(detail, "rope", start, sync_detail, q.device)
-
-    q_index_out.copy_(torch.cat((q_pe, q_nope), dim=-1))
-    index_k_out.copy_(torch.cat((k_pe, k_nope), dim=-1))
-    index_weights_out.copy_((weights * float(score_scale)).to(hidden_states.dtype))
-    return q_index_out, index_k_out, index_weights_out
-
-
 def dsa_indexer_project(
     hidden_states: torch.Tensor,
     q_c: torch.Tensor,
@@ -668,32 +516,45 @@ def dsa_indexer_project(
     rotary_mode: str = "half",
     wq_b_bmm_t: torch.Tensor | None = None,
     enable_q_bmm: bool = False,
-    detail: dict[str, float] | None = None,
-    sync_detail: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return dsa_indexer_project_torch(
-        hidden_states,
-        q_c,
-        cos,
-        sin,
-        wq_b_weight,
-        wk_weight,
-        k_norm_weight,
-        k_norm_bias,
-        weights_proj_weight,
-        q_index_out,
-        index_k_out,
-        index_weights_out,
-        n_head=n_head,
-        head_dim=head_dim,
-        rope_dim=rope_dim,
-        score_scale=score_scale,
-        rotary_mode=rotary_mode,
-        wq_b_bmm_t=wq_b_bmm_t,
-        enable_q_bmm=enable_q_bmm,
-        detail=detail,
-        sync_detail=sync_detail,
-    )
+    """Project Indexer q/k/weights and write the provided output buffers."""
+    _check_project_outputs(q_index_out, index_k_out, index_weights_out, num_tokens=int(hidden_states.shape[0]), n_head=int(n_head), head_dim=int(head_dim), dtype=hidden_states.dtype, device=hidden_states.device)
+    q = _q_project(q_c, wq_b_weight, wq_b_bmm_t, int(n_head), int(head_dim), bool(enable_q_bmm))
+
+    k = F.linear(hidden_states, wk_weight)
+
+    k = F.layer_norm(k, (int(head_dim),), k_norm_weight, k_norm_bias, eps=1e-6)
+
+    weights = F.linear(hidden_states.float(), weights_proj_weight.float()).contiguous()
+
+    rotary_mode = _normalize_rotary_mode(rotary_mode)
+    if _can_use_post_op(q, k, weights, cos, sin, rotary_mode):
+        # B-stage true AscendC sub-op: q/k RoPE + weights cast, writing final outputs in-place.
+        # DeepSeek-V3.2 BF16 SFA in vllm-ascend feeds raw weights_proj(x) to
+        # lightning_indexer, so callers pass score_scale=1.0 here.
+        _run_post_op(q, k, weights, cos, sin, q_index_out, index_k_out, index_weights_out, float(score_scale), int(rope_dim))
+        return q_index_out, index_k_out, index_weights_out
+
+    q_pe, q_nope = torch.split(q, [int(rope_dim), int(head_dim) - int(rope_dim)], dim=-1)
+    k_pe, k_nope = torch.split(k, [int(rope_dim), int(head_dim) - int(rope_dim)], dim=-1)
+    if q.device.type == "npu" and torch_npu is not None and q.dtype in (torch.float16, torch.bfloat16):
+        q_pe = torch_npu.npu_rotary_mul(
+            q_pe.unsqueeze(2), cos, sin, rotary_mode
+        ).squeeze(2)
+        k_pe = torch_npu.npu_rotary_mul(
+            k_pe.unsqueeze(1).unsqueeze(2), cos, sin, rotary_mode
+        ).squeeze(2).squeeze(1)
+    else:
+        q_pe = _apply_rope_reference(
+            q_pe, cos, sin, int(rope_dim), rotary_mode
+        )
+        k_pe = _apply_rope_reference(
+            k_pe.unsqueeze(1), cos, sin, int(rope_dim), rotary_mode
+        ).squeeze(1)
+    q_index_out.copy_(torch.cat((q_pe, q_nope), dim=-1))
+    index_k_out.copy_(torch.cat((k_pe, k_nope), dim=-1))
+    index_weights_out.copy_((weights * float(score_scale)).to(hidden_states.dtype))
+    return q_index_out, index_k_out, index_weights_out
 
 
 def dsa_indexer_project_query_only(
@@ -713,8 +574,6 @@ def dsa_indexer_project_query_only(
     rotary_mode: str = "half",
     wq_b_bmm_t: torch.Tensor | None = None,
     enable_q_bmm: bool = False,
-    detail: dict[str, float] | None = None,
-    sync_detail: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Decode-only indexer projection.
     Decode DSA update scores only need the current token's query index and per-head weights. The current decode token's index key is not part of the prefill-candidate IndexCache, so this path skips wk/k_norm/k-rope entirely.
@@ -725,22 +584,16 @@ def dsa_indexer_project_query_only(
     if index_weights_out.shape != (hidden_states.shape[0], n_head):
         raise ValueError(f"index_weights_out shape must be {(hidden_states.shape[0], n_head)}, got {tuple(index_weights_out.shape)}")
 
-    start = _timer_start(detail, sync_detail, q_c.device)
     q = _q_project(q_c, wq_b_weight, wq_b_bmm_t, int(n_head), int(head_dim), bool(enable_q_bmm))
-    _timer_end(detail, "q_proj", start, sync_detail, q_c.device)
 
-    start = _timer_start(detail, sync_detail, hidden_states.device)
     _query_only_weights_proj(hidden_states, weights_proj_weight, index_weights_out, float(score_scale))
-    _timer_end(detail, "weights_proj", start, sync_detail, hidden_states.device)
 
-    start = _timer_start(detail, sync_detail, q.device)
     q_pe, q_nope = torch.split(q, [int(rope_dim), int(head_dim) - int(rope_dim)], dim=-1)
     q_pe = _apply_query_rope_like_runtime(
         q_pe, cos, sin, int(rope_dim), rotary_mode
     )
     q_index_out[..., : int(rope_dim)].copy_(q_pe)
     q_index_out[..., int(rope_dim) :].copy_(q_nope)
-    _timer_end(detail, "rope", start, sync_detail, q.device)
     return q_index_out, index_weights_out
 
 
@@ -818,15 +671,6 @@ def dsa_indexer_pipeline_with_qc_full_graph(
 
 __all__ = [
     "dsa_indexer_project",
-    "dsa_indexer_project_post_availability_error",
-    "dsa_indexer_project_post_available",
-    "dsa_indexer_project_post_binding_version",
-    "dsa_indexer_project_post_extension_path",
-    "dsa_indexer_project_post_real",
-    "dsa_indexer_project_post_real_out",
-    "dsa_indexer_project_q_path",
     "dsa_indexer_project_query_only",
     "dsa_indexer_pipeline_with_qc_full_graph",
-    "dsa_indexer_project_torch",
-    "gather_selection_kv_cache_eager_dispatch",
 ]

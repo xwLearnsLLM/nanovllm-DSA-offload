@@ -1,12 +1,11 @@
 import os
 
-from _deepseek_example_utils import (
+from _example_utils import (
     DEEPSEEK_ASSISTANT_TOKEN,
     DEEPSEEK_USER_TOKEN,
     env_int,
     make_llm,
     print_outputs,
-    prompt_tokenizer,
 )
 from nanovllm.engine.dsa_offload import compute_sparse_blocks
 from nanovllm import SamplingParams
@@ -167,7 +166,7 @@ def main() -> None:
         max_num_prefill_seqs_per_step=max_num_prefill_seqs_per_step,
         max_num_decode_seqs_per_step=max_num_decode_seqs_per_step,
     )
-    tokenizer = prompt_tokenizer(llm)
+    tokenizer = llm.tokenizer
 
     base_ids = build_base_meaningful_prompt(tokenizer)
     prompt_token_ids = [

@@ -2,8 +2,8 @@ import torch
 import torch.nn.functional as F
 
 from nanovllm.models.dsa_indexer_project import (
+    dsa_indexer_project,
     dsa_indexer_project_query_only,
-    dsa_indexer_project_torch,
 )
 
 
@@ -51,7 +51,7 @@ def test_glm_interleaved_indexer_full_and_query_only_match_golden():
     q_out = torch.empty(tokens, n_head, head_dim)
     k_out = torch.empty(tokens, head_dim)
     weights_out = torch.empty(tokens, n_head)
-    dsa_indexer_project_torch(
+    dsa_indexer_project(
         hidden_states,
         q_c,
         cos,

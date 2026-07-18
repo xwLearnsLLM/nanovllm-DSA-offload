@@ -6,26 +6,6 @@ import torch.nn.functional as F
 from nanovllm.models import dsa_indexer_project as project
 
 
-def test_eager_dispatch_gather_preserves_tensor_dependency(monkeypatch):
-    inputs = tuple(torch.tensor([index]) for index in range(10))
-    observed = {}
-
-    def fake_dispatch(*args):
-        observed["args"] = args
-        return args[0], args[1], args[2], args[3]
-
-    monkeypatch.setattr(
-        project,
-        "_GRAPH_GATHER_SELECTION_KV_CACHE",
-        fake_dispatch,
-    )
-
-    outputs = project.gather_selection_kv_cache_eager_dispatch(*inputs)
-
-    assert observed["args"] == inputs
-    assert outputs == inputs[:4]
-
-
 def test_full_graph_pipeline_consumes_mlapo_q_c(monkeypatch):
     batch_size = 2
     n_head = 1

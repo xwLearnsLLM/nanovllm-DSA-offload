@@ -2,13 +2,12 @@
 #define DSA_INDEXER_PROJECT_TORCH_ADPT_H
 
 #include <algorithm>
-#include <tuple>
 
 #include <c10/core/DeviceGuard.h>
 #include <torch/extension.h>
 
 #include "common/torch_adapter/op_api_common.h"
-#include "common/kernels/types.h"
+#include "dsa_indexer_project_types.h"
 
 namespace vllm_ascend {
 
@@ -137,23 +136,6 @@ inline void dsa_indexer_project_post_out(
         return 0;
     });
     cmd.Run();
-}
-
-inline std::tuple<at::Tensor, at::Tensor, at::Tensor> dsa_indexer_project_post(
-    const at::Tensor& q_in,
-    const at::Tensor& k_in,
-    const at::Tensor& weights_in,
-    const at::Tensor& cos,
-    const at::Tensor& sin,
-    double score_scale,
-    int64_t rope_dim)
-{
-    CheckIndexerProjectPostInputs(q_in, k_in, weights_in, cos, sin, rope_dim);
-    at::Tensor q_out = at::empty_like(q_in);
-    at::Tensor k_out = at::empty_like(k_in);
-    at::Tensor weights_out = at::empty(weights_in.sizes(), q_in.options());
-    dsa_indexer_project_post_out(q_in, k_in, weights_in, cos, sin, q_out, k_out, weights_out, score_scale, rope_dim);
-    return std::make_tuple(q_out, k_out, weights_out);
 }
 
 } // namespace vllm_ascend

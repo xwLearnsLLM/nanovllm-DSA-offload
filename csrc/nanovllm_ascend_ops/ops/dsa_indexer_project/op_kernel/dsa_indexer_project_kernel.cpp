@@ -1,5 +1,5 @@
 #include "kernel_operator.h"
-#include "../../../common/kernels/types.h"
+#include "../dsa_indexer_project_types.h"
 
 namespace {
 

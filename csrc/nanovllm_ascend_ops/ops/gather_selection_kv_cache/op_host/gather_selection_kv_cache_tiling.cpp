@@ -21,9 +21,6 @@
 
 #include "gather_selection_kv_cache_tiling.h"
 
-#include <cstdlib>
-#include <cstring>
-
 namespace optiling {
 
 constexpr int32_t SEL_K_ROPE_IDX = 0;
@@ -67,29 +64,6 @@ template <typename T>
 static inline T CeilAlign(T num, T rnd)
 {
     return (((rnd) == 0) ? 0 : (((num) + (rnd) - 1) / (rnd)) * (rnd));
-}
-
-enum class ParallelCopyMode : uint32_t {
-    AUTO = 0,
-    DISABLED = 1,
-    REQUIRED = 2,
-};
-
-static ParallelCopyMode GetParallelCopyMode()
-{
-    // Unset: select key3 when eligible; 0/legacy: key2; force: require key3 (used by the UT).
-    const char* value = std::getenv("NANOVLLM_GS_PARALLEL_COPY");
-    if (value == nullptr || value[0] == '\0') {
-        return ParallelCopyMode::AUTO;
-    }
-    if (std::strcmp(value, "0") == 0 || std::strcmp(value, "false") == 0 ||
-        std::strcmp(value, "legacy") == 0) {
-        return ParallelCopyMode::DISABLED;
-    }
-    if (std::strcmp(value, "force") == 0) {
-        return ParallelCopyMode::REQUIRED;
-    }
-    return ParallelCopyMode::AUTO;
 }
 
 ge::graphStatus GatherSelectionKvCacheTiling::GetPlatformInfo()
@@ -608,7 +582,6 @@ ge::graphStatus GatherSelectionKvCacheTiling::DoOpTiling()
     tilingData_.set_tailCoreBsLoopNum(tailCoreBsFactor);
 
     tilingKey_ = 0;
-    const ParallelCopyMode parallelCopyMode = GetParallelCopyMode();
     const bool parallelCopyEligible = topk_ == PARALLEL_COPY_TOPK &&
         tilingData_.get_rawSeq() == 1 && headnum_ == 1 && selTopKBlockSize_ == 1 &&
         tilingData_.get_fullKvBlockSize() == PARALLEL_COPY_BLOCK_SIZE &&
@@ -616,12 +589,7 @@ ge::graphStatus GatherSelectionKvCacheTiling::DoOpTiling()
         tilingData_.get_kRopeDim() == PARALLEL_COPY_K_ROPE_DIM &&
         tilingData_.get_kvCacheDim() == PARALLEL_COPY_KV_CACHE_DIM &&
         tilingData_.get_ifQuant() == 0 && selKRopeDtype_ == ge::DT_BF16;
-    OPS_ERR_IF(
-        parallelCopyMode == ParallelCopyMode::REQUIRED && !parallelCopyEligible,
-        OPS_LOG_E(context_->GetNodeName(), "NANOVLLM_GS_PARALLEL_COPY=force but input is not eligible."),
-        return ge::GRAPH_FAILED);
-    const bool useParallelCopy = parallelCopyMode != ParallelCopyMode::DISABLED && parallelCopyEligible;
-    if (useParallelCopy) {
+    if (parallelCopyEligible) {
         tilingKey_ = 3; // 3: one row owner per request, all AIV cores copy misses
         tilingData_.set_usedCoreNum(coreNum_);
         const int64_t pairSlots = batchSize_ * topk_;

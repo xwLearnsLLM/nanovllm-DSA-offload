@@ -1,9 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import os
-import re
-import subprocess
 import sys
 from pathlib import Path
 from time import perf_counter
@@ -11,85 +8,6 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[2]
-ENV_NAME = "NANOVLLM_GS_PARALLEL_COPY"
-RESULT_RE = re.compile(
-    r"GSKV_PARALLEL_RESULT implementation=(legacy|parallel) avg_ms=([0-9.]+)"
-)
-
-
-def _worker_command(args: argparse.Namespace, implementation: str) -> list[str]:
-    return [
-        sys.executable,
-        str(Path(__file__).resolve()),
-        "--_worker",
-        "--implementation",
-        implementation,
-        "--device",
-        args.device,
-        "--batch-size",
-        str(args.batch_size),
-        "--full-len",
-        str(args.full_len),
-        "--topk",
-        str(args.topk),
-        "--block-size",
-        str(args.block_size),
-        "--rope-dim",
-        str(args.rope_dim),
-        "--kv-dim",
-        str(args.kv_dim),
-        "--overlap",
-        str(args.overlap),
-        "--warmup",
-        str(args.warmup),
-        "--iters",
-        str(args.iters),
-        "--seed",
-        str(args.seed),
-    ]
-
-
-def _run_comparison(args: argparse.Namespace) -> None:
-    results: dict[str, float] = {}
-    for implementation, env_value in (("legacy", "0"), ("parallel", "force")):
-        env = os.environ.copy()
-        env[ENV_NAME] = env_value
-        existing_pythonpath = env.get("PYTHONPATH", "")
-        env["PYTHONPATH"] = str(ROOT) + (os.pathsep + existing_pythonpath if existing_pythonpath else "")
-        completed = subprocess.run(
-            _worker_command(args, implementation),
-            cwd=ROOT,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-        )
-        print(completed.stdout, end="")
-        if completed.returncode != 0:
-            raise SystemExit(
-                f"{implementation} worker failed with exit code {completed.returncode}"
-            )
-        match = RESULT_RE.search(completed.stdout)
-        if match is None:
-            raise SystemExit(f"missing benchmark result from {implementation} worker")
-        results[implementation] = float(match.group(2))
-
-    legacy_ms = results["legacy"]
-    parallel_ms = results["parallel"]
-    speedup = legacy_ms / parallel_ms if parallel_ms > 0 else float("inf")
-    print(
-        "GSKV_PARALLEL_COMPARE "
-        f"legacy_ms={legacy_ms:.6f} parallel_ms={parallel_ms:.6f} "
-        f"speedup={speedup:.4f} min_speedup={args.min_speedup:.4f}"
-    )
-    if parallel_ms >= legacy_ms or speedup < args.min_speedup:
-        raise SystemExit(
-            "parallel-copy tiling passed correctness but did not meet the latency target"
-        )
-    print("GSKV_PARALLEL_UT_OK")
 
 
 def _make_topk_pair(
@@ -296,7 +214,7 @@ def _validate_step(
 
     print(
         "GSKV_PARALLEL_CHECK "
-        f"implementation={args.implementation} step={step} rows={args.batch_size} ok=1"
+        f"step={step} rows={args.batch_size} ok=1"
     )
 
 
@@ -325,7 +243,7 @@ def _validate_short_row_skip(args: argparse.Namespace, inputs: dict[str, Any]) -
     inputs["req_pool_entries"][skip_row] = pool_entry
     print(
         "GSKV_PARALLEL_SHORT_ROW_CHECK "
-        f"implementation={args.implementation} row={skip_row} ok=1"
+        f"row={skip_row} ok=1"
     )
 
 
@@ -395,16 +313,11 @@ def _validate_long_row_zero_miss(
     _validate_step(args, inputs, expected_topk_cpu, step)
     print(
         "GSKV_PARALLEL_ZERO_MISS_CHECK "
-        f"implementation={args.implementation} step={step} row={row} slot={slot} ok=1"
+        f"step={step} row={row} slot={slot} ok=1"
     )
 
 
-def _run_worker(args: argparse.Namespace) -> None:
-    if args.implementation not in ("legacy", "parallel"):
-        raise ValueError("worker requires --implementation legacy or parallel")
-    expected_env = "0" if args.implementation == "legacy" else "force"
-    if os.environ.get(ENV_NAME) != expected_env:
-        raise RuntimeError(f"worker expected {ENV_NAME}={expected_env}")
+def _run_test(args: argparse.Namespace) -> None:
     if (
         args.topk != 2048
         or args.block_size != 128
@@ -420,7 +333,7 @@ def _run_worker(args: argparse.Namespace) -> None:
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
     import torch
-    import torch_npu  # noqa: F401
+    __import__("torch_npu")  # Registers torch.npu and the PrivateUse1 backend.
 
     try:
         import nanovllm.ops as ascend_ops
@@ -435,7 +348,6 @@ def _run_worker(args: argparse.Namespace) -> None:
     torch.npu.set_device(device)
     print(
         "GSKV_PARALLEL_CONFIG "
-        f"implementation={args.implementation} {ENV_NAME}={expected_env} "
         f"batch={args.batch_size} full_len={args.full_len} overlap={args.overlap:g}"
     )
     inputs = _make_inputs(args, device)
@@ -477,14 +389,15 @@ def _run_worker(args: argparse.Namespace) -> None:
     miss_count = args.topk - int(round(args.topk * args.overlap))
     print(
         "GSKV_PARALLEL_RESULT "
-        f"implementation={args.implementation} avg_ms={avg_ms:.6f} "
+        f"avg_ms={avg_ms:.6f} "
         f"misses_per_row={miss_count} warmup={args.warmup} iters={args.iters}"
     )
+    print("GSKV_PARALLEL_UT_OK")
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Compare legacy and all-core GatherSelection copy tilings."
+        description="Validate and benchmark the all-core GatherSelection copy tiling."
     )
     parser.add_argument("--device", default="npu:0")
     parser.add_argument("--batch-size", type=int, default=6)
@@ -497,28 +410,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--seed", type=int, default=1234)
-    parser.add_argument(
-        "--min-speedup",
-        type=float,
-        default=1.0,
-        help="Fail comparison unless legacy_ms / parallel_ms reaches this value.",
-    )
-    parser.add_argument("--_worker", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument(
-        "--implementation",
-        choices=("legacy", "parallel"),
-        default="parallel",
-        help=argparse.SUPPRESS,
-    )
     return parser
 
 
 def main() -> None:
     args = _build_parser().parse_args()
-    if args._worker:
-        _run_worker(args)
-    else:
-        _run_comparison(args)
+    _run_test(args)
 
 
 if __name__ == "__main__":

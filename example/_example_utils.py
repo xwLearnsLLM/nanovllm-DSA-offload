@@ -3,8 +3,8 @@ import os
 from nanovllm import LLM, SamplingParams
 
 
-MODEL_PATH = "/home/models/DeepSeek-V3.2-REAP-345B-A37B-BF16/"
-TP_SIZE = 16
+DEFAULT_MODEL_PATH = "/home/models/DeepSeek-V3.2-REAP-345B-A37B-BF16/"
+DEFAULT_TP_SIZE = 16
 DEEPSEEK_USER_TOKEN = "<\uFF5CUser\uFF5C>"
 DEEPSEEK_ASSISTANT_TOKEN = "<\uFF5CAssistant\uFF5C>"
 
@@ -37,7 +37,7 @@ def env_float(name: str, default: float) -> float:
 
 
 def model_path() -> str:
-    return os.environ.get("NANOVLLM_MODEL", MODEL_PATH)
+    return os.environ.get("NANOVLLM_MODEL", DEFAULT_MODEL_PATH)
 
 
 def make_llm(
@@ -46,13 +46,14 @@ def make_llm(
     max_num_prefill_seqs_per_step: int,
     max_num_decode_seqs_per_step: int,
 ) -> LLM:
-    enforce_eager = env_bool("NANOVLLM_ENFORCE_EAGER", False)
     return LLM(
         model_path(),
-        enforce_eager=enforce_eager,
+        enforce_eager=env_bool("NANOVLLM_ENFORCE_EAGER", False),
         decode_graph_capture_sizes=(max_num_decode_seqs_per_step,),
-        tensor_parallel_size=env_int("NANOVLLM_TP_SIZE", TP_SIZE),
-        enable_expert_parallel=env_bool("NANOVLLM_ENABLE_EXPERT_PARALLEL", True),
+        tensor_parallel_size=env_int("NANOVLLM_TP_SIZE", DEFAULT_TP_SIZE),
+        enable_expert_parallel=env_bool(
+            "NANOVLLM_ENABLE_EXPERT_PARALLEL", True
+        ),
         max_model_len=max_model_len,
         max_num_prefill_seqs_per_step=max_num_prefill_seqs_per_step,
         prefill_chunk_size=env_int("NANOVLLM_PREFILL_CHUNK_SIZE", 0),
@@ -62,10 +63,6 @@ def make_llm(
         num_dram_kvcache_blocks=env_int("NANOVLLM_DRAM_NUM_BLOCKS", -1),
         trust_remote_code=True,
     )
-
-
-def prompt_tokenizer(llm: LLM):
-    return llm.tokenizer
 
 
 def encode_prompts(tokenizer, prompts: list[str]) -> list[list[int]]:
@@ -90,7 +87,11 @@ def sampling_params(max_tokens: int) -> SamplingParams:
     )
 
 
-def print_outputs(prompts: list[str], prompt_token_ids: list[list[int]], outputs) -> None:
+def print_outputs(
+    prompts: list[str],
+    prompt_token_ids: list[list[int]],
+    outputs,
+) -> None:
     for prompt, ids, output in zip(prompts, prompt_token_ids, outputs):
         one_line_prompt = " ".join(prompt.split())
         print("prompt_len:", len(ids))

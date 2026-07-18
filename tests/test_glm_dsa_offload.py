@@ -136,16 +136,10 @@ def test_glm_config_is_selected_before_deepseek_heuristic(tmp_path):
     )
 
 
-@pytest.mark.parametrize(
-    ("kwargs", "message"),
-    [
-        ({"enable_expert_parallel": False}, "requires expert parallel"),
-    ],
-)
-def test_glm_stage1_rejects_unimplemented_modes(tmp_path, kwargs, message):
+def test_glm_requires_expert_parallel(tmp_path):
     _write_glm_config(tmp_path)
-    with pytest.raises(ValueError, match=message):
-        _make_config(tmp_path, **kwargs)
+    with pytest.raises(ValueError, match="requires expert parallel"):
+        _make_config(tmp_path, enable_expert_parallel=False)
 
 
 def test_glm_dsa_offload_accepts_context_above_index_topk(tmp_path):
@@ -172,7 +166,7 @@ def test_glm_dsa_offload_keeps_native_indexer_at_index_topk(tmp_path):
     assert config.hf_config.index_topk == 2048
 
 
-def test_glm_stage1_enables_full_decode_only(tmp_path, monkeypatch):
+def test_glm_enables_full_decode_only(tmp_path, monkeypatch):
     monkeypatch.delenv("ASCEND_LAUNCH_BLOCKING", raising=False)
     _write_glm_config(tmp_path)
 

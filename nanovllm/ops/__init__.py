@@ -53,7 +53,6 @@ def _missing_dsa_indexer_project(*args, **kwargs):
 
 
 dsa_indexer_project_binding_version = getattr(_C, "dsa_indexer_project_binding_version", lambda: "missing")
-dsa_indexer_project_post = getattr(_C, "dsa_indexer_project_post", _missing_dsa_indexer_project)
 dsa_indexer_project_post_out = getattr(_C, "dsa_indexer_project_post_out", _missing_dsa_indexer_project)
 
 
@@ -127,7 +126,6 @@ def mla_preprocess(
 __all__ = [
     "batch_matmul_transpose",
     "dsa_indexer_project_binding_version",
-    "dsa_indexer_project_post",
     "dsa_indexer_project_post_out",
     "matmul_allreduce_add_rmsnorm",
     "mla_preprocess",

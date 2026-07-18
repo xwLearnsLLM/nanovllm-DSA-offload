@@ -1,8 +1,7 @@
-from _deepseek_example_utils import (
+from _example_utils import (
     encode_prompts,
     make_llm,
     print_outputs,
-    prompt_tokenizer,
     sampling_params,
 )
 
@@ -26,7 +25,7 @@ if __name__ == "__main__":
         max_num_prefill_seqs_per_step=1,
         max_num_decode_seqs_per_step=len(prompts),
     )
-    tokenizer = prompt_tokenizer(llm)
+    tokenizer = llm.tokenizer
     prompt_token_ids = encode_prompts(tokenizer, prompts)
     outputs = llm.generate(
         prompt_token_ids,

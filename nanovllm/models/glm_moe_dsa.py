@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Callable
 import re
 
 import torch
@@ -360,7 +359,6 @@ class GlmW4A8SparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         selected_experts: torch.Tensor,
         routing_weights: torch.Tensor,
-        stats_callback: Callable[[str, torch.Tensor], None] | None = None,
     ) -> torch.Tensor:
         selected_experts = selected_experts.to(torch.int32).contiguous()
         local_mask = (selected_experts >= self.local_expert_start) & (
@@ -387,10 +385,6 @@ class GlmW4A8SparseMoeBlock(nn.Module):
             )
         )
         expert_tokens = expert_tokens.to(torch.int64)
-        if stats_callback is not None:
-            stats_callback("moe_sorted_hidden", sorted_hidden)
-            stats_callback("moe_per_token_scale", per_token_scale)
-            stats_callback("moe_expert_tokens", expert_tokens)
 
         gate_up = torch_npu.npu_grouped_matmul(
             x=[sorted_hidden],
@@ -404,13 +398,8 @@ class GlmW4A8SparseMoeBlock(nn.Module):
             group_list=expert_tokens,
             output_dtype=torch.bfloat16,
         )[0]
-        if stats_callback is not None:
-            stats_callback("moe_gate_up", gate_up)
         activated = torch_npu.npu_swiglu(gate_up)
         activated, activated_scale = torch_npu.npu_dynamic_quant(activated)
-        if stats_callback is not None:
-            stats_callback("moe_activated_quant", activated)
-            stats_callback("moe_activated_scale", activated_scale)
         routed_output = torch_npu.npu_grouped_matmul(
             x=[activated],
             weight=[self.w2_weight],
@@ -423,22 +412,13 @@ class GlmW4A8SparseMoeBlock(nn.Module):
             group_list=expert_tokens,
             output_dtype=torch.bfloat16,
         )[0]
-        if stats_callback is not None:
-            stats_callback("moe_routed_gmm_output", routed_output)
-        output = torch_npu.npu_moe_token_unpermute(
+        return torch_npu.npu_moe_token_unpermute(
             permuted_tokens=routed_output,
             sorted_indices=torch.abs(expanded_row_idx),
             probs=routing_weights,
         )
-        if stats_callback is not None:
-            stats_callback("moe_routed_unpermuted", output)
-        return output
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        stats_callback: Callable[[str, torch.Tensor], None] | None = None,
-    ) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if not self._weights_processed or hidden_states.device.type != "npu":
             raise RuntimeError(
                 "GLM W4A8 MoE requires post-load packed weights on NPU."
@@ -448,24 +428,12 @@ class GlmW4A8SparseMoeBlock(nn.Module):
         routing_weights, selected_experts = self._grouped_topk(
             router_logits, hidden_states.dtype
         )
-        if stats_callback is not None:
-            stats_callback("moe_shared_output", shared_output)
-            stats_callback("moe_router_logits", router_logits)
-            stats_callback("moe_routing_weights", routing_weights)
-            stats_callback("moe_selected_experts", selected_experts)
         output = self._grouped_experts_forward(
-            hidden_states,
-            selected_experts,
-            routing_weights,
-            stats_callback=stats_callback,
+            hidden_states, selected_experts, routing_weights
         )
         output = output + shared_output
-        if stats_callback is not None:
-            stats_callback("moe_pre_allreduce", output)
         if self.ep_size > 1:
             dist.all_reduce(output)
-        if stats_callback is not None:
-            stats_callback("moe_post_allreduce", output)
         return output.view_as(hidden_states)
 
 
@@ -501,14 +469,6 @@ class GlmMoeDsaDecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual
             )
-        pipeline_stats = self.self_attn._dsa_native_pipeline_enabled
-        if pipeline_stats:
-            self.self_attn._print_dsa_native_pipeline_tensor(
-                "decoder_attn_input", hidden_states
-            )
-            self.self_attn._print_dsa_native_pipeline_tensor(
-                "decoder_residual_input", residual
-            )
         context = get_context()
         fuse_o_proj_norm = (
             not context.is_prefill
@@ -517,10 +477,6 @@ class GlmMoeDsaDecoderLayer(nn.Module):
         hidden_states = self.self_attn(
             positions, hidden_states, skip_o_proj=fuse_o_proj_norm
         )
-        if pipeline_stats:
-            self.self_attn._print_dsa_native_pipeline_tensor(
-                "decoder_attn_output", hidden_states
-            )
         if fuse_o_proj_norm:
             hidden_states, residual = self.self_attn.o_proj_add_rms_norm(
                 hidden_states, residual, self.post_attention_layernorm
@@ -529,25 +485,7 @@ class GlmMoeDsaDecoderLayer(nn.Module):
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual
             )
-        if pipeline_stats:
-            self.self_attn._print_dsa_native_pipeline_tensor(
-                "decoder_post_attn_norm", hidden_states
-            )
-            self.self_attn._print_dsa_native_pipeline_tensor(
-                "decoder_residual_after_attn", residual
-            )
-        if pipeline_stats and isinstance(self.mlp, GlmW4A8SparseMoeBlock):
-            mlp_output = self.mlp(
-                hidden_states,
-                stats_callback=self.self_attn._print_dsa_native_pipeline_tensor,
-            )
-        else:
-            mlp_output = self.mlp(hidden_states)
-        if pipeline_stats:
-            self.self_attn._print_dsa_native_pipeline_tensor(
-                "decoder_mlp_output", mlp_output
-            )
-        return mlp_output, residual
+        return self.mlp(hidden_states), residual
 
 
 class GlmMoeDsaModel(nn.Module):
@@ -593,7 +531,7 @@ class GlmMoeDsaForCausalLM(nn.Module):
     def __init__(self, config: GlmMoeDsaConfig) -> None:
         super().__init__()
         if not bool(getattr(config, "rope_interleave", True)):
-            raise ValueError("GLM stage 1 expects rope_interleave=true.")
+            raise ValueError("GLM-5.1 expects rope_interleave=true.")
         self.config = config
         self.model = GlmMoeDsaModel(config)
         self.lm_head = ParallelLMHead(

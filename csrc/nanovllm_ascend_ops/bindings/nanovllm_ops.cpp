@@ -1,5 +1,6 @@
 #include <optional>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include <torch/extension.h>
@@ -523,16 +524,6 @@ PYBIND11_MODULE(_C, m) {
   m.def(
       "dsa_indexer_project_binding_version",
       []() { return kDsaIndexerProjectBindingVersion; });
-  m.def(
-      "dsa_indexer_project_post",
-      &vllm_ascend::dsa_indexer_project_post,
-      py::arg("q_in"),
-      py::arg("k_in"),
-      py::arg("weights_in"),
-      py::arg("cos"),
-      py::arg("sin"),
-      py::arg("score_scale"),
-      py::arg("rope_dim"));
   m.def(
       "dsa_indexer_project_post_out",
       &vllm_ascend::dsa_indexer_project_post_out,

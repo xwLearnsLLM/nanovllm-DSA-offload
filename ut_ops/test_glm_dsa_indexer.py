@@ -22,10 +22,10 @@ import torch
 import torch_npu  # type: ignore
 
 import nanovllm.ops as ascend_ops
+import nanovllm.models.dsa_indexer_project as indexer_project
 from nanovllm.models.dsa_indexer_project import (
-    dsa_indexer_project_q_path,
+    dsa_indexer_project,
     dsa_indexer_project_query_only,
-    dsa_indexer_project_torch,
 )
 
 
@@ -511,7 +511,7 @@ def main() -> None:
         dtype=dtype,
         device=device,
     )
-    dsa_indexer_project_torch(
+    dsa_indexer_project(
         hidden_states,
         q_c,
         cos,
@@ -642,15 +642,13 @@ def main() -> None:
         wq_b_bmm_t=wq_b_bmm_t,
         enable_q_bmm=True,
     )
-    selected_q_path = dsa_indexer_project_q_path(
+    if not indexer_project._can_use_q_bmm(
         q_c_bmm,
         wq_b_bmm_t,
         enable_q_bmm=True,
-    )
-    if selected_q_path != "dsa_indexer_project_bmm_transpose":
+    ):
         raise AssertionError(
-            "GLM query-only A/B did not select the BMM-transpose hot path: "
-            f"selected={selected_q_path}."
+            "GLM query-only test did not select the BMM-transpose hot path."
         )
 
     torch.npu.synchronize()
@@ -676,7 +674,7 @@ def main() -> None:
     min_cosine = float(cosine.min().item())
     print(
         "GLM_DSA_QUERY_ONLY_BMM_CHECK ok=1 "
-        f"batch={bmm_batch} path={selected_q_path} "
+        f"batch={bmm_batch} path=batch_matmul_transpose "
         f"q_max_abs={q_bmm_diff:.6g} "
         f"weights_max_abs={weights_bmm_diff:.6g} "
         f"q_min_cosine={min_cosine:.9f}",
