@@ -235,9 +235,12 @@ set(OP_LIST)
 set(OP_DIR_LIST)
 op_add_subdirectory(OP_LIST OP_DIR_LIST)
 
-# Directory names are framework-facing and use DSA vocabulary. A few CANN
-# kernels keep their original registered op names to avoid changing aclnn ABI.
+# Map framework-facing operator directories to their registered kernel entry
+# names.  The aliases are also used to install the generated dynamic Python and
+# to include the kernels in binary_info_config.json.
 set(lightning_indexer_kernel_aliases lightning_indexer_vllm)
+set(lightning_indexer_decode_update_kernel_aliases nanovllm_lidu_decode_update)
+set(kvcache_scatter_copy_kernel_aliases nanovllm_kvcache_scatter_copy)
 
 foreach (OP_DIR ${OP_DIR_LIST})
     get_filename_component(_op_name "${OP_DIR}" NAME)

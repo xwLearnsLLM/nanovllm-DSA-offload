@@ -68,6 +68,22 @@ else
   bash build.sh -n "${CUSTOM_OPS}" -c "${CANN_OPP_SOC_VERSION}"
   rm -rf "${ROOT_DIR}/nanovllm/_cann_ops_custom"
   ./output/CANN-custom_ops*.run --install-path="${ROOT_DIR}/nanovllm/_cann_ops_custom"
+
+  BINARY_INFO_CONFIG="$(
+    find "${ROOT_DIR}/nanovllm/_cann_ops_custom" \
+      -name binary_info_config.json -print -quit
+  )"
+  if [[ -z "${BINARY_INFO_CONFIG}" ]]; then
+    echo "[nanovllm ops] ERROR: installed binary_info_config.json was not found." >&2
+    exit 1
+  fi
+  for OP_TYPE in NanovllmLiduDecodeUpdate NanovllmKvcacheScatterCopy; do
+    if ! grep -q "${OP_TYPE}" "${BINARY_INFO_CONFIG}"; then
+      echo "[nanovllm ops] ERROR: ${OP_TYPE} is missing from ${BINARY_INFO_CONFIG}." >&2
+      exit 1
+    fi
+  done
+  echo "[nanovllm ops] verified LIDU/SCATTER kernels in ${BINARY_INFO_CONFIG}"
   popd >/dev/null
 fi
 
