@@ -5,9 +5,9 @@
 #include "register/op_def_registry.h"
 
 namespace ops {
-class LightningIndexerDecodeUpdate : public OpDef {
+class NanovllmLiduDecodeUpdate : public OpDef {
 public:
-    explicit LightningIndexerDecodeUpdate(const char *name) : OpDef(name)
+    explicit NanovllmLiduDecodeUpdate(const char *name) : OpDef(name)
     {
         this->Input("query")
             .ParamType(REQUIRED)
@@ -71,5 +71,5 @@ public:
         this->AICore().AddConfig("ascend910_93", aicore_config);
     }
 };
-OP_ADD(LightningIndexerDecodeUpdate);
+OP_ADD(NanovllmLiduDecodeUpdate);
 } // namespace ops

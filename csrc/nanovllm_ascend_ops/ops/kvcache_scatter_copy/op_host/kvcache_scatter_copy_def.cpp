@@ -5,9 +5,9 @@
 #include "register/op_def_registry.h"
 
 namespace ops {
-class KvcacheScatterCopy : public OpDef {
+class NanovllmKvcacheScatterCopy : public OpDef {
 public:
-    explicit KvcacheScatterCopy(const char* name) : OpDef(name)
+    explicit NanovllmKvcacheScatterCopy(const char* name) : OpDef(name)
     {
         this->Input("hbm_k_rope").ParamType(REQUIRED).DataType({ge::DT_BF16, ge::DT_FLOAT16})
             .Format({ge::FORMAT_ND, ge::FORMAT_ND}).UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND});
@@ -36,5 +36,5 @@ public:
         this->AICore().AddConfig("ascend910_93").AddConfig("ascend910b");
     }
 };
-OP_ADD(KvcacheScatterCopy);
+OP_ADD(NanovllmKvcacheScatterCopy);
 } // namespace ops

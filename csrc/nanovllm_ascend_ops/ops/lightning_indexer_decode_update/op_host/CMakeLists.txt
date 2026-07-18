@@ -1,5 +1,5 @@
 add_ops_compile_options(
-        OP_NAME LightningIndexerDecodeUpdate
+        OP_NAME NanovllmLiduDecodeUpdate
         OPTIONS --cce-auto-sync=off
                 -Wno-deprecated-declarations
                 -Werror

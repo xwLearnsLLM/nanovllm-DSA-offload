@@ -61,7 +61,7 @@ TILING_DATA_FIELD_DEF(uint32_t, poolSize)
 TILING_DATA_FIELD_DEF(uint32_t, n1Size)
 TILING_DATA_FIELD_DEF(uint32_t, cacheSlotsSize)
 END_TILING_DATA_DEF
-REGISTER_TILING_DATA_CLASS(LightningIndexerDecodeUpdate, LIU2TilingData)
+REGISTER_TILING_DATA_CLASS(NanovllmLiduDecodeUpdate, LIU2TilingData)
 
 struct LIU2CompileInfo {};
 

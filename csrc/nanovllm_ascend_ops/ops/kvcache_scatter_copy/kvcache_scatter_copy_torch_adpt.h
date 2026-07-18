@@ -72,7 +72,7 @@ inline void npu_kvcache_scatter_copy(
       hbm_block_table, dram_block_table, source_token_ids,
       destination_slots, copy_counts);
   EXEC_NPU_CMD_ORDERED(
-      aclnnKvcacheScatterCopy,
+      aclnnNanovllmKvcacheScatterCopy,
       keepalive,
       hbm_k_rope,
       hbm_kv_cache,

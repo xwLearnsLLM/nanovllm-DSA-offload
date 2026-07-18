@@ -23,7 +23,7 @@ TILING_DATA_FIELD_DEF(int64_t, hbmMaxBlockNum);
 TILING_DATA_FIELD_DEF(int64_t, dramMaxBlockNum);
 END_TILING_DATA_DEF;
 
-REGISTER_TILING_DATA_CLASS(KvcacheScatterCopy, KvcacheScatterCopyTilingData)
+REGISTER_TILING_DATA_CLASS(NanovllmKvcacheScatterCopy, KvcacheScatterCopyTilingData)
 
 struct KvcacheScatterCopyCompileInfo {
 };

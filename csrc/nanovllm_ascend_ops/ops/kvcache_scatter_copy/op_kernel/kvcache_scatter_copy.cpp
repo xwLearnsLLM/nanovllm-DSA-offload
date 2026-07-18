@@ -8,7 +8,7 @@
 using namespace AscendC;
 using namespace KvcacheScatterCopyNs;
 
-extern "C" __global__ __aicore__ void kvcache_scatter_copy(
+extern "C" __global__ __aicore__ void nanovllm_kvcache_scatter_copy(
     GM_ADDR hbmKRoPE, GM_ADDR hbmKvCache, GM_ADDR dramKRoPE, GM_ADDR dramKvCache,
     GM_ADDR hbmBlockTable, GM_ADDR dramBlockTable, GM_ADDR srcTokenIds, GM_ADDR dstSlots,
     GM_ADDR copyCounts, GM_ADDR hbmKRoPEOut, GM_ADDR hbmKvCacheOut, GM_ADDR workspace, GM_ADDR tiling)

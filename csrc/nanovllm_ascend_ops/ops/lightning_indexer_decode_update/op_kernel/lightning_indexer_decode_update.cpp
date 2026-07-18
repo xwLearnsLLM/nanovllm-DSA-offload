@@ -36,7 +36,7 @@ using namespace LIKernel;
 
 
 template <int DT>
-__global__ __aicore__ void lightning_indexer_decode_update(__gm__ uint8_t *query, __gm__ uint8_t *key, __gm__ uint8_t *weights,
+__global__ __aicore__ void nanovllm_lidu_decode_update(__gm__ uint8_t *query, __gm__ uint8_t *key, __gm__ uint8_t *weights,
                                              __gm__ uint8_t *reqPoolEntries, __gm__ uint8_t *cacheSlots,
                                              __gm__ uint8_t *cacheTokens,
                                              __gm__ uint8_t *actualSeqLengths,

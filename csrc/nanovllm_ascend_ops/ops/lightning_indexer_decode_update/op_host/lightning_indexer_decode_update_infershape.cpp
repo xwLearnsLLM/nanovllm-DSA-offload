@@ -13,9 +13,9 @@ constexpr uint32_t KEY_INDEX = 1;
 constexpr uint32_t CACHE_SLOTS_INDEX = 4;
 constexpr int64_t DECODE_OUTPUT_CAPACITY = 2048;
 
-static ge::graphStatus InferShapeLightningIndexerDecodeUpdate(gert::InferShapeContext *context)
+static ge::graphStatus InferShapeNanovllmLiduDecodeUpdate(gert::InferShapeContext *context)
 {
-    OPS_ERR_IF(context == nullptr, OPS_LOG_E("LightningIndexerDecodeUpdate", "InferShapeContext is nullptr."),
+    OPS_ERR_IF(context == nullptr, OPS_LOG_E("NanovllmLiduDecodeUpdate", "InferShapeContext is nullptr."),
                return ge::GRAPH_FAILED);
     const gert::Shape *queryShape = context->GetInputShape(QUERY_INDEX);
     OPS_LOG_E_IF_NULL(context, queryShape, return ge::GRAPH_FAILED);
@@ -59,9 +59,9 @@ static ge::graphStatus InferShapeLightningIndexerDecodeUpdate(gert::InferShapeCo
     return ge::GRAPH_SUCCESS;
 }
 
-static ge::graphStatus InferDataTypeLightningIndexerDecodeUpdate(gert::InferDataTypeContext *context)
+static ge::graphStatus InferDataTypeNanovllmLiduDecodeUpdate(gert::InferDataTypeContext *context)
 {
-    OPS_ERR_IF(context == nullptr, OPS_LOG_E("LightningIndexerDecodeUpdate", "InferDataTypeContext is nullptr."),
+    OPS_ERR_IF(context == nullptr, OPS_LOG_E("NanovllmLiduDecodeUpdate", "InferDataTypeContext is nullptr."),
                return ge::GRAPH_FAILED);
     context->SetOutputDataType(0, ge::DT_INT32);
     context->SetOutputDataType(1, ge::DT_INT32);
@@ -70,7 +70,7 @@ static ge::graphStatus InferDataTypeLightningIndexerDecodeUpdate(gert::InferData
     return ge::GRAPH_SUCCESS;
 }
 
-IMPL_OP_INFERSHAPE(LightningIndexerDecodeUpdate)
-    .InferShape(InferShapeLightningIndexerDecodeUpdate)
-    .InferDataType(InferDataTypeLightningIndexerDecodeUpdate);
+IMPL_OP_INFERSHAPE(NanovllmLiduDecodeUpdate)
+    .InferShape(InferShapeNanovllmLiduDecodeUpdate)
+    .InferDataType(InferDataTypeNanovllmLiduDecodeUpdate);
 } // namespace ops

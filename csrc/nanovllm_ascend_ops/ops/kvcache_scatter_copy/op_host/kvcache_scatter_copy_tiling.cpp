@@ -192,7 +192,7 @@ ge::graphStatus TilingPrepare4KvcacheScatterCopy(gert::TilingParseContext* conte
     return ge::GRAPH_SUCCESS;
 }
 
-IMPL_OP_OPTILING(KvcacheScatterCopy)
+IMPL_OP_OPTILING(NanovllmKvcacheScatterCopy)
     .Tiling(Tiling4KvcacheScatterCopy)
     .TilingParse<KvcacheScatterCopyCompileInfo>(TilingPrepare4KvcacheScatterCopy);
 

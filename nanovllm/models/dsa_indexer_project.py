@@ -158,7 +158,7 @@ def _register_nanovllm_dsa_torchair_converters() -> None:
         meta_outputs: Any = None,
     ):
         return torchair.ge.custom_op(
-            "LightningIndexerDecodeUpdate",
+            "NanovllmLiduDecodeUpdate",
             inputs={
                 "query": query,
                 "key": key,
@@ -192,7 +192,7 @@ def _register_nanovllm_dsa_torchair_converters() -> None:
         meta_outputs: Any = None,
     ):
         return torchair.ge.custom_op(
-            "KvcacheScatterCopy",
+            "NanovllmKvcacheScatterCopy",
             inputs={
                 "hbm_k_rope": hbm_k_rope,
                 "hbm_kv_cache": hbm_kv_cache,

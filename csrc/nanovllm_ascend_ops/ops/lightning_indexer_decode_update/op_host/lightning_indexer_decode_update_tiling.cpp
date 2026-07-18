@@ -14,7 +14,7 @@ namespace optiling {
 ge::graphStatus LightningIndexerDecodeUpdateTiling::GetNpuInfo(LIU2TilingInfo &tilingInfo) const
 {
     if (context_->GetNodeName() == nullptr) {
-        OPS_LOG_E("LightningIndexerDecodeUpdate", "opName got from TilingContext is nullptr.");
+        OPS_LOG_E("NanovllmLiduDecodeUpdate", "opName got from TilingContext is nullptr.");
         return ge::GRAPH_FAILED;
     }
     tilingInfo.opName = context_->GetNodeName();
@@ -278,15 +278,15 @@ ge::graphStatus LightningIndexerDecodeUpdateTiling::DoTiling(LIU2TilingInfo *til
     return ge::GRAPH_SUCCESS;
 }
 
-static ge::graphStatus TilingPrepareForLightningIndexerDecodeUpdate(gert::TilingParseContext * /* context */)
+static ge::graphStatus TilingPrepareForNanovllmLiduDecodeUpdate(gert::TilingParseContext * /* context */)
 {
     return ge::GRAPH_SUCCESS;
 }
 
-ge::graphStatus TilingForLightningIndexerDecodeUpdate(gert::TilingContext *context)
+ge::graphStatus TilingForNanovllmLiduDecodeUpdate(gert::TilingContext *context)
 {
     OPS_ERR_IF(context == nullptr,
-               OPS_REPORT_VECTOR_INNER_ERR("LightningIndexerDecodeUpdate", "Tiling context is null."),
+               OPS_REPORT_VECTOR_INNER_ERR("NanovllmLiduDecodeUpdate", "Tiling context is null."),
                return ge::GRAPH_FAILED);
     LIU2TilingInfo liInfo;
     LightningIndexerDecodeUpdateTiling liTiling(context);
@@ -296,8 +296,8 @@ ge::graphStatus TilingForLightningIndexerDecodeUpdate(gert::TilingContext *conte
     return liTiling.DoTiling(&liInfo);
 }
 
-IMPL_OP_OPTILING(LightningIndexerDecodeUpdate)
-    .Tiling(TilingForLightningIndexerDecodeUpdate)
-    .TilingParse<LIU2CompileInfo>(TilingPrepareForLightningIndexerDecodeUpdate);
+IMPL_OP_OPTILING(NanovllmLiduDecodeUpdate)
+    .Tiling(TilingForNanovllmLiduDecodeUpdate)
+    .TilingParse<LIU2CompileInfo>(TilingPrepareForNanovllmLiduDecodeUpdate);
 
 } // namespace optiling

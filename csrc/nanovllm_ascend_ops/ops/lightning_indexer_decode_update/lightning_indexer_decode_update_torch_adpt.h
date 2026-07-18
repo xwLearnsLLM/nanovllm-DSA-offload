@@ -77,7 +77,7 @@ npu_lightning_indexer_decode_update(
       actual_seq_lengths_key, block_table, source_ids, destination_slots,
       miss_counts);
   EXEC_NPU_CMD_ORDERED(
-      aclnnLightningIndexerDecodeUpdate,
+      aclnnNanovllmLiduDecodeUpdate,
       keepalive,
       query,
       key,

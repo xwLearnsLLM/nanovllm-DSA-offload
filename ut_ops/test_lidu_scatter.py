@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from dataclasses import dataclass
 from time import perf_counter
 
@@ -563,6 +564,13 @@ def main() -> None:
     heads = _parse_heads(args.heads)
     torch.npu.set_device(device)
     torch.npu.config.allow_internal_format = False
+    opapi_path = os.environ.get("NANOVLLM_CUST_OPAPI_LIB", "")
+    if not opapi_path or not os.path.isfile(opapi_path):
+        raise RuntimeError(
+            "Repository-local libcust_opapi.so was not selected; rebuild "
+            "with `bash scripts/build_nanovllm_ops.sh`."
+        )
+    print(f"LIDU_SCATTER_OPAPI path={opapi_path} local=1")
     print(
         f"LIDU_SCATTER_CONFIG device={device} heads={list(heads)} "
         f"cache_tiers={list(CACHE_TIERS)} candidate_lens={list(CANDIDATE_LENS)} "

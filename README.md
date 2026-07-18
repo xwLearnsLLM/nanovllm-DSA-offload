@@ -11,7 +11,7 @@
 | --- | --- |
 | `none` | 不卸载，完整 MLA KV 保留在 HBM；默认值 |
 | `gs` | LightningIndexer + GatherSelectionKVCache |
-| `lidu` | LightningIndexerDecodeUpdate + KvcacheScatterCopy |
+| `lidu` | NanovllmLiduDecodeUpdate + NanovllmKvcacheScatterCopy |
 
 旧参数 `enable_dsa_offload` 和环境变量 `NANOVLLM_ENABLE_DSA_OFFLOAD` 已删除。
 
@@ -49,6 +49,7 @@ LIDU 与 SCATTER 的 host、tiling、AscendC kernel、ACLNN adapter、`torch.lib
 - `csrc/nanovllm_ascend_ops/ops/kvcache_scatter_copy/`
 
 编译和运行不会从参考工程导入、链接或动态加载这两个算子；它们只依赖本仓库代码和标准 CANN/PyTorch-NPU SDK。参考目录仅用于设计对照。
+两者使用 `NanovllmLiduDecodeUpdate` / `NanovllmKvcacheScatterCopy` 独占 CANN 名称，并按绝对路径加载本仓库生成的 `libcust_opapi.so`，避免与机器上已安装的参考算子发生 ABI 冲突。
 
 ## 编译
 

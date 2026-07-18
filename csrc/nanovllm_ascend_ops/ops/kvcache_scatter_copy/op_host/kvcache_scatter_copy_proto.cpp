@@ -29,7 +29,7 @@ static ge::graphStatus InferDtype4KvcacheScatterCopy(gert::InferDataTypeContext*
     return GRAPH_SUCCESS;
 }
 
-IMPL_OP_INFERSHAPE(KvcacheScatterCopy)
+IMPL_OP_INFERSHAPE(NanovllmKvcacheScatterCopy)
     .InferShape(InferShape4KvcacheScatterCopy)
     .InferDataType(InferDtype4KvcacheScatterCopy);
 } // namespace ops

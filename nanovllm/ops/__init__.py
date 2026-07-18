@@ -26,6 +26,14 @@ _CUSTOM_OPP_VENDOR = (
 )
 if _CUSTOM_OPP_VENDOR.exists():
     _prepend_env_path("ASCEND_CUSTOM_OPP_PATH", _CUSTOM_OPP_VENDOR)
+    custom_opapi = (
+        _CUSTOM_OPP_VENDOR / "op_api" / "lib" / "libcust_opapi.so"
+    )
+    if custom_opapi.is_file():
+        # The machine may contain another vendor's libcust_opapi.so with an
+        # older operator ABI.  Give the C++ adapter the exact repository-local
+        # library so symbol lookup can never silently bind to that copy.
+        os.environ["NANOVLLM_CUST_OPAPI_LIB"] = str(custom_opapi)
 
 try:
     importlib.import_module("torch_npu")

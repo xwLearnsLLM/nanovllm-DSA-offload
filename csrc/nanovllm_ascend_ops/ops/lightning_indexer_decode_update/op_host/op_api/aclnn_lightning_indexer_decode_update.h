@@ -2,8 +2,8 @@
  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
  */
 
-#ifndef ACLNN_lightning_indexer_decode_update_H
-#define ACLNN_lightning_indexer_decode_update_H
+#ifndef ACLNN_NANOVLLM_LIDU_DECODE_UPDATE_H
+#define ACLNN_NANOVLLM_LIDU_DECODE_UPDATE_H
 
 #include "aclnn/acl_meta.h"
 #include "aclnn/aclnn_base.h"
@@ -13,7 +13,7 @@ extern "C" {
 #endif
 
 __attribute__((visibility("default")))
-aclnnStatus aclnnLightningIndexerDecodeUpdateGetWorkspaceSize(
+aclnnStatus aclnnNanovllmLiduDecodeUpdateGetWorkspaceSize(
     const aclTensor *query,
     const aclTensor *key,
     const aclTensor *weights,
@@ -30,7 +30,7 @@ aclnnStatus aclnnLightningIndexerDecodeUpdateGetWorkspaceSize(
     aclOpExecutor **executor);
 
 __attribute__((visibility("default")))
-aclnnStatus aclnnLightningIndexerDecodeUpdate(
+aclnnStatus aclnnNanovllmLiduDecodeUpdate(
     void *workspace,
     uint64_t workspaceSize,
     aclOpExecutor *executor,
@@ -40,4 +40,4 @@ aclnnStatus aclnnLightningIndexerDecodeUpdate(
 }
 #endif
 
-#endif // ACLNN_lightning_indexer_decode_update_H
+#endif // ACLNN_NANOVLLM_LIDU_DECODE_UPDATE_H

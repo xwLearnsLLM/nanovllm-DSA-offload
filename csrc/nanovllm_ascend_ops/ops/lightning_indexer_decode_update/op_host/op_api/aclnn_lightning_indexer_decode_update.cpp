@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-extern aclnnStatus aclnnInnerLightningIndexerDecodeUpdateGetWorkspaceSize(
+extern aclnnStatus aclnnInnerNanovllmLiduDecodeUpdateGetWorkspaceSize(
     const aclTensor *query, const aclTensor *key, const aclTensor *weights,
     const aclTensor *reqPoolEntries, const aclTensor *cacheSlots,
     const aclTensor *cacheTokens,
@@ -18,10 +18,10 @@ extern aclnnStatus aclnnInnerLightningIndexerDecodeUpdateGetWorkspaceSize(
     const aclTensor *cacheSlotsOut,
     uint64_t *workspaceSize, aclOpExecutor **executor);
 
-extern aclnnStatus aclnnInnerLightningIndexerDecodeUpdate(
+extern aclnnStatus aclnnInnerNanovllmLiduDecodeUpdate(
     void *workspace, uint64_t workspaceSize, aclOpExecutor *executor, const aclrtStream stream);
 
-aclnnStatus aclnnLightningIndexerDecodeUpdateGetWorkspaceSize(
+aclnnStatus aclnnNanovllmLiduDecodeUpdateGetWorkspaceSize(
     const aclTensor *query,
     const aclTensor *key,
     const aclTensor *weights,
@@ -37,16 +37,16 @@ aclnnStatus aclnnLightningIndexerDecodeUpdateGetWorkspaceSize(
     uint64_t *workspaceSize,
     aclOpExecutor **executor)
 {
-    return aclnnInnerLightningIndexerDecodeUpdateGetWorkspaceSize(
+    return aclnnInnerNanovllmLiduDecodeUpdateGetWorkspaceSize(
         query, key, weights, reqPoolEntries, cacheSlots, cacheTokens,
         actualSeqLengthsKey, blockTable, topkIndexOut, topkSlotsOut,
         missCountOut, cacheSlotsOut, workspaceSize, executor);
 }
 
-aclnnStatus aclnnLightningIndexerDecodeUpdate(
+aclnnStatus aclnnNanovllmLiduDecodeUpdate(
     void *workspace, uint64_t workspaceSize, aclOpExecutor *executor, const aclrtStream stream)
 {
-    return aclnnInnerLightningIndexerDecodeUpdate(workspace, workspaceSize, executor, stream);
+    return aclnnInnerNanovllmLiduDecodeUpdate(workspace, workspaceSize, executor, stream);
 }
 
 #ifdef __cplusplus

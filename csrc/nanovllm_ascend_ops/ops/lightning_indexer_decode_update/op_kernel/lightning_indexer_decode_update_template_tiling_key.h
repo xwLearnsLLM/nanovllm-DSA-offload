@@ -10,7 +10,7 @@
 #define LI_TPL_FP16 1
 #define LI_TPL_BF16 27
 
-ASCENDC_TPL_ARGS_DECL(LightningIndexerDecodeUpdate,
+ASCENDC_TPL_ARGS_DECL(NanovllmLiduDecodeUpdate,
                       ASCENDC_TPL_DTYPE_DECL(DT, LI_TPL_FP16, LI_TPL_BF16));
 
 ASCENDC_TPL_SEL(

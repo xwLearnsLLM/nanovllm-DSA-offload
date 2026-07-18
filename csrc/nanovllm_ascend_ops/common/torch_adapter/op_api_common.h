@@ -21,6 +21,8 @@
 #include <acl/acl_base.h>
 #include <c10/util/Exception.h>
 #include <dlfcn.h>
+#include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <type_traits>
 #include <vector>
@@ -138,6 +140,15 @@ inline void *GetOpApiFuncAddrInLib(void *handler, const char *libName,
 }
 
 inline void *GetOpApiLibHandler(const char *libName) {
+  if (std::strcmp(libName, GetCustOpApiLibName()) == 0) {
+    const char *explicitPath = std::getenv("NANOVLLM_CUST_OPAPI_LIB");
+    if (explicitPath != nullptr && explicitPath[0] != '\0') {
+      // Do not fall back to an arbitrary system libcust_opapi.so: a function
+      // with the same name but a different ACLNN ABI corrupts the trailing
+      // workspace/executor arguments and can look like a gigantic OOM.
+      return dlopen(explicitPath, RTLD_LAZY | RTLD_LOCAL);
+    }
+  }
   auto handler = dlopen(libName, RTLD_LAZY);
   return handler;
 }
