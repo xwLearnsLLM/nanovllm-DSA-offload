@@ -27,7 +27,17 @@ from nanovllm.engine.full_decode_graph import (
     FullDecodeOnlyGraphManager,
     select_capture_size,
 )
-from nanovllm.engine.sequence import DecodeSequenceMetadata, Sequence
+from nanovllm.engine.sequence import (
+    DecodeBatchDelta,
+    DecodeBatchPacket,
+    DecodeBatchSnapshot,
+    DecodeMetadataKey,
+    DecodeSequenceMetadata,
+    Sequence,
+    apply_decode_batch_packet,
+    build_decode_batch_packet,
+    decode_metadata_key,
+)
 from nanovllm.layers.sampler import Sampler
 from nanovllm.models.deepseek_v32 import DeepseekV32ForCausalLM
 from nanovllm.models.glm_moe_dsa import GlmMoeDsaForCausalLM
@@ -145,6 +155,12 @@ class ModelRunner:
         self._decode_metadata_cache_misses = 0
         self._compact_decode_ipc_steps = 0
         self._compact_decode_ipc_bytes = 0
+        self._decode_ipc_snapshot_steps = 0
+        self._decode_ipc_snapshot_bytes = 0
+        self._decode_ipc_delta_steps = 0
+        self._decode_ipc_delta_bytes = 0
+        self._worker_decode_metadata_key: DecodeMetadataKey | None = None
+        self._worker_decode_sequences: list[DecodeSequenceMetadata] | None = None
         torch.npu.empty_cache()
         self._allocate_mla_cache()
         self.decode_graph_manager = None
@@ -286,16 +302,19 @@ class ModelRunner:
                 self.decode_graph_manager.stats(),
             )
         if self.rank == 0:
-            average_ipc_bytes = (
-                self._compact_decode_ipc_bytes
-                // max(self._compact_decode_ipc_steps, 1)
-            )
+            ipc_stats = self._decode_ipc_stats()
             logger.info(
                 "Decode hot-path stats: compact_ipc_steps=%d, "
-                "average_ipc_bytes=%d, metadata_cache_hits=%d, "
+                "average_ipc_bytes=%d, ipc_snapshot_steps=%d, "
+                "ipc_snapshot_avg_bytes=%d, ipc_delta_steps=%d, "
+                "ipc_delta_avg_bytes=%d, metadata_cache_hits=%d, "
                 "metadata_cache_misses=%d",
-                self._compact_decode_ipc_steps,
-                average_ipc_bytes,
+                ipc_stats["compact_ipc_steps"],
+                ipc_stats["average_ipc_bytes"],
+                ipc_stats["ipc_snapshot_steps"],
+                ipc_stats["ipc_snapshot_avg_bytes"],
+                ipc_stats["ipc_delta_steps"],
+                ipc_stats["ipc_delta_avg_bytes"],
                 self._decode_metadata_cache_hits,
                 self._decode_metadata_cache_misses,
             )
@@ -312,19 +331,35 @@ class ModelRunner:
             return {"enabled": False, "mode": "eager"}
         stats = self.decode_graph_manager.stats()
         stats.update(
-            compact_ipc_steps=self._compact_decode_ipc_steps,
-            average_ipc_bytes=(
-                self._compact_decode_ipc_bytes
-                // max(self._compact_decode_ipc_steps, 1)
-            ),
+            **self._decode_ipc_stats(),
             metadata_cache_hits=self._decode_metadata_cache_hits,
             metadata_cache_misses=self._decode_metadata_cache_misses,
         )
         return stats
 
+    def _decode_ipc_stats(self) -> dict[str, int]:
+        return {
+            "compact_ipc_steps": self._compact_decode_ipc_steps,
+            "average_ipc_bytes": (
+                self._compact_decode_ipc_bytes
+                // max(self._compact_decode_ipc_steps, 1)
+            ),
+            "ipc_snapshot_steps": self._decode_ipc_snapshot_steps,
+            "ipc_snapshot_avg_bytes": (
+                self._decode_ipc_snapshot_bytes
+                // max(self._decode_ipc_snapshot_steps, 1)
+            ),
+            "ipc_delta_steps": self._decode_ipc_delta_steps,
+            "ipc_delta_avg_bytes": (
+                self._decode_ipc_delta_bytes
+                // max(self._decode_ipc_delta_steps, 1)
+            ),
+        }
+
     def loop(self):
         while True:
             method_name, args = self.read_shm()
+            args = self._expand_worker_args(method_name, args)
             self.call(method_name, *args)
             if method_name == "exit":
                 break
@@ -361,19 +396,39 @@ class ModelRunner:
             event.set()
         return n
 
-    @staticmethod
-    def _compact_worker_args(method_name: str, args: tuple) -> tuple:
+    def _compact_worker_args(self, method_name: str, args: tuple) -> tuple:
         if (
             method_name == "run"
             and len(args) == 2
             and args[1] is False
         ):
-            seqs = [
-                DecodeSequenceMetadata.from_sequence(seq)
-                for seq in args[0]
-            ]
-            return seqs, False
+            packet, key = build_decode_batch_packet(
+                args[0],
+                self._worker_decode_metadata_key,
+            )
+            self._worker_decode_metadata_key = key
+            return packet, False
         return args
+
+    def _expand_worker_args(self, method_name: str, args: list) -> tuple:
+        if (
+            method_name != "run"
+            or len(args) != 2
+            or args[1] is not False
+        ):
+            return tuple(args)
+        packet = args[0]
+        if not isinstance(packet, (DecodeBatchSnapshot, DecodeBatchDelta)):
+            raise RuntimeError(
+                "TP worker received a decode run without a metadata packet."
+            )
+        sequences, key = apply_decode_batch_packet(
+            packet,
+            self._worker_decode_sequences,
+        )
+        self._worker_decode_sequences = sequences
+        self._worker_decode_metadata_key = key
+        return sequences, False
 
     def call(self, method_name, *args):
         if self.world_size > 1 and self.rank == 0:
@@ -382,6 +437,13 @@ class ModelRunner:
             if worker_args is not args:
                 self._compact_decode_ipc_steps += 1
                 self._compact_decode_ipc_bytes += payload_bytes
+                packet: DecodeBatchPacket = worker_args[0]
+                if isinstance(packet, DecodeBatchSnapshot):
+                    self._decode_ipc_snapshot_steps += 1
+                    self._decode_ipc_snapshot_bytes += payload_bytes
+                else:
+                    self._decode_ipc_delta_steps += 1
+                    self._decode_ipc_delta_bytes += payload_bytes
         method = getattr(self, method_name, None)
         return method(*args)
 
@@ -568,15 +630,6 @@ class ModelRunner:
             self._decode_dynamic_buffers[batch_size] = buffers
         return buffers
 
-    @staticmethod
-    def _decode_metadata_key(
-        seqs: list[Sequence | DecodeSequenceMetadata],
-    ) -> tuple[tuple[int, int], ...]:
-        return tuple(
-            (int(seq.seq_id), int(seq.decode_metadata_version))
-            for seq in seqs
-        )
-
     def _get_decode_static_metadata(
         self,
         seqs: list[Sequence | DecodeSequenceMetadata],
@@ -584,7 +637,7 @@ class ModelRunner:
         req_pool_entries: list[int],
         lidu_cache_tokens: list[int],
     ) -> _DecodeStaticMetadata:
-        key = self._decode_metadata_key(seqs)
+        key = decode_metadata_key(seqs)
         cached = self._decode_static_metadata
         if cached is not None and cached.key == key:
             self._decode_metadata_cache_hits += 1

@@ -1,7 +1,10 @@
+from __future__ import annotations
+
 from copy import copy
 from dataclasses import dataclass
 from enum import Enum, auto
 from itertools import count
+from typing import Union
 
 from nanovllm.sampling_params import SamplingParams
 
@@ -307,3 +310,98 @@ class DecodeSequenceMetadata:
             self.num_prefill_tokens_processed > 0
             and self.num_decode_tokens_since_prefill == 1
         )
+
+
+DecodeMetadataKey = tuple[tuple[int, int], ...]
+
+
+@dataclass
+class DecodeBatchSnapshot:
+    """Complete decode metadata sent when a worker cache must be refreshed."""
+
+    sequences: list[DecodeSequenceMetadata]
+
+
+@dataclass
+class DecodeBatchDelta:
+    """Dynamic fields sent while the decode batch metadata stays unchanged."""
+
+    key: DecodeMetadataKey
+    num_tokens: tuple[int, ...]
+    last_tokens: tuple[int, ...]
+
+
+DecodeBatchPacket = Union[DecodeBatchSnapshot, DecodeBatchDelta]
+
+
+def decode_metadata_key(
+    seqs: list[Sequence | DecodeSequenceMetadata],
+) -> DecodeMetadataKey:
+    return tuple(
+        (int(seq.seq_id), int(seq.decode_metadata_version))
+        for seq in seqs
+    )
+
+
+def build_decode_batch_packet(
+    seqs: list[Sequence],
+    previous_key: DecodeMetadataKey | None,
+) -> tuple[DecodeBatchPacket, DecodeMetadataKey]:
+    """Build either a complete worker snapshot or a stable-decode delta."""
+
+    key = decode_metadata_key(seqs)
+    if key != previous_key:
+        return (
+            DecodeBatchSnapshot(
+                [DecodeSequenceMetadata.from_sequence(seq) for seq in seqs]
+            ),
+            key,
+        )
+    return (
+        DecodeBatchDelta(
+            key=key,
+            num_tokens=tuple(int(seq.num_tokens) for seq in seqs),
+            last_tokens=tuple(int(seq.last_token) for seq in seqs),
+        ),
+        key,
+    )
+
+
+def apply_decode_batch_packet(
+    packet: DecodeBatchPacket,
+    cached_sequences: list[DecodeSequenceMetadata] | None,
+) -> tuple[list[DecodeSequenceMetadata], DecodeMetadataKey]:
+    """Expand a rank-0 IPC packet into the worker's cached sequence views."""
+
+    if isinstance(packet, DecodeBatchSnapshot):
+        sequences = packet.sequences
+        return sequences, decode_metadata_key(sequences)
+
+    if cached_sequences is None:
+        raise RuntimeError(
+            "Received a decode metadata delta before a complete snapshot."
+        )
+    cached_key = decode_metadata_key(cached_sequences)
+    if packet.key != cached_key:
+        raise RuntimeError(
+            "Decode metadata delta does not match the worker cache: "
+            f"delta={packet.key}, cached={cached_key}."
+        )
+    batch_size = len(cached_sequences)
+    if (
+        len(packet.num_tokens) != batch_size
+        or len(packet.last_tokens) != batch_size
+    ):
+        raise RuntimeError(
+            "Decode metadata delta batch size does not match the worker cache: "
+            f"num_tokens={len(packet.num_tokens)}, "
+            f"last_tokens={len(packet.last_tokens)}, cached={batch_size}."
+        )
+    for seq, num_tokens, last_token in zip(
+        cached_sequences,
+        packet.num_tokens,
+        packet.last_tokens,
+    ):
+        seq.num_tokens = int(num_tokens)
+        seq.last_token = int(last_token)
+    return cached_sequences, cached_key
