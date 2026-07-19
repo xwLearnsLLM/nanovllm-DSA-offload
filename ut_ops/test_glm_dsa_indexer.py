@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import time
 
 import torch
 import torch_npu  # type: ignore
@@ -47,6 +48,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--topk", type=int, default=2048)
     parser.add_argument("--block-size", type=int, default=128)
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--bmm-warmup", type=int, default=5)
+    parser.add_argument("--bmm-iters", type=int, default=20)
     return parser.parse_args()
 
 
@@ -59,6 +62,11 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--full-len must be positive.")
     if args.block_size <= 0:
         raise ValueError("--block-size must be positive.")
+    if args.bmm_warmup < 0 or args.bmm_iters <= 0:
+        raise ValueError(
+            "--bmm-warmup must be non-negative and --bmm-iters must be "
+            "positive."
+        )
     if not 1 <= args.topk <= min(2048, args.full_len):
         raise ValueError(
             "--topk must be in [1, min(2048, full_len)], got "
@@ -222,6 +230,17 @@ def assert_close(
             f"max_abs={diff:.6g}, atol={atol}, rtol={rtol}"
         ) from error
     return diff
+
+
+def benchmark_ms(fn, warmup: int, iters: int) -> float:
+    for _ in range(warmup):
+        fn()
+    torch.npu.synchronize()
+    started = time.perf_counter()
+    for _ in range(iters):
+        fn()
+    torch.npu.synchronize()
+    return (time.perf_counter() - started) * 1000.0 / iters
 
 
 def make_paged_index_cache(
@@ -576,9 +595,9 @@ def main() -> None:
     )
 
     # Steady-state decode uses the query-only BMM-transpose path for batches
-    # up to 64.  GLM's K=2048 and 32 index heads differ from the DeepSeek
-    # shape that originally introduced this optimization, so compare the
-    # actual hot path with its F.linear fallback before testing selection.
+    # up to 64.  Its shared-A form consumes q_c=[B, K] directly instead of
+    # materializing [B, H, K].  Check it against both the legacy expanded-A
+    # operator input and the F.linear fallback before testing selection.
     bmm_batch = min(args.batch_size, 64)
     hidden_bmm = hidden_states[:bmm_batch]
     q_c_bmm = q_c[:bmm_batch]
@@ -594,6 +613,69 @@ def main() -> None:
         .contiguous()
     )
     weights_proj_bf16 = weights_proj.to(dtype)
+    q_raw_shared = torch.empty(
+        bmm_batch,
+        GLM_INDEX_HEADS,
+        GLM_INDEX_HEAD_DIM,
+        dtype=dtype,
+        device=device,
+    )
+    q_raw_legacy = torch.empty_like(q_raw_shared)
+    q_c_by_head = (
+        q_c_bmm.unsqueeze(1)
+        .expand(-1, GLM_INDEX_HEADS, -1)
+        .contiguous()
+    )
+    ascend_ops.batch_matmul_transpose(q_c_bmm, wq_b_bmm_t, q_raw_shared)
+    ascend_ops.batch_matmul_transpose(q_c_by_head, wq_b_bmm_t, q_raw_legacy)
+    torch.npu.synchronize()
+    raw_diff = assert_close(
+        "query_only_shared_a_raw",
+        q_raw_shared,
+        q_raw_legacy,
+        atol=0.04,
+        rtol=0.02,
+    )
+
+    def run_shared_a() -> None:
+        ascend_ops.batch_matmul_transpose(
+            q_c_bmm,
+            wq_b_bmm_t,
+            q_raw_shared,
+        )
+
+    def run_legacy_expanded_a() -> None:
+        expanded = (
+            q_c_bmm.unsqueeze(1)
+            .expand(-1, GLM_INDEX_HEADS, -1)
+            .contiguous()
+        )
+        ascend_ops.batch_matmul_transpose(
+            expanded,
+            wq_b_bmm_t,
+            q_raw_legacy,
+        )
+
+    legacy_ms = benchmark_ms(
+        run_legacy_expanded_a,
+        args.bmm_warmup,
+        args.bmm_iters,
+    )
+    shared_ms = benchmark_ms(
+        run_shared_a,
+        args.bmm_warmup,
+        args.bmm_iters,
+    )
+    print(
+        "GLM_DSA_SHARED_A_BMM_CHECK ok=1 "
+        f"batch={bmm_batch} q_max_abs={raw_diff:.6g} "
+        f"legacy_expand_bmm_ms={legacy_ms:.6f} "
+        f"shared_a_bmm_ms={shared_ms:.6f} "
+        f"speedup={legacy_ms / shared_ms:.4f} "
+        f"warmup={args.bmm_warmup} iters={args.bmm_iters}",
+        flush=True,
+    )
+
     q_linear = torch.empty(
         bmm_batch,
         GLM_INDEX_HEADS,
@@ -674,7 +756,7 @@ def main() -> None:
     min_cosine = float(cosine.min().item())
     print(
         "GLM_DSA_QUERY_ONLY_BMM_CHECK ok=1 "
-        f"batch={bmm_batch} path=batch_matmul_transpose "
+        f"batch={bmm_batch} path=batch_matmul_transpose_shared_a "
         f"q_max_abs={q_bmm_diff:.6g} "
         f"weights_max_abs={weights_bmm_diff:.6g} "
         f"q_min_cosine={min_cosine:.9f}",

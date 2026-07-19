@@ -73,6 +73,7 @@ public:
         core_loop = gm_tiling_data->coreLoop;
         swizzle_cnt = gm_tiling_data->swizzlCount;
         en_shuffle_k = gm_tiling_data->enShuffleK;
+        shared_a = gm_tiling_data->sharedA != 0;
 
         AsdopsBuffer<ArchType::ASCEND_V220> buf;
         l1_base_a = buf.template GetBuffer<BufferType::ASCEND_CB, InDtype>(0);
@@ -144,6 +145,8 @@ public:
             uint64_t shuffle_k = en_shuffle_k ? (core_idx % tdim.k) : 0;
             if (TA) {
                 offset_a = shuffle_k * k0 * m * batch_size + batch_idx * m + tidx.m * m0;
+            } else if (shared_a) {
+                offset_a = tidx.m * m0 * k + shuffle_k * k0;
             } else {
                 offset_a = tidx.m * m0 * batch_size * k + batch_idx * k + shuffle_k * k0;
             }
@@ -203,7 +206,7 @@ public:
                                                                      m,                // nVal
                                                                      k_actual,         // dTileActual
                                                                      k_round,          // dTileCeil
-                                                                     k * batch_size);  // dVal
+                                                                     shared_a ? k : k * batch_size);  // dVal
                     }
                 }
                 SET_FLAG(MTE2, MTE1, event_id);
@@ -267,6 +270,8 @@ public:
                     uint64_t shuffle_k_next = en_shuffle_k ? (core_idx + tidx.k + 1) % tdim.k : (tidx.k + 1);
                     if (TA) {
                         offset_a_next = shuffle_k_next * k0 * m * batch_size + batch_idx * m + tidx.m * m0;
+                    } else if (shared_a) {
+                        offset_a_next = tidx.m * m0 * k + shuffle_k_next * k0;
                     } else {
                         offset_a_next = tidx.m * m0 * batch_size * k + batch_idx * k + shuffle_k_next * k0;
                     }
@@ -325,7 +330,7 @@ public:
                                                                          m,                    // nVal
                                                                          k_actual_next,        // dTileActual
                                                                          k_round_next,         // dTileCeil
-                                                                         k * batch_size);      // dVal
+                                                                         shared_a ? k : k * batch_size);  // dVal
                         }
                     }
                     SET_FLAG(MTE2, MTE1, event_id_next);
@@ -389,6 +394,8 @@ public:
                     uint64_t k_round_next = (k_actual_next + CONST_16 - 1) / CONST_16 * CONST_16;
                     if (TA) {
                         offset_a_next = shuffle_k_next * k0 * m * batch_size + b_idx_next * m + tidx.m * m0;
+                    } else if (shared_a) {
+                        offset_a_next = tidx.m * m0 * k + shuffle_k_next * k0;
                     } else {
                         offset_a_next = tidx.m * m0 * batch_size * k + b_idx_next * k + shuffle_k_next * k0;
                     }
@@ -444,7 +451,7 @@ public:
                                                                          m,                    // nVal
                                                                          k_actual_next,        // dTileActual
                                                                          k_round_next,         // dTileCeil
-                                                                         k * batch_size);      // dVal
+                                                                         shared_a ? k : k * batch_size);  // dVal
                         }
                     }
                     SET_FLAG(MTE2, MTE1, event_id_next);
@@ -653,6 +660,7 @@ private:
     uint32_t core_idx{0};
     uint32_t en_shuffle_k{0};
     uint32_t ping_flag{0};
+    bool shared_a{false};
 };
 
 extern "C" __global__ __aicore__ void batch_matmul_transpose(GM_ADDR gm_a, GM_ADDR gm_b, GM_ADDR gm_c,

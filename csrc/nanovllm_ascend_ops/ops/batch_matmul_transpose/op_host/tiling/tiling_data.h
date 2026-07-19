@@ -76,6 +76,10 @@ struct PpMatmulTilingData {
     uint32_t splitk{0};
     uint32_t enShuffleK{0};
     uint32_t quantMode{0};
+    // tensor_a may be [M, K] and shared by every B batch/head.  The legacy
+    // input is [M, B, K].  Keeping this in tiling data lets one kernel serve
+    // both layouts without materializing an expanded [M, B, K] tensor.
+    uint32_t sharedA{0};
 
     void SetBaseShape(uint32_t batchSize, uint32_t m, uint32_t k, uint32_t n);
     void SetBaseOp(uint32_t coreNum, uint32_t mBase, uint32_t nBase, const MatMulInfo &mmInfo);

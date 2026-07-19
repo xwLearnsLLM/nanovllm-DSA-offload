@@ -65,21 +65,32 @@ std::tuple<at::Tensor, uint32_t> batch_matmul_transpose_tiling(const at::Tensor 
     MatMul::QuantMode quantMode =
         static_cast<MatMul::QuantMode>(GetModeVal(quantModeMap, quant_mode, "per_channel_symm", "quant_mode"));
 
-    TORCH_CHECK(tensorAShape.size() == 3, "batch size is not same between srcTensor and dstTensor");
+    TORCH_CHECK(tensorAShape.size() == 2 || tensorAShape.size() == 3,
+                "tensor_a must be [M, K] (shared-A) or [M, B, K]");
+    const bool sharedA = tensorAShape.size() == 2;
+    const int64_t m = tensorAShape[0];
+    const int64_t k = sharedA ? tensorAShape[1] : tensorAShape[2];
+    TORCH_CHECK(m > 0 && k > 0, "tensor_a dimensions must be positive");
     if (formatMode == TensorFormat::TENSOR_FORMAT_ND) {
         TORCH_CHECK(tensorBShape.size() == 3, "tensor shape should be dim3 in ND format");
-        TORCH_CHECK(tensorAShape[2] == tensorBShape[1], "tensor shape is wrong");
+        TORCH_CHECK(k == tensorBShape[1], "tensor_a K must match tensor_b K");
         n = tensorBShape[2];
     } else {
         TORCH_CHECK(tensorBShape.size() == 4, "tensor shape should be dim4 in nz format");
-        TORCH_CHECK(tensorAShape[2] == tensorBShape[2], "tensor shape is wrong");
+        TORCH_CHECK(k == tensorBShape[2], "tensor_a K must match tensor_b K");
         n = tensorBShape[1] * tensorBShape[3];
     }
-    TORCH_CHECK(tensorAShape[1] == tensorBShape[0], "tensor shape is wrong");
+    const int64_t batchSize = tensorBShape[0];
+    if (!sharedA) {
+        TORCH_CHECK(tensorAShape[1] == batchSize, "tensor_a B must match tensor_b B");
+    }
+    TORCH_CHECK(tensorCShape.size() == 3 && tensorCShape[0] == m &&
+                    tensorCShape[1] == batchSize && tensorCShape[2] == n,
+                "tensor_c must have shape [M, B, N]");
 
-    OpShape opShape = {.batchSize = static_cast<uint32_t>(tensorAShape[1]),
-                       .m = static_cast<uint32_t>(tensorAShape[0]),
-                       .k = static_cast<uint32_t>(tensorAShape[2]),
+    OpShape opShape = {.batchSize = static_cast<uint32_t>(batchSize),
+                       .m = static_cast<uint32_t>(m),
+                       .k = static_cast<uint32_t>(k),
                        .n = n};
     pp_matmul::PpMatmulTilingData matmulTilingData = {
         .opShape = opShape,
@@ -98,6 +109,7 @@ std::tuple<at::Tensor, uint32_t> batch_matmul_transpose_tiling(const at::Tensor 
                          .outDtype = dTypeMap[cType],
                          .quantMode = quantMode};
     GetPpMatmulTiling(mmInfo, hwInfo, block_dim, matmulTilingData);
+    matmulTilingData.sharedA = sharedA ? 1U : 0U;
     host_utils::PpMatmulTilingCheck(matmulTilingData);
 
     // tiling
@@ -120,4 +132,3 @@ std::tuple<at::Tensor, uint32_t> batch_matmul_transpose_tiling(const at::Tensor 
 }
 
 }
-

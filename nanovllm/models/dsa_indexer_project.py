@@ -475,6 +475,11 @@ def _can_use_q_bmm(
         and hasattr(ascend_ops, "batch_matmul_transpose")
         and q_c.device.type == "npu"
         and q_c.dtype in (torch.float16, torch.bfloat16)
+        and q_c.dim() == 2
+        and wq_b_bmm_t.dim() == 3
+        and q_c.shape[1] == wq_b_bmm_t.shape[1]
+        and q_c.is_contiguous()
+        and wq_b_bmm_t.is_contiguous()
         and 0 < q_c.shape[0] <= _Q_BMM_MAX_TOKENS
     )
 
@@ -569,9 +574,11 @@ def _q_project(
     enable_q_bmm: bool,
 ) -> torch.Tensor:
     if _can_use_q_bmm(q_c, wq_b_bmm_t, enable_q_bmm):
-        q_c_by_head = q_c.unsqueeze(1).expand(-1, n_head, -1).contiguous()
         q = torch.empty((q_c.shape[0], n_head, head_dim), dtype=q_c.dtype, device=q_c.device)
-        ascend_ops.batch_matmul_transpose(q_c_by_head, wq_b_bmm_t, q)
+        # batch_matmul_transpose treats a 2-D tensor_a as shared across every
+        # index head.  This avoids materializing [tokens, heads, q_lora_rank]
+        # on every layer of the stable decode graph.
+        ascend_ops.batch_matmul_transpose(q_c, wq_b_bmm_t, q)
         return q
     return F.linear(q_c, wq_b_weight).view(-1, n_head, head_dim)
 
