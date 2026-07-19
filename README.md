@@ -88,7 +88,7 @@ python3 ut_ops/test_lidu_scatter.py \
   --graph-replays 3
 ```
 
-必须先看到 `LIDU_SCATTER_GRAPH_CHECK ... ok=1`，最终成功标志是 `LIDU_SCATTER_UT_OK`。`LIDU_GS_COMPARE` 只报告时延，不把 LIDU 必须快于 GS 设为正确性条件。
+必须先看到 `LIDU_SCATTER_GRAPH_CHECK ... ok=1`，最终成功标志是 `LIDU_SCATTER_UT_OK`。GS 与 LIDU 使用不同的 HBM 缓存预算，不在该算子 UT 中直接比较链路时延。
 
 CPU 状态机测试：
 
@@ -268,4 +268,17 @@ python3 example/short_prompts.py
 | `NANOVLLM_GS_MISS_RATE_ON_LAYERS` | eager-only；LIDU 复用该历史开关，按指定层打印各请求的 miss count/rate，例如 `0,30,60` |
 
 Chunk prefill 只降低 prefill 激活峰值；不会减少完整请求所需的 KV/IndexCache 容量。其他正式算子 UT 见 `ut_ops/UT_OPS.md`。
- 
+
+
+
+# 最新结果
+
+- 模型：GLM-5.1-w4a8
+- 并行模式：TP16 / EP16
+
+| 推理框架             | batchsize | 序列长度 | 单卡显存需求 (KV+index) | TPOT      | TPS吞吐     |
+| -------------------- | --------- | -------- | ----------------------- | --------- | ----------- |
+| vLLM0.19 原版 不卸载 | bs=24     | 10000    | 26.4 GB                 | 77 ms     | 311 TPS     |
+| vLLM0.19 原版 不卸载 | bs=9      | 21000    | 20.8 GB                 | **65 ms** | **138** TPS |
+| nanovllm 卸载        | bs=9      | 21000    | 7.9 GB                  | 79 ms     | 113 TPS     |
+| nanovllm 卸载        | bs=24     | 21000    | 21.1 GB                 | **98 ms** | **244** TPS |

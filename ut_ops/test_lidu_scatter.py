@@ -10,7 +10,7 @@ from time import perf_counter
 import torch
 import torch_npu  # type: ignore
 
-import nanovllm.ops as ascend_ops
+import nanovllm.ops  # noqa: F401  # Load repository-local custom operators.
 
 
 BLOCK_SIZE = 128
@@ -70,11 +70,6 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=3,
         help="Replay a persistent-output LIDU->SCATTER NPUGraph this many times.",
-    )
-    parser.add_argument(
-        "--skip-gs-compare",
-        action="store_true",
-        help="Skip the same-input LightningIndexer+GatherSelection timing.",
     )
     return parser.parse_args()
 
@@ -573,134 +568,6 @@ def run_graph_case(case: Case, replays: int) -> None:
     )
 
 
-def compare_with_gs(case: Case, warmup: int, iters: int) -> None:
-    """Time both stable chains on the same five offloaded request rows."""
-
-    row_slice = slice(1, None)
-    batch = len(CACHE_TIERS) - 1
-    query = case.query[row_slice].contiguous()
-    weights = case.weights[row_slice].contiguous()
-    req_entries = case.req_entries[row_slice].contiguous()
-    candidate_lens = case.candidate_lens[row_slice].contiguous()
-    index_tables = case.index_block_table[row_slice].contiguous()
-    hbm_tables = case.hbm_block_table[row_slice].contiguous()
-    dram_tables = case.dram_block_table[row_slice].contiguous()
-    cache_tokens = case.cache_tokens[row_slice].contiguous()
-    gather_lens = candidate_lens + 1
-    query_lens = torch.arange(
-        1, batch + 1, dtype=torch.int32, device=case.device
-    )
-
-    selection_blocks_per_row = TOPK // BLOCK_SIZE
-    selection_kpe = torch.zeros(
-        batch * selection_blocks_per_row,
-        BLOCK_SIZE,
-        KPE_DIM,
-        dtype=torch.bfloat16,
-        device=case.device,
-    )
-    selection_ckv = torch.zeros(
-        batch * selection_blocks_per_row,
-        BLOCK_SIZE,
-        CKV_DIM,
-        dtype=torch.bfloat16,
-        device=case.device,
-    )
-    selection_tables = torch.arange(
-        batch * selection_blocks_per_row,
-        dtype=torch.int32,
-        device=case.device,
-    ).view(batch, selection_blocks_per_row)
-    selection_status = torch.full(
-        (case.cache_slots.shape[0], 1, 1, TOPK + 1),
-        -1,
-        dtype=torch.int32,
-        device=case.device,
-    )
-
-    def li_topk() -> torch.Tensor:
-        kwargs = dict(
-            query=query,
-            key=case.index_cache,
-            weights=weights,
-            actual_seq_lengths_query=query_lens,
-            actual_seq_lengths_key=candidate_lens,
-            block_table=index_tables,
-            layout_query="TND",
-            layout_key="PA_BSND",
-            sparse_count=TOPK,
-            sparse_mode=3,
-        )
-        if case.heads == 32:
-            result = torch_npu.npu_lightning_indexer(**kwargs)
-            return result[0] if isinstance(result, (tuple, list)) else result
-        return ascend_ops.npu_lightning_indexer(**kwargs)
-
-    def gs_chain() -> None:
-        topk = li_topk()
-        ascend_ops.npu_gather_selection_kv_cache(
-            selection_kpe,
-            selection_ckv,
-            selection_tables,
-            selection_status,
-            req_entries,
-            topk.view(batch, 1, 1, TOPK),
-            case.dram_kpe,
-            case.dram_ckv,
-            dram_tables,
-            gather_lens,
-        )
-
-    def lidu_chain() -> None:
-        source, slots, counts, _ = torch.ops.nanovllm_dsa.lidu_decode_update.default(
-            query,
-            case.index_cache,
-            weights,
-            req_entries,
-            case.cache_slots,
-            cache_tokens,
-            candidate_lens,
-            index_tables,
-        )
-        torch.ops.nanovllm_dsa.scatter_copy.default(
-            case.hbm_kpe,
-            case.hbm_ckv,
-            case.dram_kpe,
-            case.dram_ckv,
-            hbm_tables,
-            dram_tables,
-            source.view(batch, TOPK),
-            slots.view(batch, TOPK),
-            counts,
-        )
-
-    # Populate GS state once; LIDU state is already warm from run_case().
-    gs_chain()
-    torch.npu.synchronize()
-    for _ in range(warmup):
-        gs_chain()
-    torch.npu.synchronize()
-    start = perf_counter()
-    for _ in range(iters):
-        gs_chain()
-    torch.npu.synchronize()
-    gs_ms = (perf_counter() - start) * 1000.0 / iters
-
-    for _ in range(warmup):
-        lidu_chain()
-    torch.npu.synchronize()
-    start = perf_counter()
-    for _ in range(iters):
-        lidu_chain()
-    torch.npu.synchronize()
-    lidu_ms = (perf_counter() - start) * 1000.0 / iters
-    print(
-        f"LIDU_GS_COMPARE heads={case.heads} batch={batch} "
-        f"li_gs_ms={gs_ms:.6f} lidu_scatter_ms={lidu_ms:.6f} "
-        f"speedup={gs_ms / lidu_ms:.4f} warmup={warmup} iters={iters}"
-    )
-
-
 def main() -> None:
     args = parse_args()
     if args.warmup < 0 or args.iters <= 0 or args.graph_replays < 0:
@@ -729,8 +596,6 @@ def main() -> None:
         case = make_case(head_count, device, args.seed)
         run_case(case, args.warmup, args.iters)
         run_graph_case(case, args.graph_replays)
-        if not args.skip_gs_compare:
-            compare_with_gs(case, args.warmup, args.iters)
         del case
         torch.npu.empty_cache()
     print("LIDU_SCATTER_UT_OK")
