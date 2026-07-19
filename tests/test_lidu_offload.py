@@ -3,11 +3,14 @@ from types import SimpleNamespace
 
 import pytest
 
+import nanovllm.engine.dsa_offload as dsa_offload
 from nanovllm.engine.dsa_offload import (
+    LIDU_CACHE_TOKEN_BUDGETS,
     OFFLOAD_MODES,
     lidu_cache_tokens,
     normalize_offload_mode,
     parse_gs_miss_rate_layers,
+    validate_lidu_cache_token_budgets,
 )
 from nanovllm.config import Config
 from nanovllm.engine.scheduler import Scheduler
@@ -73,6 +76,58 @@ def test_three_modes_and_default_public_api():
 )
 def test_lidu_cache_tiers_use_original_prompt_length(prompt_len, expected):
     assert lidu_cache_tokens(prompt_len) == expected
+
+
+def test_four_long_prompt_cache_budgets_are_centralized_and_tunable(
+    monkeypatch,
+):
+    assert LIDU_CACHE_TOKEN_BUDGETS == (3072, 5120, 8192, 12288)
+    tuned = (5120, 8192, 16384, 24576)
+    monkeypatch.setattr(
+        dsa_offload,
+        "LIDU_CACHE_TOKEN_BUDGETS",
+        tuned,
+    )
+
+    assert validate_lidu_cache_token_budgets(128) == tuned
+    assert lidu_cache_tokens(8192) == 2048
+    assert lidu_cache_tokens(8193) == 5120
+    assert lidu_cache_tokens(16385) == 8192
+    assert lidu_cache_tokens(32769) == 16384
+    assert lidu_cache_tokens(65537) == 24576
+    assert max(
+        lidu_cache_tokens(length)
+        for length in (8193, 16385, 32769, 65537)
+    ) == 24576
+
+    seq = _seq(21_000, "tuned-21k")
+    Scheduler(_config())._prepare_prefill_metadata(seq)
+    assert seq.lidu_cache_tokens == 8192
+    assert seq.num_sparse_tokens == 8192
+
+
+@pytest.mark.parametrize(
+    ("budgets", "message"),
+    [
+        ((5120, 3072, 8192, 12288), "nondecreasing"),
+        ((12288, 12288, 12288, 12288), "exceeds the complete source"),
+        ((1024, 5120, 8192, 12288), "at least 2048"),
+        ((3073, 5120, 8192, 12288), "divisible"),
+        ((3072, 5120, 8192), "exactly four integers"),
+    ],
+)
+def test_invalid_tuned_lidu_budgets_fail_at_startup(
+    monkeypatch,
+    budgets,
+    message,
+):
+    monkeypatch.setattr(
+        dsa_offload,
+        "LIDU_CACHE_TOKEN_BUDGETS",
+        budgets,
+    )
+    with pytest.raises(ValueError, match=message):
+        validate_lidu_cache_token_budgets(128)
 
 
 def test_lidu_reuses_gs_miss_rate_layer_switch():

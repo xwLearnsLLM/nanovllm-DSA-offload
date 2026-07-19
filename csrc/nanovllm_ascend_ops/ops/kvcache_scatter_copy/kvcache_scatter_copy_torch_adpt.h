@@ -35,8 +35,8 @@ inline void npu_kvcache_scatter_copy(
               "SCATTER source and destination shapes must match.");
   TORCH_CHECK(source_token_ids.size(1) > 0,
               "SCATTER input capacity must be positive.");
-  TORCH_CHECK(source_token_ids.size(1) <= 12288,
-              "SCATTER capacity must be <= 12288.");
+  TORCH_CHECK(source_token_ids.size(1) <= 65536,
+              "SCATTER capacity must be <= 65536.");
   TORCH_CHECK(copy_counts.size(0) == source_token_ids.size(0) &&
                   hbm_block_table.size(0) == source_token_ids.size(0) &&
                   dram_block_table.size(0) == source_token_ids.size(0),

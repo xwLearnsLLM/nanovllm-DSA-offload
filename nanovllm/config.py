@@ -7,12 +7,12 @@ from typing import Any
 
 from nanovllm.engine.dsa_offload import (
     DSA_SELECTION_TOPK_TOKENS,
-    LIDU_CACHE_TOKEN_BUDGETS,
     LIDU_MAX_SOURCE_TOKENS,
     OFFLOAD_GS,
     OFFLOAD_LIDU,
     OFFLOAD_NONE,
     normalize_offload_mode,
+    validate_lidu_cache_token_budgets,
 )
 from nanovllm.engine.full_decode_graph import normalize_capture_sizes
 
@@ -330,13 +330,7 @@ class Config:
                 "LIDU prefill-full-block source must contain fewer than 2^18 "
                 f"tokens, got {max_source_tokens}."
             )
-        if any(
-            budget % self.kvcache_block_size
-            for budget in LIDU_CACHE_TOKEN_BUDGETS
-        ):
-            raise ValueError(
-                "Every LIDU cache budget must be divisible by the KV block size."
-            )
+        validate_lidu_cache_token_budgets(self.kvcache_block_size)
 
     def _load_hf_config(self):
         config_path = os.path.join(self.model, "config.json")

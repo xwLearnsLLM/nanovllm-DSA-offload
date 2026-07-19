@@ -9,7 +9,14 @@ OFFLOAD_NONE: Final = "none"
 OFFLOAD_GS: Final = "gs"
 OFFLOAD_LIDU: Final = "lidu"
 OFFLOAD_MODES: Final = (OFFLOAD_NONE, OFFLOAD_GS, OFFLOAD_LIDU)
-LIDU_CACHE_TOKEN_BUDGETS: Final = (2048, 3072, 5120, 8192, 12288)
+# User-tunable LIDU budgets for prompt ranges 8193-16384,
+# 16385-32768, 32769-65536, and >=65537 respectively.  The <=8192 tiers
+# remain fixed at C=0/2048.  Edit only this tuple when comparing cache sizes.
+LIDU_CACHE_TOKEN_BUDGETS: Final = (3072, 5120, 8192, 12288)
+# Each entry is bounded by the complete-block source length at the lower edge
+# of its prompt range.  Once this repository's operators have been compiled,
+# any block-aligned values within these limits can be selected in Python.
+_LIDU_CACHE_TOKEN_BUDGET_LIMITS: Final = (8192, 16384, 32768, 65536)
 LIDU_MAX_SOURCE_TOKENS: Final = (1 << 18) - 1
 
 
@@ -61,17 +68,61 @@ def lidu_cache_tokens(prompt_len: int) -> int:
     """Return the fixed per-request LIDU HBM cache budget C."""
 
     prompt_len = int(prompt_len)
+    tier_16k, tier_32k, tier_64k, tier_larger = (
+        LIDU_CACHE_TOKEN_BUDGETS
+    )
     if prompt_len <= DSA_SELECTION_TOPK_TOKENS:
         return 0
     if prompt_len <= 8192:
-        return 2048
+        return DSA_SELECTION_TOPK_TOKENS
     if prompt_len <= 16384:
-        return 3072
+        return tier_16k
     if prompt_len <= 32768:
-        return 5120
+        return tier_32k
     if prompt_len <= 65536:
-        return 8192
-    return 12288
+        return tier_64k
+    return tier_larger
+
+
+def validate_lidu_cache_token_budgets(
+    block_size: int,
+) -> tuple[int, int, int, int]:
+    """Validate the centralized Python budgets against the current kernels."""
+
+    budgets = LIDU_CACHE_TOKEN_BUDGETS
+    if len(budgets) != 4 or any(
+        isinstance(budget, bool) or not isinstance(budget, int)
+        for budget in budgets
+    ):
+        raise ValueError(
+            "LIDU_CACHE_TOKEN_BUDGETS must contain exactly four integers."
+        )
+    if tuple(sorted(budgets)) != budgets:
+        raise ValueError(
+            "LIDU_CACHE_TOKEN_BUDGETS must be nondecreasing."
+        )
+    if any(budget < DSA_SELECTION_TOPK_TOKENS for budget in budgets):
+        raise ValueError(
+            "Every nonzero LIDU cache budget must be at least 2048 tokens."
+        )
+    oversized = [
+        (budget, limit)
+        for budget, limit in zip(
+            budgets,
+            _LIDU_CACHE_TOKEN_BUDGET_LIMITS,
+        )
+        if budget > limit
+    ]
+    if oversized:
+        raise ValueError(
+            "A LIDU cache budget exceeds the complete source available at "
+            f"its prompt-range boundary: {oversized}."
+        )
+    if any(budget % int(block_size) for budget in budgets):
+        raise ValueError(
+            "Every LIDU cache budget must be divisible by the KV block size."
+        )
+    return budgets
 
 
 def max_lidu_cache_tokens(max_model_len: int) -> int:

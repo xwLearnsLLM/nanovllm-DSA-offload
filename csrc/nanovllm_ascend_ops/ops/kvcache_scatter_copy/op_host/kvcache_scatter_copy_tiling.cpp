@@ -22,7 +22,7 @@ constexpr size_t DIM_2 = 2;
 constexpr int64_t BLOCK_SIZE = 128;
 constexpr int64_t K_ROPE_DIM = 64;
 constexpr int64_t KV_CACHE_DIM = 512;
-constexpr int64_t MAX_COPY_CAP = 12288;
+constexpr int64_t MAX_COPY_CAP = 65536;
 constexpr int64_t DEFAULT_WORKSPACE_SIZE = 32;
 
 ge::graphStatus KvcacheScatterCopyTiling::GetPlatformInfo()
@@ -87,7 +87,7 @@ ge::graphStatus KvcacheScatterCopyTiling::GetShapeInfo()
     copyCap_ = srcIdsShape.GetDim(DIM_1);
     OPS_ERR_IF(copyCap_ <= 0 || copyCap_ > MAX_COPY_CAP ||
                    dstSlotsShape.GetDim(DIM_1) != copyCap_,
-        OPS_LOG_E(context_->GetNodeName(), "src_token_ids and dst_slots must have matching [B, C] shapes with C <= 12288."),
+        OPS_LOG_E(context_->GetNodeName(), "src_token_ids and dst_slots must have matching [B, C] shapes with C <= 65536."),
         return ge::GRAPH_FAILED);
 
     batchSize_ = copyCountsShape.GetDim(DIM_0);

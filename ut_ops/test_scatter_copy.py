@@ -357,7 +357,7 @@ def main() -> None:
         or args.source_len <= 0
         or args.cache_tokens <= 0
         or args.copy_cap <= 0
-        or args.copy_cap > 12288
+        or args.copy_cap > 65536
         or args.copy_cap > args.source_len
         or args.copy_cap > args.cache_tokens
         or args.warmup < 0
@@ -365,7 +365,7 @@ def main() -> None:
     ):
         raise ValueError(
             "batch/source/cache/copy-cap/iters must be positive, copy-cap must "
-            "not exceed source/cache or 12288, and warmup must be >= 0."
+            "not exceed source/cache or 65536, and warmup must be >= 0."
         )
     miss_counts = parse_miss_counts(args.miss_counts, args.copy_cap)
     device = torch.device(args.device)

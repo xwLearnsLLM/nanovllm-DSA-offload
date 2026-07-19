@@ -37,6 +37,12 @@ LM head 和 sampler 始终在图外。首次 LIDU 缓存初始化始终 eager；
 | `32769–65536` | 8192 |
 | `>= 65537` | 12288 |
 
+后四档统一由 `nanovllm/engine/dsa_offload.py` 中的
+`LIDU_CACHE_TOKEN_BUDGETS = (3072, 5120, 8192, 12288)` 控制，按表中顺序对应。
+预算必须是 128 的倍数、不得小于 2048、保持非递减，四档上限依次为
+`8192/16384/32768/65536`。编译本版本算子一次后，实验时只需修改该元组并重启进程，
+不需要再次编译算子；同时要相应增大 `NANOVLLM_HBM_NUM_BLOCKS`。
+
 稀疏 source 只包含原始 prompt 的完整 128-token blocks。prompt 末尾非满块和所有 decode token 始终留在 dense tail，不参与 LIDU 选择或 SCATTER 搬移。Attention 对 C 个缓存 token、prompt tail 和所有 decode token 做 dense MLA，因此真正的 top-2048 一定参与计算且不会重复。
 
 每层维护持久化 request pool。`req_pool_entries[b]` 将当前 batch 行映射到该请求的状态行；batch 重排不搬移状态。首次 decode 分块计算 top-C 并初始化 HBM，稳定 decode 由 LIDU 融合 top-2048、hit/miss、eviction 和索引更新，再由 SCATTER 只搬运 miss token。

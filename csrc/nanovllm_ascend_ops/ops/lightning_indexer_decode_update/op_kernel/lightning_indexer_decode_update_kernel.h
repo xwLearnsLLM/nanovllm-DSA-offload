@@ -201,9 +201,10 @@ __aicore__ inline void LIPreload<LIT>::ProcessMain()
             CleanEmptyRequest(bIdx);
             continue;
         }
-        if (cacheMetadata != 2048 && cacheMetadata != 3072 &&
-            cacheMetadata != 5120 && cacheMetadata != 8192 &&
-            cacheMetadata != 12288) {
+        // The Python policy accepts any block-aligned C within the source
+        // range.  Cache cardinality is preserved by replacing one slot per
+        // miss, so the update kernel does not otherwise depend on a fixed C.
+        if (cacheMetadata < 2048) {
             CleanEmptyRequest(bIdx);
             continue;
         }

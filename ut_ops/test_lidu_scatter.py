@@ -11,14 +11,18 @@ import torch
 import torch_npu  # type: ignore
 
 import nanovllm.ops  # noqa: F401  # Load repository-local custom operators.
+from nanovllm.engine.dsa_offload import (
+    DSA_SELECTION_TOPK_TOKENS,
+    LIDU_CACHE_TOKEN_BUDGETS,
+)
 
 
 BLOCK_SIZE = 128
 INDEX_DIM = 128
-TOPK = 2048
+TOPK = DSA_SELECTION_TOPK_TOKENS
 KPE_DIM = 64
 CKV_DIM = 512
-CACHE_TIERS = (0, 2048, 3072, 5120, 8192, 12288)
+CACHE_TIERS = (0, TOPK, *LIDU_CACHE_TOKEN_BUDGETS)
 CANDIDATE_LENS = (1024, 4096, 8192, 16384, 32768, 65536)
 
 
@@ -368,7 +372,7 @@ def validate_state(case: Case, expected_topk: list[torch.Tensor]) -> None:
 
 
 def run_case(case: Case, warmup: int, iters: int) -> None:
-    # Initialization path: one SCATTER call with capacities up to C=12288.
+    # Initialization path: one SCATTER call at the configured maximum C.
     call_scatter(
         case,
         case.init_source_ids,
@@ -378,7 +382,10 @@ def run_case(case: Case, warmup: int, iters: int) -> None:
     torch.npu.synchronize()
     for row, sources in enumerate(case.expected_initial_sources):
         validate_cache_data(case, row, sources)
-    print(f"LIDU_SCATTER_INIT_CHECK heads={case.heads} max_c=12288 ok=1")
+    print(
+        f"LIDU_SCATTER_INIT_CHECK heads={case.heads} "
+        f"max_c={max(CACHE_TIERS)} ok=1"
+    )
 
     source_ids, destination_slots, miss_counts, cache_alias = call_lidu(case)
     if cache_alias.data_ptr() != case.cache_slots.data_ptr():
@@ -391,7 +398,18 @@ def run_case(case: Case, warmup: int, iters: int) -> None:
     )
     torch.npu.synchronize()
 
-    expected_misses = torch.tensor([0, 1024, 1024, 1024, 1024, 1024])
+    expected_misses = torch.tensor(
+        [
+            0
+            if cache_tokens == 0
+            else min(TOPK // 2, candidate_len - cache_tokens)
+            for cache_tokens, candidate_len in zip(
+                CACHE_TIERS,
+                CANDIDATE_LENS,
+            )
+        ],
+        dtype=torch.int32,
+    )
     actual_misses = miss_counts.detach().cpu()
     if not torch.equal(actual_misses, expected_misses):
         raise AssertionError(
@@ -460,7 +478,7 @@ def run_graph_case(case: Case, replays: int) -> None:
 
     if replays <= 0:
         return
-    row = 2  # candidate_len=8192, C=3072: the GLM 8.2K inference tier.
+    row = 2  # The configurable GLM 8.2K inference tier.
     query = case.query[row : row + 1].clone().contiguous()
     weights = case.weights[row : row + 1].contiguous()
     req_entries = case.req_entries[row : row + 1].contiguous()
