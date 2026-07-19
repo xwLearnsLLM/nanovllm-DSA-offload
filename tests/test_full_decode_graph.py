@@ -205,6 +205,7 @@ def test_ineligible_decode_paths_stay_eager():
     manager.offload_mode = "gs"
     manager.stateful_offload = True
     manager.eager_lidu_uninitialized_count = 0
+    manager.eager_lidu_capture_count = 0
 
     set_context(False, has_first_decode=True)
     try:
@@ -246,7 +247,9 @@ def test_lidu_noop_and_uninitialized_batches_stay_eager():
     manager.eager_no_dsa_count = 0
     manager.eager_mixed_batch_count = 0
     manager.eager_lidu_uninitialized_count = 0
+    manager.eager_lidu_capture_count = 0
     manager.eager_uncaptured_batch_count = 0
+    manager.replay_count = 0
     manager.log_enabled = False
 
     set_context(False, needs_dsa_update=False, lidu_all_rows_ready=True)
@@ -264,6 +267,57 @@ def test_lidu_noop_and_uninitialized_batches_stay_eager():
         reset_context()
     assert output.tolist() == [6, 8]
     assert manager.eager_lidu_uninitialized_count == 1
+
+
+def test_first_initialized_lidu_batch_is_captured_but_runs_eager():
+    calls = []
+    entry = SimpleNamespace(graph=None, output=None)
+    manager = object.__new__(FullDecodeOnlyGraphManager)
+    manager.model = lambda input_ids, positions: input_ids + positions
+    manager.capture_sizes = (2,)
+    manager.offload_mode = "lidu"
+    manager.stateful_offload = True
+    manager._entries = {}
+    manager.eager_prefill_count = 0
+    manager.eager_first_decode_count = 0
+    manager.eager_no_dsa_count = 0
+    manager.eager_mixed_batch_count = 0
+    manager.eager_lidu_uninitialized_count = 0
+    manager.eager_lidu_capture_count = 0
+    manager.eager_uncaptured_batch_count = 0
+    manager.replay_count = 0
+    manager.log_enabled = False
+
+    def allocate(batch_size):
+        assert batch_size == 2
+        manager._entries[batch_size] = entry
+        return entry
+
+    def capture(capture_entry, input_ids, positions, runtime_context):
+        calls.append(
+            (
+                "capture",
+                input_ids.tolist(),
+                positions.tolist(),
+                runtime_context.lidu_all_rows_ready,
+            )
+        )
+        capture_entry.graph = object()
+        capture_entry.output = torch.empty(2, 1)
+
+    manager._allocate_entry = allocate
+    manager._capture_lidu_runtime = capture
+
+    set_context(False, needs_dsa_update=True, lidu_all_rows_ready=True)
+    try:
+        output = manager.run(torch.tensor([2, 3]), torch.tensor([4, 5]))
+    finally:
+        reset_context()
+
+    assert output.tolist() == [6, 8]
+    assert calls == [("capture", [2, 3], [4, 5], True)]
+    assert manager.eager_lidu_capture_count == 1
+    assert manager.replay_count == 0
 
 
 @pytest.mark.parametrize("offload_mode", ["gs", "lidu"])
@@ -312,6 +366,7 @@ def test_exact_eligible_batch_replays_graph(monkeypatch, offload_mode):
     manager.offload_mode = offload_mode
     manager.stateful_offload = True
     manager.eager_lidu_uninitialized_count = 0
+    manager.eager_lidu_capture_count = 0
 
     context = _decode_context()
     set_context(
@@ -376,6 +431,7 @@ def test_dense_mla_graph_pads_to_the_smallest_capture(monkeypatch):
     manager.offload_mode = "none"
     manager.stateful_offload = False
     manager.eager_lidu_uninitialized_count = 0
+    manager.eager_lidu_capture_count = 0
     manager._entries = {4: entry}
     manager._update_stream = object()
     manager.replay_count = 0

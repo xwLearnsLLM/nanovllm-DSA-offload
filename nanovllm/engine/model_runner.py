@@ -166,11 +166,20 @@ class ModelRunner:
                 ),
                 log_enabled=self.rank == 0,
             )
-            if self.world_size > 1:
-                dist.barrier()
-            self.decode_graph_manager.capture_all()
-            if self.world_size > 1:
-                dist.barrier()
+            if self.offload_mode == OFFLOAD_LIDU:
+                if self.rank == 0:
+                    logger.info(
+                        "FULL_DECODE_ONLY: deferring LIDU graph capture until "
+                        "the first initialized stable decode batch."
+                    )
+                if self.world_size > 1:
+                    dist.barrier()
+            else:
+                if self.world_size > 1:
+                    dist.barrier()
+                self.decode_graph_manager.capture_all()
+                if self.world_size > 1:
+                    dist.barrier()
 
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)

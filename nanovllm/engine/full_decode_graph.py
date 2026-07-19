@@ -8,6 +8,7 @@ import gc
 from typing import Any
 
 import torch
+import torch.distributed as dist
 
 from nanovllm.engine.dsa_offload import (
     DSA_SELECTION_TOPK_TOKENS,
@@ -17,7 +18,13 @@ from nanovllm.engine.dsa_offload import (
     max_lidu_cache_tokens,
     normalize_offload_mode,
 )
-from nanovllm.utils.context import Context, get_context, reset_context, set_context
+from nanovllm.utils.context import (
+    Context,
+    get_context,
+    preserve_context,
+    reset_context,
+    set_context,
+)
 from nanovllm.utils.logger import init_logger
 
 
@@ -468,6 +475,7 @@ class FullDecodeOnlyGraphManager:
         self.eager_no_dsa_count = 0
         self.eager_mixed_batch_count = 0
         self.eager_lidu_uninitialized_count = 0
+        self.eager_lidu_capture_count = 0
         self.eager_uncaptured_batch_count = 0
 
         self._validate_runtime()
@@ -587,11 +595,14 @@ class FullDecodeOnlyGraphManager:
             **kwargs,
         )
 
-    def capture_all(self) -> None:
+    def _ensure_capture_resources(self) -> None:
         if self._graph_pool is None:
             self._graph_pool = torch.npu.graph_pool_handle()
         if self._update_stream is None:
             self._update_stream = torch.npu.Stream()
+
+    def capture_all(self) -> None:
+        self._ensure_capture_resources()
 
         if self.log_enabled:
             callable_description = (
@@ -616,14 +627,19 @@ class FullDecodeOnlyGraphManager:
         finally:
             reset_context()
 
-    def _capture(self, entry: FullDecodeGraphEntry) -> None:
-        dummy_kv_len = (
-            DSA_SELECTION_TOPK_TOKENS
-            if self.offload_mode == OFFLOAD_GS
-            else 1
-        )
-        dummy_seq_lens = [dummy_kv_len] * entry.batch_size
-        self._set_capture_context(entry, dummy_seq_lens)
+    def _capture(
+        self,
+        entry: FullDecodeGraphEntry,
+        actual_seq_lens: list[int] | None = None,
+    ) -> None:
+        if actual_seq_lens is None:
+            dummy_kv_len = (
+                DSA_SELECTION_TOPK_TOKENS
+                if self.offload_mode == OFFLOAD_GS
+                else 1
+            )
+            actual_seq_lens = [dummy_kv_len] * entry.batch_size
+        self._set_capture_context(entry, actual_seq_lens)
         capture_context = get_context()
         model_warmup = getattr(
             self.model, "full_decode_graph_eager_warmup", None
@@ -680,6 +696,37 @@ class FullDecodeOnlyGraphManager:
                 len(entry.mla_tasks),
             )
 
+    def _capture_lidu_runtime(
+        self,
+        entry: FullDecodeGraphEntry,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        runtime_context: Context,
+    ) -> None:
+        """Capture LIDU only after every request row has real initialized state."""
+
+        self._ensure_capture_resources()
+        seq_lens = entry.copy_runtime_inputs(
+            input_ids,
+            positions,
+            runtime_context,
+            offload_mode=self.offload_mode,
+        )
+        torch.npu.current_stream().synchronize()
+        if self.log_enabled:
+            logger.info(
+                "FULL_DECODE_ONLY: lazily capturing initialized LIDU decode "
+                "for batch_size=%d; this decode step remains eager.",
+                entry.batch_size,
+            )
+        distributed = dist.is_initialized() and dist.get_world_size() > 1
+        if distributed:
+            dist.barrier()
+        with preserve_context():
+            self._capture(entry, seq_lens)
+        if distributed:
+            dist.barrier()
+
     def _run_eager(
         self,
         input_ids: torch.Tensor,
@@ -725,6 +772,16 @@ class FullDecodeOnlyGraphManager:
             return self._run_eager(input_ids, positions)
         entry = self._entries.get(graph_batch_size)
         if entry is None or entry.graph is None or entry.output is None:
+            if self.offload_mode == OFFLOAD_LIDU:
+                entry = entry or self._allocate_entry(graph_batch_size)
+                self._capture_lidu_runtime(
+                    entry,
+                    input_ids,
+                    positions,
+                    runtime_context,
+                )
+                self.eager_lidu_capture_count += 1
+                return self._run_eager(input_ids, positions)
             raise RuntimeError(
                 "FULL_DECODE_ONLY graph was not pre-captured for exact batch "
                 f"size {graph_batch_size}."
@@ -771,6 +828,7 @@ class FullDecodeOnlyGraphManager:
             "eager_no_dsa": self.eager_no_dsa_count,
             "eager_mixed_batch": self.eager_mixed_batch_count,
             "eager_lidu_uninitialized": self.eager_lidu_uninitialized_count,
+            "eager_lidu_capture": self.eager_lidu_capture_count,
             "eager_uncaptured_batch": self.eager_uncaptured_batch_count,
             "metadata_refreshes": sum(
                 entry.metadata_refresh_count for entry in self._entries.values()

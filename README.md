@@ -22,7 +22,7 @@
 | `1` | eager | eager | eager |
 | `0` | eager | eager | `FULL_DECODE_ONLY` |
 
-LM head 和 sampler 始终在图外。首次 LIDU 缓存初始化也始终 eager；初始化完成后的下一次稳定 decode 才能 replay。DeepSeek 使用 `npugraph_ex + outer ACLGraph`，GLM 使用 raw outer ACLGraph，因此 GLM proof 中 `npugraph_ex=False` 是正常现象。
+LM head 和 sampler 始终在图外。首次 LIDU 缓存初始化始终 eager；下一次 initialized decode 用真实 C、block tables 和 request state 延迟 capture，并仍以 eager 产出当前 token；再下一步开始 replay。DeepSeek 使用 `npugraph_ex + outer ACLGraph`，GLM 使用 raw outer ACLGraph，因此 GLM proof 中 `npugraph_ex=False` 是正常现象。
 
 ## LIDU + SCATTER 语义
 
@@ -133,7 +133,7 @@ export NANOVLLM_PROMPT_LENGTHS=30000,30001,30002,30003,30004,30005
 python3 example/test.py
 ```
 
-结束时应满足 `offload_mode=lidu`、`captures=1`、`replays>0`、`eager_first_decode=1`，且初始化后不再出现 `eager_lidu_uninitialized` 增长。
+结束时应满足 `offload_mode=lidu`、`captures=1`、`replays>0`、`eager_first_decode=1`、`eager_lidu_capture=1`，且初始化后不再出现 `eager_lidu_uninitialized` 增长。
 
 ## DeepSeek V3.2：GS 整图对照
 
@@ -221,7 +221,7 @@ export NANOVLLM_PROMPT_LENGTHS=8200
 python3 example/test.py
 ```
 
-GLM 结束 proof 应满足 `offload_mode=lidu`、`npugraph_ex=False`、`captures=1` 和 `replays>0`。同一配置把 `NANOVLLM_ENFORCE_EAGER` 分别设为 `1/0` 时，`temperature=0` 的 token IDs 应一致。
+GLM 结束 proof 应满足 `offload_mode=lidu`、`npugraph_ex=False`、`captures=1`、`replays>0` 和 `eager_lidu_capture=1`。同一配置把 `NANOVLLM_ENFORCE_EAGER` 分别设为 `1/0` 时，`temperature=0` 的 token IDs 应一致。
 
 ## 短序列 smoke
 

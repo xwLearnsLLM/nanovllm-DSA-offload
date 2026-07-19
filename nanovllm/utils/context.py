@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 import torch
@@ -94,3 +95,15 @@ def set_context(
 def reset_context() -> None:
     global _CONTEXT
     _CONTEXT = Context()
+
+
+@contextmanager
+def preserve_context():
+    """Restore the active model context after temporary graph capture."""
+
+    global _CONTEXT
+    previous = _CONTEXT
+    try:
+        yield
+    finally:
+        _CONTEXT = previous
