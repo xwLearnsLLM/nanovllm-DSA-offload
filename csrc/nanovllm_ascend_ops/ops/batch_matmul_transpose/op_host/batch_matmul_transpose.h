@@ -25,8 +25,11 @@ std::unordered_map<c10::ScalarType, TensorDType> atType2tensorDType = {
     {at::ScalarType::BFloat16, TensorDType::TENSOR_DTYPE_BF16},
     {at::ScalarType::Half, TensorDType::TENSOR_DTYPE_FLOAT16}};
 
-// batch size -> memory index
+// M -> memory index. Shared-A and legacy expanded-A must never reuse the same
+// slot: queued kernels read tiling asynchronously, so a later host-side copy
+// for the other layout would otherwise change an earlier kernel's addressing.
 constexpr uint32_t MAX_CAPTURE_NUM = 1024;
+constexpr uint32_t CAPTURE_LAYOUT_NUM = 2;
 
 template <typename MapType>
 inline int GetModeVal(const MapType &mode_map, c10::optional<c10::string_view> mode_opt, c10::string_view default_mode,
@@ -114,18 +117,20 @@ std::tuple<at::Tensor, uint32_t> batch_matmul_transpose_tiling(const at::Tensor 
 
     // tiling
     int32_t batchIdx = opShape.m - 1;
+    int32_t tilingIdx = batchIdx + (sharedA ? MAX_CAPTURE_NUM : 0);
     uint32_t tilingSize = sizeof(pp_matmul::PpMatmulTilingData);
     static auto global_tiling_data = at::empty(
-        {tilingSize * MAX_CAPTURE_NUM}, at::TensorOptions().dtype(at::kByte).device(tensor_a.options().device()));
+        {tilingSize * MAX_CAPTURE_NUM * CAPTURE_LAYOUT_NUM},
+        at::TensorOptions().dtype(at::kByte).device(tensor_a.options().device()));
     if (batchIdx >= 0 && batchIdx < MAX_CAPTURE_NUM) {
-        aclrtMemcpy(global_tiling_data.data_ptr<uint8_t>() + (tilingSize * batchIdx), tilingSize, &matmulTilingData,
+        aclrtMemcpy(global_tiling_data.data_ptr<uint8_t>() + (tilingSize * tilingIdx), tilingSize, &matmulTilingData,
                     tilingSize, ACL_MEMCPY_HOST_TO_DEVICE);
     } else {
         // Handle the case where batchIdx is out of range
         TORCH_CHECK(false, "batchIdx is out of range: ", batchIdx);
     }
     at::Tensor tiling_tensor =
-        at::from_blob(global_tiling_data.data_ptr<uint8_t>() + (tilingSize * batchIdx), tilingSize, at::kByte);
+        at::from_blob(global_tiling_data.data_ptr<uint8_t>() + (tilingSize * tilingIdx), tilingSize, at::kByte);
 
     return std::make_tuple(tiling_tensor, block_dim);
 
