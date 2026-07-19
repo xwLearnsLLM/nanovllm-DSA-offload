@@ -36,7 +36,11 @@ public:
         }
 
         kRopeUbOffset_ = KV_CACHE_UB_BYTES / sizeof(T);
-        pipe_->InitBuffer(copyQueue_, 1, KV_CACHE_UB_BYTES + K_ROPE_UB_BYTES);
+        // Keep one payload in VECOUT while MTE2 prefetches the next random
+        // DRAM row into VECIN.  SCATTER has no vector compute with which to
+        // hide either transfer, so a two-slot bound queue is the whole
+        // software pipeline.
+        pipe_->InitBuffer(copyQueue_, 2, KV_CACHE_UB_BYTES + K_ROPE_UB_BYTES);
 
         hbmKRoPEGm_.SetGlobalBuffer((__gm__ T*)hbmKRoPE);
         hbmKvCacheGm_.SetGlobalBuffer((__gm__ T*)hbmKvCache);
@@ -55,30 +59,52 @@ public:
             return;
         }
 
-        int64_t cachedBatchIdx = -1;
-        int32_t cachedCopyCount = 0;
-        int64_t flatPairIdx = blockIdx_;
-        while (flatPairIdx < tiling_->totalPairSlots) {
-            int64_t batchIdx = flatPairIdx / tiling_->copyCap;
-            int32_t copyIdx = static_cast<int32_t>(flatPairIdx - batchIdx * tiling_->copyCap);
-            if (batchIdx != cachedBatchIdx) {
-                cachedCopyCount = copyCountsGm_.GetValue(batchIdx);
-                ASSERT_MSG(cachedCopyCount >= 0 && cachedCopyCount <= tiling_->copyCap,
-                    "copy_count exceeds the SCATTER input capacity.");
-                cachedBatchIdx = batchIdx;
+        cachedBatchIdx_ = -1;
+        cachedCopyCount_ = 0;
+
+        int64_t currentFlatPair = FindNextValidPair(blockIdx_);
+        CopyAddress currentAddress;
+        while (currentFlatPair < tiling_->totalPairSlots &&
+               !ResolveAddress(currentFlatPair, currentAddress)) {
+            currentFlatPair = FindNextValidPair(currentFlatPair + tiling_->usedCoreNum);
+        }
+        if (currentFlatPair >= tiling_->totalPairSlots) {
+            return;
+        }
+
+        CopyIn(currentAddress);
+        while (true) {
+            int64_t nextFlatPair = FindNextValidPair(currentFlatPair + tiling_->usedCoreNum);
+            CopyAddress nextAddress;
+            while (nextFlatPair < tiling_->totalPairSlots &&
+                   !ResolveAddress(nextFlatPair, nextAddress)) {
+                nextFlatPair = FindNextValidPair(nextFlatPair + tiling_->usedCoreNum);
             }
 
-            if (copyIdx >= cachedCopyCount) {
-                flatPairIdx = FirstFlatPairAtOrAfter((batchIdx + 1) * tiling_->copyCap);
-                continue;
+            const bool hasNext = nextFlatPair < tiling_->totalPairSlots;
+            if (hasNext) {
+                // Issue the next DRAM->UB transfer before draining the current
+                // UB->HBM payload.  The two queue slots keep both operations
+                // in flight without changing per-core destination ownership.
+                CopyIn(nextAddress);
             }
-
-            CopyOne(batchIdx, copyIdx);
-            flatPairIdx += tiling_->usedCoreNum;
+            CopyOut(currentAddress);
+            if (!hasNext) {
+                break;
+            }
+            currentFlatPair = nextFlatPair;
+            currentAddress = nextAddress;
         }
     }
 
 private:
+    struct CopyAddress {
+        int64_t srcKv = 0;
+        int64_t dstKv = 0;
+        int64_t srcRope = 0;
+        int64_t dstRope = 0;
+    };
+
     __aicore__ inline int64_t FirstFlatPairAtOrAfter(int64_t start)
     {
         if (start <= blockIdx_) {
@@ -88,14 +114,35 @@ private:
         return blockIdx_ + steps * tiling_->usedCoreNum;
     }
 
-    __aicore__ inline void CopyOne(int64_t batchIdx, int32_t copyIdx)
+    __aicore__ inline int64_t FindNextValidPair(int64_t flatPairIdx)
     {
+        while (flatPairIdx < tiling_->totalPairSlots) {
+            int64_t batchIdx = flatPairIdx / tiling_->copyCap;
+            int32_t copyIdx = static_cast<int32_t>(flatPairIdx - batchIdx * tiling_->copyCap);
+            if (batchIdx != cachedBatchIdx_) {
+                cachedCopyCount_ = copyCountsGm_.GetValue(batchIdx);
+                ASSERT_MSG(cachedCopyCount_ >= 0 && cachedCopyCount_ <= tiling_->copyCap,
+                    "copy_count exceeds the SCATTER input capacity.");
+                cachedBatchIdx_ = batchIdx;
+            }
+            if (copyIdx < cachedCopyCount_) {
+                return flatPairIdx;
+            }
+            flatPairIdx = FirstFlatPairAtOrAfter((batchIdx + 1) * tiling_->copyCap);
+        }
+        return tiling_->totalPairSlots;
+    }
+
+    __aicore__ inline bool ResolveAddress(int64_t flatPairIdx, CopyAddress& address)
+    {
+        int64_t batchIdx = flatPairIdx / tiling_->copyCap;
+        int32_t copyIdx = static_cast<int32_t>(flatPairIdx - batchIdx * tiling_->copyCap);
         int64_t pairOffset = batchIdx * tiling_->copyCap + copyIdx;
         int32_t srcTokenId = srcTokenIdsGm_.GetValue(pairOffset);
         int32_t dstSlot = dstSlotsGm_.GetValue(pairOffset);
         ASSERT_MSG(srcTokenId >= 0 && dstSlot >= 0, "active src_token_ids and dst_slots must be non-negative.");
         if (srcTokenId < 0 || dstSlot < 0) {
-            return;
+            return false;
         }
 
         int64_t srcBlockCol = static_cast<int64_t>(srcTokenId) >> BLOCK_SHIFT;
@@ -105,7 +152,7 @@ private:
         ASSERT_MSG(srcBlockCol < tiling_->dramMaxBlockNum && dstBlockCol < tiling_->hbmMaxBlockNum,
             "active source token or destination slot exceeds its block table.");
         if (srcBlockCol >= tiling_->dramMaxBlockNum || dstBlockCol >= tiling_->hbmMaxBlockNum) {
-            return;
+            return false;
         }
 
         int32_t srcPhysicalBlock =
@@ -114,29 +161,40 @@ private:
             hbmBlockTableGm_.GetValue(batchIdx * tiling_->hbmMaxBlockNum + dstBlockCol);
         ASSERT_MSG(srcPhysicalBlock >= 0 && dstPhysicalBlock >= 0, "block table entries must be non-negative.");
         if (srcPhysicalBlock < 0 || dstPhysicalBlock < 0) {
-            return;
+            return false;
         }
 
-        int64_t srcKvAddr =
+        address.srcKv =
             (static_cast<int64_t>(srcPhysicalBlock) * BLOCK_SIZE + srcBlockOffset) * KV_CACHE_DIM;
-        int64_t dstKvAddr =
+        address.dstKv =
             (static_cast<int64_t>(dstPhysicalBlock) * BLOCK_SIZE + dstBlockOffset) * KV_CACHE_DIM;
-        int64_t srcRopeAddr =
+        address.srcRope =
             (static_cast<int64_t>(srcPhysicalBlock) * BLOCK_SIZE + srcBlockOffset) * K_ROPE_DIM;
-        int64_t dstRopeAddr =
+        address.dstRope =
             (static_cast<int64_t>(dstPhysicalBlock) * BLOCK_SIZE + dstBlockOffset) * K_ROPE_DIM;
+        return true;
+    }
 
+    __aicore__ inline void CopyIn(const CopyAddress& address)
+    {
         LocalTensor<T> local = copyQueue_.AllocTensor<T>();
         DataCopyPadExtParams<T> padParams{false, 0, 0, 0};
         DataCopyExtParams kvParams{1, static_cast<uint32_t>(KV_CACHE_UB_BYTES), 0, 0, 0};
         DataCopyExtParams ropeParams{1, static_cast<uint32_t>(K_ROPE_UB_BYTES), 0, 0, 0};
 
-        DataCopyPad(local, dramKvCacheGm_[srcKvAddr], kvParams, padParams);
-        DataCopyPad(local[kRopeUbOffset_], dramKRoPEGm_[srcRopeAddr], ropeParams, padParams);
+        DataCopyPad(local, dramKvCacheGm_[address.srcKv], kvParams, padParams);
+        DataCopyPad(local[kRopeUbOffset_], dramKRoPEGm_[address.srcRope], ropeParams, padParams);
         copyQueue_.EnQue(local);
-        local = copyQueue_.DeQue<T>();
-        DataCopyPad(hbmKvCacheGm_[dstKvAddr], local, kvParams);
-        DataCopyPad(hbmKRoPEGm_[dstRopeAddr], local[kRopeUbOffset_], ropeParams);
+    }
+
+    __aicore__ inline void CopyOut(const CopyAddress& address)
+    {
+        LocalTensor<T> local = copyQueue_.DeQue<T>();
+        DataCopyExtParams kvParams{1, static_cast<uint32_t>(KV_CACHE_UB_BYTES), 0, 0, 0};
+        DataCopyExtParams ropeParams{1, static_cast<uint32_t>(K_ROPE_UB_BYTES), 0, 0, 0};
+
+        DataCopyPad(hbmKvCacheGm_[address.dstKv], local, kvParams);
+        DataCopyPad(hbmKRoPEGm_[address.dstRope], local[kRopeUbOffset_], ropeParams);
         copyQueue_.FreeTensor(local);
     }
 
@@ -150,6 +208,8 @@ private:
     const KvcacheScatterCopyTilingData* tiling_;
     int32_t blockIdx_ = -1;
     int32_t kRopeUbOffset_ = 0;
+    int64_t cachedBatchIdx_ = -1;
+    int32_t cachedCopyCount_ = 0;
 
     GlobalTensor<T> hbmKRoPEGm_;
     GlobalTensor<T> hbmKvCacheGm_;
@@ -160,7 +220,7 @@ private:
     GlobalTensor<int32_t> srcTokenIdsGm_;
     GlobalTensor<int32_t> dstSlotsGm_;
     GlobalTensor<int32_t> copyCountsGm_;
-    TQueBind<QuePosition::VECIN, QuePosition::VECOUT, 1> copyQueue_;
+    TQueBind<QuePosition::VECIN, QuePosition::VECOUT, 2> copyQueue_;
 };
 
 } // namespace KvcacheScatterCopyNs
