@@ -732,12 +732,30 @@ def main() -> None:
         raise AssertionError(
             "GLM query-only test did not select the BMM-transpose hot path."
         )
+    if not indexer_project._can_use_query_rope_op(
+        q_bmm,
+        cos_bmm,
+        sin_bmm,
+        GLM_INDEX_ROPE_DIM,
+        "interleave",
+    ):
+        raise AssertionError(
+            "GLM query-only test did not select the fused in-place RoPE "
+            "hot path. Rebuild nanovllm ops."
+        )
 
     torch.npu.synchronize()
     q_bmm_diff = assert_close(
         "query_only_bmm_q_index",
         q_bmm,
         q_linear,
+        atol=0.04,
+        rtol=0.02,
+    )
+    q_bmm_golden_diff = assert_close(
+        "query_only_bmm_q_index_golden",
+        q_bmm,
+        q_expected[:bmm_batch],
         atol=0.04,
         rtol=0.02,
     )
@@ -758,8 +776,75 @@ def main() -> None:
         "GLM_DSA_QUERY_ONLY_BMM_CHECK ok=1 "
         f"batch={bmm_batch} path=batch_matmul_transpose_shared_a "
         f"q_max_abs={q_bmm_diff:.6g} "
+        f"q_golden_max_abs={q_bmm_golden_diff:.6g} "
         f"weights_max_abs={weights_bmm_diff:.6g} "
         f"q_min_cosine={min_cosine:.9f}",
+        flush=True,
+    )
+
+    q_post_legacy_raw = torch.empty_like(q_bmm)
+    q_post_legacy_out = torch.empty_like(q_bmm)
+    q_post_fused_out = torch.empty_like(q_bmm)
+
+    def run_legacy_query_post() -> None:
+        ascend_ops.batch_matmul_transpose(
+            q_c_bmm,
+            wq_b_bmm_t,
+            q_post_legacy_raw,
+        )
+        q_pe = indexer_project._apply_query_rope_like_runtime(
+            q_post_legacy_raw[..., :GLM_INDEX_ROPE_DIM],
+            cos_bmm,
+            sin_bmm,
+            GLM_INDEX_ROPE_DIM,
+            "interleave",
+        )
+        q_post_legacy_out[..., :GLM_INDEX_ROPE_DIM].copy_(q_pe)
+        q_post_legacy_out[..., GLM_INDEX_ROPE_DIM:].copy_(
+            q_post_legacy_raw[..., GLM_INDEX_ROPE_DIM:]
+        )
+
+    def run_fused_query_post() -> None:
+        ascend_ops.batch_matmul_transpose(
+            q_c_bmm,
+            wq_b_bmm_t,
+            q_post_fused_out,
+        )
+        ascend_ops.dsa_indexer_query_rope_inplace(
+            q_post_fused_out,
+            cos_bmm,
+            sin_bmm,
+            GLM_INDEX_ROPE_DIM,
+            "interleave",
+        )
+
+    run_legacy_query_post()
+    run_fused_query_post()
+    torch.npu.synchronize()
+    query_post_diff = assert_close(
+        "query_only_fused_post",
+        q_post_fused_out,
+        q_post_legacy_out,
+        atol=0.04,
+        rtol=0.02,
+    )
+    legacy_query_post_ms = benchmark_ms(
+        run_legacy_query_post,
+        args.bmm_warmup,
+        args.bmm_iters,
+    )
+    fused_query_post_ms = benchmark_ms(
+        run_fused_query_post,
+        args.bmm_warmup,
+        args.bmm_iters,
+    )
+    print(
+        "GLM_DSA_QUERY_POST_CHECK ok=1 "
+        f"batch={bmm_batch} q_max_abs={query_post_diff:.6g} "
+        f"legacy_shared_bmm_rope_copy_ms={legacy_query_post_ms:.6f} "
+        f"direct_bmm_fused_rope_ms={fused_query_post_ms:.6f} "
+        f"speedup={legacy_query_post_ms / fused_query_post_ms:.4f} "
+        f"warmup={args.bmm_warmup} iters={args.bmm_iters}",
         flush=True,
     )
 

@@ -72,7 +72,7 @@ namespace py = pybind11;
 namespace {
 
 constexpr const char* kDsaIndexerProjectBindingVersion =
-    "dsa_indexer_project_post_csrc_v1";
+    "dsa_indexer_project_post_csrc_v2";
 
 c10::optional<at::Tensor> optional_tensor(const py::object& obj) {
   if (obj.is_none()) {
@@ -686,4 +686,12 @@ PYBIND11_MODULE(_C, m) {
       py::arg("weights_out"),
       py::arg("score_scale"),
       py::arg("rope_dim"));
+  m.def(
+      "dsa_indexer_query_rope_inplace",
+      &vllm_ascend::dsa_indexer_query_rope_inplace,
+      py::arg("q_inout"),
+      py::arg("cos"),
+      py::arg("sin"),
+      py::arg("rope_dim"),
+      py::arg("rotary_mode"));
 }

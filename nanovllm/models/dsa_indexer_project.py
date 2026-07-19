@@ -213,7 +213,7 @@ _register_nanovllm_dsa_torchair_converters()
 
 _POST_OPS = None
 _POST_IMPORT_ERROR: Exception | None = None
-_EXPECTED_POST_BINDING_VERSION = "dsa_indexer_project_post_csrc_v1"
+_EXPECTED_POST_BINDING_VERSION = "dsa_indexer_project_post_csrc_v2"
 if ascend_ops is None:
     _POST_IMPORT_ERROR = ascend_ops_import_error
 else:
@@ -572,15 +572,89 @@ def _q_project(
     n_head: int,
     head_dim: int,
     enable_q_bmm: bool,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    expected_shape = (q_c.shape[0], n_head, head_dim)
+    if out is not None:
+        if out.shape != expected_shape:
+            raise ValueError(
+                f"q projection output shape must be {expected_shape}, "
+                f"got {tuple(out.shape)}"
+            )
+        if out.dtype != q_c.dtype or out.device != q_c.device:
+            raise ValueError(
+                "q projection output must match q_c dtype/device, got "
+                f"dtype={out.dtype} device={out.device}"
+            )
+        if not out.is_contiguous():
+            raise ValueError("q projection output must be contiguous")
     if _can_use_q_bmm(q_c, wq_b_bmm_t, enable_q_bmm):
-        q = torch.empty((q_c.shape[0], n_head, head_dim), dtype=q_c.dtype, device=q_c.device)
+        q = out
+        if q is None:
+            q = torch.empty(
+                expected_shape,
+                dtype=q_c.dtype,
+                device=q_c.device,
+            )
         # batch_matmul_transpose treats a 2-D tensor_a as shared across every
         # index head.  This avoids materializing [tokens, heads, q_lora_rank]
         # on every layer of the stable decode graph.
         ascend_ops.batch_matmul_transpose(q_c, wq_b_bmm_t, q)
         return q
-    return F.linear(q_c, wq_b_weight).view(-1, n_head, head_dim)
+    q = F.linear(q_c, wq_b_weight).view(expected_shape)
+    if out is not None:
+        out.copy_(q)
+        return out
+    return q
+
+
+def _can_use_query_rope_op(
+    q: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    rope_dim: int,
+    rotary_mode: str,
+) -> bool:
+    # GLM uses a raw outer ACLGraph.  Keep the DeepSeek half/NeoX path on its
+    # existing npugraph_ex-compatible operators for now.
+    return (
+        _normalize_rotary_mode(rotary_mode) == "interleave"
+        and _POST_OPS is not None
+        and hasattr(_POST_OPS, "dsa_indexer_query_rope_inplace")
+        and q.device.type == "npu"
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and cos.dtype == q.dtype
+        and sin.dtype == q.dtype
+        and q.is_contiguous()
+        and cos.is_contiguous()
+        and sin.is_contiguous()
+        and 0 < int(rope_dim) <= q.shape[-1]
+        and int(rope_dim) % 16 == 0
+        and q.shape[-1] % 16 == 0
+    )
+
+
+def _run_query_rope_inplace(
+    q: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    rope_dim: int,
+    rotary_mode: str,
+) -> None:
+    if _POST_OPS is None or not hasattr(
+        _POST_OPS, "dsa_indexer_query_rope_inplace"
+    ):
+        raise RuntimeError(
+            "dsa_indexer query RoPE op is not built into nanovllm.ops. Run "
+            "`bash scripts/build_nanovllm_ops.sh` on the Ascend machine first."
+        ) from _POST_IMPORT_ERROR
+    _POST_OPS.dsa_indexer_query_rope_inplace(
+        q,
+        cos,
+        sin,
+        int(rope_dim),
+        _normalize_rotary_mode(rotary_mode),
+    )
 
 
 def dsa_indexer_project(
@@ -672,16 +746,41 @@ def dsa_indexer_project_query_only(
     if index_weights_out.shape != (hidden_states.shape[0], n_head):
         raise ValueError(f"index_weights_out shape must be {(hidden_states.shape[0], n_head)}, got {tuple(index_weights_out.shape)}")
 
-    q = _q_project(q_c, wq_b_weight, wq_b_bmm_t, int(n_head), int(head_dim), bool(enable_q_bmm))
+    rotary_mode = _normalize_rotary_mode(rotary_mode)
+    # GLM stable decode writes the shared-A BMM result directly into the
+    # persistent query buffer.  The non-RoPE suffix is already final and no
+    # longer needs a slice/copy round trip. Keep DeepSeek's npugraph_ex path
+    # unchanged until this raw custom launch is registered for Dynamo.
+    direct_out = q_index_out if rotary_mode == "interleave" else None
+    q = _q_project(
+        q_c,
+        wq_b_weight,
+        wq_b_bmm_t,
+        int(n_head),
+        int(head_dim),
+        bool(enable_q_bmm),
+        out=direct_out,
+    )
 
     _query_only_weights_proj(hidden_states, weights_proj_weight, index_weights_out, float(score_scale))
 
-    q_pe, q_nope = torch.split(q, [int(rope_dim), int(head_dim) - int(rope_dim)], dim=-1)
+    if _can_use_query_rope_op(q, cos, sin, int(rope_dim), rotary_mode):
+        _run_query_rope_inplace(
+            q,
+            cos,
+            sin,
+            int(rope_dim),
+            rotary_mode,
+        )
+        return q_index_out, index_weights_out
+
+    q_pe = q[..., : int(rope_dim)]
     q_pe = _apply_query_rope_like_runtime(
         q_pe, cos, sin, int(rope_dim), rotary_mode
     )
     q_index_out[..., : int(rope_dim)].copy_(q_pe)
-    q_index_out[..., int(rope_dim) :].copy_(q_nope)
+    if q is not q_index_out:
+        q_index_out[..., int(rope_dim) :].copy_(q[..., int(rope_dim) :])
     return q_index_out, index_weights_out
 
 
