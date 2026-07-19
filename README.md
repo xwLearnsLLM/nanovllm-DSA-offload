@@ -268,3 +268,4 @@ python3 example/short_prompts.py
 | `NANOVLLM_GS_MISS_RATE_ON_LAYERS` | eager-only；LIDU 复用该历史开关，按指定层打印各请求的 miss count/rate，例如 `0,30,60` |
 
 Chunk prefill 只降低 prefill 激活峰值；不会减少完整请求所需的 KV/IndexCache 容量。其他正式算子 UT 见 `ut_ops/UT_OPS.md`。
+ 
