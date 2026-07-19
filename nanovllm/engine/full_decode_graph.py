@@ -160,6 +160,7 @@ class FullDecodeGraphEntry:
     decode_metadata_key: tuple[tuple[int, int], ...] | None = None
     metadata_refresh_count: int = 0
     metadata_reuse_count: int = 0
+    replay_count: int = 0
 
     @classmethod
     def allocate(
@@ -810,8 +811,33 @@ class FullDecodeOnlyGraphManager:
                 graph_batch_size,
                 self.offload_mode,
             )
+        entry.replay_count += 1
         self.replay_count += 1
         return entry.output[:batch_size]
+
+    def is_stable_replay_ready(self, runtime_batch_size: int) -> bool:
+        """Return whether the next decode uses an already-warmed graph entry."""
+
+        if self.stateful_offload:
+            graph_batch_size = (
+                runtime_batch_size
+                if runtime_batch_size in self.capture_sizes
+                else None
+            )
+        else:
+            graph_batch_size = select_capture_size(
+                runtime_batch_size,
+                self.capture_sizes,
+            )
+        if graph_batch_size is None:
+            return False
+        entry = self._entries.get(graph_batch_size)
+        return bool(
+            entry is not None
+            and entry.graph is not None
+            and entry.output is not None
+            and entry.replay_count > 0
+        )
 
     def stats(self) -> dict[str, Any]:
         return {

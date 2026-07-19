@@ -91,9 +91,10 @@ class LLMEngine:
             self.model_runner = ModelRunner(config, 0, self.events)
             self.scheduler = Scheduler(config)
             self._last_prefill_chunk_progress = None
-            # Profiling is created lazily in the rank-0 engine immediately
-            # before its first decode forward. Worker ranks only run
-            # ModelRunner.loop(), so they never create a profiler.
+            # Profiling is created lazily in the rank-0 engine. Eager mode
+            # starts at its first decode; graph mode waits until lazy capture
+            # and the first replay have completed, so profiling cannot skew
+            # one TP rank during graph construction.
             self._decode_profile_output = os.environ.get(
                 "NANOVLLM_PROFILE_DECODE_OUTPUT",
                 "",
@@ -276,10 +277,26 @@ class LLMEngine:
             experimental_config=experimental_config,
         )
         logger.info(
-            "Starting TP rank-0 profiler before the first decode step: %s",
+            "Starting TP rank-0 profiler before %s: %s",
+            (
+                "the first eager decode step"
+                if self.config.enforce_eager
+                else "a stable FULL_DECODE_ONLY replay"
+            ),
             output_dir,
         )
         self._decode_profiler.start()
+
+    def _decode_profile_ready(self, batch_size: int) -> bool:
+        if not self._decode_profile_output or self._decode_profiler is not None:
+            return False
+        if self.config.enforce_eager:
+            return True
+        manager = self.model_runner.decode_graph_manager
+        return bool(
+            manager is not None
+            and manager.is_stable_replay_ready(batch_size)
+        )
 
     def _stop_decode_profiler(self) -> None:
         profiler = self._decode_profiler
@@ -329,7 +346,7 @@ class LLMEngine:
             is_final_prefill_step = progress == len(seq)
         else:
             num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
-        if not is_prefill:
+        if not is_prefill and self._decode_profile_ready(len(seqs)):
             self._start_decode_profiler()
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         if is_final_prefill_step:
