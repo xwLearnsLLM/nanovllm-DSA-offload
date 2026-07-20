@@ -371,6 +371,34 @@ def validate_state(case: Case, expected_topk: list[torch.Tensor]) -> None:
             raise AssertionError(f"row={row} does not contain every true top-2048 token")
 
 
+def validate_full_topk_slots(
+    case: Case,
+    destination_slots: torch.Tensor,
+    expected_topk: list[torch.Tensor],
+) -> None:
+    """The full LIDU slot row is the sparse Attention index input."""
+
+    state_pool = case.cache_slots.detach().cpu()
+    actual_rows = destination_slots.detach().cpu().view(len(CACHE_TIERS), TOPK)
+    for row, (cache_tokens, topk_sources) in enumerate(
+        zip(CACHE_TIERS, expected_topk)
+    ):
+        if cache_tokens == 0:
+            continue
+        pool_row = int(case.req_entries_cpu[row])
+        expected_slots = state_pool[pool_row, topk_sources].to(torch.int64)
+        actual_slots = actual_rows[row].to(torch.int64)
+        if bool((actual_slots < 0).any()):
+            raise AssertionError(f"row={row} full top-k slots contain invalid values")
+        if torch.unique(actual_slots).numel() != TOPK:
+            raise AssertionError(f"row={row} full top-k slots are not unique")
+        if not torch.equal(
+            torch.sort(actual_slots).values,
+            torch.sort(expected_slots).values,
+        ):
+            raise AssertionError(f"row={row} full top-k slot set is incorrect")
+
+
 def run_case(case: Case, warmup: int, iters: int) -> None:
     # Initialization path: one SCATTER call at the configured maximum C.
     call_scatter(
@@ -422,12 +450,14 @@ def run_case(case: Case, warmup: int, iters: int) -> None:
         for cache_tokens, candidate_len in zip(CACHE_TIERS, CANDIDATE_LENS)
     ]
     validate_state(case, expected_high)
+    validate_full_topk_slots(case, destination_slots, expected_high)
     for row, sources in enumerate(expected_high):
         validate_cache_data(case, row, sources)
     print(
         f"LIDU_SCATTER_UPDATE_CHECK heads={case.heads} "
         f"miss_counts={actual_misses.tolist()} ok=1"
     )
+    print(f"LIDU_FULL_TOPK_SLOTS_CHECK heads={case.heads} ok=1")
 
     # Identical query must be a zero-miss repeat and leave every pool row valid.
     repeat_source, repeat_slots, repeat_counts, _ = call_lidu(case)
@@ -444,6 +474,7 @@ def run_case(case: Case, warmup: int, iters: int) -> None:
             f"repeat update must have zero misses, got {repeat_counts_cpu.tolist()}"
         )
     validate_state(case, expected_high)
+    validate_full_topk_slots(case, repeat_slots, expected_high)
     print(f"LIDU_SCATTER_ZERO_MISS_CHECK heads={case.heads} ok=1")
 
     for _ in range(warmup):
@@ -578,6 +609,16 @@ def run_graph_case(case: Case, replays: int) -> None:
         if bool((state[expected] < 0).any()):
             raise AssertionError(
                 f"graph replay={replay} dropped a true top-2048 token"
+            )
+        full_slots = graph_outputs[1].view(-1).cpu().to(torch.int64)
+        expected_slots = state[expected].to(torch.int64)
+        if not torch.equal(
+            torch.sort(full_slots).values,
+            torch.sort(expected_slots).values,
+        ):
+            raise AssertionError(
+                f"graph replay={replay} did not publish the full top-2048 "
+                "HBM slot set"
             )
         validate_cache_data(case, row, expected)
     print(

@@ -146,6 +146,7 @@ class FullDecodeGraphEntry:
     input_ids: torch.Tensor
     positions: torch.Tensor
     flat_slot_mapping_i32: torch.Tensor
+    actual_seq_lengths_kv: torch.Tensor
     block_tables: torch.Tensor
     index_block_tables: torch.Tensor
     dram_block_tables: torch.Tensor
@@ -188,6 +189,9 @@ class FullDecodeGraphEntry:
             input_ids=torch.zeros(batch_size, dtype=torch.int64, device=device),
             positions=torch.zeros(batch_size, dtype=torch.int64, device=device),
             flat_slot_mapping_i32=flat_slot_mapping_i32,
+            actual_seq_lengths_kv=torch.ones(
+                batch_size, dtype=torch.int32, device=device
+            ),
             block_tables=torch.zeros(
                 batch_size,
                 max_block_columns,
@@ -260,6 +264,7 @@ class FullDecodeGraphEntry:
         context: Context,
         *,
         offload_mode: str = OFFLOAD_NONE,
+        uses_tensor_mla_lengths: bool = False,
     ) -> list[int]:
         if input_ids.ndim != 1 or positions.ndim != 1:
             raise ValueError(
@@ -302,6 +307,10 @@ class FullDecodeGraphEntry:
                 required_metadata["lidu_cache_tokens"] = (
                     context.lidu_cache_tokens
                 )
+        if uses_tensor_mla_lengths:
+            required_metadata["actual_seq_lengths_kv_tensor"] = (
+                context.actual_seq_lengths_kv_tensor
+            )
         missing = [name for name, value in required_metadata.items() if value is None]
         if missing:
             raise RuntimeError(
@@ -385,6 +394,10 @@ class FullDecodeGraphEntry:
                 "Decode actual_seq_lengths_kv must have one value per request: "
                 f"got {len(seq_lens)} for batch {runtime_batch_size}."
             )
+        if uses_tensor_mla_lengths:
+            self.actual_seq_lengths_kv.copy_(
+                context.actual_seq_lengths_kv_tensor
+            )
         if stateful_offload:
             return seq_lens
         return seq_lens + [0] * (self.batch_size - runtime_batch_size)
@@ -408,6 +421,7 @@ class FullDecodeOnlyGraphManager:
         device: str | torch.device,
         expected_mla_tasks: int,
         offload_mode: str = OFFLOAD_NONE,
+        uses_tensor_mla_lengths: bool = False,
         enable_npugraph_ex: bool = True,
         log_enabled: bool = True,
     ) -> None:
@@ -464,6 +478,7 @@ class FullDecodeOnlyGraphManager:
             )
         self.device = torch.device(device)
         self.expected_mla_tasks = int(expected_mla_tasks)
+        self.uses_tensor_mla_lengths = bool(uses_tensor_mla_lengths)
         self.enable_npugraph_ex = bool(enable_npugraph_ex)
         self.log_enabled = bool(log_enabled)
         self._entries: dict[int, FullDecodeGraphEntry] = {}
@@ -569,6 +584,17 @@ class FullDecodeOnlyGraphManager:
         entry: FullDecodeGraphEntry,
         actual_seq_kvlen: list[int],
     ) -> None:
+        uses_tensor_mla_lengths = getattr(
+            self, "uses_tensor_mla_lengths", False
+        )
+        if uses_tensor_mla_lengths:
+            entry.actual_seq_lengths_kv.copy_(
+                torch.tensor(
+                    actual_seq_kvlen,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+            )
         kwargs = {}
         if self.stateful_offload:
             kwargs.update(
@@ -591,6 +617,11 @@ class FullDecodeOnlyGraphManager:
             False,
             flat_slot_mapping_i32=entry.flat_slot_mapping_i32,
             actual_seq_lengths_kv=actual_seq_kvlen,
+            actual_seq_lengths_kv_tensor=(
+                entry.actual_seq_lengths_kv
+                if uses_tensor_mla_lengths
+                else None
+            ),
             block_tables=entry.block_tables,
             has_first_decode=False,
             **kwargs,
@@ -712,6 +743,9 @@ class FullDecodeOnlyGraphManager:
             positions,
             runtime_context,
             offload_mode=self.offload_mode,
+            uses_tensor_mla_lengths=getattr(
+                self, "uses_tensor_mla_lengths", False
+            ),
         )
         torch.npu.current_stream().synchronize()
         if self.log_enabled:
@@ -793,6 +827,9 @@ class FullDecodeOnlyGraphManager:
             positions,
             runtime_context,
             offload_mode=self.offload_mode,
+            uses_tensor_mla_lengths=getattr(
+                self, "uses_tensor_mla_lengths", False
+            ),
         )
 
         # Wait for H2D metadata staging and the previous replay before changing

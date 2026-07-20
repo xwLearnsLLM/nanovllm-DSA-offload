@@ -89,6 +89,7 @@ class _DecodeDynamicBuffers:
     input_ids: _HostDeviceVector
     positions: _HostDeviceVector
     slot_mapping_i32: _HostDeviceVector
+    actual_seq_lengths_kv: _HostDeviceVector
 
     @classmethod
     def allocate(cls, batch_size: int, device: str) -> "_DecodeDynamicBuffers":
@@ -104,6 +105,11 @@ class _DecodeDynamicBuffers:
                 device,
             ),
             slot_mapping_i32=_HostDeviceVector.allocate(
+                batch_size,
+                torch.int32,
+                device,
+            ),
+            actual_seq_lengths_kv=_HostDeviceVector.allocate(
                 batch_size,
                 torch.int32,
                 device,
@@ -147,6 +153,10 @@ class ModelRunner:
         torch.set_default_device(self.device)
 
         self.model = self._load_default_strategy()
+        self.uses_sparse_and_tail_attention = (
+            self.offload_mode == OFFLOAD_LIDU
+            and isinstance(self.model, GlmMoeDsaForCausalLM)
+        )
 
         self.sampler = Sampler()
         self._decode_dynamic_buffers: dict[int, _DecodeDynamicBuffers] = {}
@@ -172,8 +182,13 @@ class ModelRunner:
                 max_model_len=config.max_model_len,
                 block_size=config.kvcache_block_size,
                 device=self.device,
-                expected_mla_tasks=int(text_config.num_hidden_layers),
+                expected_mla_tasks=(
+                    0
+                    if self.uses_sparse_and_tail_attention
+                    else int(text_config.num_hidden_layers)
+                ),
                 offload_mode=self.offload_mode,
+                uses_tensor_mla_lengths=self.uses_sparse_and_tail_attention,
                 # GLM W4A8 + EP16 is captured as one raw outer ACLGraph.
                 # TorchAir's optional FX lowering is left enabled for
                 # DeepSeek, where it is already validated and faster.
@@ -221,9 +236,14 @@ class ModelRunner:
                         else "FULL_DECODE_ONLY raw ACLGraph"
                     ),
                     (
-                        f"{self.offload_mode} decode offload (topk=2048)"
-                        if self.uses_offload
-                        else "dense MLA (all KV)"
+                        "lidu offload + sparse-and-tail MLA "
+                        "(cached top-2048 + dense tail)"
+                        if self.offload_mode == OFFLOAD_LIDU
+                        else (
+                            f"{self.offload_mode} decode offload (topk=2048)"
+                            if self.uses_offload
+                            else "dense MLA (all KV)"
+                        )
                     ),
                     self.config.max_model_len,
                     self.world_size,
@@ -865,6 +885,11 @@ class ModelRunner:
             flat_slot_mapping_i32 = dynamic_buffers.slot_mapping_i32.stage(
                 flat_slot_mapping
             )
+            actual_seq_lengths_kv_tensor = (
+                dynamic_buffers.actual_seq_lengths_kv.stage(sparse_kv_lens)
+                if self.uses_sparse_and_tail_attention
+                else None
+            )
             flat_slot_mapping_i64 = None
         else:
             # Preserve the allocation-based eager path.  Worker ranks can
@@ -886,6 +911,13 @@ class ModelRunner:
                 pin_memory=True,
             ).to(self.device, non_blocking=True)
             flat_slot_mapping_i64 = None
+            actual_seq_lengths_kv_tensor = None
+            if self.uses_sparse_and_tail_attention:
+                actual_seq_lengths_kv_tensor = torch.tensor(
+                    sparse_kv_lens,
+                    dtype=torch.int32,
+                    pin_memory=True,
+                ).to(self.device, non_blocking=True)
             if has_first_decode:
                 flat_slot_mapping_i64 = torch.tensor(
                     flat_slot_mapping,
@@ -913,6 +945,7 @@ class ModelRunner:
             flat_slot_mapping=flat_slot_mapping_i64,
             flat_slot_mapping_i32=flat_slot_mapping_i32,
             actual_seq_lengths_kv=sparse_kv_lens,
+            actual_seq_lengths_kv_tensor=actual_seq_lengths_kv_tensor,
             block_tables=static_metadata.block_tables,
             index_block_tables=static_metadata.index_block_tables,
             dram_block_tables=static_metadata.dram_block_tables,

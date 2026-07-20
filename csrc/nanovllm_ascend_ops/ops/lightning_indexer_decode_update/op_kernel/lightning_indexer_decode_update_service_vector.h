@@ -559,13 +559,15 @@ __aicore__ inline void LIVector<LIT>::UpdateCacheAndWriteTopkSlots(
             cacheSlotsGm.SetValue(rowBase + missIndex, evictSlot);
         }
     }
-    if (missCount > 0) {
-        SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
-        SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
-        DataCopyPad(topkSlotsGm[outOffset], topkSlotsLocal,
-                    {1, static_cast<uint16_t>(missCount * sizeof(int32_t)), 0, 0});
-        SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
-    }
+    // SCATTER consumes only the first missCount entries.  The complete row is
+    // also the logical-slot list for sparse attention after the cache update,
+    // so publish all top-k slots without adding another index materialization
+    // kernel to every decoder layer.
+    SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
+    SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
+    DataCopyPad(topkSlotsGm[outOffset], topkSlotsLocal,
+                {1, static_cast<uint16_t>(BASE_TOPK * sizeof(int32_t)), 0, 0});
+    SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
 }
 
 template <typename LIT>

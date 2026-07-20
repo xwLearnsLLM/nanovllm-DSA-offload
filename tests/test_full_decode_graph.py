@@ -30,6 +30,9 @@ def _decode_context(
             dtype=torch.int32,
         ),
         actual_seq_lengths_kv=list(range(2200, 2200 + batch_size)),
+        actual_seq_lengths_kv_tensor=torch.arange(
+            2200, 2200 + batch_size, dtype=torch.int32
+        ),
         block_tables=block_tables,
         index_block_tables=block_tables + 10,
         dram_block_tables=block_tables + 20,
@@ -97,6 +100,33 @@ def test_static_entry_copies_lidu_tiers_for_mixed_batch():
     )
 
     assert entry.lidu_cache_tokens.tolist() == [0, 3072]
+
+
+def test_static_entry_refreshes_tensor_mla_lengths_every_step():
+    entry = FullDecodeGraphEntry.allocate(2, 4, 2, torch.device("cpu"))
+    key = ((10, 3), (11, 7))
+    context = _decode_context(metadata_key=key)
+
+    entry.copy_runtime_inputs(
+        torch.tensor([11, 12], dtype=torch.int64),
+        torch.tensor([2199, 2200], dtype=torch.int64),
+        context,
+        offload_mode="lidu",
+        uses_tensor_mla_lengths=True,
+    )
+    assert entry.actual_seq_lengths_kv.tolist() == [2200, 2201]
+
+    context.actual_seq_lengths_kv = [2201, 2202]
+    context.actual_seq_lengths_kv_tensor.add_(1)
+    entry.copy_runtime_inputs(
+        torch.tensor([21, 22], dtype=torch.int64),
+        torch.tensor([2200, 2201], dtype=torch.int64),
+        context,
+        offload_mode="lidu",
+        uses_tensor_mla_lengths=True,
+    )
+    assert entry.metadata_reuse_count == 1
+    assert entry.actual_seq_lengths_kv.tolist() == [2201, 2202]
 
 
 def test_static_entry_reuses_unchanged_decode_metadata():

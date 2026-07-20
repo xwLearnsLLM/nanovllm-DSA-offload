@@ -19,9 +19,10 @@ def lidu_decode_update(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run the repository-bundled stable LIDU operator.
 
-    Only the first ``miss_counts[b]`` entries of the two 2048-capacity output
-    rows are valid.  The final return value aliases ``cache_slots_pool`` so
-    graph compilers can see the mutable request-state dependency.
+    The first ``miss_counts[b]`` source IDs and destination slots describe
+    SCATTER copies.  The complete destination row contains the 2048 HBM slots
+    selected for attention after the cache update.  The final return value
+    aliases ``cache_slots_pool`` so graph compilers can see mutable state.
     """
 
     return torch.ops.nanovllm_dsa.lidu_decode_update.default(
@@ -89,6 +90,36 @@ def scatter_copy(
         source_token_ids,
         destination_slots,
         copy_counts,
+    )
+
+
+def sparse_and_tail_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    sparse_slots: torch.Tensor,
+    cache_tokens: torch.Tensor,
+    block_table: torch.Tensor,
+    actual_seq_lengths_query: torch.Tensor,
+    actual_seq_lengths_kv: torch.Tensor,
+    query_rope: torch.Tensor,
+    key_rope: torch.Tensor,
+    scale_value: float,
+) -> torch.Tensor:
+    """Attend to cached top-2048 slots plus the complete dense tail."""
+
+    return torch.ops.nanovllm_dsa.sparse_and_tail_attention.default(
+        query,
+        key,
+        value,
+        sparse_slots,
+        cache_tokens,
+        block_table,
+        actual_seq_lengths_query,
+        actual_seq_lengths_kv,
+        query_rope,
+        key_rope,
+        float(scale_value),
     )
 
 

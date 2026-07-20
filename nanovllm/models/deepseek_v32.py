@@ -36,6 +36,7 @@ from nanovllm.models.lidu import (
     lidu_decode_update,
     lidu_decode_update_out,
     scatter_copy,
+    sparse_and_tail_attention,
 )
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
@@ -767,6 +768,10 @@ class DeepseekV32MLAAttention(nn.Module):
             self.offload_mode == OFFLOAD_LIDU
             and getattr(config, "model_type", "") == "glm_moe_dsa"
         )
+        self._use_lidu_sparse_and_tail_attention = (
+            self.offload_mode == OFFLOAD_LIDU
+            and getattr(config, "model_type", "") == "glm_moe_dsa"
+        )
         self._lidu_raw_graph_outputs: dict[
             int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]
         ] = {}
@@ -873,7 +878,7 @@ class DeepseekV32MLAAttention(nn.Module):
         q_c: torch.Tensor,
         positions: torch.Tensor,
         batch_size: int,
-    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
         if self.indexer is None or self.indexer_rotary_emb is None:
             raise RuntimeError("DSA indexer is disabled for this engine.")
         context = get_context()
@@ -1448,7 +1453,7 @@ class DeepseekV32MLAAttention(nn.Module):
         q_index: torch.Tensor,
         weights: torch.Tensor,
         batch_size: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         context = get_context()
         required = {
             "req_pool_entries": context.req_pool_entries,
@@ -1529,7 +1534,7 @@ class DeepseekV32MLAAttention(nn.Module):
             )
         if self._lidu_miss_count_enabled:
             self._print_lidu_miss_counts(miss_counts, batch_size)
-        return scatter_copy(
+        kpe_alias, ckv_alias = scatter_copy(
             hbm_kpe,
             hbm_ckv,
             dram_kpe,
@@ -1540,6 +1545,7 @@ class DeepseekV32MLAAttention(nn.Module):
             destination_slots.view(batch_size, -1),
             miss_counts[:batch_size],
         )
+        return kpe_alias, ckv_alias, destination_slots
 
     @torch.compiler.disable
     def _print_lidu_miss_counts(
@@ -1579,7 +1585,9 @@ class DeepseekV32MLAAttention(nn.Module):
         q_index: torch.Tensor | None,
         weights: torch.Tensor | None,
         dsa_updated: bool = False,
-        cache_aliases: tuple[torch.Tensor, torch.Tensor] | None = None,
+        cache_aliases: tuple[
+            torch.Tensor, torch.Tensor, torch.Tensor
+        ] | None = None,
     ) -> torch.Tensor:
         context = get_context()
         batch_size = int(ql_nope.shape[0])
@@ -1591,18 +1599,69 @@ class DeepseekV32MLAAttention(nn.Module):
                 cache_aliases = self._lidu_update(q_index, weights, batch_size)
             else:
                 self._dsa_offload_update(q_index, weights, batch_size)
-        kpe_cache = ckv_cache = None
+        kpe_cache = ckv_cache = sparse_slots = None
         if cache_aliases is not None:
-            kpe_cache, ckv_cache = cache_aliases
-        latent = self._decode_forward_mla_v2(
-            ql_nope,
-            q_pe,
-            context.block_tables[:batch_size],
-            context.actual_seq_lengths_kv,
-            ckv_cache=ckv_cache,
-            kpe_cache=kpe_cache,
-        )
-        output = torch_npu.npu_transpose_batchmatmul(latent.view(self.num_local_heads, batch_size, self.kv_lora_rank), self.w_uv, perm_y=(1, 0, 2)).reshape(batch_size, -1)
+            kpe_cache, ckv_cache, sparse_slots = cache_aliases
+        if (
+            self._use_lidu_sparse_and_tail_attention
+            and not context.has_first_decode
+            and sparse_slots is not None
+        ):
+            required = {
+                "candidate_query_lens": context.candidate_query_lens,
+                "actual_seq_lengths_kv_tensor": (
+                    context.actual_seq_lengths_kv_tensor
+                ),
+                "lidu_cache_tokens": context.lidu_cache_tokens,
+                "block_tables": context.block_tables,
+            }
+            missing = [
+                name for name, value in required.items() if value is None
+            ]
+            if missing:
+                raise RuntimeError(
+                    "Sparse-and-tail Attention context is missing: "
+                    + ", ".join(missing)
+                )
+            latent = sparse_and_tail_attention(
+                ql_nope,
+                ckv_cache.view(
+                    -1, self.block_size, 1, self.kv_lora_rank
+                ),
+                ckv_cache.view(
+                    -1, self.block_size, 1, self.kv_lora_rank
+                ),
+                sparse_slots[:batch_size],
+                context.lidu_cache_tokens[:batch_size],
+                context.block_tables[:batch_size],
+                context.candidate_query_lens[:batch_size],
+                context.actual_seq_lengths_kv_tensor[:batch_size],
+                q_pe,
+                kpe_cache.view(
+                    -1, self.block_size, 1, self.qk_rope_head_dim
+                ),
+                self.scale,
+            )
+            latent_for_v_up = latent.transpose(0, 1).contiguous()
+        else:
+            latent = self._decode_forward_mla_v2(
+                ql_nope,
+                q_pe,
+                context.block_tables[:batch_size],
+                context.actual_seq_lengths_kv,
+                ckv_cache=ckv_cache,
+                kpe_cache=kpe_cache,
+            )
+            latent_for_v_up = latent.view(
+                self.num_local_heads,
+                batch_size,
+                self.kv_lora_rank,
+            )
+        output = torch_npu.npu_transpose_batchmatmul(
+            latent_for_v_up,
+            self.w_uv,
+            perm_y=(1, 0, 2),
+        ).reshape(batch_size, -1)
         return output
 
     def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor, skip_o_proj: bool = False) -> torch.Tensor:

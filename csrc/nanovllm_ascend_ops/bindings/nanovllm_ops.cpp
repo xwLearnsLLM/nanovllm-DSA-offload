@@ -62,6 +62,7 @@ extern void mla_preprocess_impl(
 #include "ops/gather_selection_kv_cache/gather_selection_kv_cache_torch_adpt.h"
 #include "ops/lightning_indexer_decode_update/lightning_indexer_decode_update_torch_adpt.h"
 #include "ops/kvcache_scatter_copy/kvcache_scatter_copy_torch_adpt.h"
+#include "ops/sparse_and_tail_attention/sparse_and_tail_attention_torch_adpt.h"
 #include "ops/matmul_allreduce_add_rmsnorm/matmul_allreduce_add_rmsnorm_torch_adpt.h"
 #include "ops/moe_gating_top_k/moe_gating_top_k_torch_adpt.h"
 #include "ops/dsa_indexer_project/dsa_indexer_project_torch_adpt.h"
@@ -380,6 +381,49 @@ std::tuple<at::Tensor, at::Tensor> scatter_copy_meta(
   return std::make_tuple(hbm_k_rope, hbm_kv_cache);
 }
 
+at::Tensor sparse_and_tail_attention_torch_op(
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& value,
+    const at::Tensor& sparse_slots,
+    const at::Tensor& cache_tokens,
+    const at::Tensor& block_table,
+    const at::Tensor& actual_seq_lengths_query,
+    const at::Tensor& actual_seq_lengths_kv,
+    const at::Tensor& query_rope,
+    const at::Tensor& key_rope,
+    double scale_value) {
+  return vllm_ascend::npu_sparse_and_tail_attention(
+      query, key, value, sparse_slots, cache_tokens, block_table,
+      actual_seq_lengths_query, actual_seq_lengths_kv, query_rope, key_rope,
+      scale_value);
+}
+
+at::Tensor sparse_and_tail_attention_meta(
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& value,
+    const at::Tensor& sparse_slots,
+    const at::Tensor& cache_tokens,
+    const at::Tensor& block_table,
+    const at::Tensor& actual_seq_lengths_query,
+    const at::Tensor& actual_seq_lengths_kv,
+    const at::Tensor& query_rope,
+    const at::Tensor& key_rope,
+    double scale_value) {
+  (void)key;
+  (void)value;
+  (void)sparse_slots;
+  (void)cache_tokens;
+  (void)block_table;
+  (void)actual_seq_lengths_query;
+  (void)actual_seq_lengths_kv;
+  (void)query_rope;
+  (void)key_rope;
+  (void)scale_value;
+  return at::empty_like(query);
+}
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_gating_top_k_py(
     const at::Tensor& x,
     int64_t k,
@@ -557,6 +601,11 @@ TORCH_LIBRARY(nanovllm_dsa, ops) {
       " Tensor dram_block_table, Tensor source_token_ids,"
       " Tensor destination_slots, Tensor copy_counts)"
       " -> (Tensor(a!), Tensor(b!))");
+  ops.def(
+      "sparse_and_tail_attention(Tensor query, Tensor key, Tensor value,"
+      " Tensor sparse_slots, Tensor cache_tokens, Tensor block_table,"
+      " Tensor actual_seq_lengths_query, Tensor actual_seq_lengths_kv,"
+      " Tensor query_rope, Tensor key_rope, float scale_value) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(nanovllm_dsa, PrivateUse1, ops) {
@@ -565,6 +614,7 @@ TORCH_LIBRARY_IMPL(nanovllm_dsa, PrivateUse1, ops) {
   ops.impl("lidu_decode_update", &lidu_decode_update_torch_op);
   ops.impl("lidu_decode_update_out", &lidu_decode_update_out_torch_op);
   ops.impl("scatter_copy", &scatter_copy_torch_op);
+  ops.impl("sparse_and_tail_attention", &sparse_and_tail_attention_torch_op);
 }
 
 TORCH_LIBRARY_IMPL(nanovllm_dsa, Meta, ops) {
@@ -573,6 +623,7 @@ TORCH_LIBRARY_IMPL(nanovllm_dsa, Meta, ops) {
   ops.impl("lidu_decode_update", &lidu_decode_update_meta);
   ops.impl("lidu_decode_update_out", &lidu_decode_update_out_meta);
   ops.impl("scatter_copy", &scatter_copy_meta);
+  ops.impl("sparse_and_tail_attention", &sparse_and_tail_attention_meta);
 }
 
 PYBIND11_MODULE(_C, m) {

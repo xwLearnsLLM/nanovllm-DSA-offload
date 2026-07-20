@@ -14,6 +14,7 @@ class Context:
     flat_slot_mapping_i32: torch.Tensor | None = None
     flat_index_slot_mapping: torch.Tensor | None = None
     actual_seq_lengths_kv: list[int] | None = None
+    actual_seq_lengths_kv_tensor: torch.Tensor | None = None
     block_tables: torch.Tensor | None = None
     index_block_tables: torch.Tensor | None = None
     dram_block_tables: torch.Tensor | None = None
@@ -48,6 +49,7 @@ def set_context(
     flat_slot_mapping_i32=None,
     flat_index_slot_mapping=None,
     actual_seq_lengths_kv=None,
+    actual_seq_lengths_kv_tensor=None,
     block_tables=None,
     index_block_tables=None,
     dram_block_tables=None,
@@ -73,6 +75,7 @@ def set_context(
         flat_slot_mapping_i32=flat_slot_mapping_i32,
         flat_index_slot_mapping=flat_index_slot_mapping,
         actual_seq_lengths_kv=actual_seq_lengths_kv,
+        actual_seq_lengths_kv_tensor=actual_seq_lengths_kv_tensor,
         block_tables=block_tables,
         index_block_tables=index_block_tables,
         dram_block_tables=dram_block_tables,
