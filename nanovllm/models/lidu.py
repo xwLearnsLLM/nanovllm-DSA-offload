@@ -95,8 +95,7 @@ def scatter_copy(
 
 def sparse_and_tail_attention(
     query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
+    latent_kv_cache: torch.Tensor,
     sparse_slots: torch.Tensor,
     cache_tokens: torch.Tensor,
     block_table: torch.Tensor,
@@ -110,8 +109,8 @@ def sparse_and_tail_attention(
 
     return torch.ops.nanovllm_dsa.sparse_and_tail_attention.default(
         query,
-        key,
-        value,
+        latent_kv_cache,
+        latent_kv_cache,
         sparse_slots,
         cache_tokens,
         block_table,

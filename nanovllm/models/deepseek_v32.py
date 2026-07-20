@@ -1623,14 +1623,12 @@ class DeepseekV32MLAAttention(nn.Module):
                     "Sparse-and-tail Attention context is missing: "
                     + ", ".join(missing)
                 )
+            latent_kv_cache = ckv_cache.view(
+                -1, self.block_size, 1, self.kv_lora_rank
+            )
             latent = sparse_and_tail_attention(
                 ql_nope,
-                ckv_cache.view(
-                    -1, self.block_size, 1, self.kv_lora_rank
-                ),
-                ckv_cache.view(
-                    -1, self.block_size, 1, self.kv_lora_rank
-                ),
+                latent_kv_cache,
                 sparse_slots[:batch_size],
                 context.lidu_cache_tokens[:batch_size],
                 context.block_tables[:batch_size],
