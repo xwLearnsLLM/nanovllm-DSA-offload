@@ -21,6 +21,7 @@ from nanovllm.engine.dsa_offload import (
     OFFLOAD_GS,
     OFFLOAD_LIDU,
     OFFLOAD_NONE,
+    finalize_prefill_hbm_layout,
     max_lidu_cache_tokens,
 )
 from nanovllm.engine.full_decode_graph import (
@@ -977,38 +978,7 @@ class ModelRunner:
                 if finalize is not None:
                     finalize(seq, old_hbm_block_table)
 
-            if seq.num_sparse_blocks >= seq.num_prefill_full_blocks:
-                keep_sparse = old_hbm_block_table[: seq.num_prefill_full_blocks]
-                release_blocks = []
-                if self.offload_mode == OFFLOAD_LIDU:
-                    # The complete source already fits the tier budget.  Every
-                    # layer installed an identity source->slot map above, so no
-                    # first-decode top-C initialization or DRAM copy is needed.
-                    seq.lidu_cache_initialized = True
-            elif self.offload_mode == OFFLOAD_LIDU:
-                # LIDU owns a dense destination arena [0, C).  The first
-                # decode eagerly replaces these initial tokens with top-C;
-                # prompt tail and future decode blocks remain after the arena.
-                keep_sparse = old_hbm_block_table[: seq.num_sparse_blocks]
-                release_blocks = old_hbm_block_table[
-                    seq.num_sparse_blocks : seq.num_prefill_full_blocks
-                ]
-            else:
-                # GS preserves its prefix/suffix layout and mutable status map.
-                prefix_blocks = 1 if seq.num_sparse_blocks > 0 else 0
-                suffix_blocks = seq.num_sparse_blocks - prefix_blocks
-                suffix_start = seq.num_prefill_full_blocks - suffix_blocks
-                keep_sparse = (
-                    old_hbm_block_table[:prefix_blocks]
-                    + old_hbm_block_table[suffix_start : seq.num_prefill_full_blocks]
-                )
-                release_blocks = old_hbm_block_table[prefix_blocks:suffix_start]
-            keep_tail = old_hbm_block_table[seq.num_prefill_full_blocks : seq.num_prefill_blocks]
-            seq.hbm_block_table = keep_sparse + keep_tail
-            seq.block_table = seq.hbm_block_table
-            seq.hbm_blocks_to_release = release_blocks
-            seq.offload_finalized = True
-            seq.bump_decode_metadata_version()
+            finalize_prefill_hbm_layout(seq, self.offload_mode)
 
     @torch.inference_mode()
     def run(

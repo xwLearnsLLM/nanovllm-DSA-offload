@@ -115,11 +115,49 @@ class Scheduler:
         seq.num_sparse_tokens = num_sparse_blocks * seq.block_size
         seq.lidu_cache_tokens = lidu_tokens
         seq.lidu_cache_initialized = not lidu_tokens
+        seq.lidu_decode_hbm_pending = False
         seq.num_prefix_cached_blocks = 0
         seq.offload_finalized = False
 
+    def _lidu_decode_reservation_blocks(self, seq: Sequence) -> int:
+        """Return this request's initial/active decode HBM footprint.
+
+        A request that has not completed prefill yet will sample one token at
+        the end of prefill, hence the extra token below.  The reservation is a
+        logical admission-control budget only: pending C blocks remain free and
+        may be borrowed by a later prefill.
+        """
+
+        source_tokens = seq.num_prefill_full_blocks * self.block_size
+        tail_and_decode_tokens = max(0, len(seq) - source_tokens)
+        if not seq.offload_finalized:
+            tail_and_decode_tokens += 1
+        tail_and_decode_blocks = (
+            tail_and_decode_tokens + self.block_size - 1
+        ) // self.block_size
+        return seq.num_sparse_blocks + tail_and_decode_blocks
+
+    def _can_reserve_lidu_decode_hbm(self, candidate: Sequence) -> bool:
+        if self.offload_mode != OFFLOAD_LIDU:
+            return True
+        active = list(self.running)
+        if self.prefilling is not None and self.prefilling not in active:
+            active.append(self.prefilling)
+        if candidate not in active:
+            active.append(candidate)
+        reserved_blocks = sum(
+            self._lidu_decode_reservation_blocks(seq) for seq in active
+        )
+        usable_blocks = (
+            len(self.hbm_block_manager.free_block_ids)
+            + len(self.hbm_block_manager.used_block_ids)
+        )
+        return reserved_blocks <= usable_blocks
+
     def _can_allocate_prefill(self, seq: Sequence) -> bool:
         self._prepare_prefill_metadata(seq)
+        if not self._can_reserve_lidu_decode_hbm(seq):
+            return False
         if not self.hbm_block_manager.can_allocate_blocks(
             seq.num_prefill_blocks
         ):
@@ -232,21 +270,43 @@ class Scheduler:
         return [seq]
 
     def can_append(self, seq: Sequence) -> bool:
-        need_new_block = len(seq) % self.block_size == 1
-        if not need_new_block:
-            return True
-        if not self.hbm_block_manager.can_allocate_blocks(1):
-            return False
-        return True
+        pending_sparse_blocks = (
+            seq.num_sparse_blocks
+            if (
+                self.offload_mode == OFFLOAD_LIDU
+                and seq.lidu_decode_hbm_pending
+            )
+            else 0
+        )
+        growth_blocks = int(len(seq) % self.block_size == 1)
+        return self.hbm_block_manager.can_allocate_blocks(
+            pending_sparse_blocks + growth_blocks
+        )
 
     def may_append(self, seq: Sequence) -> None:
-        if len(seq) % self.block_size != 1:
+        pending_sparse_blocks = (
+            seq.num_sparse_blocks
+            if (
+                self.offload_mode == OFFLOAD_LIDU
+                and seq.lidu_decode_hbm_pending
+            )
+            else 0
+        )
+        growth_blocks = int(len(seq) % self.block_size == 1)
+        num_new_blocks = pending_sparse_blocks + growth_blocks
+        if not num_new_blocks:
             return
+        new_blocks = self.hbm_block_manager.allocate_blocks(num_new_blocks)
+        if pending_sparse_blocks:
+            seq.hbm_block_table = (
+                new_blocks[:pending_sparse_blocks]
+                + seq.hbm_block_table
+            )
+            seq.lidu_decode_hbm_pending = False
         # Decode tokens never participate in sparse selection, so growing a
         # request must not consume IndexCache blocks.
-        seq.hbm_block_table.extend(
-            self.hbm_block_manager.allocate_blocks(1),
-        )
+        if growth_blocks:
+            seq.hbm_block_table.extend(new_blocks[pending_sparse_blocks:])
         seq.block_table = seq.hbm_block_table
         seq.bump_decode_metadata_version()
 
@@ -277,6 +337,7 @@ class Scheduler:
         seq.offload_pool_entry = -1
         seq.offload_finalized = False
         seq.lidu_cache_initialized = not seq.lidu_cache_tokens
+        seq.lidu_decode_hbm_pending = False
         seq.bump_decode_metadata_version()
 
     def preempt(self, seq: Sequence):

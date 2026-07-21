@@ -45,6 +45,8 @@ LM head 和 sampler 始终在图外。首次 LIDU 缓存初始化始终 eager；
 
 稀疏 source 只包含原始 prompt 的完整 128-token blocks。prompt 末尾非满块和所有 decode token 始终留在 dense tail，不参与 LIDU 选择或 SCATTER 搬移。Attention 对 C 个缓存 token、prompt tail 和所有 decode token 做 dense MLA，因此真正的 top-2048 一定参与计算且不会重复。
 
+对于真正发生卸载的 LIDU 请求，final prefill 把完整 source KV 持久化到 DRAM 后会释放全部完整 prompt HBM blocks，只保留 dense tail。C-token HBM arena 此时只做逻辑容量预留，后续请求的 prefill 可以临时借用这些空闲 blocks；该请求第一次进入 decode 前，调度器再原子申请 C blocks（以及必要的新 tail block）并放到 block table 前部。准入检查会保证所有活跃请求最终的 decode footprint 不超过可用 HBM，避免多个 prefill 成功后在首次 decode 才 OOM。GS 的缓存布局不受这一策略影响。
+
 每层维护持久化 request pool。`req_pool_entries[b]` 将当前 batch 行映射到该请求的状态行；batch 重排不搬移状态。首次 decode 分块计算 top-C 并初始化 HBM，稳定 decode 由 LIDU 融合 top-2048、hit/miss、eviction 和索引更新，再由 SCATTER 只搬运 miss token。
 
 ## 本仓库自包含算子

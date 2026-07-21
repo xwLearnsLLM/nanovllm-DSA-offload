@@ -161,9 +161,18 @@ def print_prompt_plan(
             )
         elif offload_mode == OFFLOAD_LIDU:
             cache_tokens = lidu_cache_tokens(length)
+            cache_blocks = (
+                cache_tokens // block_size
+                if cache_tokens
+                else full_blocks
+            )
+            delays_cache_arena = 0 < cache_blocks < full_blocks
             detail = (
                 f"lidu_cache_tokens={cache_tokens}, "
-                f"release_blocks={max(0, full_blocks - cache_tokens // block_size)}"
+                f"final_prefill_release_blocks="
+                f"{full_blocks if delays_cache_arena else 0}, "
+                f"first_decode_allocate_blocks="
+                f"{cache_blocks if delays_cache_arena else 0}"
             )
         else:
             detail = f"tail_tokens={length % block_size}"

@@ -50,6 +50,10 @@ class Sequence:
         self.offload_finalized = False
         self.lidu_cache_tokens = 0
         self.lidu_cache_initialized = False
+        # True only between final prefill and first decode for a genuinely
+        # offloaded LIDU request.  During this window HBM contains only its
+        # dense tail; Scheduler prepends the C-token arena before decode.
+        self.lidu_decode_hbm_pending = False
         self.num_prefill_blocks = 0
         self.num_prefill_full_blocks = 0
         self.num_prefill_tail_blocks = 0
@@ -187,6 +191,7 @@ class Sequence:
             "offload_finalized": self.offload_finalized,
             "lidu_cache_tokens": self.lidu_cache_tokens,
             "lidu_cache_initialized": self.lidu_cache_initialized,
+            "lidu_decode_hbm_pending": self.lidu_decode_hbm_pending,
             "num_prefill_blocks": self.num_prefill_blocks,
             "num_prefill_full_blocks": self.num_prefill_full_blocks,
             "num_prefill_tail_blocks": self.num_prefill_tail_blocks,
@@ -224,6 +229,9 @@ class Sequence:
         self.lidu_cache_tokens = state.get("lidu_cache_tokens", 0)
         self.lidu_cache_initialized = state.get(
             "lidu_cache_initialized", False
+        )
+        self.lidu_decode_hbm_pending = state.get(
+            "lidu_decode_hbm_pending", False
         )
         self.num_prefill_blocks = state.get("num_prefill_blocks", 0)
         self.num_prefill_full_blocks = state.get("num_prefill_full_blocks", 0)
@@ -277,6 +285,11 @@ class DecodeSequenceMetadata:
 
     @classmethod
     def from_sequence(cls, seq: Sequence) -> "DecodeSequenceMetadata":
+        if seq.lidu_decode_hbm_pending:
+            raise RuntimeError(
+                "LIDU decode metadata was requested before its HBM cache "
+                "arena was allocated."
+            )
         return cls(
             seq_id=seq.seq_id,
             num_tokens=len(seq),
