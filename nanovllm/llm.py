@@ -7,11 +7,13 @@ class LLM(LLMEngine):
         model,
         prefill_chunk_size: int = 0,
         offload_mode: str = "none",
+        num_speculative_tokens: int = 0,
         **kwargs,
     ):
         super().__init__(
             model,
             prefill_chunk_size=prefill_chunk_size,
             offload_mode=offload_mode,
+            num_speculative_tokens=num_speculative_tokens,
             **kwargs,
         )

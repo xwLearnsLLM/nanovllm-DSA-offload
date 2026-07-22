@@ -1203,7 +1203,11 @@ class GlmMLAAttention(nn.Module):
         if self.wd_qkv is None:
             raise RuntimeError("Fused qkv_a weight is not prepared.")
 
-        use_decode_mlapo = not context.is_prefill and not context.has_first_decode
+        use_decode_mlapo = (
+            not context.is_prefill
+            and not context.is_spec_decode
+            and not context.has_first_decode
+        )
         needs_decode_dsa_update = bool(context.needs_dsa_update)
         if use_decode_mlapo:
             ql_nope, q_pe, q_c = self._decode_mlapo_preprocess(
@@ -1283,7 +1287,7 @@ class GlmMLAAttention(nn.Module):
 
         ql_nope = self._q_nope_up_proj(q_nope)
 
-        if context.is_prefill:
+        if context.is_prefill or context.is_spec_decode:
             attn_output = self._prefill_forward_npu_mla(ql_nope, q_pe)
         else:
             attn_output = self._decode_forward_mla(ql_nope, q_pe, q_index, weights)

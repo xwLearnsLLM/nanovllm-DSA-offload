@@ -9,7 +9,12 @@ from nanovllm.engine.dsa_offload import (
     SimpleBlockManager,
     lidu_cache_tokens,
 )
-from nanovllm.engine.sequence import FinishReason, Sequence, SequenceStatus
+from nanovllm.engine.sequence import (
+    FinishReason,
+    Sequence,
+    SequenceStatus,
+    SpeculativeStepOutput,
+)
 
 if TYPE_CHECKING:
     from nanovllm.config import Config
@@ -22,6 +27,9 @@ class Scheduler:
         self.max_num_decode_seqs_per_step = config.max_num_decode_seqs_per_step
         self.block_size = config.kvcache_block_size
         self.offload_mode = config.offload_mode
+        self.num_speculative_tokens = int(
+            getattr(config, "num_speculative_tokens", 0)
+        )
         self.uses_offload = self.offload_mode != OFFLOAD_NONE
         eos = config.eos
         if isinstance(eos, int):
@@ -57,6 +65,7 @@ class Scheduler:
         self.num_dram_blocks = (
             config.num_dram_kvcache_blocks if self.uses_offload else 0
         )
+        self.last_speculative_stats: dict[str, int] | None = None
 
     def is_finished(self):
         return not self.waiting and not self.running and self.prefilling is None
@@ -153,7 +162,7 @@ class Scheduler:
         if not self._can_reserve_lidu_decode_hbm(seq):
             return False
         if not self.hbm_block_manager.can_allocate_blocks(
-            seq.num_prefill_blocks
+            self._prefill_hbm_blocks(seq)
         ):
             return False
         if not self.uses_offload:
@@ -173,7 +182,7 @@ class Scheduler:
         assert not seq.hbm_block_table
         assert not seq.dram_block_table
         seq.hbm_block_table = self.hbm_block_manager.allocate_blocks(
-            seq.num_prefill_blocks,
+            self._prefill_hbm_blocks(seq),
         )
         seq.block_table = seq.hbm_block_table
         if self.uses_offload:
@@ -186,6 +195,17 @@ class Scheduler:
                     seq.num_prefill_full_blocks,
                 )
         seq.bump_decode_metadata_version()
+
+    def _prefill_hbm_blocks(self, seq: Sequence) -> int:
+        if not self.num_speculative_tokens or self.uses_offload:
+            return seq.num_prefill_blocks
+        # Final prefill immediately runs the MTP recurrence. Reserve enough
+        # slots for its K-token lookahead and the following target verify.
+        required_tokens = len(seq) + self.num_speculative_tokens
+        return max(
+            seq.num_prefill_blocks,
+            (required_tokens + self.block_size - 1) // self.block_size,
+        )
 
     def schedule(self) -> tuple[list[Sequence], bool]:
         if self.prefill_chunk_size and (
@@ -219,8 +239,26 @@ class Scheduler:
         if scheduled_seqs:
             return scheduled_seqs, True
 
-        while self.running and len(scheduled_seqs) < self.max_num_decode_seqs_per_step:
+        # Finish the short ordinary tail first. Otherwise a stable MTP row at
+        # the front of ``running`` could indefinitely defer a tail row because
+        # the two fixed query shapes intentionally cannot share one forward.
+        kinds = [self._decode_kind(seq) for seq in self.running]
+        decode_kind = "tail" if "tail" in kinds else None
+        deferred: deque[Sequence] = deque()
+        remaining_to_consider = len(self.running)
+        while (
+            self.running
+            and remaining_to_consider > 0
+            and len(scheduled_seqs) < self.max_num_decode_seqs_per_step
+        ):
             seq = self.running.popleft()
+            remaining_to_consider -= 1
+            kind = self._decode_kind(seq)
+            if decode_kind is None:
+                decode_kind = kind
+            if kind != decode_kind:
+                deferred.append(seq)
+                continue
             while not self.can_append(seq):
                 if self.running:
                     self.preempt(self.running.pop())
@@ -232,9 +270,32 @@ class Scheduler:
                 self.may_append(seq)
                 scheduled_seqs.append(seq)
 
+        self.running.extend(deferred)
         if scheduled_seqs:
             self.running.extendleft(reversed(scheduled_seqs))
         return scheduled_seqs, False
+
+    def _decode_kind(self, seq: Sequence) -> str:
+        if not self.num_speculative_tokens:
+            return "normal"
+        draft_count = len(seq.draft_token_ids)
+        if draft_count not in (0, self.num_speculative_tokens):
+            raise RuntimeError(
+                "MTP request has an invalid draft count: "
+                f"expected 0 or {self.num_speculative_tokens}, got "
+                f"{draft_count}."
+            )
+        if (
+            draft_count == self.num_speculative_tokens
+            and len(seq) + 2 * self.num_speculative_tokens - 1
+            <= self.max_model_len
+        ):
+            return "mtp"
+        # The final K positions use ordinary one-token eager decode. Keep
+        # these requests in their own batch so other requests' drafts do not
+        # become stale.
+        seq.draft_token_ids.clear()
+        return "tail"
 
     def _schedule_chunked_prefill(self) -> list[Sequence]:
         if self.prefilling is None:
@@ -268,7 +329,7 @@ class Scheduler:
             )
             else 0
         )
-        growth_blocks = int(len(seq) % self.block_size == 1)
+        growth_blocks = self._decode_growth_blocks(seq)
         return self.hbm_block_manager.can_allocate_blocks(
             pending_sparse_blocks + growth_blocks
         )
@@ -281,7 +342,7 @@ class Scheduler:
             )
             else 0
         )
-        growth_blocks = int(len(seq) % self.block_size == 1)
+        growth_blocks = self._decode_growth_blocks(seq)
         num_new_blocks = pending_sparse_blocks + growth_blocks
         if not num_new_blocks:
             return
@@ -298,6 +359,24 @@ class Scheduler:
             seq.hbm_block_table.extend(new_blocks[pending_sparse_blocks:])
         seq.block_table = seq.hbm_block_table
         seq.bump_decode_metadata_version()
+
+    def _decode_growth_blocks(self, seq: Sequence) -> int:
+        if not self.num_speculative_tokens or self.uses_offload:
+            return int(len(seq) % self.block_size == 1)
+        lookahead = (
+            self.num_speculative_tokens
+            if len(seq.draft_token_ids) == self.num_speculative_tokens
+            else 0
+        )
+        # Target verification writes through L+K-1. If all K drafts are
+        # accepted, the K-step MTP recurrence can additionally write through
+        # L+2K-2 before the scheduler sees the accepted count. Reserve that
+        # exact worst-case range up front; at K<=3 it costs at most one block.
+        required_tokens = len(seq) + (2 * lookahead - 1 if lookahead else 0)
+        required_blocks = (
+            required_tokens + self.block_size - 1
+        ) // self.block_size
+        return max(0, required_blocks - len(seq.hbm_block_table))
 
     def release_prefill_hbm_blocks(self, seqs: list[Sequence]) -> None:
         if not self.uses_offload:
@@ -327,6 +406,7 @@ class Scheduler:
         seq.offload_finalized = False
         seq.lidu_cache_initialized = not seq.lidu_cache_tokens
         seq.lidu_decode_hbm_pending = False
+        seq.draft_token_ids.clear()
         seq.bump_decode_metadata_version()
 
     def preempt(self, seq: Sequence):
@@ -355,11 +435,16 @@ class Scheduler:
     def postprocess(
         self,
         seqs: list[Sequence],
-        token_ids: list[int] | None,
+        token_ids: list[int] | SpeculativeStepOutput | None,
         is_prefill: bool,
     ) -> None:
+        self.last_speculative_stats = None
         if self.prefill_chunk_size and is_prefill:
             self._postprocess_chunked_prefill(seqs, token_ids)
+            return
+
+        if isinstance(token_ids, SpeculativeStepOutput):
+            self._postprocess_speculative(seqs, token_ids, is_prefill)
             return
 
         if token_ids is None:
@@ -373,7 +458,7 @@ class Scheduler:
     def _postprocess_chunked_prefill(
         self,
         seqs: list[Sequence],
-        token_ids: list[int] | None,
+        token_ids: list[int] | SpeculativeStepOutput | None,
     ) -> None:
         if len(seqs) != 1 or seqs[0] is not self.prefilling:
             raise RuntimeError("Chunk prefill must postprocess its active sequence.")
@@ -381,7 +466,15 @@ class Scheduler:
         chunk_end = seq.num_prefill_tokens_processed + seq.num_scheduled_tokens
         is_last_chunk = chunk_end == len(seq)
         if is_last_chunk:
-            if token_ids is None or len(token_ids) != 1:
+            if isinstance(token_ids, SpeculativeStepOutput):
+                valid_output = (
+                    len(token_ids.token_ids) == 1
+                    and len(token_ids.token_ids[0]) == 1
+                    and len(token_ids.draft_token_ids) == 1
+                )
+            else:
+                valid_output = token_ids is not None and len(token_ids) == 1
+            if not valid_output:
                 raise RuntimeError(
                     "The final prefill chunk must sample exactly one token."
                 )
@@ -394,8 +487,66 @@ class Scheduler:
             return
 
         self.prefilling = None
-        if not self._append_sampled_token(seq, token_ids[0]):
+        if isinstance(token_ids, SpeculativeStepOutput):
+            sampled_token = token_ids.token_ids[0][0]
+            next_drafts = token_ids.draft_token_ids[0]
+        else:
+            sampled_token = token_ids[0]
+            next_drafts = []
+        if not self._append_sampled_token(seq, sampled_token):
+            seq.draft_token_ids = list(next_drafts)
             self.running.append(seq)
+
+    def _postprocess_speculative(
+        self,
+        seqs: list[Sequence],
+        output: SpeculativeStepOutput,
+        is_prefill: bool,
+    ) -> None:
+        batch_size = len(seqs)
+        if not (
+            len(output.token_ids)
+            == len(output.draft_token_ids)
+            == len(output.accepted_draft_counts)
+            == batch_size
+        ):
+            raise RuntimeError(
+                "MTP output batch size does not match scheduled sequences."
+            )
+
+        emitted = 0
+        for seq, accepted, drafts in zip(
+            seqs, output.token_ids, output.draft_token_ids
+        ):
+            if is_prefill:
+                seq.num_prefill_tokens_processed = len(seq)
+            if not accepted:
+                raise RuntimeError("MTP must commit at least one token.")
+            finished = False
+            for token_id in accepted:
+                emitted += 1
+                if self._append_sampled_token(seq, int(token_id)):
+                    finished = True
+                    break
+            if not finished:
+                seq.draft_token_ids = [int(token_id) for token_id in drafts]
+            else:
+                seq.draft_token_ids.clear()
+            if finished and seq in self.running:
+                self.running.remove(seq)
+
+        proposed = (
+            0 if is_prefill else batch_size * self.num_speculative_tokens
+        )
+        accepted_drafts = (
+            0 if is_prefill else sum(output.accepted_draft_counts)
+        )
+        self.last_speculative_stats = {
+            "batch_size": batch_size,
+            "emitted_tokens": emitted,
+            "accepted_drafts": accepted_drafts,
+            "proposed_drafts": proposed,
+        }
 
     def _append_sampled_token(self, seq: Sequence, token_id: int) -> bool:
         seq.append_token(token_id)

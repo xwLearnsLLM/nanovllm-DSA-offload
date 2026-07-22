@@ -62,6 +62,7 @@ class Config:
     device = "npu"
     trust_remote_code: bool = False
     prefill_chunk_size: int = 0
+    num_speculative_tokens: int = 0
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -84,6 +85,7 @@ class Config:
             self.prefill_chunk_size,
             self.max_num_prefill_seqs_per_step,
         )
+        self._validate_num_speculative_tokens(self.num_speculative_tokens)
         if self.max_num_decode_seqs_per_step <= 0:
             raise ValueError("max_num_decode_seqs_per_step must be > 0.")
         if self.max_model_len <= 0:
@@ -114,6 +116,7 @@ class Config:
             )
 
         self._configure_glm_runtime()
+        self._validate_mtp_runtime()
         self._validate_lidu_runtime(text_config)
         eos_token_id = getattr(text_config, "eos_token_id", None)
         if eos_token_id is not None:
@@ -132,6 +135,82 @@ class Config:
         if prefill_chunk_size and max_num_prefill_seqs_per_step != 1:
             raise ValueError(
                 "Chunk prefill requires max_num_prefill_seqs_per_step=1."
+            )
+
+    @staticmethod
+    def _validate_num_speculative_tokens(value: int) -> None:
+        if type(value) is not int:
+            raise TypeError("num_speculative_tokens must be an int.")
+        if not 0 <= value <= 3:
+            raise ValueError(
+                "num_speculative_tokens must be between 0 and 3."
+            )
+
+    def _validate_mtp_runtime(self) -> None:
+        k = self.num_speculative_tokens
+        setattr(self.hf_config, "nanovllm_num_speculative_tokens", k)
+        if not k:
+            return
+
+        if getattr(self.hf_config, "model_type", "") != "glm_moe_dsa":
+            raise ValueError(
+                "Built-in MTP currently supports GLM-5.1-W4A8 only."
+            )
+        if self.offload_mode != OFFLOAD_NONE:
+            raise ValueError(
+                "GLM MTP phase 1 requires offload_mode='none'."
+            )
+        if not self.enforce_eager:
+            raise ValueError(
+                "GLM MTP phase 1 is eager-only; set enforce_eager=True / "
+                "NANOVLLM_ENFORCE_EAGER=1."
+            )
+        if int(getattr(self.hf_config, "num_nextn_predict_layers", 0)) != 1:
+            raise ValueError(
+                "GLM MTP expects num_nextn_predict_layers=1 in config.json."
+            )
+        mtp_layer_idx = int(getattr(self.hf_config, "num_hidden_layers", -1))
+        if mtp_layer_idx != 78:
+            raise ValueError(
+                "GLM-5.1 MTP expects 78 target layers and checkpoint layer "
+                f"78, got num_hidden_layers={mtp_layer_idx}."
+            )
+
+        metadata = getattr(self.hf_config, "nanovllm_quant_metadata", {})
+        if metadata.get("is_rot_used") is not True:
+            raise ValueError(
+                "GLM MTP requires ModelSlim is_rot_used=true."
+            )
+        rot_path = os.path.join(self.model, "rot.safetensors")
+        if not os.path.isfile(rot_path):
+            raise ValueError(
+                "GLM MTP requires root-level rot.safetensors containing "
+                "rot.weight."
+            )
+
+        description_path = os.path.join(
+            self.model, "quant_model_description.json"
+        )
+        with open(description_path, "r", encoding="utf-8") as file:
+            description = json.load(file)
+        mtp_entries = {
+            name: quant_type
+            for name, quant_type in description.items()
+            if name.startswith(f"model.layers.{mtp_layer_idx}.")
+        }
+        if not mtp_entries:
+            raise ValueError(
+                "GLM checkpoint has no model.layers.78 MTP weights."
+            )
+        non_float = sorted(
+            name
+            for name, quant_type in mtp_entries.items()
+            if quant_type != "FLOAT"
+        )
+        if non_float:
+            raise ValueError(
+                "GLM MTP layer must be FLOAT/BF16 in the ModelSlim "
+                f"description; non-FLOAT entries include {non_float[:3]}."
             )
 
     def _configure_decode_graph(self) -> None:

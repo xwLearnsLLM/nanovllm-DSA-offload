@@ -42,6 +42,7 @@ class Sequence:
         self.num_cached_tokens = 0
         self.num_prefill_tokens_processed = 0
         self.num_scheduled_tokens = 0
+        self.draft_token_ids: list[int] = []
         self.block_table = []
         self.index_block_table = []
         self.hbm_block_table = self.block_table
@@ -131,6 +132,7 @@ class Sequence:
     def reset_prefill_progress(self):
         self.num_prefill_tokens_processed = 0
         self.num_scheduled_tokens = 0
+        self.draft_token_ids.clear()
 
     def scheduled_prefill_chunk(
         self,
@@ -183,6 +185,7 @@ class Sequence:
             "num_cached_tokens": self.num_cached_tokens,
             "num_prefill_tokens_processed": self.num_prefill_tokens_processed,
             "num_scheduled_tokens": self.num_scheduled_tokens,
+            "draft_token_ids": self.draft_token_ids,
             "block_table": self.block_table,
             "index_block_table": self.index_block_table,
             "hbm_block_table": self.hbm_block_table,
@@ -220,6 +223,7 @@ class Sequence:
             "num_prefill_tokens_processed", 0
         )
         self.num_scheduled_tokens = state.get("num_scheduled_tokens", 0)
+        self.draft_token_ids = list(state.get("draft_token_ids", []))
         self.block_table = state["block_table"]
         self.index_block_table = state.get("index_block_table", self.block_table)
         self.hbm_block_table = state.get("hbm_block_table", self.block_table)
@@ -268,6 +272,7 @@ class DecodeSequenceMetadata:
     seq_id: int
     num_tokens: int
     last_token: int
+    draft_token_ids: list[int]
     num_prefill_tokens_processed: int
     block_size: int
     hbm_block_table: list[int]
@@ -294,6 +299,7 @@ class DecodeSequenceMetadata:
             seq_id=seq.seq_id,
             num_tokens=len(seq),
             last_token=seq.last_token,
+            draft_token_ids=list(seq.draft_token_ids),
             num_prefill_tokens_processed=seq.num_prefill_tokens_processed,
             block_size=seq.block_size,
             hbm_block_table=list(seq.hbm_block_table),
@@ -342,6 +348,7 @@ class DecodeBatchDelta:
     key: DecodeMetadataKey
     num_tokens: tuple[int, ...]
     last_tokens: tuple[int, ...]
+    draft_token_ids: tuple[tuple[int, ...], ...] = ()
 
 
 DecodeBatchPacket = Union[DecodeBatchSnapshot, DecodeBatchDelta]
@@ -375,6 +382,10 @@ def build_decode_batch_packet(
             key=key,
             num_tokens=tuple(int(seq.num_tokens) for seq in seqs),
             last_tokens=tuple(int(seq.last_token) for seq in seqs),
+            draft_token_ids=tuple(
+                tuple(int(token_id) for token_id in seq.draft_token_ids)
+                for seq in seqs
+            ),
         ),
         key,
     )
@@ -404,17 +415,29 @@ def apply_decode_batch_packet(
     if (
         len(packet.num_tokens) != batch_size
         or len(packet.last_tokens) != batch_size
+        or len(packet.draft_token_ids) != batch_size
     ):
         raise RuntimeError(
             "Decode metadata delta batch size does not match the worker cache: "
             f"num_tokens={len(packet.num_tokens)}, "
             f"last_tokens={len(packet.last_tokens)}, cached={batch_size}."
         )
-    for seq, num_tokens, last_token in zip(
+    for seq, num_tokens, last_token, draft_token_ids in zip(
         cached_sequences,
         packet.num_tokens,
         packet.last_tokens,
+        packet.draft_token_ids,
     ):
         seq.num_tokens = int(num_tokens)
         seq.last_token = int(last_token)
+        seq.draft_token_ids = list(draft_token_ids)
     return cached_sequences, cached_key
+
+
+@dataclass
+class SpeculativeStepOutput:
+    """Rank-0 output for one MTP prefill or verification step."""
+
+    token_ids: list[list[int]]
+    draft_token_ids: list[list[int]]
+    accepted_draft_counts: list[int]

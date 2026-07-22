@@ -33,9 +33,15 @@ from nanovllm.engine.sequence import (
     DecodeMetadataKey,
     DecodeSequenceMetadata,
     Sequence,
+    SpeculativeStepOutput,
     apply_decode_batch_packet,
     build_decode_batch_packet,
     decode_metadata_key,
+)
+from nanovllm.engine.speculative import (
+    greedy_prefix_accept,
+    materialize_accepted_tokens,
+    shifted_mtp_prefill_tokens,
 )
 from nanovllm.layers.sampler import Sampler
 from nanovllm.models.glm_moe_dsa import GlmMoeDsaForCausalLM
@@ -135,6 +141,7 @@ class ModelRunner:
         self.hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
         self.offload_mode = config.offload_mode
+        self.num_speculative_tokens = config.num_speculative_tokens
         self.uses_offload = self.offload_mode != OFFLOAD_NONE
         self.world_size = config.tensor_parallel_size
         self.rank = rank
@@ -217,7 +224,7 @@ class ModelRunner:
             logger.info(
                 "GLM-5.1 W4A8: %s decode, attention=%s, max_model_len=%d, "
                 "EP%d (%d local experts/rank), ModelSlim version=%s "
-                "group_size=%s; MTP is disabled.",
+                "group_size=%s; MTP K=%d.",
                 (
                     "eager"
                     if self.config.enforce_eager
@@ -229,12 +236,18 @@ class ModelRunner:
                 int(self.hf_config.n_routed_experts) // self.world_size,
                 quant_metadata.get("version"),
                 quant_metadata.get("group_size"),
+                self.num_speculative_tokens,
             )
-        load_model(
+        loaded_parameters = load_model(
             model,
             self.config.model,
             name_mapping=getattr(model, "weight_name_mapping", None),
         )
+        validate_loaded_weights = getattr(
+            model, "validate_loaded_weights", None
+        )
+        if callable(validate_loaded_weights):
+            validate_loaded_weights(loaded_parameters)
         if hasattr(model, "post_load_prepare"):
             model.post_load_prepare()
         return model
@@ -414,7 +427,9 @@ class ModelRunner:
         hf_config = config.hf_config
         text_config = getattr(hf_config, "text_config", hf_config)
         cache_dtype = torch.bfloat16
-        num_layers = int(text_config.num_hidden_layers)
+        num_layers = int(text_config.num_hidden_layers) + int(
+            self.num_speculative_tokens > 0
+        )
         kv_lora_rank = int(text_config.kv_lora_rank)
         rope_dim = int(text_config.qk_rope_head_dim)
         hbm_kv_block_bytes = num_layers * self.block_size * (kv_lora_rank + rope_dim) * torch.empty((), dtype=cache_dtype).element_size()
@@ -835,6 +850,295 @@ class ModelRunner:
         )
         return input_ids, positions
 
+    def _prepare_mtp_prefill_input_ids(
+        self,
+        seqs: list[Sequence],
+        sampled_token_ids: torch.Tensor | None,
+    ) -> torch.Tensor:
+        sampled = (
+            sampled_token_ids.detach().cpu().tolist()
+            if sampled_token_ids is not None
+            else None
+        )
+        shifted: list[int] = []
+        for row, seq in enumerate(seqs):
+            if self.config.prefill_chunk_size:
+                start = seq.num_prefill_tokens_processed
+                end = start + seq.num_scheduled_tokens
+            else:
+                start = 0
+                end = len(seq)
+            shifted.extend(
+                shifted_mtp_prefill_tokens(
+                    seq.token_ids,
+                    start,
+                    end,
+                    sampled_token_id=(
+                        None if sampled is None else int(sampled[row])
+                    ),
+                )
+            )
+        return torch.tensor(
+            shifted, dtype=torch.int64, device=self.device
+        )
+
+    @staticmethod
+    def _greedy_sample(logits: torch.Tensor) -> torch.Tensor:
+        return logits.float().argmax(dim=-1)
+
+    def _slots_from_positions(
+        self,
+        block_tables: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        block_indices = torch.div(
+            positions, self.block_size, rounding_mode="floor"
+        ).to(torch.long)
+        block_ids = block_tables.gather(
+            1, block_indices.unsqueeze(1)
+        ).squeeze(1)
+        return (
+            block_ids.to(torch.long) * self.block_size
+            + torch.remainder(positions, self.block_size)
+        )
+
+    def _set_mtp_decode_context(
+        self,
+        block_tables: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> None:
+        batch_size = int(positions.numel())
+        slots = self._slots_from_positions(block_tables, positions)
+        cu_seqlens_q = torch.arange(
+            batch_size + 1,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        set_context(
+            False,
+            cu_seqlens_q=cu_seqlens_q,
+            flat_slot_mapping=slots,
+            flat_slot_mapping_i32=slots.to(torch.int32),
+            actual_seq_lengths_kv=(
+                positions.add(1).detach().cpu().tolist()
+            ),
+            block_tables=block_tables,
+        )
+
+    def _run_mtp_recurrence(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        previous_hidden_states: torch.Tensor,
+        block_tables: torch.Tensor,
+        steps: int,
+    ) -> torch.Tensor:
+        mtp = getattr(self.model, "mtp", None)
+        if mtp is None:
+            raise RuntimeError("MTP recurrence requested without an MTP model.")
+        drafts: list[torch.Tensor] = []
+        for _ in range(steps):
+            self._set_mtp_decode_context(block_tables, positions)
+            previous_hidden_states = mtp(
+                input_ids, positions, previous_hidden_states
+            )
+            input_ids = self._greedy_sample(
+                mtp.compute_logits(previous_hidden_states)
+            )
+            drafts.append(input_ids)
+            positions = positions + 1
+        if not drafts:
+            return torch.empty(
+                (input_ids.shape[0], 0),
+                dtype=torch.long,
+                device=input_ids.device,
+            )
+        return torch.stack(drafts, dim=1)
+
+    def _run_mtp_prefill(
+        self,
+        seqs: list[Sequence],
+        positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        sampled_token_ids: torch.Tensor | None,
+        is_last_chunk: bool,
+    ) -> tuple[torch.Tensor, list[bool]] | None:
+        mtp = getattr(self.model, "mtp", None)
+        if mtp is None:
+            raise RuntimeError("MTP prefill requested without an MTP model.")
+        mtp_input_ids = self._prepare_mtp_prefill_input_ids(
+            seqs, sampled_token_ids
+        )
+        mtp_hidden_states = mtp(
+            mtp_input_ids, positions, target_hidden_states
+        )
+        if not is_last_chunk:
+            return None
+
+        draft_eligible = [
+            len(seq) + 2 * self.num_speculative_tokens
+            <= self.config.max_model_len
+            for seq in seqs
+        ]
+
+        context = get_context()
+        last_indices = context.cu_seqlens_q[1:] - 1
+        last_hidden_states = mtp_hidden_states.index_select(
+            0, last_indices.to(torch.long)
+        )
+        first_draft = self._greedy_sample(
+            mtp.compute_logits(mtp_hidden_states)
+        )
+        if first_draft.shape != (len(seqs),):
+            raise RuntimeError(
+                "MTP prefill shared head must produce one draft per request, "
+                f"got shape={tuple(first_draft.shape)} for batch={len(seqs)}."
+            )
+        drafts = torch.zeros(
+            (len(seqs), self.num_speculative_tokens),
+            dtype=torch.long,
+            device=self.device,
+        )
+        drafts[:, 0] = first_draft
+        eligible_rows = torch.tensor(
+            [row for row, eligible in enumerate(draft_eligible) if eligible],
+            dtype=torch.long,
+            device=self.device,
+        )
+        if self.num_speculative_tokens > 1 and eligible_rows.numel():
+            last_positions = positions.index_select(
+                0, last_indices.to(torch.long)
+            )
+            remaining = self._run_mtp_recurrence(
+                first_draft.index_select(0, eligible_rows),
+                last_positions.index_select(0, eligible_rows) + 1,
+                last_hidden_states.index_select(0, eligible_rows),
+                context.block_tables.index_select(0, eligible_rows),
+                self.num_speculative_tokens - 1,
+            )
+            eligible_drafts = torch.cat(
+                (
+                    first_draft.index_select(0, eligible_rows).unsqueeze(1),
+                    remaining,
+                ),
+                dim=1,
+            )
+            drafts.index_copy_(0, eligible_rows, eligible_drafts)
+        return drafts, draft_eligible
+
+    def _prepare_mtp_verify(
+        self,
+        seqs: list[Sequence | DecodeSequenceMetadata],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        k = self.num_speculative_tokens
+        input_ids: list[int] = []
+        positions: list[int] = []
+        slots: list[int] = []
+        cu_seqlens_q = [0]
+        for seq in seqs:
+            if len(seq.draft_token_ids) != k:
+                raise RuntimeError(
+                    "MTP verification requires exactly "
+                    f"{k} draft tokens per request."
+                )
+            row_ids = [seq.last_token, *seq.draft_token_ids]
+            row_positions = list(range(len(seq) - 1, len(seq) + k))
+            input_ids.extend(row_ids)
+            positions.extend(row_positions)
+            slots.extend(
+                seq.hbm_block_table[position // self.block_size]
+                * self.block_size
+                + position % self.block_size
+                for position in row_positions
+            )
+            cu_seqlens_q.append(cu_seqlens_q[-1] + k + 1)
+
+        input_ids_tensor = torch.tensor(
+            input_ids, dtype=torch.int64, device=self.device
+        )
+        positions_tensor = torch.tensor(
+            positions, dtype=torch.int64, device=self.device
+        )
+        slots_tensor = torch.tensor(
+            slots, dtype=torch.int64, device=self.device
+        )
+        cu_seqlens_tensor = torch.tensor(
+            cu_seqlens_q, dtype=torch.int32, device=self.device
+        )
+        block_tables = self.prepare_block_tables(
+            seqs, "hbm_block_table"
+        )
+        set_context(
+            False,
+            is_spec_decode=True,
+            cu_seqlens_q=cu_seqlens_tensor,
+            flat_slot_mapping=slots_tensor,
+            flat_slot_mapping_i32=slots_tensor.to(torch.int32),
+            actual_seq_lengths_kv=[len(seq) + k for seq in seqs],
+            block_tables=block_tables,
+        )
+        drafts = torch.tensor(
+            [seq.draft_token_ids for seq in seqs],
+            dtype=torch.long,
+            device=self.device,
+        )
+        return input_ids_tensor, positions_tensor, drafts, block_tables
+
+    def _run_mtp_verify(
+        self,
+        seqs: list[Sequence | DecodeSequenceMetadata],
+    ) -> SpeculativeStepOutput | None:
+        k = self.num_speculative_tokens
+        (
+            input_ids,
+            positions,
+            draft_token_ids,
+            block_tables,
+        ) = self._prepare_mtp_verify(seqs)
+        target_hidden_states = self.model(input_ids, positions)
+        target_tokens = self._greedy_sample(
+            self.model.compute_logits(target_hidden_states)
+        ).view(len(seqs), k + 1)
+        accepted_counts, next_token_ids = greedy_prefix_accept(
+            target_tokens, draft_token_ids
+        )
+        rows = torch.arange(
+            len(seqs), dtype=torch.long, device=self.device
+        )
+        hidden_by_request = target_hidden_states.view(
+            len(seqs), k + 1, -1
+        )
+        selected_hidden_states = hidden_by_request[rows, accepted_counts]
+        base_positions = torch.tensor(
+            [len(seq) - 1 for seq in seqs],
+            dtype=torch.long,
+            device=self.device,
+        )
+        selected_positions = base_positions + accepted_counts
+        next_drafts = self._run_mtp_recurrence(
+            next_token_ids,
+            selected_positions,
+            selected_hidden_states,
+            block_tables,
+            k,
+        )
+
+        if self.rank != 0:
+            return None
+        accepted_counts_cpu = accepted_counts.cpu().tolist()
+        target_tokens_cpu = target_tokens.cpu().tolist()
+        next_drafts_cpu = next_drafts.cpu().tolist()
+        accepted_token_ids = materialize_accepted_tokens(
+            [list(seq.draft_token_ids) for seq in seqs],
+            target_tokens_cpu,
+            accepted_counts_cpu,
+        )
+        return SpeculativeStepOutput(
+            token_ids=accepted_token_ids,
+            draft_token_ids=next_drafts_cpu,
+            accepted_draft_counts=[int(value) for value in accepted_counts_cpu],
+        )
+
     @torch.inference_mode()
     def finalize_prefill_offload(self, seqs: list[Sequence]) -> None:
         if not self.uses_offload:
@@ -855,8 +1159,19 @@ class ModelRunner:
         self,
         seqs: list[Sequence | DecodeSequenceMetadata],
         is_prefill: bool,
-    ) -> list[int] | None:
+    ) -> list[int] | SpeculativeStepOutput | None:
         try:
+            if (
+                self.num_speculative_tokens
+                and not is_prefill
+                and all(
+                    len(seq.draft_token_ids)
+                    == self.num_speculative_tokens
+                    for seq in seqs
+                )
+            ):
+                return self._run_mtp_verify(seqs)
+
             if is_prefill:
                 input_ids, positions, should_sample = self.prepare_prefill(seqs)
             else:
@@ -878,6 +1193,43 @@ class ModelRunner:
                 hidden_states = self.model(input_ids, positions)
             else:
                 hidden_states = self.decode_graph_manager.run(input_ids, positions)
+            if self.num_speculative_tokens and is_prefill:
+                sampled_token_ids = None
+                if should_sample:
+                    sampled_token_ids = self._greedy_sample(
+                        self.model.compute_logits(hidden_states)
+                    )
+                draft_result = self._run_mtp_prefill(
+                    seqs,
+                    positions,
+                    hidden_states,
+                    sampled_token_ids,
+                    should_sample,
+                )
+                if not should_sample:
+                    return None
+                self.finalize_prefill_offload(seqs)
+                if self.rank != 0:
+                    return None
+                if draft_result is None:
+                    raise RuntimeError(
+                        "Final MTP prefill did not produce draft state."
+                    )
+                drafts, draft_eligible = draft_result
+                draft_rows = drafts.cpu().tolist()
+                return SpeculativeStepOutput(
+                    token_ids=[
+                        [int(token_id)]
+                        for token_id in sampled_token_ids.cpu().tolist()
+                    ],
+                    draft_token_ids=[
+                        row if eligible else []
+                        for row, eligible in zip(
+                            draft_rows, draft_eligible
+                        )
+                    ],
+                    accepted_draft_counts=[0] * len(seqs),
+                )
             if not is_prefill and self.uses_offload:
                 init_rows = get_context().lidu_init_rows
                 if init_rows is not None and init_rows.numel() > 0:

@@ -56,6 +56,9 @@ def make_llm(
         max_model_len=max_model_len,
         max_num_prefill_seqs_per_step=max_num_prefill_seqs_per_step,
         prefill_chunk_size=env_int("NANOVLLM_PREFILL_CHUNK_SIZE", 0),
+        num_speculative_tokens=env_int(
+            "NANOVLLM_NUM_SPECULATIVE_TOKENS", 0
+        ),
         max_num_decode_seqs_per_step=max_num_decode_seqs_per_step,
         kvcache_block_size=env_int("NANOVLLM_KVCACHE_BLOCK_SIZE", 128),
         num_hbm_kvcache_blocks=env_int("NANOVLLM_HBM_NUM_BLOCKS", -1),

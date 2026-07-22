@@ -208,6 +208,7 @@ def main() -> None:
         f"max_model_len={max_model_len}, "
         f"max_num_prefill_seqs_per_step={max_num_prefill_seqs_per_step}, "
         f"prefill_chunk_size={env_int('NANOVLLM_PREFILL_CHUNK_SIZE', 0)}, "
+        f"num_speculative_tokens={llm.config.num_speculative_tokens}, "
         f"max_num_decode_seqs_per_step={max_num_decode_seqs_per_step}, "
         f"offload_mode={llm.config.offload_mode}, "
         f"max_gen_tokens={max_gen_tokens}, "

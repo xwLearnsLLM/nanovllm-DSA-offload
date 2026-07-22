@@ -40,9 +40,10 @@ class LLMEngine:
         logger.info(f"config: {config}")
         logger.info(
             "execution mode: prefill=eager, first_decode=eager, "
-            "stable_decode=%s, attention=%s",
+            "stable_decode=%s, attention=%s, mtp_k=%d",
             "eager" if config.enforce_eager else "full_decode_only",
             config.offload_mode,
+            config.num_speculative_tokens,
         )
         # Fail fast on tokenizer/version problems before all TP ranks load the
         # 400+ GB GLM checkpoint.
@@ -66,6 +67,7 @@ class LLMEngine:
             self.model_runner = ModelRunner(config, 0, self.events)
             self.scheduler = Scheduler(config)
             self._last_prefill_chunk_progress = None
+            self._last_speculative_stats = None
             # Profiling is created lazily in the rank-0 engine. Eager mode
             # starts at its first decode; graph mode waits until lazy capture
             # and the first replay have completed, so profiling cannot skew
@@ -273,6 +275,14 @@ class LLMEngine:
                     sampling_params: SamplingParams,
                     request_id: str = None,
                     ):
+        if (
+            self.config.num_speculative_tokens
+            and sampling_params.temperature > 1e-10
+        ):
+            raise ValueError(
+                "GLM MTP phase 1 supports greedy sampling only; set "
+                "temperature=0."
+            )
         if isinstance(prompt, str):
             prompt = self._encode_string_prompt(prompt)
         seq = Sequence(
@@ -303,6 +313,9 @@ class LLMEngine:
         if is_final_prefill_step:
             self.scheduler.release_prefill_hbm_blocks(seqs)
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        self._last_speculative_stats = self.scheduler.last_speculative_stats
+        if not is_prefill and self._last_speculative_stats is not None:
+            num_tokens = -self._last_speculative_stats["emitted_tokens"]
         outputs = [(seq.seq_id, seq.completion_token_ids, seq.num_prompt_tokens, seq.num_cached_tokens) for seq in seqs
                    if seq.is_finished]
         if return_stats:
@@ -338,10 +351,13 @@ class LLMEngine:
         total_start = perf_counter()
         total_prefill_time = 0.0
         total_decode_time = 0.0
+        total_decode_request_time = 0.0
         total_prefill_tokens = 0
         total_decode_tokens = 0
         prefill_steps = 0
         decode_steps = 0
+        total_accepted_drafts = 0
+        total_proposed_drafts = 0
         last_is_prefill = False
         i_step = 0
         while not self.is_finished():
@@ -360,6 +376,11 @@ class LLMEngine:
                 decode_steps += 1
                 total_decode_tokens += step_tokens
                 total_decode_time += step_elapsed
+                total_decode_request_time += step_elapsed * batch_size
+                spec_stats = self._last_speculative_stats
+                if spec_stats is not None:
+                    total_accepted_drafts += spec_stats["accepted_drafts"]
+                    total_proposed_drafts += spec_stats["proposed_drafts"]
 
             if (
                 is_prefill
@@ -384,12 +405,27 @@ class LLMEngine:
                         f"DRAM_KV={dram_used}/{dram_total}, "
                         f"HBM_INDEX={index_used}/{index_total}, "
                     )
+                spec_text = ""
+                latency_value = step_elapsed
+                if not is_prefill and self._last_speculative_stats is not None:
+                    emitted = self._last_speculative_stats["emitted_tokens"]
+                    mean_emitted = emitted / max(batch_size, 1)
+                    latency_value = step_elapsed / max(mean_emitted, 1e-9)
+                    proposed = self._last_speculative_stats["proposed_drafts"]
+                    accepted = self._last_speculative_stats["accepted_drafts"]
+                    acceptance = accepted / proposed if proposed else 0.0
+                    spec_text = (
+                        f", step_latency={step_elapsed:.4f} sec, "
+                        f"mean_emitted={mean_emitted:.3f}, "
+                        f"accepted_drafts={accepted}/{proposed}, "
+                        f"acceptance={acceptance:.3f}"
+                    )
                 print(
                     f"[step{i_step:4d} {'Prefill' if is_prefill else ' Decode'}] "
                     f"bsz={batch_size}, num_tokens={step_tokens}{progress_text}, "
                     f"{cache_text}"
-                    f"{latency_name}={step_elapsed:.4f} sec, "
-                    f"TPS={step_tps:.2f} tok/s"
+                    f"{latency_name}={latency_value:.4f} sec, "
+                    f"TPS={step_tps:.2f} tok/s{spec_text}"
                 )
             last_is_prefill = is_prefill
 
@@ -414,9 +450,20 @@ class LLMEngine:
             if total_decode_time > 0
             else 0.0
         )
-        decode_mean_tpot = (
-            total_decode_time / decode_steps
-            if decode_steps > 0
+        if self.config.num_speculative_tokens:
+            decode_mean_tpot = (
+                total_decode_request_time / total_decode_tokens
+                if total_decode_tokens > 0
+                else 0.0
+            )
+        else:
+            # Preserve the historical K=0 statistic exactly.
+            decode_mean_tpot = (
+                total_decode_time / decode_steps if decode_steps else 0.0
+            )
+        acceptance_rate = (
+            total_accepted_drafts / total_proposed_drafts
+            if total_proposed_drafts
             else 0.0
         )
         e2e_input_tps = total_input_tokens / elapsed if elapsed > 0 else 0.0
@@ -434,7 +481,14 @@ class LLMEngine:
             f"total decode time = {total_decode_time:.4f} sec, "
             f"decode mean TPOT = {decode_mean_tpot:.4f} sec, "
             f"decode TPS = {decode_tps:.2f} tok/s\n"
-            f"    e2e input TPS = {e2e_input_tps:.2f} tok/s, "
+            + (
+                f"    MTP accepted drafts = {total_accepted_drafts}/"
+                f"{total_proposed_drafts}, acceptance rate = "
+                f"{acceptance_rate:.4f}\n"
+                if self.config.num_speculative_tokens
+                else ""
+            )
+            + f"    e2e input TPS = {e2e_input_tps:.2f} tok/s, "
             f"e2e output TPS = {e2e_output_tps:.2f} tok/s\n"
             + (
                 "    PREFILL_STEP is one chunk latency; TPOT is the per-step "

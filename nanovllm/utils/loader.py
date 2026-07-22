@@ -115,7 +115,7 @@ def load_model(
     name_mapping=None,
     *,
     quant_description: dict[str, Any] | None = None,
-):
+) -> set[str]:
     """Load safetensors weights, including the GLM ModelSlim export format.
 
     W8A8_DYNAMIC dense weights are dequantized to the model parameter dtype so
@@ -130,6 +130,7 @@ def load_model(
     tensor_types = quant_tensor_types(quant_description)
     weight_map = _load_weight_map(path) if tensor_types else {}
 
+    loaded_parameters: set[str] = set()
     for file in sorted(glob(os.path.join(path, "*.safetensors"))):
         with safe_open(file, "pt", "cpu") as reader:
             current_keys = set(reader.keys())
@@ -205,6 +206,7 @@ def load_model(
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, tensor, *target.loader_args)
+                    loaded_parameters.add(target.name)
                     continue
 
                 target_name = target
@@ -228,6 +230,7 @@ def load_model(
                     param = model.get_parameter(param_name)
                     weight_loader = getattr(param, "weight_loader")
                     weight_loader(param, tensor, shard_id)
+                    loaded_parameters.add(param_name)
                     break
                 else:
                     try:
@@ -241,3 +244,6 @@ def load_model(
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, tensor)
+                    loaded_parameters.add(target_name)
+
+    return loaded_parameters

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import re
 
 import torch
@@ -438,6 +439,320 @@ class GlmW4A8SparseMoeBlock(nn.Module):
         return output.view_as(hidden_states)
 
 
+class GlmFloatSparseMoeBlock(nn.Module):
+    """BF16 MTP experts with GLM's FP32 router semantics."""
+
+    def __init__(self, config: GlmMoeDsaConfig, layer_idx: int) -> None:
+        super().__init__()
+        self.layer_idx = int(layer_idx)
+        self.hidden_size = int(config.hidden_size)
+        self.moe_intermediate_size = int(config.moe_intermediate_size)
+        self.num_experts = int(config.n_routed_experts)
+        self.top_k = int(config.num_experts_per_tok)
+        self.renormalize = bool(getattr(config, "norm_topk_prob", True))
+        self.scoring_func = str(getattr(config, "scoring_func", "sigmoid"))
+        self.routed_scaling_factor = float(
+            getattr(config, "routed_scaling_factor", 1.0)
+        )
+        self.num_expert_group = int(getattr(config, "n_group", 1) or 1)
+        self.topk_group = int(getattr(config, "topk_group", 1) or 1)
+        self.num_shared_experts = int(
+            getattr(config, "n_shared_experts", 1) or 1
+        )
+        if not bool(
+            getattr(config, "nanovllm_enable_expert_parallel", False)
+        ):
+            raise ValueError("GLM FLOAT MTP experts require expert parallel.")
+        self.ep_size = dist.get_world_size()
+        self.ep_rank = dist.get_rank()
+        if self.num_experts % self.ep_size:
+            raise ValueError(
+                "n_routed_experts must be divisible by the EP world size."
+            )
+        self.num_local_experts = self.num_experts // self.ep_size
+        self.local_expert_start = self.ep_rank * self.num_local_experts
+        self.local_expert_end = self.local_expert_start + self.num_local_experts
+        self.local_expert_ids = tuple(
+            range(self.local_expert_start, self.local_expert_end)
+        )
+        self.local_expert_id_set = set(self.local_expert_ids)
+
+        self.gate = ReplicatedLinear(
+            self.hidden_size, self.num_experts, bias=False
+        ).to(torch.float32)
+        if getattr(config, "topk_method", None) == "noaux_tc":
+            self.gate.e_score_correction_bias = nn.Parameter(
+                torch.empty(self.num_experts, dtype=torch.float32)
+            )
+        else:
+            self.gate.register_parameter("e_score_correction_bias", None)
+
+        self.shared_experts = GlmMLP(
+            hidden_size=self.hidden_size,
+            intermediate_size=(
+                self.moe_intermediate_size * self.num_shared_experts
+            ),
+            hidden_act=str(config.hidden_act),
+            reduce_results=False,
+        )
+        self.experts = nn.ModuleDict(
+            {
+                str(expert_idx): GlmMLP(
+                    hidden_size=self.hidden_size,
+                    intermediate_size=self.moe_intermediate_size,
+                    hidden_act=str(config.hidden_act),
+                    disable_tp=True,
+                )
+                for expert_idx in self.local_expert_ids
+            }
+        )
+        self.local_expert_layers = tuple(
+            self.experts[str(expert_idx)]
+            for expert_idx in self.local_expert_ids
+        )
+        self.register_parameter("grouped_w13_weight", None)
+        self.register_parameter("grouped_w2_weight", None)
+
+    def post_load_prepare(self) -> None:
+        if self.grouped_w13_weight is not None or not self.local_expert_layers:
+            return
+        first_weight = self.local_expert_layers[0].gate_up_proj.weight
+        if first_weight.device.type != "npu":
+            return
+        dtype = first_weight.dtype
+        device = first_weight.device
+
+        cpu_w13_parts = [
+            expert.gate_up_proj.weight.detach().cpu()
+            for expert in self.local_expert_layers
+        ]
+        cpu_w2_parts = [
+            expert.down_proj.weight.detach().cpu()
+            for expert in self.local_expert_layers
+        ]
+        for expert in self.local_expert_layers:
+            expert.gate_up_proj._parameters.pop("weight", None)
+            expert.down_proj._parameters.pop("weight", None)
+        self.experts = nn.ModuleDict()
+        self.local_expert_layers = ()
+        gc.collect()
+        torch.npu.empty_cache()
+
+        w13 = torch.empty(
+            (
+                self.num_local_experts,
+                self.hidden_size,
+                2 * self.moe_intermediate_size,
+            ),
+            dtype=dtype,
+            device=device,
+        )
+        w2 = torch.empty(
+            (
+                self.num_local_experts,
+                self.moe_intermediate_size,
+                self.hidden_size,
+            ),
+            dtype=dtype,
+            device=device,
+        )
+        for local_idx, (w13_part, w2_part) in enumerate(
+            zip(cpu_w13_parts, cpu_w2_parts)
+        ):
+            w13[local_idx].copy_(w13_part.transpose(0, 1))
+            w2[local_idx].copy_(w2_part.transpose(0, 1))
+        self.grouped_w13_weight = nn.Parameter(w13, requires_grad=False)
+        self.grouped_w2_weight = nn.Parameter(w2, requires_grad=False)
+        del cpu_w13_parts, cpu_w2_parts
+        gc.collect()
+
+    def _grouped_topk(
+        self, router_logits: torch.Tensor, output_dtype: torch.dtype
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.scoring_func not in ("softmax", "sigmoid"):
+            raise ValueError(
+                f"Unsupported GLM scoring function {self.scoring_func!r}."
+            )
+        topk_weights, topk_ids, _ = ascend_ops.moe_gating_top_k(
+            router_logits.contiguous(),
+            k=self.top_k,
+            k_group=self.topk_group,
+            group_count=self.num_expert_group,
+            group_select_mode=1,
+            renorm=1 if self.renormalize else 0,
+            norm_type=1 if self.scoring_func == "sigmoid" else 0,
+            out_flag=False,
+            routed_scaling_factor=self.routed_scaling_factor,
+            eps=1e-20,
+            bias_opt=getattr(self.gate, "e_score_correction_bias", None),
+        )
+        return topk_weights.to(output_dtype), topk_ids
+
+    def _grouped_experts_forward(
+        self,
+        hidden_states: torch.Tensor,
+        selected_experts: torch.Tensor,
+        routing_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        selected_experts = selected_experts.to(torch.int32).contiguous()
+        local_mask = (selected_experts >= self.local_expert_start) & (
+            selected_experts < self.local_expert_end
+        )
+        routing_weights = (
+            routing_weights * local_mask.to(routing_weights.dtype)
+        ).contiguous()
+        sorted_hidden, expanded_row_idx, expert_tokens, _ = (
+            torch_npu.npu_moe_init_routing_v2(
+                hidden_states,
+                selected_experts,
+                scale=None,
+                active_num=hidden_states.shape[0] * self.top_k,
+                expert_num=self.num_experts,
+                expert_tokens_num_type=1,
+                expert_tokens_num_flag=True,
+                active_expert_range=[
+                    self.local_expert_start,
+                    self.local_expert_end,
+                ],
+                quant_mode=-1,
+            )
+        )
+        gate_up = torch_npu.npu_grouped_matmul(
+            x=[sorted_hidden],
+            weight=[self.grouped_w13_weight],
+            split_item=2,
+            group_list_type=1,
+            group_type=0,
+            group_list=expert_tokens,
+        )[0]
+        routed = torch_npu.npu_swiglu(gate_up)
+        routed = torch_npu.npu_grouped_matmul(
+            x=[routed],
+            weight=[self.grouped_w2_weight],
+            split_item=2,
+            group_list_type=1,
+            group_type=0,
+            group_list=expert_tokens,
+        )[0]
+        return torch_npu.npu_moe_token_unpermute(
+            permuted_tokens=routed,
+            sorted_indices=torch.abs(expanded_row_idx),
+            probs=routing_weights,
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        shared_output = self.shared_experts(hidden_states)
+        router_logits = self.gate(hidden_states.to(torch.float32))
+        routing_weights, selected_experts = self._grouped_topk(
+            router_logits, hidden_states.dtype
+        )
+        if self.grouped_w13_weight is None or hidden_states.device.type != "npu":
+            raise RuntimeError(
+                "GLM FLOAT MTP experts are not prepared. Call "
+                "post_load_prepare() after loading weights on NPU."
+            )
+        routed_output = self._grouped_experts_forward(
+            hidden_states, selected_experts, routing_weights
+        )
+        output = routed_output + shared_output
+        if self.ep_size > 1:
+            dist.all_reduce(output)
+        return output.view_as(hidden_states)
+
+
+class GlmMTPDecoderLayer(nn.Module):
+    """The checkpoint's FLOAT decoder block at model.layers.78."""
+
+    def __init__(self, config: GlmMoeDsaConfig) -> None:
+        super().__init__()
+        layer_idx = int(config.num_hidden_layers)
+        self.self_attn = GlmMLAAttention(config, layer_idx)
+        self.mlp = GlmFloatSparseMoeBlock(config, layer_idx)
+        self.input_layernorm = RMSNorm(
+            int(config.hidden_size), eps=float(config.rms_norm_eps)
+        )
+        self.post_attention_layernorm = RMSNorm(
+            int(config.hidden_size), eps=float(config.rms_norm_eps)
+        )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(
+                hidden_states, residual
+            )
+        hidden_states = self.self_attn(positions, hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, residual
+        )
+        return self.mlp(hidden_states), residual
+
+    def post_load_prepare(self) -> None:
+        self.self_attn.post_load_prepare()
+        self.mlp.post_load_prepare()
+
+
+class GlmMTP(nn.Module):
+    """One GLM MTP layer recursively reused for K draft tokens."""
+
+    def __init__(self, config: GlmMoeDsaConfig) -> None:
+        super().__init__()
+        hidden_size = int(config.hidden_size)
+        self.embed_tokens = VocabParallelEmbedding(
+            int(config.vocab_size), hidden_size
+        )
+        self.enorm = RMSNorm(hidden_size, eps=float(config.rms_norm_eps))
+        self.hnorm = RMSNorm(hidden_size, eps=float(config.rms_norm_eps))
+        self.rot = ReplicatedLinear(hidden_size, hidden_size, bias=False)
+        self.eh_proj = ReplicatedLinear(
+            hidden_size * 2, hidden_size, bias=False
+        )
+        self.mtp_block = GlmMTPDecoderLayer(config)
+        self.shared_head_norm = RMSNorm(
+            hidden_size, eps=float(config.rms_norm_eps)
+        )
+        self.shared_head = ParallelLMHead(
+            int(config.vocab_size), hidden_size
+        )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        previous_hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        inputs_embeds = self.embed_tokens(input_ids)
+        inputs_embeds = torch.where(
+            positions.unsqueeze(-1) == 0,
+            torch.zeros((), dtype=inputs_embeds.dtype, device=inputs_embeds.device),
+            inputs_embeds,
+        )
+        inputs_embeds = self.enorm(inputs_embeds)
+        previous_hidden_states = self.hnorm(
+            self.rot(previous_hidden_states)
+        )
+        hidden_states = self.eh_proj(
+            torch.cat((inputs_embeds, previous_hidden_states), dim=-1)
+        )
+        hidden_states, residual = self.mtp_block(
+            positions, hidden_states, residual=None
+        )
+        return hidden_states + residual
+
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.shared_head(self.shared_head_norm(hidden_states))
+
+    def post_load_prepare(self) -> None:
+        self.mtp_block.post_load_prepare()
+
+
 class GlmMoeDsaDecoderLayer(nn.Module):
     def __init__(self, config: GlmMoeDsaConfig, layer_idx: int) -> None:
         super().__init__()
@@ -473,6 +788,7 @@ class GlmMoeDsaDecoderLayer(nn.Module):
         context = get_context()
         fuse_o_proj_norm = (
             not context.is_prefill
+            and not context.is_spec_decode
             and self.self_attn.can_fuse_o_proj_add_rms_norm()
         )
         hidden_states = self.self_attn(
@@ -540,6 +856,10 @@ class GlmMoeDsaForCausalLM(nn.Module):
         )
         # The checkpoint stores lm_head in FP32; retain it for logits accuracy.
         self.lm_head.weight.data = self.lm_head.weight.data.to(torch.float32)
+        self.num_speculative_tokens = int(
+            getattr(config, "nanovllm_num_speculative_tokens", 0)
+        )
+        self.mtp = GlmMTP(config) if self.num_speculative_tokens else None
 
     def forward(
         self, input_ids: torch.Tensor, positions: torch.Tensor
@@ -605,6 +925,57 @@ class GlmMoeDsaForCausalLM(nn.Module):
 
     def post_load_prepare(self) -> None:
         self.model.post_load_prepare()
+        if self.mtp is not None:
+            self.mtp.post_load_prepare()
+
+    def validate_loaded_weights(self, loaded_parameters: set[str]) -> None:
+        if self.mtp is None:
+            return
+        expected = {
+            f"mtp.{name}" for name, _ in self.mtp.named_parameters()
+        }
+        missing = sorted(expected - loaded_parameters)
+        if missing:
+            raise RuntimeError(
+                "GLM MTP checkpoint loading is incomplete; missing "
+                f"{len(missing)} parameter(s), including {missing[:5]}."
+            )
+
+    def _map_mtp_weight(
+        self, weight_name: str
+    ) -> str | WeightTarget | None:
+        if weight_name == "rot.weight":
+            return "mtp.rot.weight"
+
+        prefix = f"model.layers.{int(self.config.num_hidden_layers)}."
+        if not weight_name.startswith(prefix):
+            return None
+        suffix = weight_name[len(prefix):]
+        if suffix.startswith("self_attn.indexer."):
+            return None
+        special = {
+            "embed_tokens.weight": "mtp.embed_tokens.weight",
+            "enorm.weight": "mtp.enorm.weight",
+            "hnorm.weight": "mtp.hnorm.weight",
+            "eh_proj.weight": "mtp.eh_proj.weight",
+            "shared_head.norm.weight": "mtp.shared_head_norm.weight",
+            "shared_head.head.weight": "mtp.shared_head.weight",
+        }
+        target = special.get(suffix)
+        if target is not None:
+            return target
+
+        match = _EXPERT_WEIGHT_RE.match(weight_name)
+        if match is not None:
+            expert_idx = int(match.group("expert"))
+            if expert_idx not in self.mtp.mtp_block.mlp.local_expert_id_set:
+                return None
+            if match.group("field") != "weight":
+                raise ValueError(
+                    "GLM MTP experts must contain BF16 weight tensors only; "
+                    f"got {weight_name!r}."
+                )
+        return f"mtp.mtp_block.{suffix}"
 
     def weight_name_mapping(self, weight_name: str) -> str | WeightTarget | None:
         if (
@@ -614,7 +985,13 @@ class GlmMoeDsaForCausalLM(nn.Module):
             and ".self_attn.indexer." in weight_name
         ):
             return None
-        # MTP draft weights/rotation are never executed.
+        if self.mtp is not None and (
+            weight_name == "rot.weight"
+            or weight_name.startswith(
+                f"model.layers.{int(self.config.num_hidden_layers)}."
+            )
+        ):
+            return self._map_mtp_weight(weight_name)
         if should_skip_glm_checkpoint_weight(weight_name):
             return None
 
