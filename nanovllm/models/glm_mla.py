@@ -914,6 +914,63 @@ class GlmMLAAttention(nn.Module):
         latent = mla_result[0] if isinstance(mla_result, (tuple, list)) else mla_result
         return torch_npu.npu_transpose_batchmatmul(latent.transpose(0, 1).contiguous(), self.w_uv, perm_y=(1, 0, 2)).reshape(latent.shape[0], -1)
 
+    def _spec_decode_forward_npu_mla(
+        self,
+        ql_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the target model's K+1 causal MTP verification."""
+
+        context = get_context()
+        if context.cu_seqlens_q is None:
+            raise RuntimeError("MTP verification is missing query lengths.")
+        if context.actual_seq_lengths_kv is None:
+            raise RuntimeError("MTP verification is missing KV lengths.")
+        if context.block_tables is None:
+            raise RuntimeError("MTP verification is missing block tables.")
+
+        num_tokens = int(ql_nope.shape[0])
+        query = ql_nope.view(
+            num_tokens, self.num_local_heads, self.kv_lora_rank
+        ).contiguous()
+        query_rope = q_pe.view(
+            num_tokens, self.num_local_heads, self.qk_rope_head_dim
+        )
+        key_cache = self.ckv_cache.view(
+            -1, 1, self.block_size, self.kv_lora_rank
+        )
+        key_rope_cache = self.kpe_cache.view(
+            -1, 1, self.block_size, self.qk_rope_head_dim
+        )
+        actual_seq_qlen = (
+            context.cu_seqlens_q[1:].detach().cpu().tolist()
+        )
+        latent, _ = torch_npu.npu_fused_infer_attention_score_v2(
+            query,
+            key_cache,
+            key_cache,
+            query_rope=query_rope,
+            key_rope=key_rope_cache,
+            num_query_heads=self.num_local_heads,
+            num_key_value_heads=1,
+            input_layout="TND_NTD",
+            atten_mask=_get_npu_mla_attention_mask(query.device, 2048),
+            sparse_mode=3,
+            softmax_scale=float(self.scale),
+            block_table=context.block_tables,
+            block_size=self.block_size,
+            actual_seq_qlen=actual_seq_qlen,
+            actual_seq_kvlen=context.actual_seq_lengths_kv,
+        )
+        latent = latent.view(
+            self.num_local_heads, num_tokens, self.kv_lora_rank
+        )
+        return torch_npu.npu_transpose_batchmatmul(
+            latent,
+            self.w_uv,
+            perm_y=(1, 0, 2),
+        ).reshape(num_tokens, -1)
+
     def _lidu_update(
         self,
         q_index: torch.Tensor,
@@ -1287,7 +1344,9 @@ class GlmMLAAttention(nn.Module):
 
         ql_nope = self._q_nope_up_proj(q_nope)
 
-        if context.is_prefill or context.is_spec_decode:
+        if context.is_spec_decode:
+            attn_output = self._spec_decode_forward_npu_mla(ql_nope, q_pe)
+        elif context.is_prefill:
             attn_output = self._prefill_forward_npu_mla(ql_nope, q_pe)
         else:
             attn_output = self._decode_forward_mla(ql_nope, q_pe, q_index, weights)
