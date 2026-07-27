@@ -3,6 +3,7 @@
 这里只保留与正式推理路径直接对应的 NPU 测试：
 
 - LIDU + SCATTER 的全部缓存档位、request pool、精确搬运、重复更新和链路时延。
+- GLM LIDU 融合 SCATTER + sparse-and-tail Attention 的真实 DRAM 搬移与 Attention 结果。
 - GatherSelectionKVCache 的状态迁移、精确搬运、短行跳过、零 miss 和性能。
 - GLM 32-head Indexer 投影、interleaved RoPE、LightningIndexer 到 GatherSelection 的组合语义。
 - GLM ModelSlim W4A8 routed expert。
@@ -33,6 +34,27 @@ python3 ut_ops/test_lidu_scatter.py \
 
 成功标志是 `LIDU_SCATTER_UT_OK`。必须先通过该测试，才运行
 `NANOVLLM_OFFLOAD_MODE=lidu` 的完整推理。
+
+## GLM 融合 SCATTER + sparse-and-tail Attention
+
+```bash
+unset NANOVLLM_GS_MISS_RATE_ON_LAYERS
+unset NANOVLLM_PROFILE_DECODE_OUTPUT
+unset NANOVLLM_CUST_OPAPI_LIB
+unset ASCEND_CUSTOM_OPP_PATH
+
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export ASCEND_LAUNCH_BLOCKING=0
+export ASCEND_RT_VISIBLE_DEVICES=4
+export PYTHONUNBUFFERED=1
+export PYTHONPATH=$PWD:$PYTHONPATH
+export ASCEND_HOME_PATH=/usr/local/Ascend/cann-8.5.1
+
+python3 ut_ops/test_fused_attention_scatter.py --device npu:0 --mode check --batch-size 24 --heads 8 --source-len 65536 --cache-tokens 8192 --tail-tokens 64 --miss-min 0 --miss-max 2048 --seed 7
+python3 ut_ops/test_fused_attention_scatter.py --device npu:0 --mode all --batch-size 24 --heads 8 --source-len 65536 --cache-tokens 8192 --tail-tokens 64 --miss-min 0 --miss-max 300 --warmup 10 --iters 100 --seed 7
+```
+
+该测试使用 `empty_with_swapped_memory` 创建真实 DRAM source，并分别对旧路径和融合路径验证目标 slot 的 poison 覆盖、非目标 guard 不变、DRAM→HBM 精确搬移、CPU Attention golden 和两条路径结果一致。最终成功标志是 `FUSED_SCATTER_ATTENTION_UT_OK`。
 
 ## GatherSelectionKVCache
 

@@ -52,6 +52,7 @@ class Config:
     tensor_parallel_size: int = 1
     enable_expert_parallel: bool = False
     offload_mode: str = OFFLOAD_NONE
+    enable_lidu_fused_attention_scatter: bool = False
     enforce_eager: bool = False
     decode_graph_capture_sizes: tuple[int, ...] | list[int] | None = None
     hf_config: Any = field(init=False)
@@ -69,6 +70,10 @@ class Config:
         assert self.kvcache_block_size % 16 == 0
         assert 1 <= self.tensor_parallel_size
         self.offload_mode = normalize_offload_mode(self.offload_mode)
+        if type(self.enable_lidu_fused_attention_scatter) is not bool:
+            raise TypeError(
+                "enable_lidu_fused_attention_scatter must be a bool."
+            )
         if self.num_hbm_kvcache_blocks <= 2:
             raise ValueError(
                 "num_hbm_kvcache_blocks must be > 2. The example scripts "
@@ -100,6 +105,11 @@ class Config:
             "nanovllm_offload_mode",
             self.offload_mode,
         )
+        setattr(
+            self.hf_config,
+            "nanovllm_enable_lidu_fused_attention_scatter",
+            self.enable_lidu_fused_attention_scatter,
+        )
         self._validate_model_format()
 
         text_config = getattr(self.hf_config, "text_config", self.hf_config)
@@ -116,6 +126,7 @@ class Config:
 
         self._configure_glm_runtime()
         self._validate_lidu_runtime(text_config)
+        self._validate_lidu_fused_attention_scatter()
         eos_token_id = getattr(text_config, "eos_token_id", None)
         if eos_token_id is not None:
             self.eos = normalize_eos_token_ids(eos_token_id)
@@ -331,6 +342,20 @@ class Config:
                 f"tokens, got {max_source_tokens}."
             )
         validate_lidu_cache_token_budgets(self.kvcache_block_size)
+
+    def _validate_lidu_fused_attention_scatter(self) -> None:
+        if not self.enable_lidu_fused_attention_scatter:
+            return
+        if self.offload_mode != OFFLOAD_LIDU:
+            raise ValueError(
+                "enable_lidu_fused_attention_scatter requires "
+                "offload_mode='lidu'."
+            )
+        if getattr(self.hf_config, "model_type", "") != "glm_moe_dsa":
+            raise ValueError(
+                "Fused LIDU Attention+SCATTER currently supports "
+                "GLM-5.1-w4a8 only."
+            )
 
     def _load_hf_config(self):
         config_path = os.path.join(self.model, "config.json")

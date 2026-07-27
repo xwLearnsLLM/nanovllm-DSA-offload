@@ -237,8 +237,13 @@ class ModelRunner:
                         else "FULL_DECODE_ONLY raw ACLGraph"
                     ),
                     (
-                        "lidu offload + sparse-and-tail MLA "
-                        "(cached top-2048 + dense tail)"
+                        (
+                            "lidu offload + fused SCATTER/sparse-and-tail MLA "
+                            "(cached top-2048 + dense tail)"
+                            if self.config.enable_lidu_fused_attention_scatter
+                            else "lidu offload + sparse-and-tail MLA "
+                            "(cached top-2048 + dense tail)"
+                        )
                         if self.offload_mode == OFFLOAD_LIDU
                         else (
                             f"{self.offload_mode} decode offload (topk=2048)"
@@ -353,6 +358,9 @@ class ModelRunner:
         stats = self.decode_graph_manager.stats()
         stats.update(
             **self._decode_ipc_stats(),
+            lidu_fused_attention_scatter=(
+                self.config.enable_lidu_fused_attention_scatter
+            ),
             metadata_cache_hits=self._decode_metadata_cache_hits,
             metadata_cache_misses=self._decode_metadata_cache_misses,
         )

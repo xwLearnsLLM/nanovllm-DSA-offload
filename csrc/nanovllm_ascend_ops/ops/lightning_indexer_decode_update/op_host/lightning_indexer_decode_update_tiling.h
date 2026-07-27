@@ -60,6 +60,7 @@ TILING_DATA_FIELD_DEF(uint32_t, maxBlockNumPerBatch)
 TILING_DATA_FIELD_DEF(uint32_t, poolSize)
 TILING_DATA_FIELD_DEF(uint32_t, n1Size)
 TILING_DATA_FIELD_DEF(uint32_t, cacheSlotsSize)
+TILING_DATA_FIELD_DEF(uint32_t, scheduleMode)
 END_TILING_DATA_DEF
 REGISTER_TILING_DATA_CLASS(NanovllmLiduDecodeUpdate, LIU2TilingData)
 

@@ -1,0 +1,27 @@
+#ifndef NANOVLLM_SPARSE_AND_TAIL_ATTENTION_AND_SCATTER_COPY_TILING_H
+#define NANOVLLM_SPARSE_AND_TAIL_ATTENTION_AND_SCATTER_COPY_TILING_H
+
+#include "../../sparse_and_tail_attention/op_host/nanovllm_sparse_and_tail_attention_tiling.h"
+
+namespace optiling {
+
+BEGIN_TILING_DATA_DEF(NanovllmSparseAndTailAttentionAndScatterCopyTilingData)
+TILING_DATA_FIELD_DEF_STRUCT(NanovllmSparseAndTailAttentionBaseParamsMla, baseParams);
+TILING_DATA_FIELD_DEF_STRUCT(NanovllmSparseAndTailAttentionSplitKVParamsMla, splitKVParams);
+TILING_DATA_FIELD_DEF_STRUCT(NanovllmSparseAndTailAttentionSingleCoreParamsMla, singleCoreParams);
+TILING_DATA_FIELD_DEF_STRUCT(NanovllmSparseAndTailAttentionSingleCoreTensorSizeMla, singleCoreTensorSize);
+TILING_DATA_FIELD_DEF_STRUCT(NanovllmSparseAndTailAttentionInnerSplitParams, innerSplitParams);
+TILING_DATA_FIELD_DEF(uint32_t, copyCap);
+TILING_DATA_FIELD_DEF(uint32_t, dramMaxBlockNum);
+END_TILING_DATA_DEF
+
+REGISTER_TILING_DATA_CLASS(
+    NanovllmSparseAndTailAttentionAndScatterCopy,
+    NanovllmSparseAndTailAttentionAndScatterCopyTilingData)
+
+struct NanovllmSparseAndTailAttentionAndScatterCopyCompileInfo {
+};
+
+}  // namespace optiling
+
+#endif

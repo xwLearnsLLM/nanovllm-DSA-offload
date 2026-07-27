@@ -26,12 +26,15 @@ struct RunInfo {
     uint32_t loop;
     uint32_t bIdx;
     uint32_t s2Idx;
+    uint32_t segmentChunkIdx;
     uint32_t actS2Size;
     uint32_t cacheRowIdx;
     uint32_t actualSingleProcessSInnerSize;
     uint32_t actualSingleProcessSInnerSizeAlign;
     bool isFirstS2InnerLoop;
     bool isLastS2InnerLoop;
+    bool isPartialSegment;
+    uint32_t partialSlot;
 };
 
 struct ConstInfo {

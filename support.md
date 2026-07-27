@@ -1,7 +1,7 @@
 # 模型、卸载模式与 FULL_DECODE_ONLY 支持矩阵
 
 本文梳理 `main` 分支当前支持的模型、decode KV 模式，以及各组合进入
-`FULL_DECODE_ONLY` 的条件。审计基线为 commit `f30b595`。
+`FULL_DECODE_ONLY` 的条件。
 
 ## 总体支持矩阵
 
@@ -92,6 +92,7 @@ Dense MLA 整图要求 capture size 不超过 KV cache block size，以便 paddi
 
 - LIDU 融合 top-2048、hit/miss、eviction 和索引更新；
 - SCATTER 只负责 DRAM→HBM 搬移；
+- GLM 可用 `enable_lidu_fused_attention_scatter=True`（示例环境变量为 `NANOVLLM_ENABLE_LIDU_FUSED_ATTENTION_SCATTER=1`）改走融合 SCATTER + sparse-and-tail Attention；
 - HBM 缓存预算按原始 prompt 长度选择；
 - 支持 `FULL_DECODE_ONLY`，使用 exact-size lazy capture；
 - 允许 `C=0` 短请求和 `C>0` 长请求混合入图。
@@ -119,9 +120,11 @@ Dense MLA 整图要求 capture size 不超过 KV cache block size，以便 paddi
 GLM 和 DeepSeek 在 LIDU 模式下的 Attention 路径不同：
 
 - GLM + LIDU 使用 `sparse_and_tail_attention`，计算缓存中的 top-2048
-  加 dense tail；
+  加 dense tail；开启融合开关后，稳定 decode 且 batch size 不超过 24 时改用
+  `sparse_and_tail_attention_and_scatter_copy`，首次 decode、初始化 step 和更大
+  batch 自动回退旧的 SCATTER + Attention 路径；
 - DeepSeek + LIDU 仍使用 dense MLA，计算全部 C 个缓存 token
-  加 prompt tail 和 decode token。
+  加 prompt tail 和 decode token；融合开关目前不支持 DeepSeek。
 
 ## FULL_DECODE_ONLY 的边界
 

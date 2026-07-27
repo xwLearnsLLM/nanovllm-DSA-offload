@@ -242,6 +242,8 @@ set(lightning_indexer_kernel_aliases lightning_indexer_vllm)
 set(lightning_indexer_decode_update_kernel_aliases nanovllm_lidu_decode_update)
 set(kvcache_scatter_copy_kernel_aliases nanovllm_kvcache_scatter_copy)
 set(sparse_and_tail_attention_kernel_aliases nanovllm_sparse_and_tail_attention)
+set(sparse_and_tail_attention_and_scatter_copy_kernel_aliases
+    nanovllm_sparse_and_tail_attention_and_scatter_copy)
 
 foreach (OP_DIR ${OP_DIR_LIST})
     get_filename_component(_op_name "${OP_DIR}" NAME)

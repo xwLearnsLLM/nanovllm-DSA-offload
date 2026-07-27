@@ -38,9 +38,11 @@ constexpr uint32_t TOPK_PAIR_FLOATS = BASE_TOPK * VALUE_AND_INDEX_NUM;
 constexpr uint32_t EVICT_PAIR_FLOATS = EVICT_CANDIDATE_CAP * VALUE_AND_INDEX_NUM;
 constexpr uint32_t SORTED_SCRATCH_FLOATS = SORT_TMP_FLOATS + CHUNK_PAIR_FLOATS;
 constexpr uint32_t SORT_BUFFER_FLOATS = TOPK_PAIR_FLOATS + EVICT_PAIR_FLOATS + SORTED_SCRATCH_FLOATS;
+constexpr uint32_t PARTIAL_SLOTS_PER_CORE = 2;
+constexpr uint32_t PARTIAL_META_INTS_PER_CORE = 8;
 
 #ifndef LI_DECODE_UPDATE_EVICT_EXTRA_SCAN_CHUNKS
-#define LI_DECODE_UPDATE_EVICT_EXTRA_SCAN_CHUNKS 8
+#define LI_DECODE_UPDATE_EVICT_EXTRA_SCAN_CHUNKS 4
 #endif
 
 static_assert(LI_DECODE_UPDATE_EVICT_EXTRA_SCAN_CHUNKS >= 0,
@@ -77,7 +79,13 @@ public:
                                                 GlobalTensor<int32_t> topkIndexGm,
                                                 GlobalTensor<int32_t> topkSlotsGm,
                                                 GlobalTensor<int32_t> missCountGm,
-                                                GlobalTensor<float> scoresGm);
+                                                GlobalTensor<float> scoresGm,
+                                                GlobalTensor<float> partialTopkGm,
+                                                GlobalTensor<int32_t> partialMetaGm);
+    __aicore__ inline void InitPartialMetadata(uint32_t coreIdx);
+    __aicore__ inline void FinalizePartialRequest(uint32_t bIdx, uint32_t cacheRowIdx,
+                                                  uint32_t actualSeqLen, uint32_t firstOwner,
+                                                  uint32_t lastOwner);
     __aicore__ inline void WriteZeroMissCount(uint32_t bIdx);
 
 protected:
@@ -88,6 +96,8 @@ protected:
     GlobalTensor<int32_t> topkSlotsGm;
     GlobalTensor<int32_t> missCountGm;
     GlobalTensor<float> scoresGm;
+    GlobalTensor<float> partialTopkGm;
+    GlobalTensor<int32_t> partialMetaGm;
 
 private:
     // queue
@@ -100,11 +110,13 @@ private:
     TBuf<TPosition::VECCALC> payloadBuf_;
     TBuf<TPosition::VECCALC> reduceOutBuf_;
     TBuf<TPosition::VECCALC> brcBuf_;
+    TBuf<TPosition::VECCALC> partialMetaBuf_;
 
     LocalTensor<int32_t> globalTopkIndice_;
     LocalTensor<float> globalTopkUb_;
     LocalTensor<float> evictCandidateUb_;
     LocalTensor<float> SortedBasicBlock_;
+    LocalTensor<int32_t> partialMetaLocal_;
 
     static constexpr int32_t s2BaseSize_ = S2_BASE_SIZE;
     uint32_t scoreStride_ = 0;
@@ -125,6 +137,7 @@ private:
                                           LocalTensor<float> &tmpSortBuf);
     __aicore__ inline void WriteScoreChunk(uint32_t bIdx, int32_t s2BaseIdx,
                                            const LocalTensor<float> &scoreLocal, int32_t alignedLen);
+    __aicore__ inline void WritePartialTopK(uint32_t coreIdx, uint32_t partialSlot, uint32_t bIdx);
     __aicore__ inline void SortEvictCandidateChunk(uint32_t bIdx, uint32_t cacheRowIdx, uint32_t chunkIdx,
                                                    uint32_t actualSeqLen,
                                                    const LocalTensor<float> &pairOut,
@@ -132,11 +145,11 @@ private:
     __aicore__ inline void MergeEvictCandidateChunk(const LocalTensor<float> &chunkPairLocal,
                                                      uint32_t candidateCap,
                                                      LocalTensor<float> &tmpSortBuf);
-    __aicore__ inline void MergeExtraEvictChunks512(uint32_t bIdx, uint32_t cacheRowIdx,
-                                                    uint32_t actualSeqLen, uint32_t startChunk,
-                                                    uint32_t chunkNum, uint32_t firstScanOffset,
-                                                    uint32_t extraChunks, LocalTensor<float> &tmpSortBuf);
-    __aicore__ inline void FindEvictCandidates(uint32_t bIdx, uint32_t cacheRowIdx, uint32_t actualSeqLen,
+    __aicore__ inline void MergeEvictChunkBatch512(uint32_t bIdx, uint32_t cacheRowIdx,
+                                                   uint32_t actualSeqLen, uint32_t startChunk,
+                                                   uint32_t chunkNum, uint32_t firstScanOffset,
+                                                   uint32_t batchChunks, LocalTensor<float> &tmpSortBuf);
+    __aicore__ inline bool FindEvictCandidates(uint32_t bIdx, uint32_t cacheRowIdx, uint32_t actualSeqLen,
                                                uint32_t scanSeed, uint32_t missCount, uint32_t candidateCap,
                                                float thresholdScore, LocalTensor<float> &tmpSortBuf);
     __aicore__ inline uint32_t CopyDecodedPayloadOut(int64_t outOffset, const LocalTensor<uint32_t> &payloadLocal,
@@ -153,6 +166,8 @@ private:
                                                         int64_t outOffset, uint32_t actualSeqLen, uint32_t scanSeed,
                                                         float thresholdScore, uint32_t missCount,
                                                         const LocalTensor<int32_t> &indexLocal,
+                                                        const LocalTensor<uint32_t> &candidatePayloadLocal,
+                                                        const LocalTensor<int32_t> &scalarLocal,
                                                         const LocalTensor<int32_t> &topkSlotsLocal);
     __aicore__ inline void WriteMissCount(uint32_t bIdx, int32_t missCount,
                                           const LocalTensor<int32_t> &scalarLocal);
@@ -176,12 +191,14 @@ __aicore__ inline void LIVector<LIT>::InitBuffers(TPipe *pipe)
     pipe->InitBuffer(payloadBuf_, S2_BASE_SIZE * PAYLOAD_BUF_SLOTS * sizeof(int32_t));
     pipe->InitBuffer(reduceOutBuf_, S2_BASE_SIZE * 2 * sizeof(float));
     pipe->InitBuffer(brcBuf_, GROUP_INNER * 8 * sizeof(float));
+    pipe->InitBuffer(partialMetaBuf_, PARTIAL_META_INTS_PER_CORE * sizeof(int32_t));
 
     //
     globalTopkIndice_ = indexBuf_.Get<int32_t>();
     globalTopkUb_ = sortOutBuf_.Get<float>();
     evictCandidateUb_ = globalTopkUb_[TOPK_PAIR_FLOATS];
     SortedBasicBlock_ = evictCandidateUb_[EVICT_PAIR_FLOATS];
+    partialMetaLocal_ = partialMetaBuf_.Get<int32_t>();
 
     ArithProgression<int32_t>(globalTopkIndice_, 0, 1, S2_BASE_SIZE);
     PipeBarrier<PIPE_V>();
@@ -203,7 +220,8 @@ __aicore__ inline void
 LIVector<LIT>::InitVec1GlobalTensor(GlobalTensor<MM1_OUT_T> mm1ResGm, GlobalTensor<K_T> weightsGm,
                                     GlobalTensor<int32_t> cacheSlotsGm, GlobalTensor<int32_t> topkIndexGm,
                                     GlobalTensor<int32_t> topkSlotsGm, GlobalTensor<int32_t> missCountGm,
-                                    GlobalTensor<float> scoresGm)
+                                    GlobalTensor<float> scoresGm, GlobalTensor<float> partialTopkGm,
+                                    GlobalTensor<int32_t> partialMetaGm)
 {
     this->mm1ResGm = mm1ResGm;
     this->weightsGm = weightsGm;
@@ -212,6 +230,21 @@ LIVector<LIT>::InitVec1GlobalTensor(GlobalTensor<MM1_OUT_T> mm1ResGm, GlobalTens
     this->topkSlotsGm = topkSlotsGm;
     this->missCountGm = missCountGm;
     this->scoresGm = scoresGm;
+    this->partialTopkGm = partialTopkGm;
+    this->partialMetaGm = partialMetaGm;
+}
+
+template <typename LIT>
+__aicore__ inline void LIVector<LIT>::InitPartialMetadata(uint32_t coreIdx)
+{
+    if ((GetBlockIdx() & 1U) != 0) {
+        return;
+    }
+    Duplicate(partialMetaLocal_, LICommon::ConstInfo::INVALID_IDX, PARTIAL_META_INTS_PER_CORE);
+    SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
+    LIServiceVec::CopyOut(partialMetaGm[coreIdx * PARTIAL_META_INTS_PER_CORE],
+                          partialMetaLocal_, PARTIAL_META_INTS_PER_CORE);
+    SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
 }
 
 template <typename LIT>
@@ -282,6 +315,20 @@ __aicore__ inline void LIVector<LIT>::WriteScoreChunk(uint32_t bIdx, int32_t s2B
 {
     SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
     LIServiceVec::CopyOut(scoresGm[bIdx * scoreStride_ + static_cast<uint32_t>(s2BaseIdx)], scoreLocal, alignedLen);
+}
+
+template <typename LIT>
+__aicore__ inline void LIVector<LIT>::WritePartialTopK(uint32_t coreIdx, uint32_t partialSlot, uint32_t bIdx)
+{
+    uint32_t resultSlot = coreIdx * PARTIAL_SLOTS_PER_CORE + partialSlot;
+    SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
+    partialMetaLocal_.SetValue(partialSlot, static_cast<int32_t>(bIdx));
+    SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
+    LIServiceVec::CopyOut(partialMetaGm[coreIdx * PARTIAL_META_INTS_PER_CORE],
+                          partialMetaLocal_, PARTIAL_META_INTS_PER_CORE);
+    SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
+    LIServiceVec::CopyOut(partialTopkGm[static_cast<uint64_t>(resultSlot) * TOPK_PAIR_FLOATS],
+                          globalTopkUb_, TOPK_PAIR_FLOATS);
     SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
 }
 
@@ -358,39 +405,34 @@ __aicore__ inline void LIVector<LIT>::MergeEvictCandidateChunk(const LocalTensor
 }
 
 template <typename LIT>
-__aicore__ inline void LIVector<LIT>::MergeExtraEvictChunks512(uint32_t bIdx, uint32_t cacheRowIdx,
-                                                               uint32_t actualSeqLen, uint32_t startChunk,
-                                                               uint32_t chunkNum, uint32_t firstScanOffset,
-                                                               uint32_t extraChunks,
-                                                               LocalTensor<float> &tmpSortBuf)
+__aicore__ inline void LIVector<LIT>::MergeEvictChunkBatch512(uint32_t bIdx, uint32_t cacheRowIdx,
+                                                              uint32_t actualSeqLen, uint32_t startChunk,
+                                                              uint32_t chunkNum, uint32_t firstScanOffset,
+                                                              uint32_t batchChunks,
+                                                              LocalTensor<float> &tmpSortBuf)
 {
-    uint32_t scanned = 0;
-    while (scanned < extraChunks) {
-        uint32_t batchChunks = Min<uint32_t, uint32_t>(PAYLOAD_BUF_SLOTS, extraChunks - scanned);
-        for (uint32_t batchIdx = 0; batchIdx < batchChunks; ++batchIdx) {
-            uint32_t scanOffset = firstScanOffset + scanned + batchIdx;
-            uint32_t chunkIdx = startChunk + scanOffset;
-            if (chunkIdx >= chunkNum) {
-                chunkIdx -= chunkNum;
-            }
-            LocalTensor<float> chunkPairLocal = globalTopkUb_[batchIdx * CHUNK_PAIR_FLOATS];
-            SortEvictCandidateChunk(bIdx, cacheRowIdx, chunkIdx, actualSeqLen, chunkPairLocal, tmpSortBuf);
-            PipeBarrier<PIPE_V>();
+    for (uint32_t batchIdx = 0; batchIdx < batchChunks; ++batchIdx) {
+        uint32_t scanOffset = firstScanOffset + batchIdx;
+        uint32_t chunkIdx = startChunk + scanOffset;
+        if (chunkIdx >= chunkNum) {
+            chunkIdx -= chunkNum;
         }
+        LocalTensor<float> chunkPairLocal = globalTopkUb_[batchIdx * CHUNK_PAIR_FLOATS];
+        SortEvictCandidateChunk(bIdx, cacheRowIdx, chunkIdx, actualSeqLen, chunkPairLocal, tmpSortBuf);
+        PipeBarrier<PIPE_V>();
+    }
 
-        if (batchChunks == 1U) {
-            MergeSort(evictCandidateUb_, s2BaseSize_, globalTopkUb_, s2BaseSize_, tmpSortBuf);
-        } else {
-            MrgBasicBlock(tmpSortBuf, globalTopkUb_, static_cast<int64_t>(batchChunks), s2BaseSize_);
-            PipeBarrier<PIPE_V>();
-            MergeSort(evictCandidateUb_, s2BaseSize_, tmpSortBuf, s2BaseSize_, globalTopkUb_);
-        }
-        scanned += batchChunks;
+    if (batchChunks == 1U) {
+        MergeSort(evictCandidateUb_, s2BaseSize_, globalTopkUb_, s2BaseSize_, tmpSortBuf);
+    } else {
+        MrgBasicBlock(tmpSortBuf, globalTopkUb_, static_cast<int64_t>(batchChunks), s2BaseSize_);
+        PipeBarrier<PIPE_V>();
+        MergeSort(evictCandidateUb_, s2BaseSize_, tmpSortBuf, s2BaseSize_, globalTopkUb_);
     }
 }
 
 template <typename LIT>
-__aicore__ inline void LIVector<LIT>::FindEvictCandidates(uint32_t bIdx, uint32_t cacheRowIdx,
+__aicore__ inline bool LIVector<LIT>::FindEvictCandidates(uint32_t bIdx, uint32_t cacheRowIdx,
                                                           uint32_t actualSeqLen, uint32_t scanSeed,
                                                           uint32_t missCount, uint32_t candidateCap,
                                                           float thresholdScore,
@@ -401,6 +443,41 @@ __aicore__ inline void LIVector<LIT>::FindEvictCandidates(uint32_t bIdx, uint32_
     uint32_t chunkNum = CeilDiv(actualSeqLen, static_cast<uint32_t>(s2BaseSize_));
     uint32_t startChunk = HashEvictScanSeed(scanSeed, cacheRowIdx) % chunkNum;
     uint32_t stopScanOffset = chunkNum;
+
+    if (candidateCap == static_cast<uint32_t>(s2BaseSize_)) {
+        uint32_t scanOffset = 0;
+        while (scanOffset < chunkNum) {
+            uint32_t batchChunks = Min<uint32_t, uint32_t>(PAYLOAD_BUF_SLOTS, chunkNum - scanOffset);
+            if (stopScanOffset != chunkNum) {
+                batchChunks = Min<uint32_t, uint32_t>(batchChunks, stopScanOffset - scanOffset);
+            }
+            MergeEvictChunkBatch512(bIdx, cacheRowIdx, actualSeqLen, startChunk, chunkNum,
+                                    scanOffset, batchChunks, tmpSortBuf);
+            scanOffset += batchChunks;
+
+            if (stopScanOffset != chunkNum) {
+                if (scanOffset >= stopScanOffset) {
+                    SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
+                    break;
+                }
+                continue;
+            }
+
+            SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
+            if (evictCandidateUb_.GetValue((missCount - 1U) * VALUE_AND_INDEX_NUM) > stopKey) {
+                uint32_t remainingChunks = chunkNum - scanOffset;
+                uint32_t extraChunks = EVICT_EXTRA_SCAN_CHUNKS < remainingChunks
+                                           ? EVICT_EXTRA_SCAN_CHUNKS
+                                           : remainingChunks;
+                if (extraChunks == 0U) {
+                    break;
+                }
+                stopScanOffset = scanOffset + extraChunks;
+            }
+        }
+        return evictCandidateUb_.GetValue((missCount - 1U) * VALUE_AND_INDEX_NUM) > stopKey;
+    }
+
     LocalTensor<float> chunkPairLocal = tmpSortBuf[SORT_TMP_FLOATS];
     if (candidateCap > static_cast<uint32_t>(s2BaseSize_) && candidateCap < EVICT_CANDIDATE_CAP) {
         chunkPairLocal = evictCandidateUb_[candidateCap * VALUE_AND_INDEX_NUM];
@@ -433,15 +510,10 @@ __aicore__ inline void LIVector<LIT>::FindEvictCandidates(uint32_t bIdx, uint32_
             if (extraChunks == 0U) {
                 break;
             }
-            if (candidateCap == static_cast<uint32_t>(s2BaseSize_)) {
-                MergeExtraEvictChunks512(bIdx, cacheRowIdx, actualSeqLen, startChunk, chunkNum,
-                                         scanOffset + 1U, extraChunks, tmpSortBuf);
-                SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
-                break;
-            }
             stopScanOffset = scanOffset + extraChunks;
         }
     }
+    return false;
 }
 
 template <typename LIT>
@@ -511,52 +583,72 @@ template <typename LIT>
 __aicore__ inline void LIVector<LIT>::UpdateCacheAndWriteTopkSlots(
     uint32_t bIdx, uint32_t cacheRowIdx, int64_t outOffset, uint32_t actualSeqLen, uint32_t scanSeed,
     float thresholdScore, uint32_t missCount,
-    const LocalTensor<int32_t> &indexLocal, const LocalTensor<int32_t> &topkSlotsLocal)
+    const LocalTensor<int32_t> &indexLocal, const LocalTensor<uint32_t> &candidatePayloadLocal,
+    const LocalTensor<int32_t> &scalarLocal, const LocalTensor<int32_t> &topkSlotsLocal)
 {
     uint32_t candidateCap = 0;
+    bool hasFullCandidatePrefix = false;
     if (missCount > 0) {
         candidateCap = ((missCount + S2_BASE_SIZE - 1U) / S2_BASE_SIZE) * S2_BASE_SIZE;
         if (candidateCap > EVICT_CANDIDATE_CAP) {
             candidateCap = EVICT_CANDIDATE_CAP;
         }
-        FindEvictCandidates(bIdx, cacheRowIdx, actualSeqLen, scanSeed, missCount, candidateCap,
-                            thresholdScore, SortedBasicBlock_);
+        hasFullCandidatePrefix =
+            FindEvictCandidates(bIdx, cacheRowIdx, actualSeqLen, scanSeed, missCount, candidateCap,
+                                thresholdScore, SortedBasicBlock_);
     }
 
-    uint32_t candidateCursor = 0;
-    uint32_t fallbackCursor = 0;
     uint64_t rowBase = static_cast<uint64_t>(cacheRowIdx) * cacheSlotsSize_;
-    float stopKey = -thresholdScore;
     LocalTensor<uint32_t> candidateBitsLocal = evictCandidateUb_.template ReinterpretCast<uint32_t>();
-    for (uint32_t missIdx = 0; missIdx < missCount; ++missIdx) {
-        uint32_t evictIndex = 0;
-        int32_t evictSlot = LICommon::ConstInfo::INVALID_IDX;
-        bool foundCandidate = false;
-        while (candidateCursor < candidateCap) {
-            float candidateKey = evictCandidateUb_.GetValue(candidateCursor * VALUE_AND_INDEX_NUM);
-            if (candidateKey <= stopKey) {
-                break;
-            }
-            uint32_t payload = candidateBitsLocal.GetValue(candidateCursor * VALUE_AND_INDEX_NUM + 1);
-            ++candidateCursor;
-            int32_t slot = static_cast<int32_t>(payload >> INDEX_BITS);
-            uint32_t index = payload & INDEX_MASK;
-            if (slot >= 0 && index < actualSeqLen) {
-                evictIndex = index;
-                evictSlot = slot;
-                foundCandidate = true;
-                break;
-            }
-        }
-        if (!foundCandidate) {
-            foundCandidate = FindFallbackEvict(cacheRowIdx, actualSeqLen, indexLocal, fallbackCursor,
-                                               evictIndex, evictSlot);
-        }
-        if (foundCandidate) {
+    if (hasFullCandidatePrefix && missCount <= static_cast<uint32_t>(s2BaseSize_)) {
+        ExtractIndex(candidatePayloadLocal, candidateBitsLocal, missCount);
+        DecodeIndexFromPayload(scalarLocal.template ReinterpretCast<uint32_t>(),
+                               candidatePayloadLocal, missCount);
+        ShiftRight(topkSlotsLocal.template ReinterpretCast<uint32_t>(), candidatePayloadLocal,
+                   INDEX_BITS, missCount);
+        PipeBarrier<PIPE_V>();
+        SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
+        for (uint32_t missIdx = 0; missIdx < missCount; ++missIdx) {
             uint32_t missIndex = static_cast<uint32_t>(indexLocal.GetValue(missIdx));
-            topkSlotsLocal.SetValue(missIdx, evictSlot);
+            uint32_t evictIndex = static_cast<uint32_t>(scalarLocal.GetValue(missIdx));
+            int32_t evictSlot = topkSlotsLocal.GetValue(missIdx);
             cacheSlotsGm.SetValue(rowBase + evictIndex, LICommon::ConstInfo::INVALID_IDX);
             cacheSlotsGm.SetValue(rowBase + missIndex, evictSlot);
+        }
+    } else {
+        uint32_t candidateCursor = 0;
+        uint32_t fallbackCursor = 0;
+        float stopKey = -thresholdScore;
+        for (uint32_t missIdx = 0; missIdx < missCount; ++missIdx) {
+            uint32_t evictIndex = 0;
+            int32_t evictSlot = LICommon::ConstInfo::INVALID_IDX;
+            bool foundCandidate = false;
+            while (candidateCursor < candidateCap) {
+                float candidateKey = evictCandidateUb_.GetValue(candidateCursor * VALUE_AND_INDEX_NUM);
+                if (candidateKey <= stopKey) {
+                    break;
+                }
+                uint32_t payload = candidateBitsLocal.GetValue(candidateCursor * VALUE_AND_INDEX_NUM + 1);
+                ++candidateCursor;
+                int32_t slot = static_cast<int32_t>(payload >> INDEX_BITS);
+                uint32_t index = payload & INDEX_MASK;
+                if (slot >= 0 && index < actualSeqLen) {
+                    evictIndex = index;
+                    evictSlot = slot;
+                    foundCandidate = true;
+                    break;
+                }
+            }
+            if (!foundCandidate) {
+                foundCandidate = FindFallbackEvict(cacheRowIdx, actualSeqLen, indexLocal, fallbackCursor,
+                                                   evictIndex, evictSlot);
+            }
+            if (foundCandidate) {
+                uint32_t missIndex = static_cast<uint32_t>(indexLocal.GetValue(missIdx));
+                topkSlotsLocal.SetValue(missIdx, evictSlot);
+                cacheSlotsGm.SetValue(rowBase + evictIndex, LICommon::ConstInfo::INVALID_IDX);
+                cacheSlotsGm.SetValue(rowBase + missIndex, evictSlot);
+            }
         }
     }
     // SCATTER consumes only the first missCount entries.  The complete row is
@@ -634,12 +726,12 @@ __aicore__ inline void LIVector<LIT>::ProcessVec(const LICommon::RunInfo &info)
     FinishPayload(payloadUb, cuBaseS2Idx, cuS2Len);
 
     LocalTensor<float> tmpSortBuf = outQueue_.AllocTensor<float>();
-    uint32_t cachedChunkIdx = info.s2Idx % 4;
+    uint32_t cachedChunkIdx = info.segmentChunkIdx % PAYLOAD_BUF_SLOTS;
     Sort<float, true>(SortedBasicBlock_[cachedChunkIdx * s2BaseSize_ * VALUE_AND_INDEX_NUM], reduceOutBuff,
                       payloadUb.template ReinterpretCast<uint32_t>(), tmpSortBuf, s2BaseSize_ / 32);
     PipeBarrier<PIPE_V>();
     if (cachedChunkIdx == 3 || info.isLastS2InnerLoop) {
-        if (info.s2Idx < 4) {
+        if (info.segmentChunkIdx < PAYLOAD_BUF_SLOTS) {
             MrgBasicBlock(globalTopkUb_, SortedBasicBlock_, static_cast<int64_t>(cachedChunkIdx + 1), s2BaseSize_);
         } else {
             if (cachedChunkIdx > 0) {
@@ -653,6 +745,13 @@ __aicore__ inline void LIVector<LIT>::ProcessVec(const LICommon::RunInfo &info)
         }
     }
     PipeBarrier<PIPE_V>();
+    SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
+
+    if (info.isLastS2InnerLoop && info.isPartialSegment) {
+        WritePartialTopK(GetBlockIdx() / 2U, info.partialSlot, info.bIdx);
+        outQueue_.FreeTensor(tmpSortBuf);
+        return;
+    }
 
     float thresholdScore = 0.0f;
     if (info.isLastS2InnerLoop) {
@@ -673,10 +772,75 @@ __aicore__ inline void LIVector<LIT>::ProcessVec(const LICommon::RunInfo &info)
         uint32_t missCount = CopyDecodedPayloadOut(outOffset, payloadLocal, indexLocal, slotLocal, scratchLocal,
                                                    BASE_TOPK, info.actS2Size < BASE_TOPK);
         UpdateCacheAndWriteTopkSlots(info.bIdx, info.cacheRowIdx, outOffset, info.actS2Size,
-                                     info.actS2Size, thresholdScore, missCount, indexLocal, slotLocal);
+                                     info.actS2Size, thresholdScore, missCount, indexLocal,
+                                     payloadLocal, scratchLocal, slotLocal);
         WriteMissCount(info.bIdx, static_cast<int32_t>(missCount), scratchLocal);
         outQueue_.FreeTensor(valueULocal);
     }
+}
+
+template <typename LIT>
+__aicore__ inline void LIVector<LIT>::FinalizePartialRequest(uint32_t bIdx, uint32_t cacheRowIdx,
+                                                             uint32_t actualSeqLen, uint32_t firstOwner,
+                                                             uint32_t lastOwner)
+{
+    if ((GetBlockIdx() & 1U) != 0) {
+        return;
+    }
+
+    LocalTensor<float> tmpSortBuf = outQueue_.AllocTensor<float>();
+    bool hasPartial = false;
+    for (uint32_t coreIdx = firstOwner; coreIdx <= lastOwner; ++coreIdx) {
+        for (uint32_t partialSlot = 0; partialSlot < PARTIAL_SLOTS_PER_CORE; ++partialSlot) {
+            uint32_t resultSlot = coreIdx * PARTIAL_SLOTS_PER_CORE + partialSlot;
+            uint32_t metaOffset = coreIdx * PARTIAL_META_INTS_PER_CORE + partialSlot;
+            if (partialMetaGm.GetValue(metaOffset) != static_cast<int32_t>(bIdx)) {
+                continue;
+            }
+
+            SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
+            SetWaitFlag<HardEvent::S_MTE2>(HardEvent::S_MTE2);
+            DataCopyPad(SortedBasicBlock_,
+                        partialTopkGm[static_cast<uint64_t>(resultSlot) * TOPK_PAIR_FLOATS],
+                        AscendC::DataCopyExtParams{
+                            1, static_cast<uint32_t>(TOPK_PAIR_FLOATS * sizeof(float)), 0, 0, 0},
+                        AscendC::DataCopyPadExtParams<float>{false, 0, 0, 0.0f});
+            SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
+            if (!hasPartial) {
+                DataCopy(globalTopkUb_, SortedBasicBlock_, TOPK_PAIR_FLOATS);
+                hasPartial = true;
+            } else {
+                SparseTopK(globalTopkUb_, SortedBasicBlock_, tmpSortBuf, BASE_TOPK, BASE_TOPK);
+            }
+            PipeBarrier<PIPE_V>();
+        }
+    }
+
+    if (!hasPartial) {
+        outQueue_.FreeTensor(tmpSortBuf);
+        return;
+    }
+
+    SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
+    float thresholdScore = globalTopkUb_.GetValue((BASE_TOPK - 1U) * VALUE_AND_INDEX_NUM);
+    SortTopKBySlot(globalTopkUb_, reduceOutBuf_.Get<float>(), payloadBuf_.Get<int32_t>(), tmpSortBuf);
+    outQueue_.FreeTensor(tmpSortBuf);
+
+    LocalTensor<float> valueULocal = outQueue_.AllocTensor<float>();
+    LocalTensor<uint32_t> payloadLocal = valueULocal.template ReinterpretCast<uint32_t>();
+    LocalTensor<int32_t> indexLocal = valueULocal.template ReinterpretCast<int32_t>()[BASE_TOPK];
+    LocalTensor<int32_t> slotLocal = valueULocal.template ReinterpretCast<int32_t>()[BASE_TOPK * 2];
+    LocalTensor<int32_t> scratchLocal = valueULocal.template ReinterpretCast<int32_t>()[BASE_TOPK * 3];
+    ExtractIndex(payloadLocal, globalTopkUb_.template ReinterpretCast<uint32_t>(), BASE_TOPK);
+    PipeBarrier<PIPE_V>();
+    int64_t outOffset = static_cast<int64_t>(bIdx) * OUTPUT_CAPACITY;
+    uint32_t missCount =
+        CopyDecodedPayloadOut(outOffset, payloadLocal, indexLocal, slotLocal, scratchLocal, BASE_TOPK, false);
+    UpdateCacheAndWriteTopkSlots(bIdx, cacheRowIdx, outOffset, actualSeqLen, actualSeqLen,
+                                 thresholdScore, missCount, indexLocal,
+                                 payloadLocal, scratchLocal, slotLocal);
+    WriteMissCount(bIdx, static_cast<int32_t>(missCount), scratchLocal);
+    outQueue_.FreeTensor(valueULocal);
 }
 
 } // namespace LIKernel

@@ -184,6 +184,96 @@ def test_glm_lidu_accepts_supported_cache_geometry(tmp_path):
 
     assert config.offload_mode == "lidu"
     assert config.hf_config.nanovllm_offload_mode == "lidu"
+    assert config.enable_lidu_fused_attention_scatter is False
+    assert (
+        config.hf_config.nanovllm_enable_lidu_fused_attention_scatter
+        is False
+    )
+
+
+def test_glm_lidu_accepts_fused_attention_scatter(tmp_path):
+    _write_glm_config(
+        tmp_path,
+        q_lora_rank=2048,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+    )
+
+    config = _make_config(
+        tmp_path,
+        offload_mode="lidu",
+        max_model_len=16384,
+        kvcache_block_size=128,
+        enable_lidu_fused_attention_scatter=True,
+    )
+
+    assert config.enable_lidu_fused_attention_scatter is True
+    assert (
+        config.hf_config.nanovllm_enable_lidu_fused_attention_scatter
+        is True
+    )
+
+
+def test_glm_lidu_fused_attention_scatter_allows_full_decode_only(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.delenv("ASCEND_LAUNCH_BLOCKING", raising=False)
+    _write_glm_config(
+        tmp_path,
+        q_lora_rank=2048,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+    )
+
+    config = _make_config(
+        tmp_path,
+        offload_mode="lidu",
+        max_model_len=32768,
+        kvcache_block_size=128,
+        enable_lidu_fused_attention_scatter=True,
+        enforce_eager=False,
+        max_num_decode_seqs_per_step=24,
+        decode_graph_capture_sizes=(24,),
+    )
+
+    assert config.decode_graph_capture_sizes == (24,)
+
+
+@pytest.mark.parametrize("offload_mode", ["none", "gs"])
+def test_fused_attention_scatter_requires_lidu(tmp_path, offload_mode):
+    _write_glm_config(tmp_path)
+
+    with pytest.raises(ValueError, match="requires offload_mode='lidu'"):
+        _make_config(
+            tmp_path,
+            offload_mode=offload_mode,
+            enable_lidu_fused_attention_scatter=True,
+        )
+
+
+def test_fused_attention_scatter_rejects_non_bool(tmp_path):
+    _write_glm_config(tmp_path)
+
+    with pytest.raises(
+        TypeError,
+        match="enable_lidu_fused_attention_scatter must be a bool",
+    ):
+        _make_config(
+            tmp_path,
+            offload_mode="lidu",
+            enable_lidu_fused_attention_scatter=1,
+        )
+
+
+def test_fused_attention_scatter_rejects_non_glm_model():
+    config = object.__new__(Config)
+    config.enable_lidu_fused_attention_scatter = True
+    config.offload_mode = "lidu"
+    config.hf_config = SimpleNamespace(model_type="deepseek_v3")
+
+    with pytest.raises(ValueError, match="GLM-5.1-w4a8 only"):
+        config._validate_lidu_fused_attention_scatter()
 
 
 def test_glm_dense_mla_mode_needs_no_dram_cache(tmp_path):

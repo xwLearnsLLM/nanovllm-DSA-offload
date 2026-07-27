@@ -246,7 +246,12 @@ ge::graphStatus LightningIndexerDecodeUpdateTiling::DoTiling(LIU2TilingInfo *til
     auto ascendcPlatform = platform_ascendc::PlatformAscendC(tilingInfo->platformInfo);
     uint32_t aivNum = ascendcPlatform.GetCoreNumAiv();
     uint32_t aicNum = ascendcPlatform.GetCoreNumAic();
-    tilingInfo->usedCoreNum = std::min(tilingInfo->bSize, aicNum);
+    constexpr uint32_t SCHEDULE_BALANCED = 1;
+    constexpr uint32_t SCHEDULE_AUTO = 2;
+    uint32_t selectedScheduleMode =
+        (tilingInfo->bSize % aicNum) == 0U ? SCHEDULE_AUTO : SCHEDULE_BALANCED;
+    tilingInfo->usedCoreNum =
+        selectedScheduleMode == SCHEDULE_BALANCED ? aicNum : std::min(tilingInfo->bSize, aicNum);
     uint32_t requestedAivNum = std::min(aivNum, tilingInfo->usedCoreNum * 2U);
     uint32_t blockDim = ascendcPlatform.CalcTschBlockDim(requestedAivNum, aicNum, aivNum);
     context_->SetBlockDim(blockDim);
@@ -260,6 +265,12 @@ ge::graphStatus LightningIndexerDecodeUpdateTiling::DoTiling(LIU2TilingInfo *til
     uint64_t scoreStride = ((static_cast<uint64_t>(tilingInfo->s2Size) + S2_BASE_SIZE - 1) / S2_BASE_SIZE) *
                            S2_BASE_SIZE;
     workspaceSize += static_cast<uint64_t>(tilingInfo->bSize) * scoreStride * sizeof(float);
+    constexpr uint32_t PARTIAL_SLOTS_PER_CORE = 2;
+    constexpr uint32_t PARTIAL_META_INTS_PER_CORE = 8;
+    constexpr uint32_t TOPK_PAIR_ELEMS = DECODE_SPARSE_COUNT * 2;
+    workspaceSize +=
+        static_cast<uint64_t>(blockDim) * PARTIAL_SLOTS_PER_CORE * TOPK_PAIR_ELEMS * sizeof(float);
+    workspaceSize += static_cast<uint64_t>(blockDim) * PARTIAL_META_INTS_PER_CORE * sizeof(int32_t);
     context_->GetWorkspaceSizes(1)[0] = workspaceSize;
 
     tilingData_.set_bSize(tilingInfo->bSize);
@@ -270,6 +281,7 @@ ge::graphStatus LightningIndexerDecodeUpdateTiling::DoTiling(LIU2TilingInfo *til
     tilingData_.set_n1Size(tilingInfo->n1Size);
     tilingData_.set_cacheSlotsSize(tilingInfo->cacheSlotsSize);
     tilingData_.set_usedCoreNum(blockDim);
+    tilingData_.set_scheduleMode(selectedScheduleMode);
     tilingData_.SaveToBuffer(context_->GetRawTilingData()->GetData(), context_->GetRawTilingData()->GetCapacity());
     context_->GetRawTilingData()->SetDataSize(tilingData_.GetDataSize());
 

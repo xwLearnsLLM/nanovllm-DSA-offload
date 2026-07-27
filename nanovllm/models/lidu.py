@@ -122,6 +122,47 @@ def sparse_and_tail_attention(
     )
 
 
+def sparse_and_tail_attention_and_scatter_copy(
+    query: torch.Tensor,
+    hbm_ckv: torch.Tensor,
+    sparse_slots: torch.Tensor,
+    cache_tokens: torch.Tensor,
+    hbm_block_table: torch.Tensor,
+    actual_seq_lengths_query: torch.Tensor,
+    actual_seq_lengths_kv: torch.Tensor,
+    query_rope: torch.Tensor,
+    hbm_kpe: torch.Tensor,
+    dram_kpe: torch.Tensor,
+    dram_ckv: torch.Tensor,
+    dram_block_table: torch.Tensor,
+    source_token_ids: torch.Tensor,
+    copy_counts: torch.Tensor,
+    scale_value: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Copy LIDU misses and attend to top-2048 plus tail in one operator."""
+
+    return (
+        torch.ops.nanovllm_dsa
+        .sparse_and_tail_attention_and_scatter_copy.default(
+            query,
+            hbm_ckv,
+            sparse_slots,
+            cache_tokens,
+            hbm_block_table,
+            actual_seq_lengths_query,
+            actual_seq_lengths_kv,
+            query_rope,
+            hbm_kpe,
+            dram_kpe,
+            dram_ckv,
+            dram_block_table,
+            source_token_ids,
+            copy_counts,
+            float(scale_value),
+        )
+    )
+
+
 @torch.inference_mode()
 def initialize_lidu_row(
     *,

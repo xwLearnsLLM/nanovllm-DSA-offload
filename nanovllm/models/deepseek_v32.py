@@ -37,6 +37,7 @@ from nanovllm.models.lidu import (
     lidu_decode_update_out,
     scatter_copy,
     sparse_and_tail_attention,
+    sparse_and_tail_attention_and_scatter_copy,
 )
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
@@ -53,6 +54,13 @@ from nanovllm.utils.context import get_context
 ACL_FORMAT_FRACTAL_NZ = 29
 _NPU_MLA_ATTENTION_MASK_CACHE: dict[tuple[str, int], torch.Tensor] = {}
 _NPU_MLA_V2_WORKSPACE_CACHE: dict[tuple, torch.Tensor] = {}
+_LiduUpdateResult = tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]
 _DSA_GATHER_TOPK = DSA_SELECTION_TOPK_TOKENS
 _NPU_MOE_SHARED_STREAM = None
 
@@ -772,6 +780,16 @@ class DeepseekV32MLAAttention(nn.Module):
             self.offload_mode == OFFLOAD_LIDU
             and getattr(config, "model_type", "") == "glm_moe_dsa"
         )
+        self._use_lidu_fused_attention_scatter = (
+            getattr(config, "model_type", "") == "glm_moe_dsa"
+            and bool(
+                getattr(
+                    config,
+                    "nanovllm_enable_lidu_fused_attention_scatter",
+                    False,
+                )
+            )
+        )
         self._lidu_raw_graph_outputs: dict[
             int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]
         ] = {}
@@ -878,7 +896,7 @@ class DeepseekV32MLAAttention(nn.Module):
         q_c: torch.Tensor,
         positions: torch.Tensor,
         batch_size: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    ) -> _LiduUpdateResult | None:
         if self.indexer is None or self.indexer_rotary_emb is None:
             raise RuntimeError("DSA indexer is disabled for this engine.")
         context = get_context()
@@ -1453,7 +1471,7 @@ class DeepseekV32MLAAttention(nn.Module):
         q_index: torch.Tensor,
         weights: torch.Tensor,
         batch_size: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> _LiduUpdateResult:
         context = get_context()
         required = {
             "req_pool_entries": context.req_pool_entries,
@@ -1534,18 +1552,42 @@ class DeepseekV32MLAAttention(nn.Module):
             )
         if self._lidu_miss_count_enabled:
             self._print_lidu_miss_counts(miss_counts, batch_size)
-        kpe_alias, ckv_alias = scatter_copy(
-            hbm_kpe,
-            hbm_ckv,
-            dram_kpe,
-            dram_ckv,
-            context.block_tables[:batch_size],
-            context.dram_block_tables[:batch_size],
-            source_ids.view(batch_size, -1),
-            destination_slots.view(batch_size, -1),
-            miss_counts[:batch_size],
+        use_fused_attention_scatter = (
+            self._can_use_lidu_fused_attention_scatter(batch_size)
         )
-        return kpe_alias, ckv_alias, destination_slots
+        if use_fused_attention_scatter:
+            kpe_alias, ckv_alias = hbm_kpe, hbm_ckv
+        else:
+            kpe_alias, ckv_alias = scatter_copy(
+                hbm_kpe,
+                hbm_ckv,
+                dram_kpe,
+                dram_ckv,
+                context.block_tables[:batch_size],
+                context.dram_block_tables[:batch_size],
+                source_ids.view(batch_size, -1),
+                destination_slots.view(batch_size, -1),
+                miss_counts[:batch_size],
+            )
+        return (
+            kpe_alias,
+            ckv_alias,
+            destination_slots,
+            source_ids,
+            miss_counts,
+        )
+
+    def _can_use_lidu_fused_attention_scatter(
+        self,
+        batch_size: int,
+    ) -> bool:
+        context = get_context()
+        return (
+            self._use_lidu_fused_attention_scatter
+            and not context.has_first_decode
+            and context.lidu_init_rows is None
+            and batch_size <= 24
+        )
 
     @torch.compiler.disable
     def _print_lidu_miss_counts(
@@ -1585,9 +1627,7 @@ class DeepseekV32MLAAttention(nn.Module):
         q_index: torch.Tensor | None,
         weights: torch.Tensor | None,
         dsa_updated: bool = False,
-        cache_aliases: tuple[
-            torch.Tensor, torch.Tensor, torch.Tensor
-        ] | None = None,
+        cache_aliases: _LiduUpdateResult | None = None,
     ) -> torch.Tensor:
         context = get_context()
         batch_size = int(ql_nope.shape[0])
@@ -1600,8 +1640,15 @@ class DeepseekV32MLAAttention(nn.Module):
             else:
                 self._dsa_offload_update(q_index, weights, batch_size)
         kpe_cache = ckv_cache = sparse_slots = None
+        source_ids = miss_counts = None
         if cache_aliases is not None:
-            kpe_cache, ckv_cache, sparse_slots = cache_aliases
+            (
+                kpe_cache,
+                ckv_cache,
+                sparse_slots,
+                source_ids,
+                miss_counts,
+            ) = cache_aliases
         if (
             self._use_lidu_sparse_and_tail_attention
             and not context.has_first_decode
@@ -1626,20 +1673,50 @@ class DeepseekV32MLAAttention(nn.Module):
             latent_kv_cache = ckv_cache.view(
                 -1, self.block_size, 1, self.kv_lora_rank
             )
-            latent = sparse_and_tail_attention(
-                ql_nope,
-                latent_kv_cache,
-                sparse_slots[:batch_size],
-                context.lidu_cache_tokens[:batch_size],
-                context.block_tables[:batch_size],
-                context.candidate_query_lens[:batch_size],
-                context.actual_seq_lengths_kv_tensor[:batch_size],
-                q_pe,
-                kpe_cache.view(
-                    -1, self.block_size, 1, self.qk_rope_head_dim
-                ),
-                self.scale,
+            hbm_kpe = kpe_cache.view(
+                -1, self.block_size, 1, self.qk_rope_head_dim
             )
+            if (
+                self._can_use_lidu_fused_attention_scatter(batch_size)
+                and source_ids is not None
+                and miss_counts is not None
+            ):
+                if context.dram_block_tables is None:
+                    raise RuntimeError(
+                        "Fused Attention+SCATTER requires DRAM block tables."
+                    )
+                latent, _, _ = (
+                    sparse_and_tail_attention_and_scatter_copy(
+                        ql_nope,
+                        latent_kv_cache,
+                        sparse_slots[:batch_size],
+                        context.lidu_cache_tokens[:batch_size],
+                        context.block_tables[:batch_size],
+                        context.candidate_query_lens[:batch_size],
+                        context.actual_seq_lengths_kv_tensor[:batch_size],
+                        q_pe,
+                        hbm_kpe,
+                        self.dram_kpe_cache.squeeze(2),
+                        self.dram_ckv_cache.squeeze(2),
+                        context.dram_block_tables[:batch_size],
+                        source_ids.view(batch_size, -1),
+                        miss_counts[:batch_size],
+                        self.scale,
+                    )
+                )
+            else:
+                latent = sparse_and_tail_attention(
+                    ql_nope,
+                    latent_kv_cache,
+                    sparse_slots[:batch_size],
+                    context.lidu_cache_tokens[:batch_size],
+                    context.block_tables[:batch_size],
+                    context.candidate_query_lens[:batch_size],
+                    context.actual_seq_lengths_kv_tensor[:batch_size],
+                    q_pe,
+                    hbm_kpe,
+                    self.scale,
+                )
             latent_for_v_up = latent.transpose(0, 1).contiguous()
         else:
             latent = self._decode_forward_mla_v2(
