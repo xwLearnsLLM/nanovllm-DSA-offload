@@ -76,6 +76,7 @@ private:
     uint32_t finalizeRequestIdx = ~0U;
     uint32_t finalizeCacheRowIdx = 0;
     uint32_t finalizeActualSeqLen = 0;
+    uint32_t finalizeCacheTokenCount = 0;
     uint32_t finalizeRequestChunkEnd = 0;
     LICommon::ConstInfo constInfo{};
 
@@ -86,9 +87,9 @@ private:
     __aicore__ inline void ProcessBalancedMain(uint32_t globalChunkStart, uint32_t globalChunkCount);
     __aicore__ inline uint32_t GetChunkCount(uint32_t bIdx);
     __aicore__ inline void ProcessRequestSegment(uint32_t bIdx, uint32_t cacheRowIdx,
-                                                 uint32_t actualSeqLen, uint32_t chunkStart,
-                                                 uint32_t chunkEnd, uint32_t partialSlot,
-                                                 uint32_t &loop);
+                                                 uint32_t actualSeqLen, uint32_t cacheTokenCount,
+                                                 uint32_t chunkStart, uint32_t chunkEnd,
+                                                 uint32_t partialSlot, uint32_t &loop);
     __aicore__ inline void ProcessChunk(const LICommon::RunInfo &runInfo);
     __aicore__ inline void CleanEmptyRequest(uint32_t bIdx);
 };
@@ -295,6 +296,7 @@ __aicore__ inline void LIPreload<LIT>::ProcessMain()
             runInfo.s2Idx = chunkIdx;
             runInfo.segmentChunkIdx = chunkIdx;
             runInfo.actS2Size = processSeqLen;
+            runInfo.cacheTokenCount = static_cast<uint32_t>(cacheMetadata);
             runInfo.cacheRowIdx = static_cast<uint32_t>(cacheRowIdx);
             uint32_t chunkStart = chunkIdx * constInfo.s2BaseSize;
             runInfo.actualSingleProcessSInnerSize =
@@ -335,8 +337,8 @@ __aicore__ inline uint32_t LIPreload<LIT>::GetChunkCount(uint32_t bIdx)
 
 template <typename LIT>
 __aicore__ inline void LIPreload<LIT>::ProcessRequestSegment(
-    uint32_t bIdx, uint32_t cacheRowIdx, uint32_t actualSeqLen, uint32_t chunkStart,
-    uint32_t chunkEnd, uint32_t partialSlot, uint32_t &loop)
+    uint32_t bIdx, uint32_t cacheRowIdx, uint32_t actualSeqLen, uint32_t cacheTokenCount,
+    uint32_t chunkStart, uint32_t chunkEnd, uint32_t partialSlot, uint32_t &loop)
 {
     uint32_t requestChunkCount = CeilDiv(actualSeqLen, constInfo.s2BaseSize);
     bool isPartialSegment = chunkStart != 0U || chunkEnd != requestChunkCount;
@@ -348,6 +350,7 @@ __aicore__ inline void LIPreload<LIT>::ProcessRequestSegment(
         runInfo.s2Idx = chunkIdx;
         runInfo.segmentChunkIdx = chunkIdx - chunkStart;
         runInfo.actS2Size = actualSeqLen;
+        runInfo.cacheTokenCount = cacheTokenCount;
         uint32_t chunkBase = chunkIdx * constInfo.s2BaseSize;
         runInfo.actualSingleProcessSInnerSize =
             Min(constInfo.s2BaseSize, actualSeqLen - chunkBase);
@@ -390,16 +393,20 @@ __aicore__ inline void LIPreload<LIT>::ProcessBalancedMain(uint32_t globalChunkS
             uint32_t chunkStart = overlapStart - requestChunkBase;
             uint32_t chunkEnd = overlapEnd - requestChunkBase;
             int32_t cacheRowIdx = reqPoolEntriesGm.GetValue(bIdx);
+            uint32_t cacheTokenCount =
+                static_cast<uint32_t>(cacheTokensGm.GetValue(bIdx));
             uint32_t actualSeqLen = actualSeqLengthsGm.GetValue(bIdx);
             bool isPartial = chunkStart != 0U || chunkEnd != requestChunkCount;
             if (chunkStart == 0U && chunkEnd < requestChunkCount) {
                 finalizeRequestIdx = bIdx;
                 finalizeCacheRowIdx = static_cast<uint32_t>(cacheRowIdx);
                 finalizeActualSeqLen = actualSeqLen;
+                finalizeCacheTokenCount = cacheTokenCount;
                 finalizeRequestChunkEnd = requestChunkEnd;
             }
-            ProcessRequestSegment(bIdx, static_cast<uint32_t>(cacheRowIdx), actualSeqLen,
-                                  chunkStart, chunkEnd, partialSlot, loop);
+            ProcessRequestSegment(
+                bIdx, static_cast<uint32_t>(cacheRowIdx), actualSeqLen,
+                cacheTokenCount, chunkStart, chunkEnd, partialSlot, loop);
             if (isPartial) {
                 ++partialSlot;
             }
@@ -455,7 +462,9 @@ __aicore__ inline void LIPreload<LIT>::ProcessBalanced()
                                      ? requestLastChunk / (chunksPerCore + 1U)
                                      : extraChunkCores + (requestLastChunk - largeCoreSpan) / chunksPerCore;
             vectorService.FinalizePartialRequest(finalizeRequestIdx, finalizeCacheRowIdx,
-                                                 finalizeActualSeqLen, aiCoreIdx, lastOwner);
+                                                 finalizeActualSeqLen,
+                                                 finalizeCacheTokenCount,
+                                                 aiCoreIdx, lastOwner);
         }
     }
 }

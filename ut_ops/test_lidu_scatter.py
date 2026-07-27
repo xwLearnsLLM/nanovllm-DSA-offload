@@ -504,6 +504,197 @@ def run_case(case: Case, warmup: int, iters: int) -> None:
     )
 
 
+def run_local_bs24_case(
+    heads: int,
+    device: torch.device,
+    seed: int,
+) -> None:
+    """Cover the one-request-per-core schedule used by the target batch 24."""
+
+    batch = 24
+    candidate_len = 19_968
+    cache_budget = int(LIDU_CACHE_TOKEN_BUDGETS[1])
+    miss_target = 300
+    if not TOPK <= cache_budget <= candidate_len:
+        raise ValueError(
+            "The 16K-32K LIDU budget is invalid for the bs24 local-schedule "
+            f"test: C={cache_budget}, source={candidate_len}."
+        )
+
+    generator = torch.Generator().manual_seed(seed + heads + 2400)
+    candidate_blocks = candidate_len // BLOCK_SIZE
+    block_table_cpu = torch.arange(
+        candidate_blocks, dtype=torch.int32
+    ).repeat(batch, 1)
+    index_cpu = torch.zeros(
+        candidate_blocks,
+        BLOCK_SIZE,
+        1,
+        INDEX_DIM,
+        dtype=torch.bfloat16,
+    )
+    logical_ids = torch.arange(candidate_len, dtype=torch.int64)
+    index_cpu[:, :, 0, 0] = (
+        logical_ids.reshape(candidate_blocks, BLOCK_SIZE) // 256
+    ).to(torch.bfloat16)
+    index_cpu[:, :, 0, 1] = (
+        logical_ids.reshape(candidate_blocks, BLOCK_SIZE) % 256
+    ).to(torch.bfloat16)
+
+    query = torch.zeros(
+        batch, heads, INDEX_DIM, dtype=torch.bfloat16, device=device
+    )
+    query[:, 0, 0] = 256
+    query[:, 0, 1] = 1
+    weights = torch.zeros(
+        batch, heads, dtype=torch.bfloat16, device=device
+    )
+    weights[:, 0] = 1
+
+    req_entries_cpu = torch.randperm(
+        batch, generator=generator
+    ).to(torch.int32)
+    cache_slots_cpu = torch.full(
+        (batch, candidate_len), -1, dtype=torch.int32
+    )
+    cached_top_count = TOPK - miss_target
+    cached_sources = torch.cat(
+        (
+            torch.arange(
+                candidate_len - cached_top_count,
+                candidate_len,
+                dtype=torch.int64,
+            ),
+            torch.arange(
+                cache_budget - cached_top_count,
+                dtype=torch.int64,
+            ),
+        )
+    )
+    for row in range(batch):
+        destinations = torch.randperm(
+            cache_budget, generator=generator
+        ).to(torch.int32)
+        pool_row = int(req_entries_cpu[row])
+        cache_slots_cpu[pool_row, cached_sources] = destinations
+
+    cache_slots = cache_slots_cpu.to(device)
+    cache_tokens = torch.full(
+        (batch,), cache_budget, dtype=torch.int32, device=device
+    )
+    candidate_lens = torch.full(
+        (batch,), candidate_len, dtype=torch.int32, device=device
+    )
+    req_entries = req_entries_cpu.to(device)
+    block_table = block_table_cpu.to(device)
+    index_cache = index_cpu.to(device)
+
+    source_ids, destination_slots, miss_counts, _ = (
+        torch.ops.nanovllm_dsa.lidu_decode_update.default(
+            query,
+            index_cache,
+            weights,
+            req_entries,
+            cache_slots,
+            cache_tokens,
+            candidate_lens,
+            block_table,
+        )
+    )
+    torch.npu.synchronize()
+    counts_cpu = miss_counts.cpu()
+    expected_counts = torch.full_like(counts_cpu, miss_target)
+    if not torch.equal(counts_cpu, expected_counts):
+        raise AssertionError(
+            "bs24 local schedule returned unexpected miss counts: "
+            f"{counts_cpu.tolist()}"
+        )
+
+    expected_topk = torch.arange(
+        candidate_len - TOPK, candidate_len, dtype=torch.int64
+    )
+    expected_misses = expected_topk[:miss_target]
+    state_pool = cache_slots.cpu()
+    sources_cpu = source_ids.view(batch, TOPK).cpu().to(torch.int64)
+    slots_cpu = destination_slots.view(batch, TOPK).cpu().to(torch.int64)
+    for row in range(batch):
+        pool_row = int(req_entries_cpu[row])
+        state = state_pool[pool_row]
+        valid_slots = state[state >= 0].to(torch.int64)
+        if (
+            valid_slots.numel() != cache_budget
+            or torch.unique(valid_slots).numel() != cache_budget
+            or int(valid_slots.min()) != 0
+            or int(valid_slots.max()) != cache_budget - 1
+        ):
+            raise AssertionError(
+                f"bs24 row={row} cache state is not a permutation of [0,C)."
+            )
+        if bool((state[expected_topk] < 0).any()):
+            raise AssertionError(
+                f"bs24 row={row} dropped a true top-2048 token."
+            )
+        active_sources = torch.sort(
+            sources_cpu[row, :miss_target]
+        ).values
+        if not torch.equal(active_sources, expected_misses):
+            raise AssertionError(
+                f"bs24 row={row} active miss source set is incorrect."
+            )
+        active_slots = slots_cpu[row, :miss_target]
+        if (
+            bool((active_slots < 0).any())
+            or bool((active_slots >= cache_budget).any())
+            or torch.unique(active_slots).numel() != miss_target
+        ):
+            raise AssertionError(
+                f"bs24 row={row} active destination exceeds [0,C)."
+            )
+        expected_slots = state[expected_topk].to(torch.int64)
+        if not torch.equal(
+            torch.sort(slots_cpu[row]).values,
+            torch.sort(expected_slots).values,
+        ):
+            raise AssertionError(
+                f"bs24 row={row} full top-k slot set is incorrect."
+            )
+
+    _, repeat_slots, repeat_counts, _ = (
+        torch.ops.nanovllm_dsa.lidu_decode_update.default(
+            query,
+            index_cache,
+            weights,
+            req_entries,
+            cache_slots,
+            cache_tokens,
+            candidate_lens,
+            block_table,
+        )
+    )
+    torch.npu.synchronize()
+    if bool((repeat_counts.cpu() != 0).any()):
+        raise AssertionError("bs24 identical-query repeat must have zero misses.")
+    repeat_slots_cpu = repeat_slots.view(batch, TOPK).cpu().to(torch.int64)
+    repeat_state_pool = cache_slots.cpu()
+    for row in range(batch):
+        pool_row = int(req_entries_cpu[row])
+        expected_slots = repeat_state_pool[pool_row, expected_topk].to(
+            torch.int64
+        )
+        if not torch.equal(
+            torch.sort(repeat_slots_cpu[row]).values,
+            torch.sort(expected_slots).values,
+        ):
+            raise AssertionError(
+                f"bs24 row={row} repeat top-k slot set is incorrect."
+            )
+    print(
+        f"LIDU_LOCAL_BS24_CHECK heads={heads} batch={batch} "
+        f"candidate_len={candidate_len} cache_tokens={cache_budget} "
+        f"misses_per_row={miss_target} shuffled_pool_entries=1 ok=1"
+    )
+
+
 def run_graph_case(case: Case, replays: int) -> None:
     """Capture with zero misses, then replay with changing nonzero misses."""
 
@@ -656,6 +847,8 @@ def main() -> None:
         run_case(case, args.warmup, args.iters)
         run_graph_case(case, args.graph_replays)
         del case
+        torch.npu.empty_cache()
+        run_local_bs24_case(head_count, device, args.seed)
         torch.npu.empty_cache()
     print("LIDU_SCATTER_UT_OK")
 

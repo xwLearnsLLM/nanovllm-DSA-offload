@@ -28,6 +28,7 @@ struct RunInfo {
     uint32_t s2Idx;
     uint32_t segmentChunkIdx;
     uint32_t actS2Size;
+    uint32_t cacheTokenCount;
     uint32_t cacheRowIdx;
     uint32_t actualSingleProcessSInnerSize;
     uint32_t actualSingleProcessSInnerSizeAlign;

@@ -77,8 +77,8 @@ def test_three_modes_and_default_public_api():
         (8192, 2048),
         (8193, 3072),
         (16384, 3072),
-        (16385, 5120),
-        (32768, 5120),
+        (16385, 6144),
+        (32768, 6144),
         (32769, 8192),
         (65536, 8192),
         (65537, 12288),
@@ -91,7 +91,7 @@ def test_lidu_cache_tiers_use_original_prompt_length(prompt_len, expected):
 def test_four_long_prompt_cache_budgets_are_centralized_and_tunable(
     monkeypatch,
 ):
-    assert LIDU_CACHE_TOKEN_BUDGETS == (3072, 5120, 8192, 12288)
+    assert LIDU_CACHE_TOKEN_BUDGETS == (3072, 6144, 8192, 12288)
     tuned = (5120, 8192, 16384, 24576)
     monkeypatch.setattr(
         dsa_offload,
