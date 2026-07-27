@@ -35,6 +35,37 @@ python3 ut_ops/test_lidu_scatter.py \
 成功标志是 `LIDU_SCATTER_UT_OK`。必须先通过该测试，才运行
 `NANOVLLM_OFFLOAD_MODE=lidu` 的完整推理。
 
+## LIDU 索引管理时延
+
+该测试不调用 SCATTER，使用 NPU Event 分别测量同一输入上的 LightningIndexer 和 LIDU kernel。`index_management_us = lidu_us - lightning_indexer_us`，与 `ops_li_update/README.md` 表格的“索引管理时间”口径一致；缓存状态恢复发生在计时区间之外。
+
+```bash
+unset NANOVLLM_ENABLE_DSA_OFFLOAD
+unset NANOVLLM_OFFLOAD_MODE
+unset NANOVLLM_ENABLE_LIDU_FUSED_ATTENTION_SCATTER
+unset NANOVLLM_GS_MISS_RATE_ON_LAYERS
+unset NANOVLLM_PROFILE_DECODE_OUTPUT
+unset NANOVLLM_CUST_OPAPI_LIB
+unset ASCEND_CUSTOM_OPP_PATH
+
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export ASCEND_LAUNCH_BLOCKING=0
+export ASCEND_RT_VISIBLE_DEVICES=4
+export PYTHONUNBUFFERED=1
+export PYTHONPATH=$PWD:$PYTHONPATH
+export ASCEND_HOME_PATH=/usr/local/Ascend/cann-8.5.1
+
+python3 ut_ops/test_lidu_perf.py --device npu:0 --heads 32 --batch-sizes 24 --seq-lens 20992 --cache-tokens 6144 --miss-ranges 0:0,0:200,0:300,0:2048 --warmup 10 --iters 100 --seed 7
+```
+
+上面是当前 GLM-5.1、batch 24、约 21K prompt 的重点配置。若要复现参考工程表格的 64-head 测试矩阵，使用：
+
+```bash
+python3 ut_ops/test_lidu_perf.py --device npu:0 --heads 64 --batch-sizes 1,4,8,16,24,32,48,64 --seq-lens 65536,131072 --cache-tokens 10240 --miss-ranges 0:0,0:200,0:300,0:2048 --warmup 10 --iters 100 --seed 7
+```
+
+每个 case 都先验证 top-2048、目标 miss count、request-pool 状态和 destination slots，再打印 `LIDU_PERF_RESULT`。最后会直接输出 Markdown 表格；成功标志是 `LIDU_PERF_UT_OK`。
+
 ## GLM 融合 SCATTER + sparse-and-tail Attention
 
 ```bash
