@@ -75,173 +75,24 @@ export SOC_VERSION=ascend910_9391
 export ASCEND_HOME_PATH=/usr/local/Ascend/cann-8.5.1
 
 bash scripts/build_nanovllm_ops.sh
-ls -lh nanovllm/_C*.so nanovllm/libnanovllm_ascend_kernels.so
 ```
 
-## 先运行 LIDU + SCATTER 单卡 UT
-
-必须先通过算子语义测试，再运行 nano-vLLM 推理。该 UT 的 batch=6 主路径和 batch=1 图路径会覆盖 balanced chunk 调度，并覆盖 32/64 heads、所有 C 档位、C=0、乱序 request-pool entries、随机 block tables、初始化 C-copy、稳定 miss-copy、重复零 miss，以及 capture 时零 miss、replay 时非零 miss 的 LIDU→SCATTER raw NPUGraph 链。
+## GLM-5.1-w4a8 推理
 
 ```bash
-unset NANOVLLM_GS_MISS_RATE_ON_LAYERS
-unset NANOVLLM_PROFILE_DECODE_OUTPUT
-unset NANOVLLM_ENABLE_LIDU_FUSED_ATTENTION_SCATTER
-
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export ASCEND_LAUNCH_BLOCKING=0
-export ASCEND_RT_VISIBLE_DEVICES=4
-export PYTHONUNBUFFERED=1
-export PYTHONPATH=$PWD:$PYTHONPATH
-
-python3 ut_ops/test_lidu_scatter.py \
-  --device npu:0 \
-  --heads 32,64 \
-  --seed 7 \
-  --warmup 2 \
-  --iters 10 \
-  --graph-replays 3
-```
-
-必须先看到 `LIDU_SCATTER_GRAPH_CHECK ... ok=1`，最终成功标志是 `LIDU_SCATTER_UT_OK`。GS 与 LIDU 使用不同的 HBM 缓存预算，不在该算子 UT 中直接比较链路时延。
-
-融合算子还必须通过真实 swapped-memory DRAM 搬移、poison、guard token、CPU Attention golden 和旧路径对照测试：
-
-```bash
+unset NANOVLLM_ENABLE_DSA_OFFLOAD
 unset NANOVLLM_GS_MISS_RATE_ON_LAYERS
 unset NANOVLLM_PROFILE_DECODE_OUTPUT
 unset NANOVLLM_CUST_OPAPI_LIB
 unset ASCEND_CUSTOM_OPP_PATH
+unset NANOVLLM_DSA_BOUNDARY_PROBE
 
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export ASCEND_LAUNCH_BLOCKING=0
-export ASCEND_RT_VISIBLE_DEVICES=4
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
 export PYTHONUNBUFFERED=1
 export PYTHONPATH=$PWD:$PYTHONPATH
 export ASCEND_HOME_PATH=/usr/local/Ascend/cann-8.5.1
-
-python3 ut_ops/test_fused_attention_scatter.py --device npu:0 --mode check --batch-size 24 --heads 8 --source-len 65536 --cache-tokens 8192 --tail-tokens 64 --miss-min 0 --miss-max 2048 --seed 7
-python3 ut_ops/test_fused_attention_scatter.py --device npu:0 --mode all --batch-size 24 --heads 8 --source-len 65536 --cache-tokens 8192 --tail-tokens 64 --miss-min 0 --miss-max 300 --warmup 10 --iters 100 --seed 7
-```
-
-成功标志依次包括 `FUSED_SCATTER_ATTENTION_MIXED_C0_CHECK ... ok=1`、`FUSED_SCATTER_ATTENTION_DRAM_COPY_CHECK ... ok=1`、`FUSED_SCATTER_ATTENTION_CPU_GOLDEN_CHECK ... ok=1` 和 `FUSED_SCATTER_ATTENTION_UT_OK`。
-
-CPU 状态机测试：
-
-```bash
-export PYTHONUNBUFFERED=1
-export PYTHONPATH=$PWD:$PYTHONPATH
-
-python3 -m pytest -q \
-  tests/test_lidu_offload.py \
-  tests/test_chunked_prefill.py \
-  tests/test_full_decode_graph.py \
-  tests/test_glm_dsa_offload.py
-```
-
-## DeepSeek V3.2：LIDU 整图
-
-以下是 TP16+EP16、batch 6、约 30K token 的完整命令：
-
-```bash
-unset NANOVLLM_GS_MISS_RATE_ON_LAYERS
-unset NANOVLLM_PROFILE_DECODE_OUTPUT
-unset NANOVLLM_ENABLE_LIDU_FUSED_ATTENTION_SCATTER
-
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export ASCEND_LAUNCH_BLOCKING=0
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
-export PYTHONUNBUFFERED=1
-export PYTHONPATH=$PWD:$PYTHONPATH
-
-export NANOVLLM_MODEL=/home/models/DeepSeek-V3.2-REAP-345B-A37B-BF16/
-export NANOVLLM_TP_SIZE=16
-export NANOVLLM_ENABLE_EXPERT_PARALLEL=1
-export NANOVLLM_OFFLOAD_MODE=lidu
-export NANOVLLM_ENFORCE_EAGER=0
-export NANOVLLM_KVCACHE_BLOCK_SIZE=128
-export NANOVLLM_HBM_NUM_BLOCKS=350
-export NANOVLLM_DRAM_NUM_BLOCKS=1500
-export NANOVLLM_PREFILL_CHUNK_SIZE=1024
-export NANOVLLM_IGNORE_EOS=1
-export NANOVLLM_MAX_GEN_TOKENS=16
-export NANOVLLM_PROMPT_LENGTHS=30000,30001,30002,30003,30004,30005
-
-python3 example/test.py
-```
-
-结束时应满足 `offload_mode=lidu`、`captures=1`、`replays>0`、`eager_first_decode=1`、`eager_lidu_capture=1`，且初始化后不再出现 `eager_lidu_uninitialized` 增长。
-
-## DeepSeek V3.2：GS 整图对照
-
-```bash
-unset NANOVLLM_GS_MISS_RATE_ON_LAYERS
-unset NANOVLLM_PROFILE_DECODE_OUTPUT
-unset NANOVLLM_ENABLE_LIDU_FUSED_ATTENTION_SCATTER
-
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export ASCEND_LAUNCH_BLOCKING=0
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
-export PYTHONUNBUFFERED=1
-export PYTHONPATH=$PWD:$PYTHONPATH
-
-export NANOVLLM_MODEL=/home/models/DeepSeek-V3.2-REAP-345B-A37B-BF16/
-export NANOVLLM_TP_SIZE=16
-export NANOVLLM_ENABLE_EXPERT_PARALLEL=1
-export NANOVLLM_OFFLOAD_MODE=gs
-export NANOVLLM_ENFORCE_EAGER=0
-export NANOVLLM_KVCACHE_BLOCK_SIZE=128
-export NANOVLLM_HBM_NUM_BLOCKS=350
-export NANOVLLM_DRAM_NUM_BLOCKS=1500
-export NANOVLLM_PREFILL_CHUNK_SIZE=1024
-export NANOVLLM_IGNORE_EOS=1
-export NANOVLLM_MAX_GEN_TOKENS=16
-export NANOVLLM_PROMPT_LENGTHS=30000,30001,30002,30003,30004,30005
-
-python3 example/test.py
-```
-
-## DeepSeek V3.2：不卸载整图对照
-
-不卸载模式必须给完整 prompt KV 留出足够 HBM blocks：
-
-```bash
-unset NANOVLLM_GS_MISS_RATE_ON_LAYERS
-unset NANOVLLM_PROFILE_DECODE_OUTPUT
-unset NANOVLLM_DRAM_NUM_BLOCKS
-unset NANOVLLM_ENABLE_LIDU_FUSED_ATTENTION_SCATTER
-
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export ASCEND_LAUNCH_BLOCKING=0
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
-export PYTHONUNBUFFERED=1
-export PYTHONPATH=$PWD:$PYTHONPATH
-
-export NANOVLLM_MODEL=/home/models/DeepSeek-V3.2-REAP-345B-A37B-BF16/
-export NANOVLLM_TP_SIZE=16
-export NANOVLLM_ENABLE_EXPERT_PARALLEL=1
-export NANOVLLM_OFFLOAD_MODE=none
-export NANOVLLM_ENFORCE_EAGER=0
-export NANOVLLM_KVCACHE_BLOCK_SIZE=128
-export NANOVLLM_HBM_NUM_BLOCKS=96
-export NANOVLLM_PREFILL_CHUNK_SIZE=1024
-export NANOVLLM_IGNORE_EOS=1
-export NANOVLLM_MAX_GEN_TOKENS=8
-export NANOVLLM_PROMPT_LENGTHS=8192
-
-python3 example/test.py
-```
-
-## GLM-5.1-w4a8：LIDU 长序列整图
-
-```bash
-unset NANOVLLM_GS_MISS_RATE_ON_LAYERS
-unset NANOVLLM_PROFILE_DECODE_OUTPUT
-
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export ASCEND_LAUNCH_BLOCKING=0
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
-export PYTHONUNBUFFERED=1
-export PYTHONPATH=$PWD:$PYTHONPATH
 
 export NANOVLLM_MODEL=/mnt/models/GLM-5.1-w4a8/
 export NANOVLLM_TP_SIZE=16
@@ -250,76 +101,13 @@ export NANOVLLM_OFFLOAD_MODE=lidu
 export NANOVLLM_ENABLE_LIDU_FUSED_ATTENTION_SCATTER=1
 export NANOVLLM_ENFORCE_EAGER=0
 export NANOVLLM_KVCACHE_BLOCK_SIZE=128
-export NANOVLLM_HBM_NUM_BLOCKS=96
-export NANOVLLM_DRAM_NUM_BLOCKS=128
+export NANOVLLM_HBM_NUM_BLOCKS=1190
+export NANOVLLM_DRAM_NUM_BLOCKS=3800
 export NANOVLLM_PREFILL_CHUNK_SIZE=1024
 export NANOVLLM_IGNORE_EOS=1
-export NANOVLLM_MAX_GEN_TOKENS=8
-export NANOVLLM_PROMPT_LENGTHS=8200
+export NANOVLLM_MAX_GEN_TOKENS=20
+export NANOVLLM_PROMPT_LENGTHS=20000,20001,20002,20003,20004,20005,20006,20007,20008,20009,20010,20011,20012,20013,20014,20015,20016,20017,20018,20019,20020,20021,20022,20023
 
 python3 example/test.py
 ```
 
-GLM 结束 proof 应满足 `offload_mode=lidu`、`lidu_fused_attention_scatter=True`、`npugraph_ex=False`、`captures=1`、`replays>0` 和 `eager_lidu_capture=1`。同一配置把 `NANOVLLM_ENABLE_LIDU_FUSED_ATTENTION_SCATTER` 分别设为 `0/1` 时，`temperature=0` 的 token IDs 必须一致；再比较稳定 replay TPOT。
-
-## 短序列 smoke
-
-`example/short_prompts.py` 同时支持 DeepSeek 和 GLM。以下 GLM 命令使用默认的非卸载 eager 路径：
-
-```bash
-unset NANOVLLM_GS_MISS_RATE_ON_LAYERS
-unset NANOVLLM_PROFILE_DECODE_OUTPUT
-unset NANOVLLM_DRAM_NUM_BLOCKS
-unset NANOVLLM_ENABLE_LIDU_FUSED_ATTENTION_SCATTER
-
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export ASCEND_LAUNCH_BLOCKING=0
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
-export PYTHONUNBUFFERED=1
-export PYTHONPATH=$PWD:$PYTHONPATH
-
-export NANOVLLM_MODEL=/mnt/models/GLM-5.1-w4a8/
-export NANOVLLM_TP_SIZE=16
-export NANOVLLM_ENABLE_EXPERT_PARALLEL=1
-export NANOVLLM_OFFLOAD_MODE=none
-export NANOVLLM_ENFORCE_EAGER=1
-export NANOVLLM_KVCACHE_BLOCK_SIZE=128
-export NANOVLLM_HBM_NUM_BLOCKS=64
-export NANOVLLM_PREFILL_CHUNK_SIZE=0
-export NANOVLLM_MAX_MODEL_LEN=512
-export NANOVLLM_MAX_GEN_TOKENS=8
-export NANOVLLM_IGNORE_EOS=0
-
-python3 example/short_prompts.py
-```
-
-## 关键环境变量
-
-| 变量 | 说明 |
-| --- | --- |
-| `NANOVLLM_OFFLOAD_MODE` | `none|gs|lidu`，默认 `none` |
-| `NANOVLLM_ENABLE_LIDU_FUSED_ATTENTION_SCATTER` | `1` 启用 GLM LIDU 稳态融合 SCATTER+Attention；`0` 使用旧的两算子路径，默认 `0` |
-| `NANOVLLM_ENFORCE_EAGER` | `1` 全 eager；`0` 后续稳定 decode 使用整图 |
-| `NANOVLLM_KVCACHE_BLOCK_SIZE` | LIDU/SCATTER 当前只支持 `128` |
-| `NANOVLLM_HBM_NUM_BLOCKS` | HBM KV blocks，必须大于 2 |
-| `NANOVLLM_DRAM_NUM_BLOCKS` | `gs/lidu` 必须大于 2；决定 DRAM KV 与 HBM IndexCache 容量 |
-| `NANOVLLM_PREFILL_CHUNK_SIZE` | 只允许 `0` 或 `1024`；不引入 prefill/decode 混合 forward |
-| `NANOVLLM_PROMPT_LENGTHS` | `example/test.py` 的精确 token 长度列表；条目数即 batch size |
-| `NANOVLLM_PROFILE_DECODE_OUTPUT` | 非空时只采集 TP rank 0；eager 从首次 decode 开始，图模式跳过首次 decode、lazy capture 和首次 replay，从后续稳定 replay 开始，程序结束时停止 |
-| `NANOVLLM_GS_MISS_RATE_ON_LAYERS` | eager-only；LIDU 复用该历史开关，按指定层打印各请求的 miss count/rate，例如 `0,30,60` |
-
-Chunk prefill 只降低 prefill 激活峰值；不会减少完整请求所需的 KV/IndexCache 容量。其他正式算子 UT 见 `ut_ops/UT_OPS.md`。
-
-
-
-# 最新结果
-
-- 模型：GLM-5.1-w4a8
-- 并行模式：TP16 / EP16
-
-| 推理框架             | batchsize | 序列长度 | 单卡显存需求 (KV+index) | TPOT      | TPS吞吐     |
-| -------------------- | --------- | -------- | ----------------------- | --------- | ----------- |
-| vLLM0.19 原版 不卸载 | bs=24     | 10000    | 26.4 GB                 | 77 ms     | 311 TPS     |
-| vLLM0.19 原版 不卸载 | bs=9      | 21000    | 20.8 GB                 | **65 ms** | **138** TPS |
-| nanovllm 卸载        | bs=9      | 21000    | 7.9 GB                  | 79 ms     | 113 TPS     |
-| nanovllm 卸载        | bs=24     | 21000    | 21.1 GB                 | **98 ms** | **244** TPS |
