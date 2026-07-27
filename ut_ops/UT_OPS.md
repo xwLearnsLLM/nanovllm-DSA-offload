@@ -37,7 +37,7 @@ python3 ut_ops/test_lidu_scatter.py \
 
 ## LIDU 索引管理时延
 
-该测试不调用 SCATTER，使用 NPU Event 分别测量同一输入上的 LightningIndexer 和 LIDU kernel。`index_management_us = lidu_us - lightning_indexer_us`，与 `ops_li_update/README.md` 表格的“索引管理时间”口径一致；缓存状态恢复发生在计时区间之外。
+该测试不调用 SCATTER，使用 NPU Event 分别测量同一输入上的 LightningIndexer 和 LIDU kernel。`index_management_us = lidu_us - lightning_indexer_us`，与 `ops_li_update/README.md` 表格的“索引管理时间”口径一致；缓存状态恢复发生在计时区间之外。GLM 的 32-head case 使用正式 GS 路径同款 `torch_npu.npu_lightning_indexer` 基线，因为仓内旧 `LightningIndexerVllm` 只支持 64 heads；64-head case 使用仓内基线。
 
 ```bash
 unset NANOVLLM_ENABLE_DSA_OFFLOAD

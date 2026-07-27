@@ -35,6 +35,7 @@ MAX_CACHE_TOKENS = 16_382  # Packed slot value 0x3fff is reserved as invalid.
 
 @dataclass(frozen=True)
 class Result:
+    baseline: str
     heads: int
     batch_size: int
     seq_len: int
@@ -149,22 +150,44 @@ def run_lightning_indexer(
     query_lens: torch.Tensor,
     candidate_lens: torch.Tensor,
     block_table: torch.Tensor,
-) -> torch.Tensor:
-    return torch.ops.nanovllm_dsa.lightning_indexer.default(
-        query,
-        key,
-        weights,
-        query_lens,
-        candidate_lens,
-        block_table,
-        "TND",
-        "PA_BSND",
-        TOPK,
-        3,
-        (1 << 63) - 1,
-        (1 << 63) - 1,
-        False,
-    )[0]
+) -> tuple[torch.Tensor, str]:
+    if query.shape[1] == 32:
+        # This is also the production GLM GatherSelection baseline.  The
+        # repository-bundled LightningIndexerVllm is specialized for N1/N2=64.
+        output = torch_npu.npu_lightning_indexer(
+            query=query,
+            key=key,
+            weights=weights,
+            actual_seq_lengths_query=query_lens,
+            actual_seq_lengths_key=candidate_lens,
+            block_table=block_table,
+            layout_query="TND",
+            layout_key="PA_BSND",
+            sparse_count=TOPK,
+            sparse_mode=3,
+        )
+        if isinstance(output, (tuple, list)):
+            output = output[0]
+        return output, "torch_npu_native"
+
+    return (
+        torch.ops.nanovllm_dsa.lightning_indexer.default(
+            query,
+            key,
+            weights,
+            query_lens,
+            candidate_lens,
+            block_table,
+            "TND",
+            "PA_BSND",
+            TOPK,
+            3,
+            (1 << 63) - 1,
+            (1 << 63) - 1,
+            False,
+        )[0],
+        "repo_vllm",
+    )
 
 
 def benchmark_npu_events(
@@ -441,8 +464,12 @@ def run_case(
         device=device,
     )
 
+    baseline = (
+        "torch_npu_native" if heads == 32 else "repo_vllm"
+    )
+
     def run_li() -> torch.Tensor:
-        return run_lightning_indexer(
+        output, actual_baseline = run_lightning_indexer(
             query,
             key,
             weights,
@@ -450,6 +477,12 @@ def run_case(
             candidate_lens,
             block_table,
         )
+        if actual_baseline != baseline:
+            raise AssertionError(
+                f"LightningIndexer baseline changed from {baseline} to "
+                f"{actual_baseline}."
+            )
+        return output
 
     def reset_lidu() -> None:
         cache_slots.copy_(initial_cache)
@@ -514,6 +547,7 @@ def run_case(
     lightning_us = statistics.mean(lightning_times) * 1000.0
     lidu_us = statistics.mean(lidu_times) * 1000.0
     result = Result(
+        baseline=baseline,
         heads=heads,
         batch_size=batch_size,
         seq_len=seq_len,
@@ -526,7 +560,8 @@ def run_case(
     )
     print(
         "LIDU_PERF_RESULT "
-        f"heads={heads} batch={batch_size} seq_len={seq_len} "
+        f"baseline={baseline} heads={heads} batch={batch_size} "
+        f"seq_len={seq_len} "
         f"cache_tokens={cache_tokens_value} "
         f"miss_range={miss_min}:{miss_max} "
         f"actual_miss_mean={result.actual_miss_mean:.2f} "
@@ -542,15 +577,16 @@ def run_case(
 def print_table(results: list[Result]) -> None:
     print("LIDU_PERF_TABLE")
     print(
-        "| heads | bsz | seqlen | C | miss range | actual miss mean | "
+        "| baseline | heads | bsz | seqlen | C | miss range | actual miss mean | "
         "LightningIndexer (us) | LIDU (us) | index management (us) |"
     )
     print(
-        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
     )
     for result in results:
         print(
-            f"| {result.heads} | {result.batch_size} | {result.seq_len} | "
+            f"| {result.baseline} | {result.heads} | {result.batch_size} | "
+            f"{result.seq_len} | "
             f"{result.cache_tokens} | {result.miss_min}:{result.miss_max} | "
             f"{result.actual_miss_mean:.2f} | "
             f"{result.lightning_indexer_us:.3f} | {result.lidu_us:.3f} | "
