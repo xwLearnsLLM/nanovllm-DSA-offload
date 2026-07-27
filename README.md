@@ -111,3 +111,9 @@ export NANOVLLM_PROMPT_LENGTHS=20000,20001,20002,20003,20004,20005,20006,20007,2
 python3 example/test.py
 ```
 
+如果要输出 PROFILE :
+
+```
+NANOVLLM_PROFILE_DECODE_OUTPUT=$PWD/profile python3 example/test.py
+```
+
