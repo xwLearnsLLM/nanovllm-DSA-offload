@@ -104,11 +104,7 @@ export PYTHONPATH=$PWD:$PYTHONPATH
 export ASCEND_HOME_PATH=/usr/local/Ascend/cann-8.5.1
 export CANN_INSTALL_PATH=/usr/local/Ascend/cann-8.5.1
 
-for bs in 1 8 12 16 24; do
-  for seq_len in 20096 65536 12288; do
-    python3 ut_ops/test_lidu_perf.py --device npu:0 --heads 32 --batch-sizes "$bs" --seq-lens "$seq_len" --cache-tokens 6144 --miss-ranges 0:300 --warmup 3 --iters 100 --seed 7
-  done
-done
+python3 ut_ops/test_lidu_perf.py --device npu:0 --heads 32 --batch-sizes 1,4,8,12,16,24 --seq-lens 20096,65536,12288 --cache-tokens 6144 --miss-ranges 0:300 --warmup 3 --iters 100 --seed 7
 ```
 
 
