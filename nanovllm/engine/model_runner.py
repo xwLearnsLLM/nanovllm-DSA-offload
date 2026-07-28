@@ -413,7 +413,7 @@ class ModelRunner:
         config = self.config
         hf_config = config.hf_config
         text_config = getattr(hf_config, "text_config", hf_config)
-        cache_dtype = self._set_torch_dtype(text_config)
+        cache_dtype = torch.bfloat16
         num_layers = int(text_config.num_hidden_layers)
         kv_lora_rank = int(text_config.kv_lora_rank)
         rope_dim = int(text_config.qk_rope_head_dim)
