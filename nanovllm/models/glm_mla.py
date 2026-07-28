@@ -12,7 +12,7 @@ import torch.nn.functional as F
 import nanovllm.ops as ascend_ops
 from nanovllm.engine.dsa_offload import (
     DSA_SELECTION_TOPK_TOKENS,
-    OFFLOAD_LIDU,
+    OFFLOAD_FUSE,
     OFFLOAD_NONE,
     parse_lidu_miss_count_layers,
 )
@@ -379,13 +379,13 @@ class GlmMLAAttention(nn.Module):
         )
         tp_rank = dist.get_rank()
         self._lidu_miss_count_enabled = (
-            self.offload_mode == OFFLOAD_LIDU
+            self.uses_offload
             and tp_rank == 0
             and self.layer_idx in miss_count_layers
         )
         self._lidu_miss_count_decode_step = 0
         if (
-            self.offload_mode == OFFLOAD_LIDU
+            self.uses_offload
             and tp_rank == 0
             and self.layer_idx == 0
             and miss_count_layers
@@ -431,20 +431,10 @@ class GlmMLAAttention(nn.Module):
             self.indexer = GlmDsaIndexer(config)
         # GLM captures this module directly in a raw outer NPUGraph. Keep the
         # LIDU->SCATTER intermediates alive at fixed addresses across replay.
-        self._use_persistent_lidu_raw_graph_outputs = (
-            self.offload_mode == OFFLOAD_LIDU
-        )
-        self._use_lidu_sparse_and_tail_attention = (
-            self.offload_mode == OFFLOAD_LIDU
-        )
+        self._use_persistent_lidu_raw_graph_outputs = self.uses_offload
+        self._use_lidu_sparse_and_tail_attention = self.uses_offload
         self._use_lidu_fused_attention_scatter = (
-            bool(
-                getattr(
-                    config,
-                    "nanovllm_enable_lidu_fused_attention_scatter",
-                    False,
-                )
-            )
+            self.offload_mode == OFFLOAD_FUSE
         )
         self._lidu_raw_graph_outputs: dict[
             int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]

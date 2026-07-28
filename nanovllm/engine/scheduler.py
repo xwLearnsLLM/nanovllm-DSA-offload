@@ -4,7 +4,6 @@ from collections import deque
 from typing import TYPE_CHECKING
 
 from nanovllm.engine.dsa_offload import (
-    OFFLOAD_LIDU,
     OFFLOAD_NONE,
     PoolEntryManager,
     SimpleBlockManager,
@@ -133,7 +132,7 @@ class Scheduler:
         return seq.num_sparse_blocks + tail_and_decode_blocks
 
     def _can_reserve_lidu_decode_hbm(self, candidate: Sequence) -> bool:
-        if self.offload_mode != OFFLOAD_LIDU:
+        if not self.uses_offload:
             return True
         active = list(self.running)
         if self.prefilling is not None and self.prefilling not in active:
@@ -265,8 +264,7 @@ class Scheduler:
         pending_sparse_blocks = (
             seq.num_sparse_blocks
             if (
-                self.offload_mode == OFFLOAD_LIDU
-                and seq.lidu_decode_hbm_pending
+                self.uses_offload and seq.lidu_decode_hbm_pending
             )
             else 0
         )
@@ -279,8 +277,7 @@ class Scheduler:
         pending_sparse_blocks = (
             seq.num_sparse_blocks
             if (
-                self.offload_mode == OFFLOAD_LIDU
-                and seq.lidu_decode_hbm_pending
+                self.uses_offload and seq.lidu_decode_hbm_pending
             )
             else 0
         )

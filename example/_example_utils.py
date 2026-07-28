@@ -47,10 +47,6 @@ def make_llm(
     return LLM(
         model_path(),
         offload_mode=os.environ.get("NANOVLLM_OFFLOAD_MODE", "none"),
-        enable_lidu_fused_attention_scatter=env_bool(
-            "NANOVLLM_ENABLE_LIDU_FUSED_ATTENTION_SCATTER",
-            False,
-        ),
         enforce_eager=enforce_eager,
         decode_graph_capture_sizes=(max_num_decode_seqs_per_step,),
         tensor_parallel_size=env_int("NANOVLLM_TP_SIZE", DEFAULT_TP_SIZE),

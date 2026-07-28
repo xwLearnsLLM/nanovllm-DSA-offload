@@ -6,8 +6,9 @@ import pytest
 import nanovllm.engine.dsa_offload as dsa_offload
 from nanovllm.engine.dsa_offload import (
     LIDU_CACHE_TOKEN_BUDGETS,
-    OFFLOAD_LIDU,
+    OFFLOAD_FUSE,
     OFFLOAD_MODES,
+    OFFLOAD_SPLIT,
     finalize_prefill_hbm_layout,
     lidu_cache_tokens,
     normalize_offload_mode,
@@ -29,7 +30,7 @@ def _config(
     max_decode_seqs: int = 4,
     num_hbm_blocks: int = 800,
     num_dram_blocks: int = 800,
-    offload_mode: str = OFFLOAD_LIDU,
+    offload_mode: str = OFFLOAD_SPLIT,
     prefill_chunk_size: int = 0,
 ):
     return SimpleNamespace(
@@ -54,13 +55,22 @@ def _seq(length: int, request_id: str) -> Sequence:
     )
 
 
-def test_two_modes_and_default_public_api():
-    assert OFFLOAD_MODES == ("none", "lidu")
+def test_three_modes_and_default_public_api():
+    assert OFFLOAD_MODES == ("none", "offload_split", "offload_fuse")
     assert Config.__dataclass_fields__["offload_mode"].default == "none"
+    assert (
+        "enable_lidu_fused_attention_scatter"
+        not in Config.__dataclass_fields__
+    )
     for mode in OFFLOAD_MODES:
         assert normalize_offload_mode(mode.upper()) == mode
-    with pytest.raises(ValueError, match="none.*lidu"):
+    with pytest.raises(
+        ValueError,
+        match="none.*offload_split.*offload_fuse",
+    ):
         normalize_offload_mode("legacy")
+    with pytest.raises(ValueError):
+        normalize_offload_mode("lidu")
     with pytest.raises(TypeError, match="must be a string"):
         normalize_offload_mode(True)
 
@@ -210,7 +220,7 @@ def test_preemption_releases_pool_row_and_resets_lidu_initialization():
     scheduler._prepare_prefill_metadata(seq)
     scheduler._allocate_prefill(seq)
     entry = seq.offload_pool_entry
-    finalize_prefill_hbm_layout(seq, OFFLOAD_LIDU)
+    finalize_prefill_hbm_layout(seq, OFFLOAD_SPLIT)
     scheduler.release_prefill_hbm_blocks([seq])
     assert seq.lidu_decode_hbm_pending
     seq.status = SequenceStatus.RUNNING
@@ -279,7 +289,7 @@ def test_lidu_releases_all_full_prefill_blocks_until_first_decode(
     old_hbm_blocks = list(seq.hbm_block_table)
     old_metadata_version = seq.decode_metadata_version
 
-    finalize_prefill_hbm_layout(seq, OFFLOAD_LIDU)
+    finalize_prefill_hbm_layout(seq, OFFLOAD_SPLIT)
 
     assert seq.hbm_block_table == old_hbm_blocks[
         seq.num_prefill_full_blocks:seq.num_prefill_blocks
@@ -321,7 +331,7 @@ def _finish_lidu_prefill_without_running_decode(
 ) -> None:
     assert scheduler._can_allocate_prefill(seq)
     scheduler._allocate_prefill(seq)
-    finalize_prefill_hbm_layout(seq, OFFLOAD_LIDU)
+    finalize_prefill_hbm_layout(seq, OFFLOAD_SPLIT)
     scheduler.release_prefill_hbm_blocks([seq])
     seq.num_prefill_tokens_processed = len(seq)
     seq.append_token(42)
@@ -401,7 +411,7 @@ def test_chunk_prefill_keeps_sparse_arena_delayed_until_decode():
             == len(seq)
         )
         if is_last:
-            finalize_prefill_hbm_layout(seq, OFFLOAD_LIDU)
+            finalize_prefill_hbm_layout(seq, OFFLOAD_SPLIT)
             scheduler.release_prefill_hbm_blocks([seq])
             scheduler.postprocess(scheduled, [42], is_prefill)
         else:
@@ -442,7 +452,7 @@ def test_short_lidu_final_layout_is_unchanged():
     short_scheduler._prepare_prefill_metadata(short)
     short_scheduler._allocate_prefill(short)
     short_hbm = list(short.hbm_block_table)
-    finalize_prefill_hbm_layout(short, OFFLOAD_LIDU)
+    finalize_prefill_hbm_layout(short, OFFLOAD_FUSE)
     assert short.hbm_block_table == short_hbm
     assert short.hbm_blocks_to_release == []
     assert not short.lidu_decode_hbm_pending

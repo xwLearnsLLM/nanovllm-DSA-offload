@@ -9,8 +9,10 @@ if TYPE_CHECKING:
 
 DSA_SELECTION_TOPK_TOKENS = 2048
 OFFLOAD_NONE: Final = "none"
-OFFLOAD_LIDU: Final = "lidu"
-OFFLOAD_MODES: Final = (OFFLOAD_NONE, OFFLOAD_LIDU)
+OFFLOAD_SPLIT: Final = "offload_split"
+OFFLOAD_FUSE: Final = "offload_fuse"
+LIDU_OFFLOAD_MODES: Final = (OFFLOAD_SPLIT, OFFLOAD_FUSE)
+OFFLOAD_MODES: Final = (OFFLOAD_NONE, *LIDU_OFFLOAD_MODES)
 # User-tunable LIDU budgets for prompt ranges 8193-16384,
 # 16385-32768, 32769-65536, and >=65537 respectively.  The <=8192 tiers
 # remain fixed at C=0/2048.  Edit only this tuple when comparing cache sizes.
@@ -143,9 +145,9 @@ def finalize_prefill_hbm_layout(
     block arena immediately before first decode.
     """
 
-    if offload_mode != OFFLOAD_LIDU:
+    if offload_mode not in LIDU_OFFLOAD_MODES:
         raise ValueError(
-            "finalize_prefill_hbm_layout requires lidu mode, "
+            "finalize_prefill_hbm_layout requires an LIDU offload mode, "
             f"got {offload_mode!r}."
         )
 

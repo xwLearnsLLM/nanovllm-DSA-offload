@@ -21,7 +21,7 @@ def make_config(
     block_size: int = 128,
     num_hbm_blocks: int = 256,
     num_dram_blocks: int = 256,
-    offload_mode: str = "lidu",
+    offload_mode: str = "offload_split",
 ):
     return SimpleNamespace(
         max_num_prefill_seqs_per_step=max_num_prefill_seqs_per_step,

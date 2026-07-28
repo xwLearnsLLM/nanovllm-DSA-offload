@@ -447,8 +447,6 @@ class LLMEngine:
             print(
                 "    FULL_DECODE_ONLY proof: "
                 f"offload_mode={graph_stats['offload_mode']}, "
-                "lidu_fused_attention_scatter="
-                f"{graph_stats['lidu_fused_attention_scatter']}, "
                 f"capture_sizes={graph_stats['capture_sizes']}, "
                 f"captures={graph_stats['captures']}, "
                 f"replays={graph_stats['replays']}, "

@@ -111,7 +111,7 @@ def _make_config(path, **overrides):
         max_model_len=2048,
         tensor_parallel_size=16,
         enable_expert_parallel=True,
-        offload_mode="lidu",
+        offload_mode="offload_split",
         enforce_eager=True,
         kvcache_block_size=128,
         num_hbm_kvcache_blocks=64,
@@ -177,7 +177,14 @@ def test_glm_dsa_offload_keeps_native_indexer_at_index_topk(tmp_path):
     assert config.hf_config.index_topk == 2048
 
 
-def test_glm_lidu_accepts_supported_cache_geometry(tmp_path):
+@pytest.mark.parametrize(
+    "offload_mode",
+    ["offload_split", "offload_fuse"],
+)
+def test_glm_offload_accepts_supported_cache_geometry(
+    tmp_path,
+    offload_mode,
+):
     _write_glm_config(
         tmp_path,
         q_lora_rank=2048,
@@ -187,44 +194,20 @@ def test_glm_lidu_accepts_supported_cache_geometry(tmp_path):
 
     config = _make_config(
         tmp_path,
-        offload_mode="lidu",
+        offload_mode=offload_mode,
         max_model_len=16384,
         kvcache_block_size=128,
     )
 
-    assert config.offload_mode == "lidu"
-    assert config.hf_config.nanovllm_offload_mode == "lidu"
-    assert config.enable_lidu_fused_attention_scatter is False
-    assert (
-        config.hf_config.nanovllm_enable_lidu_fused_attention_scatter
-        is False
+    assert config.offload_mode == offload_mode
+    assert config.hf_config.nanovllm_offload_mode == offload_mode
+    assert not hasattr(
+        config.hf_config,
+        "nanovllm_enable_lidu_fused_attention_scatter",
     )
 
 
-def test_glm_lidu_accepts_fused_attention_scatter(tmp_path):
-    _write_glm_config(
-        tmp_path,
-        q_lora_rank=2048,
-        kv_lora_rank=512,
-        qk_rope_head_dim=64,
-    )
-
-    config = _make_config(
-        tmp_path,
-        offload_mode="lidu",
-        max_model_len=16384,
-        kvcache_block_size=128,
-        enable_lidu_fused_attention_scatter=True,
-    )
-
-    assert config.enable_lidu_fused_attention_scatter is True
-    assert (
-        config.hf_config.nanovllm_enable_lidu_fused_attention_scatter
-        is True
-    )
-
-
-def test_glm_lidu_fused_attention_scatter_allows_full_decode_only(
+def test_glm_offload_fuse_allows_full_decode_only(
     tmp_path,
     monkeypatch,
 ):
@@ -238,42 +221,15 @@ def test_glm_lidu_fused_attention_scatter_allows_full_decode_only(
 
     config = _make_config(
         tmp_path,
-        offload_mode="lidu",
+        offload_mode="offload_fuse",
         max_model_len=32768,
         kvcache_block_size=128,
-        enable_lidu_fused_attention_scatter=True,
         enforce_eager=False,
         max_num_decode_seqs_per_step=24,
         decode_graph_capture_sizes=(24,),
     )
 
     assert config.decode_graph_capture_sizes == (24,)
-
-
-@pytest.mark.parametrize("offload_mode", ["none"])
-def test_fused_attention_scatter_requires_lidu(tmp_path, offload_mode):
-    _write_glm_config(tmp_path)
-
-    with pytest.raises(ValueError, match="requires offload_mode='lidu'"):
-        _make_config(
-            tmp_path,
-            offload_mode=offload_mode,
-            enable_lidu_fused_attention_scatter=True,
-        )
-
-
-def test_fused_attention_scatter_rejects_non_bool(tmp_path):
-    _write_glm_config(tmp_path)
-
-    with pytest.raises(
-        TypeError,
-        match="enable_lidu_fused_attention_scatter must be a bool",
-    ):
-        _make_config(
-            tmp_path,
-            offload_mode="lidu",
-            enable_lidu_fused_attention_scatter=1,
-        )
 
 
 def test_glm_dense_mla_mode_needs_no_dram_cache(tmp_path):
@@ -418,7 +374,7 @@ def test_glm_8200_prompt_really_crosses_dsa_offload_boundary():
         eos=[154820, 154827, 154829],
         num_hbm_kvcache_blocks=96,
         num_dram_kvcache_blocks=128,
-        offload_mode="lidu",
+        offload_mode="offload_split",
         kvcache_block_size=128,
         max_model_len=8224,
     )

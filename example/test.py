@@ -8,7 +8,7 @@ from _example_utils import (
     print_outputs,
 )
 from nanovllm.engine.dsa_offload import (
-    OFFLOAD_LIDU,
+    LIDU_OFFLOAD_MODES,
     lidu_cache_tokens,
 )
 from nanovllm import SamplingParams
@@ -150,7 +150,7 @@ def print_prompt_plan(
     print("prompt plan:")
     for i, length in enumerate(lengths, 1):
         full_blocks = length // block_size
-        if offload_mode == OFFLOAD_LIDU:
+        if offload_mode in LIDU_OFFLOAD_MODES:
             cache_tokens = lidu_cache_tokens(length)
             cache_blocks = (
                 cache_tokens // block_size

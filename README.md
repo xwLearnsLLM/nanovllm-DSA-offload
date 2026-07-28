@@ -5,7 +5,10 @@
 | `offload_mode` / `NANOVLLM_OFFLOAD_MODE` | Decode KV 路径 |
 | --- | --- |
 | `none` | 不卸载，完整 MLA KV 保留在 HBM；默认值 |
-| `lidu` | LIDU 索引更新 + DRAM→HBM SCATTER + sparse-and-tail Attention |
+| `offload_split` | LIDU + SCATTER + sparse-and-tail Attention |
+| `offload_fuse` | LIDU + 融合 sparse-and-tail Attention/SCATTER |
+
+旧值 `lidu` 和独立开关 `NANOVLLM_ENABLE_LIDU_FUSED_ATTENTION_SCATTER` 已删除。
 
 执行模式只保留 eager 和 `FULL_DECODE_ONLY`。Prefill 始终 eager，也不做 prefill/decode 混合 forward。`NANOVLLM_ENFORCE_EAGER=1` 时所有 decode 都 eager；设为 `0` 时，首次 decode、LIDU 初始化和首次 capture 允许 eager，后续稳定 decode 使用 raw outer ACLGraph replay。LM head 和 sampler 始终在图外。
 
@@ -24,7 +27,7 @@ Chunk prefill 只支持 `NANOVLLM_PREFILL_CHUNK_SIZE=0` 或 `1024`；设为 `102
 
 后四档由 [dsa_offload.py](nanovllm/engine/dsa_offload.py) 中的 `LIDU_CACHE_TOKEN_BUDGETS` 集中控制。修改这些 Python 常量不需要重新编译算子，但预算必须是 KV block size 的倍数，并需要相应增加 HBM block 数量。
 
-稀疏 source 只包含原始 prompt 的完整 128-token blocks；prompt 末尾非满块和 decode token 始终留在 dense tail。稳定 decode 的 Attention 覆盖缓存中的 top-2048 和完整 tail。`NANOVLLM_ENABLE_LIDU_FUSED_ATTENTION_SCATTER=1` 使用融合搬移/Attention 算子；设为 `0` 使用 SCATTER 后接 sparse-and-tail Attention。
+稀疏 source 只包含原始 prompt 的完整 128-token blocks；prompt 末尾非满块和 decode token 始终留在 dense tail。稳定 decode 的 Attention 覆盖缓存中的 top-2048 和完整 tail。`offload_split` 使用独立 SCATTER 和 sparse-and-tail Attention；`offload_fuse` 在稳定且 batch size 不超过 24 时使用融合搬移/Attention 算子，首次 decode、初始化 step 和更大 batch 回退分离路径。
 
 ## 编译
 
@@ -59,8 +62,7 @@ export ASCEND_HOME_PATH=/usr/local/Ascend/cann-8.5.1
 export NANOVLLM_MODEL=/mnt/models/GLM-5.1-w4a8/
 export NANOVLLM_TP_SIZE=16
 export NANOVLLM_ENABLE_EXPERT_PARALLEL=1
-export NANOVLLM_OFFLOAD_MODE=lidu
-export NANOVLLM_ENABLE_LIDU_FUSED_ATTENTION_SCATTER=1
+export NANOVLLM_OFFLOAD_MODE=offload_fuse
 export NANOVLLM_ENFORCE_EAGER=0
 export NANOVLLM_KVCACHE_BLOCK_SIZE=128
 export NANOVLLM_HBM_NUM_BLOCKS=1190
@@ -72,7 +74,7 @@ export NANOVLLM_PROMPT_LENGTHS=20000,20001,20002,20003,20004,20005,20006,20007,2
 python3 example/test.py
 ```
 
-测试不卸载路径时只需把 `NANOVLLM_OFFLOAD_MODE` 改为 `none`，并把 `NANOVLLM_ENABLE_LIDU_FUSED_ATTENTION_SCATTER` 改为 `0`。测试全 eager 时把 `NANOVLLM_ENFORCE_EAGER` 改为 `1`。
+测试非融合卸载路径时把 `NANOVLLM_OFFLOAD_MODE` 改为 `offload_split`；测试不卸载路径时改为 `none`。测试全 eager 时把 `NANOVLLM_ENFORCE_EAGER` 改为 `1`。
 
 ## Profile
 

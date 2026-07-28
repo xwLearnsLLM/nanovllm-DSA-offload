@@ -11,7 +11,6 @@ import torch
 import torch.distributed as dist
 
 from nanovllm.engine.dsa_offload import (
-    OFFLOAD_LIDU,
     OFFLOAD_NONE,
     normalize_offload_mode,
 )
@@ -496,12 +495,9 @@ class FullDecodeOnlyGraphManager:
                 candidate_query_lens=entry.candidate_query_lens,
                 needs_dsa_update=True,
                 full_decode_graph=True,
+                lidu_cache_tokens=entry.lidu_cache_tokens,
+                lidu_all_rows_ready=True,
             )
-            if self.offload_mode == OFFLOAD_LIDU:
-                kwargs.update(
-                    lidu_cache_tokens=entry.lidu_cache_tokens,
-                    lidu_all_rows_ready=True,
-                )
         set_context(
             False,
             flat_slot_mapping_i32=entry.flat_slot_mapping_i32,
@@ -657,7 +653,7 @@ class FullDecodeOnlyGraphManager:
             self.eager_first_decode_count += 1
             return self._run_eager(input_ids, positions)
         batch_size = int(input_ids.shape[0])
-        if self.offload_mode == OFFLOAD_LIDU:
+        if self.stateful_offload:
             if not runtime_context.needs_dsa_update:
                 self.eager_no_dsa_count += 1
                 return self._run_eager(input_ids, positions)
@@ -676,7 +672,7 @@ class FullDecodeOnlyGraphManager:
             return self._run_eager(input_ids, positions)
         entry = self._entries.get(graph_batch_size)
         if entry is None or entry.graph is None or entry.output is None:
-            if self.offload_mode == OFFLOAD_LIDU:
+            if self.stateful_offload:
                 entry = entry or self._allocate_entry(graph_batch_size)
                 self._capture_lidu_runtime(
                     entry,

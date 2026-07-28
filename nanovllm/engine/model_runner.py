@@ -17,7 +17,7 @@ torch.npu.config.allow_internal_format = True
 
 from nanovllm.config import Config
 from nanovllm.engine.dsa_offload import (
-    OFFLOAD_LIDU,
+    OFFLOAD_FUSE,
     OFFLOAD_NONE,
     finalize_prefill_hbm_layout,
     max_lidu_cache_tokens,
@@ -149,9 +149,7 @@ class ModelRunner:
         torch.set_default_device(self.device)
 
         self.model = self._load_model()
-        self.uses_sparse_and_tail_attention = (
-            self.offload_mode == OFFLOAD_LIDU
-        )
+        self.uses_sparse_and_tail_attention = self.uses_offload
 
         self.sampler = Sampler()
         self._decode_dynamic_buffers: dict[int, _DecodeDynamicBuffers] = {}
@@ -186,7 +184,7 @@ class ModelRunner:
                 uses_tensor_mla_lengths=self.uses_sparse_and_tail_attention,
                 log_enabled=self.rank == 0,
             )
-            if self.offload_mode == OFFLOAD_LIDU:
+            if self.uses_offload:
                 if self.rank == 0:
                     logger.info(
                         "FULL_DECODE_ONLY: deferring LIDU graph capture until "
@@ -212,12 +210,10 @@ class ModelRunner:
                 self.hf_config, "nanovllm_quant_metadata", {}
             )
             attention = "dense MLA (all KV)"
-            if self.offload_mode == OFFLOAD_LIDU:
-                attention = (
-                    "LIDU + fused SCATTER/sparse-and-tail MLA"
-                    if self.config.enable_lidu_fused_attention_scatter
-                    else "LIDU + SCATTER + sparse-and-tail MLA"
-                )
+            if self.offload_mode == OFFLOAD_FUSE:
+                attention = "LIDU + fused SCATTER/sparse-and-tail MLA"
+            elif self.uses_offload:
+                attention = "LIDU + SCATTER + sparse-and-tail MLA"
             logger.info(
                 "GLM-5.1 W4A8: %s decode, attention=%s, max_model_len=%d, "
                 "EP%d (%d local experts/rank), ModelSlim version=%s "
@@ -298,9 +294,6 @@ class ModelRunner:
         stats = self.decode_graph_manager.stats()
         stats.update(
             **self._decode_ipc_stats(),
-            lidu_fused_attention_scatter=(
-                self.config.enable_lidu_fused_attention_scatter
-            ),
             metadata_cache_hits=self._decode_metadata_cache_hits,
             metadata_cache_misses=self._decode_metadata_cache_misses,
         )
@@ -885,7 +878,7 @@ class ModelRunner:
                 hidden_states = self.model(input_ids, positions)
             else:
                 hidden_states = self.decode_graph_manager.run(input_ids, positions)
-            if not is_prefill and self.offload_mode == OFFLOAD_LIDU:
+            if not is_prefill and self.uses_offload:
                 init_rows = get_context().lidu_init_rows
                 if init_rows is not None and init_rows.numel() > 0:
                     # Initialization is deliberately outside the stable graph.

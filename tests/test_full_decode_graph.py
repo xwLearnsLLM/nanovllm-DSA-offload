@@ -66,7 +66,7 @@ def test_static_entry_copies_all_lidu_metadata():
         torch.tensor([11, 12], dtype=torch.int64),
         torch.tensor([2199, 2200], dtype=torch.int64),
         context,
-        offload_mode="lidu",
+        offload_mode="offload_split",
     )
 
     assert seq_lens == [2200, 2201]
@@ -89,7 +89,7 @@ def test_static_entry_copies_lidu_tiers_for_mixed_batch():
         torch.tensor([11, 12], dtype=torch.int64),
         torch.tensor([2199, 2200], dtype=torch.int64),
         context,
-        offload_mode="lidu",
+        offload_mode="offload_split",
     )
 
     assert entry.lidu_cache_tokens.tolist() == [0, 3072]
@@ -104,7 +104,7 @@ def test_static_entry_refreshes_tensor_mla_lengths_every_step():
         torch.tensor([11, 12], dtype=torch.int64),
         torch.tensor([2199, 2200], dtype=torch.int64),
         context,
-        offload_mode="lidu",
+        offload_mode="offload_split",
         uses_tensor_mla_lengths=True,
     )
     assert entry.actual_seq_lengths_kv.tolist() == [2200, 2201]
@@ -115,7 +115,7 @@ def test_static_entry_refreshes_tensor_mla_lengths_every_step():
         torch.tensor([21, 22], dtype=torch.int64),
         torch.tensor([2200, 2201], dtype=torch.int64),
         context,
-        offload_mode="lidu",
+        offload_mode="offload_split",
         uses_tensor_mla_lengths=True,
     )
     assert entry.metadata_reuse_count == 1
@@ -130,7 +130,7 @@ def test_static_entry_reuses_unchanged_decode_metadata():
         torch.tensor([11, 12], dtype=torch.int64),
         torch.tensor([2199, 2200], dtype=torch.int64),
         first,
-        offload_mode="lidu",
+        offload_mode="offload_split",
     )
     original_tables = entry.block_tables.clone()
 
@@ -140,7 +140,7 @@ def test_static_entry_reuses_unchanged_decode_metadata():
         torch.tensor([21, 22], dtype=torch.int64),
         torch.tensor([2200, 2201], dtype=torch.int64),
         same_revision,
-        offload_mode="lidu",
+        offload_mode="offload_split",
     )
 
     assert entry.input_ids.tolist() == [21, 22]
@@ -155,7 +155,7 @@ def test_static_entry_reuses_unchanged_decode_metadata():
         torch.tensor([31, 32], dtype=torch.int64),
         torch.tensor([2201, 2202], dtype=torch.int64),
         next_revision,
-        offload_mode="lidu",
+        offload_mode="offload_split",
     )
     assert entry.block_tables[:, :3].equal(next_revision.block_tables)
     assert entry.metadata_refresh_count == 2
@@ -168,7 +168,7 @@ def test_static_entry_rejects_bucket_padding():
             torch.tensor([11, 12], dtype=torch.int64),
             torch.tensor([100, 200], dtype=torch.int64),
             _decode_context(),
-            offload_mode="lidu",
+            offload_mode="offload_split",
         )
 
 
@@ -219,7 +219,7 @@ def test_lidu_noop_and_uninitialized_batches_stay_eager():
     manager = object.__new__(FullDecodeOnlyGraphManager)
     manager.model = lambda input_ids, positions: input_ids + positions
     manager.capture_sizes = (2,)
-    manager.offload_mode = "lidu"
+    manager.offload_mode = "offload_split"
     manager.stateful_offload = True
     manager.eager_prefill_count = 0
     manager.eager_first_decode_count = 0
@@ -253,7 +253,7 @@ def test_first_initialized_lidu_batch_is_captured_but_runs_eager():
     manager = object.__new__(FullDecodeOnlyGraphManager)
     manager.model = lambda input_ids, positions: input_ids + positions
     manager.capture_sizes = (2,)
-    manager.offload_mode = "lidu"
+    manager.offload_mode = "offload_split"
     manager.stateful_offload = True
     manager._entries = {}
     manager.eager_prefill_count = 0
@@ -338,7 +338,7 @@ def test_exact_eligible_lidu_batch_replays_graph(monkeypatch):
     manager.eager_no_dsa_count = 0
     manager.eager_uncaptured_batch_count = 0
     manager.log_enabled = False
-    manager.offload_mode = "lidu"
+    manager.offload_mode = "offload_split"
     manager.stateful_offload = True
     manager.eager_lidu_uninitialized_count = 0
     manager.eager_lidu_capture_count = 0
