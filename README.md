@@ -85,7 +85,30 @@ NANOVLLM_PROFILE_DECODE_OUTPUT=$PWD/profile python3 example/test.py
 ## LI+update 融合算子单测
 
 ```
-python3 ut_ops/test_lidu_perf.py --heads 32 --batch-sizes 24 --seq-lens 20000 --cache-tokens 6144 --miss-ranges 0:200 --warmup 3 --iters 100 --seed 7
+unset NANOVLLM_ENABLE_DSA_OFFLOAD
+unset NANOVLLM_ENABLE_LIDU_FUSED_ATTENTION_SCATTER
+unset NANOVLLM_OFFLOAD_MODE
+unset NANOVLLM_GS_MISS_RATE_ON_LAYERS
+unset NANOVLLM_LIDU_MISS_COUNT_ON_LAYERS
+unset NANOVLLM_PROFILE_DECODE_OUTPUT
+unset NANOVLLM_CUST_OPAPI_LIB
+unset ASCEND_CUSTOM_OPP_PATH
+unset NANOVLLM_DSA_BOUNDARY_PROBE
+unset NANOVLLM_GS_PARALLEL_COPY
+
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export ASCEND_LAUNCH_BLOCKING=0
+export ASCEND_RT_VISIBLE_DEVICES=4
+export PYTHONUNBUFFERED=1
+export PYTHONPATH=$PWD:$PYTHONPATH
+export ASCEND_HOME_PATH=/usr/local/Ascend/cann-8.5.1
+export CANN_INSTALL_PATH=/usr/local/Ascend/cann-8.5.1
+
+for bs in 1 8 12 16 24; do
+  for seq_len in 20096 65536 12288; do
+    python3 ut_ops/test_lidu_perf.py --device npu:0 --heads 32 --batch-sizes "$bs" --seq-lens "$seq_len" --cache-tokens 6144 --miss-ranges 0:300 --warmup 3 --iters 100 --seed 7
+  done
+done
 ```
 
 
@@ -93,6 +116,29 @@ python3 ut_ops/test_lidu_perf.py --heads 32 --batch-sizes 24 --seq-lens 20000 --
 ## copy+SFA 融合算子单测
 
 ```
-python3 ut_ops/test_fused_attention_scatter.py --mode all --batch-size 24 --heads 8 --source-len 20000 --cache-tokens 6144 --tail-tokens 64 --miss-min 0 --miss-max 200 --warmup 3 --iters 100 --seed 7
+unset NANOVLLM_ENABLE_DSA_OFFLOAD
+unset NANOVLLM_ENABLE_LIDU_FUSED_ATTENTION_SCATTER
+unset NANOVLLM_OFFLOAD_MODE
+unset NANOVLLM_GS_MISS_RATE_ON_LAYERS
+unset NANOVLLM_LIDU_MISS_COUNT_ON_LAYERS
+unset NANOVLLM_PROFILE_DECODE_OUTPUT
+unset NANOVLLM_CUST_OPAPI_LIB
+unset ASCEND_CUSTOM_OPP_PATH
+unset NANOVLLM_DSA_BOUNDARY_PROBE
+unset NANOVLLM_GS_PARALLEL_COPY
+
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export ASCEND_LAUNCH_BLOCKING=0
+export ASCEND_RT_VISIBLE_DEVICES=4
+export PYTHONUNBUFFERED=1
+export PYTHONPATH=$PWD:$PYTHONPATH
+export ASCEND_HOME_PATH=/usr/local/Ascend/cann-8.5.1
+export CANN_INSTALL_PATH=/usr/local/Ascend/cann-8.5.1
+
+for bs in 1 8 12 16 24; do
+  for seq_len in 20096 65536 12288; do
+    python3 ut_ops/test_fused_attention_scatter.py --device npu:0 --mode all --batch-size "$bs" --heads 8 --source-len "$seq_len" --cache-tokens 6144 --tail-tokens 64 --miss-min 0 --miss-max 300 --warmup 3 --iters 100 --seed 7
+  done
+done
 ```
 
