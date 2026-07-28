@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON_BIN="${PYTHON:-python}"
 RAW_SOC_VERSION="${SOC_VERSION:-ascend910_9391}"
 ASCEND_HOME_PATH="${ASCEND_HOME_PATH:-/usr/local/Ascend/ascend-toolkit/latest}"
-CUSTOM_OPS="lightning_indexer;gather_selection_kv_cache;lightning_indexer_decode_update;kvcache_scatter_copy;sparse_and_tail_attention;sparse_and_tail_attention_and_scatter_copy;moe_gating_top_k;matmul_allreduce_add_rmsnorm"
+CUSTOM_OPS="lightning_indexer_decode_update;kvcache_scatter_copy;sparse_and_tail_attention;sparse_and_tail_attention_and_scatter_copy;moe_gating_top_k;matmul_allreduce_add_rmsnorm"
 NANOVLLM_EXT_BUILD_JOBS="${NANOVLLM_EXT_BUILD_JOBS:-1}"
 
 prepare_catlass() {

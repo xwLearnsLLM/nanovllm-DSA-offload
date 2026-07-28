@@ -47,25 +47,21 @@ except ImportError as exc:
 
 
 moe_gating_top_k = _C.moe_gating_top_k
-npu_lightning_indexer = _C.npu_lightning_indexer
-npu_gather_selection_kv_cache = _C.npu_gather_selection_kv_cache
 batch_matmul_transpose = _C.batch_matmul_transpose
 matmul_allreduce_add_rmsnorm = _C.matmul_allreduce_add_rmsnorm
 
 
-def _missing_dsa_indexer_project(*args, **kwargs):
+def _missing_dsa_indexer_rope(*args, **kwargs):
     raise RuntimeError(
-        "dsa_indexer_project_post is not built into nanovllm._C. "
+        "dsa_indexer_query_rope_inplace is not built into nanovllm._C. "
         "Run `bash scripts/build_nanovllm_ops.sh` on the Ascend machine first."
     )
 
 
-dsa_indexer_project_binding_version = getattr(_C, "dsa_indexer_project_binding_version", lambda: "missing")
-dsa_indexer_project_post_out = getattr(_C, "dsa_indexer_project_post_out", _missing_dsa_indexer_project)
 dsa_indexer_query_rope_inplace = getattr(
     _C,
     "dsa_indexer_query_rope_inplace",
-    _missing_dsa_indexer_project,
+    _missing_dsa_indexer_rope,
 )
 
 
@@ -138,12 +134,8 @@ def mla_preprocess(
 
 __all__ = [
     "batch_matmul_transpose",
-    "dsa_indexer_project_binding_version",
-    "dsa_indexer_project_post_out",
     "dsa_indexer_query_rope_inplace",
     "matmul_allreduce_add_rmsnorm",
     "mla_preprocess",
     "moe_gating_top_k",
-    "npu_gather_selection_kv_cache",
-    "npu_lightning_indexer",
 ]

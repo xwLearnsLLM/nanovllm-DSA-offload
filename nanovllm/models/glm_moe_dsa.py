@@ -12,9 +12,9 @@ from nanovllm.engine.dsa_offload import OFFLOAD_NONE
 from nanovllm.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
 from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import ReplicatedLinear
-from nanovllm.models.deepseek_v32 import (
-    DeepseekV32MLAAttention,
-    DeepseekV32MLP,
+from nanovllm.models.glm_mla import (
+    GlmMLAAttention,
+    GlmMLP,
 )
 from nanovllm.models.glm_moe_dsa_config import GlmMoeDsaConfig
 from nanovllm.utils.context import get_context
@@ -88,7 +88,7 @@ class GlmW4A8SparseMoeBlock(nn.Module):
         else:
             self.gate.register_parameter("e_score_correction_bias", None)
 
-        self.shared_experts = DeepseekV32MLP(
+        self.shared_experts = GlmMLP(
             hidden_size=self.hidden_size,
             intermediate_size=(
                 self.moe_intermediate_size * self.num_shared_experts
@@ -441,9 +441,9 @@ class GlmW4A8SparseMoeBlock(nn.Module):
 class GlmMoeDsaDecoderLayer(nn.Module):
     def __init__(self, config: GlmMoeDsaConfig, layer_idx: int) -> None:
         super().__init__()
-        self.self_attn = DeepseekV32MLAAttention(config, layer_idx)
+        self.self_attn = GlmMLAAttention(config, layer_idx)
         if layer_idx < int(config.first_k_dense_replace):
-            self.mlp = DeepseekV32MLP(
+            self.mlp = GlmMLP(
                 hidden_size=int(config.hidden_size),
                 intermediate_size=int(config.intermediate_size),
                 hidden_act=str(config.hidden_act),

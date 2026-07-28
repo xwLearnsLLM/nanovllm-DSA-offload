@@ -9,9 +9,8 @@ if TYPE_CHECKING:
 
 DSA_SELECTION_TOPK_TOKENS = 2048
 OFFLOAD_NONE: Final = "none"
-OFFLOAD_GS: Final = "gs"
 OFFLOAD_LIDU: Final = "lidu"
-OFFLOAD_MODES: Final = (OFFLOAD_NONE, OFFLOAD_GS, OFFLOAD_LIDU)
+OFFLOAD_MODES: Final = (OFFLOAD_NONE, OFFLOAD_LIDU)
 # User-tunable LIDU budgets for prompt ranges 8193-16384,
 # 16385-32768, 32769-65536, and >=65537 respectively.  The <=8192 tiers
 # remain fixed at C=0/2048.  Edit only this tuple when comparing cache sizes.
@@ -23,25 +22,25 @@ _LIDU_CACHE_TOKEN_BUDGET_LIMITS: Final = (8192, 16384, 32768, 65536)
 LIDU_MAX_SOURCE_TOKENS: Final = (1 << 18) - 1
 
 
-def parse_gs_miss_rate_layers(
+def parse_lidu_miss_count_layers(
     value: str | None,
     num_hidden_layers: int,
 ) -> frozenset[int]:
-    """Parse the historical eager-only miss-statistics layer switch."""
+    """Parse the eager-only LIDU miss-count layer switch."""
 
     if value is None or not value.strip():
         return frozenset()
     parts = value.split(",")
     if any(not part.strip() for part in parts):
         raise ValueError(
-            "NANOVLLM_GS_MISS_RATE_ON_LAYERS must be a comma-separated "
+            "NANOVLLM_LIDU_MISS_COUNT_ON_LAYERS must be a comma-separated "
             "list such as 0,30,60."
         )
     try:
         layers = frozenset(int(part.strip()) for part in parts)
     except ValueError as exc:
         raise ValueError(
-            "NANOVLLM_GS_MISS_RATE_ON_LAYERS must contain integers."
+            "NANOVLLM_LIDU_MISS_COUNT_ON_LAYERS must contain integers."
         ) from exc
     invalid = sorted(
         layer for layer in layers
@@ -49,7 +48,7 @@ def parse_gs_miss_rate_layers(
     )
     if invalid:
         raise ValueError(
-            "NANOVLLM_GS_MISS_RATE_ON_LAYERS contains out-of-range layers "
+            "NANOVLLM_LIDU_MISS_COUNT_ON_LAYERS contains out-of-range layers "
             f"{invalid}; valid range is [0, {int(num_hidden_layers) - 1}]."
         )
     return layers
@@ -132,24 +131,6 @@ def max_lidu_cache_tokens(max_model_len: int) -> int:
     return lidu_cache_tokens(int(max_model_len))
 
 
-def compute_sparse_blocks(
-    num_prefill_full_blocks: int,
-    block_size: int = 128,
-) -> int:
-    """Return the HBM blocks retained for the 2048-token DSA budget."""
-
-    num_blocks = int(num_prefill_full_blocks)
-    block_size = int(block_size)
-    if num_blocks <= 0:
-        return 0
-    if num_blocks * block_size <= DSA_SELECTION_TOPK_TOKENS:
-        return num_blocks
-    budget_blocks = (
-        DSA_SELECTION_TOPK_TOKENS + block_size - 1
-    ) // block_size
-    return min(num_blocks, budget_blocks)
-
-
 def finalize_prefill_hbm_layout(
     seq: "Sequence",
     offload_mode: str,
@@ -158,10 +139,15 @@ def finalize_prefill_hbm_layout(
 
     LIDU does not need its C-token destination arena until first decode.  For
     a genuinely offloaded request, release every complete-prompt HBM block now
-    and leave only the dense tail resident.  The scheduler installs a fresh C
-    block arena immediately before first decode.  GS retains its historical
-    prefix/suffix arena unchanged.
+    and leave only the dense tail resident. The scheduler installs a fresh C
+    block arena immediately before first decode.
     """
+
+    if offload_mode != OFFLOAD_LIDU:
+        raise ValueError(
+            "finalize_prefill_hbm_layout requires lidu mode, "
+            f"got {offload_mode!r}."
+        )
 
     old_hbm_block_table = list(seq.hbm_block_table)
     num_full_blocks = int(seq.num_prefill_full_blocks)
@@ -178,33 +164,16 @@ def finalize_prefill_hbm_layout(
     if num_sparse_blocks >= num_full_blocks:
         keep_sparse = old_hbm_block_table[:num_full_blocks]
         release_blocks: list[int] = []
-        if offload_mode == OFFLOAD_LIDU:
-            # The complete source fits in HBM and already has an identity
-            # source-to-slot mapping, so no first-decode initialization is
-            # needed.
-            seq.lidu_cache_initialized = True
-    elif offload_mode == OFFLOAD_LIDU:
+        # The complete source fits in HBM and already has an identity
+        # source-to-slot mapping, so no first-decode initialization is needed.
+        seq.lidu_cache_initialized = True
+    else:
         # Full-prompt KV was persisted to DRAM by every attention layer before
         # this host-side transition.  Borrow the future C-token arena for later
         # prefills, then allocate it atomically just before first decode.
         keep_sparse = []
         release_blocks = old_hbm_block_table[:num_full_blocks]
         seq.lidu_decode_hbm_pending = num_sparse_blocks > 0
-    elif offload_mode == OFFLOAD_GS:
-        # GS owns a persistent prefix/suffix cache and mutable status map.
-        prefix_blocks = 1 if num_sparse_blocks > 0 else 0
-        suffix_blocks = num_sparse_blocks - prefix_blocks
-        suffix_start = num_full_blocks - suffix_blocks
-        keep_sparse = (
-            old_hbm_block_table[:prefix_blocks]
-            + old_hbm_block_table[suffix_start:num_full_blocks]
-        )
-        release_blocks = old_hbm_block_table[prefix_blocks:suffix_start]
-    else:
-        raise ValueError(
-            "finalize_prefill_hbm_layout requires gs or lidu mode, "
-            f"got {offload_mode!r}."
-        )
 
     keep_tail = old_hbm_block_table[num_full_blocks:num_prefill_blocks]
     seq.hbm_block_table = keep_sparse + keep_tail

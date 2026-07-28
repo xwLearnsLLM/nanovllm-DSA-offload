@@ -1,6 +1,7 @@
 """Measure bundled LIDU latency and its index-management increment.
 
-The test times two repository-local kernels on identical inputs:
+The test times GLM's native LightningIndexer and the repository-local LIDU
+kernel on identical inputs:
 
 * LightningIndexer: score projection plus top-2048 selection.
 * LIDU: the same selection plus hit/miss, eviction, request-pool mutation,
@@ -59,7 +60,7 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--device", default="npu:0")
-    parser.add_argument("--heads", type=int, default=32, choices=(32, 64))
+    parser.add_argument("--heads", type=int, default=32, choices=(32,))
     parser.add_argument("--batch-sizes", default="24")
     parser.add_argument("--seq-lens", default="20992")
     parser.add_argument("--cache-tokens", type=int, default=6144)
@@ -151,43 +152,21 @@ def run_lightning_indexer(
     candidate_lens: torch.Tensor,
     block_table: torch.Tensor,
 ) -> tuple[torch.Tensor, str]:
-    if query.shape[1] == 32:
-        # This is also the production GLM GatherSelection baseline.  The
-        # repository-bundled LightningIndexerVllm is specialized for N1/N2=64.
-        output = torch_npu.npu_lightning_indexer(
-            query=query,
-            key=key,
-            weights=weights,
-            actual_seq_lengths_query=query_lens,
-            actual_seq_lengths_key=candidate_lens,
-            block_table=block_table,
-            layout_query="TND",
-            layout_key="PA_BSND",
-            sparse_count=TOPK,
-            sparse_mode=3,
-        )
-        if isinstance(output, (tuple, list)):
-            output = output[0]
-        return output, "torch_npu_native"
-
-    return (
-        torch.ops.nanovllm_dsa.lightning_indexer.default(
-            query,
-            key,
-            weights,
-            query_lens,
-            candidate_lens,
-            block_table,
-            "TND",
-            "PA_BSND",
-            TOPK,
-            3,
-            (1 << 63) - 1,
-            (1 << 63) - 1,
-            False,
-        )[0],
-        "repo_vllm",
+    output = torch_npu.npu_lightning_indexer(
+        query=query,
+        key=key,
+        weights=weights,
+        actual_seq_lengths_query=query_lens,
+        actual_seq_lengths_key=candidate_lens,
+        block_table=block_table,
+        layout_query="TND",
+        layout_key="PA_BSND",
+        sparse_count=TOPK,
+        sparse_mode=3,
     )
+    if isinstance(output, (tuple, list)):
+        output = output[0]
+    return output, "torch_npu_native"
 
 
 def benchmark_npu_events(
@@ -464,9 +443,7 @@ def run_case(
         device=device,
     )
 
-    baseline = (
-        "torch_npu_native" if heads == 32 else "repo_vllm"
-    )
+    baseline = "torch_npu_native"
 
     def run_li() -> torch.Tensor:
         output, actual_baseline = run_lightning_indexer(

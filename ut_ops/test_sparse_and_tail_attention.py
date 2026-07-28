@@ -24,7 +24,7 @@ def parse_args() -> argparse.Namespace:
         description="Validate NanovllmSparseAndTailAttention against CPU golden and dense MLA."
     )
     parser.add_argument("--device", default="npu:0")
-    parser.add_argument("--heads", type=int, default=2)
+    parser.add_argument("--heads", type=int, default=8, choices=(8, 128))
     parser.add_argument("--batch-size", type=int, default=24)
     parser.add_argument("--cache-tokens", type=int, default=5120)
     parser.add_argument("--tail-tokens", type=int, default=64)
@@ -394,10 +394,7 @@ def run_performance(
 def main() -> None:
     args = parse_args()
     if (
-        args.heads <= 0
-        or args.heads > 64
-        or args.heads & (args.heads - 1)
-        or args.batch_size <= 0
+        args.batch_size <= 0
         or args.cache_tokens < TOPK
         or args.tail_tokens < 0
         or args.warmup < 0
@@ -405,8 +402,8 @@ def main() -> None:
         or args.min_speedup < 0
     ):
         raise ValueError(
-            "heads must be a power of two in [1,64], batch/cache/iters must "
-            "be positive, cache_tokens >= 2048, and tail/warmup/speedup >= 0."
+            "batch/cache/iters must be positive, cache_tokens >= 2048, and "
+            "tail/warmup/speedup >= 0."
         )
     device = torch.device(args.device)
     if device.type != "npu":

@@ -82,6 +82,9 @@ def _write_glm_config(path, **overrides):
         "n_routed_experts": 256,
         "num_experts_per_tok": 8,
         "num_attention_heads": 64,
+        "q_lora_rank": 2048,
+        "kv_lora_rank": 512,
+        "qk_rope_head_dim": 64,
     }
     raw.update(overrides)
     (path / "config.json").write_text(json.dumps(raw), encoding="utf-8")
@@ -108,8 +111,9 @@ def _make_config(path, **overrides):
         max_model_len=2048,
         tensor_parallel_size=16,
         enable_expert_parallel=True,
-        offload_mode="gs",
+        offload_mode="lidu",
         enforce_eager=True,
+        kvcache_block_size=128,
         num_hbm_kvcache_blocks=64,
         num_dram_kvcache_blocks=128,
     )
@@ -117,7 +121,7 @@ def _make_config(path, **overrides):
     return Config(str(path), **kwargs)
 
 
-def test_glm_config_is_selected_before_deepseek_heuristic(tmp_path):
+def test_glm_config_is_loaded(tmp_path):
     _write_glm_config(
         tmp_path,
         q_lora_rank=2048,
@@ -135,6 +139,12 @@ def test_glm_config_is_selected_before_deepseek_heuristic(tmp_path):
         config.hf_config.nanovllm_original_max_position_embeddings
         == 202752
     )
+
+
+def test_glm_rejects_non_bf16_runtime(tmp_path):
+    _write_glm_config(tmp_path, dtype="float16")
+    with pytest.raises(ValueError, match="requires BF16 runtime dtype"):
+        _make_config(tmp_path)
 
 
 def test_glm_requires_expert_parallel(tmp_path):
@@ -240,7 +250,7 @@ def test_glm_lidu_fused_attention_scatter_allows_full_decode_only(
     assert config.decode_graph_capture_sizes == (24,)
 
 
-@pytest.mark.parametrize("offload_mode", ["none", "gs"])
+@pytest.mark.parametrize("offload_mode", ["none"])
 def test_fused_attention_scatter_requires_lidu(tmp_path, offload_mode):
     _write_glm_config(tmp_path)
 
@@ -264,16 +274,6 @@ def test_fused_attention_scatter_rejects_non_bool(tmp_path):
             offload_mode="lidu",
             enable_lidu_fused_attention_scatter=1,
         )
-
-
-def test_fused_attention_scatter_rejects_non_glm_model():
-    config = object.__new__(Config)
-    config.enable_lidu_fused_attention_scatter = True
-    config.offload_mode = "lidu"
-    config.hf_config = SimpleNamespace(model_type="deepseek_v3")
-
-    with pytest.raises(ValueError, match="GLM-5.1-w4a8 only"):
-        config._validate_lidu_fused_attention_scatter()
 
 
 def test_glm_dense_mla_mode_needs_no_dram_cache(tmp_path):
@@ -418,7 +418,7 @@ def test_glm_8200_prompt_really_crosses_dsa_offload_boundary():
         eos=[154820, 154827, 154829],
         num_hbm_kvcache_blocks=96,
         num_dram_kvcache_blocks=128,
-        offload_mode="gs",
+        offload_mode="lidu",
         kvcache_block_size=128,
         max_model_len=8224,
     )
@@ -435,12 +435,12 @@ def test_glm_8200_prompt_really_crosses_dsa_offload_boundary():
     assert seq.num_prefill_full_blocks == 64
     assert seq.num_prefill_tail_blocks == 1
     assert seq.prefill_tail_len == 8
-    assert seq.num_sparse_blocks == 16
-    assert seq.num_sparse_tokens == 2048
+    assert seq.num_sparse_blocks == 24
+    assert seq.num_sparse_tokens == 3072
     candidate_len = seq.num_prefill_full_blocks * seq.block_size
     assert candidate_len == 8192
-    assert candidate_len > seq.num_sparse_tokens
-    assert seq.num_sparse_tokens + seq.prefill_tail_len + 1 == 2057
+    assert candidate_len > 2048
+    assert 2048 + seq.prefill_tail_len + 1 == 2057
 
 
 def test_quant_description_filters_non_tensor_metadata():

@@ -11,11 +11,8 @@ import torch
 import torch.distributed as dist
 
 from nanovllm.engine.dsa_offload import (
-    DSA_SELECTION_TOPK_TOKENS,
-    OFFLOAD_GS,
     OFFLOAD_LIDU,
     OFFLOAD_NONE,
-    max_lidu_cache_tokens,
     normalize_offload_mode,
 )
 from nanovllm.utils.context import (
@@ -142,7 +139,6 @@ class FullDecodeGraphEntry:
 
     batch_size: int
     max_block_columns: int
-    selection_block_columns: int
     input_ids: torch.Tensor
     positions: torch.Tensor
     flat_slot_mapping_i32: torch.Tensor
@@ -150,7 +146,6 @@ class FullDecodeGraphEntry:
     block_tables: torch.Tensor
     index_block_tables: torch.Tensor
     dram_block_tables: torch.Tensor
-    selection_block_tables: torch.Tensor
     req_pool_entries: torch.Tensor
     candidate_lens: torch.Tensor
     candidate_query_lens: torch.Tensor
@@ -168,7 +163,6 @@ class FullDecodeGraphEntry:
         cls,
         batch_size: int,
         max_block_columns: int,
-        selection_block_columns: int,
         device: torch.device,
     ) -> "FullDecodeGraphEntry":
         flat_slot_mapping_i32 = torch.arange(
@@ -185,7 +179,6 @@ class FullDecodeGraphEntry:
         return cls(
             batch_size=batch_size,
             max_block_columns=max_block_columns,
-            selection_block_columns=selection_block_columns,
             input_ids=torch.zeros(batch_size, dtype=torch.int64, device=device),
             positions=torch.zeros(batch_size, dtype=torch.int64, device=device),
             flat_slot_mapping_i32=flat_slot_mapping_i32,
@@ -210,12 +203,6 @@ class FullDecodeGraphEntry:
                 dtype=torch.int32,
                 device=device,
             ),
-            selection_block_tables=torch.zeros(
-                batch_size,
-                selection_block_columns,
-                dtype=torch.int32,
-                device=device,
-            ),
             req_pool_entries=torch.arange(
                 batch_size,
                 dtype=torch.int32,
@@ -223,7 +210,7 @@ class FullDecodeGraphEntry:
             ),
             candidate_lens=torch.full(
                 (batch_size,),
-                DSA_SELECTION_TOPK_TOKENS,
+                1,
                 dtype=torch.int32,
                 device=device,
             ),
@@ -277,7 +264,7 @@ class FullDecodeGraphEntry:
         if stateful_offload and runtime_batch_size != self.batch_size:
             raise ValueError(
                 "DSA FULL_DECODE_ONLY uses exact capture sizes because padding "
-                "would mutate another request's persistent gather status: "
+                "would mutate another request's persistent LIDU state: "
                 f"runtime={runtime_batch_size}, graph={self.batch_size}."
             )
         if runtime_batch_size > self.batch_size:
@@ -298,15 +285,11 @@ class FullDecodeGraphEntry:
             required_metadata.update(
                 index_block_tables=context.index_block_tables,
                 dram_block_tables=context.dram_block_tables,
-                selection_block_tables=context.selection_block_tables,
                 req_pool_entries=context.req_pool_entries,
                 candidate_lens=context.candidate_lens,
                 candidate_query_lens=context.candidate_query_lens,
+                lidu_cache_tokens=context.lidu_cache_tokens,
             )
-            if offload_mode == OFFLOAD_LIDU:
-                required_metadata["lidu_cache_tokens"] = (
-                    context.lidu_cache_tokens
-                )
         if uses_tensor_mla_lengths:
             required_metadata["actual_seq_lengths_kv_tensor"] = (
                 context.actual_seq_lengths_kv_tensor
@@ -357,8 +340,7 @@ class FullDecodeGraphEntry:
                 self.req_pool_entries.copy_(context.req_pool_entries)
                 self.candidate_lens.copy_(context.candidate_lens)
                 self.candidate_query_lens.copy_(context.candidate_query_lens)
-                if offload_mode == OFFLOAD_LIDU:
-                    self.lidu_cache_tokens.copy_(context.lidu_cache_tokens)
+                self.lidu_cache_tokens.copy_(context.lidu_cache_tokens)
                 self._copy_table(
                     self.block_tables, context.block_tables, "block_tables"
                 )
@@ -371,11 +353,6 @@ class FullDecodeGraphEntry:
                     self.dram_block_tables,
                     context.dram_block_tables,
                     "dram_block_tables",
-                )
-                self._copy_table(
-                    self.selection_block_tables,
-                    context.selection_block_tables,
-                    "selection_block_tables",
                 )
             else:
                 columns = int(context.block_tables.shape[1])
@@ -406,7 +383,7 @@ class FullDecodeGraphEntry:
 class FullDecodeOnlyGraphManager:
     """Capture/replay the complete steady-state decode model.
 
-    DSA offload uses exact-size captures because gather status is persistent.
+    LIDU uses exact-size captures because its request-pool state is persistent.
     Dense MLA may pad into reserved null-block slots and select the smallest
     configured capture that fits the runtime batch.
     """
@@ -422,7 +399,6 @@ class FullDecodeOnlyGraphManager:
         expected_mla_tasks: int,
         offload_mode: str = OFFLOAD_NONE,
         uses_tensor_mla_lengths: bool = False,
-        enable_npugraph_ex: bool = True,
         log_enabled: bool = True,
     ) -> None:
         self.model = model
@@ -430,42 +406,9 @@ class FullDecodeOnlyGraphManager:
         self.block_size = int(block_size)
         self.offload_mode = normalize_offload_mode(offload_mode)
         self.stateful_offload = self.offload_mode != OFFLOAD_NONE
-        if (
-            self.offload_mode == OFFLOAD_GS
-            and DSA_SELECTION_TOPK_TOKENS % self.block_size != 0
-        ):
-            raise ValueError(
-                "FULL_DECODE_ONLY requires the DSA sparse budget to be exactly "
-                f"divisible by block_size: budget={DSA_SELECTION_TOPK_TOKENS}, "
-                f"block_size={self.block_size}."
-            )
         self.max_block_columns = (
             int(max_model_len) + self.block_size - 1
         ) // self.block_size
-        self.selection_block_columns = (
-            (
-                DSA_SELECTION_TOPK_TOKENS
-                if self.offload_mode == OFFLOAD_GS
-                else max_lidu_cache_tokens(max_model_len)
-            )
-            // self.block_size
-            if self.stateful_offload
-            else 1
-        )
-        self.selection_block_columns = max(1, self.selection_block_columns)
-        if (
-            self.stateful_offload
-            and self.max_block_columns < self.selection_block_columns
-        ):
-            sparse_budget = (
-                DSA_SELECTION_TOPK_TOKENS
-                if self.offload_mode == OFFLOAD_GS
-                else max_lidu_cache_tokens(max_model_len)
-            )
-            raise ValueError(
-                "DSA FULL_DECODE_ONLY requires max_model_len to cover the "
-                f"{sparse_budget}-token sparse budget."
-            )
         if (
             not self.stateful_offload
             and max(self.capture_sizes) > self.block_size
@@ -479,7 +422,6 @@ class FullDecodeOnlyGraphManager:
         self.device = torch.device(device)
         self.expected_mla_tasks = int(expected_mla_tasks)
         self.uses_tensor_mla_lengths = bool(uses_tensor_mla_lengths)
-        self.enable_npugraph_ex = bool(enable_npugraph_ex)
         self.log_enabled = bool(log_enabled)
         self._entries: dict[int, FullDecodeGraphEntry] = {}
         self._graph_pool = None
@@ -489,13 +431,13 @@ class FullDecodeOnlyGraphManager:
         self.eager_prefill_count = 0
         self.eager_first_decode_count = 0
         self.eager_no_dsa_count = 0
-        self.eager_mixed_batch_count = 0
         self.eager_lidu_uninitialized_count = 0
         self.eager_lidu_capture_count = 0
         self.eager_uncaptured_batch_count = 0
 
         self._validate_runtime()
-        self._callable = self._build_decode_callable(model)
+        torch.npu.set_compile_mode(jit_compile=False)
+        self._callable = model
 
     def _validate_runtime(self) -> None:
         npu = getattr(torch, "npu", None)
@@ -519,61 +461,10 @@ class FullDecodeOnlyGraphManager:
                 f"FULL_DECODE_ONLY: {', '.join(missing)}."
             )
 
-    def _build_decode_callable(self, model: Callable) -> Callable:
-        torch.npu.set_compile_mode(jit_compile=False)
-        if not getattr(self, "enable_npugraph_ex", True):
-            # GLM-5.1 W4A8 + EP16 is not reliable in TorchAir's compiled
-            # warmup on CANN 8.5.1.  The raw callable is still captured by the
-            # outer NPUGraph below, including Indexer/Gather/FIA/MoE, so the
-            # steady-state boundary remains FULL_DECODE_ONLY.
-            if self.log_enabled:
-                logger.info(
-                    "FULL_DECODE_ONLY: npugraph_ex FX optimization is "
-                    "disabled for this model; one raw outer ACLGraph still "
-                    "captures the complete decode forward."
-                )
-            return model
-
-        if hasattr(torch, "_dynamo"):
-            torch._dynamo.config.cache_size_limit = max(
-                int(torch._dynamo.config.cache_size_limit),
-                2048,
-            )
-            if hasattr(torch._dynamo.config, "accumulated_cache_size_limit"):
-                torch._dynamo.config.accumulated_cache_size_limit = max(
-                    int(torch._dynamo.config.accumulated_cache_size_limit),
-                    8192,
-                )
-
-        try:
-            import torchair  # type: ignore
-        except ImportError as exc:
-            raise RuntimeError(
-                "FULL_DECODE_ONLY requires TorchAir's npugraph_ex backend."
-            ) from exc
-
-        compiler_config = torchair.CompilerConfig()
-        compiler_config.mode = "reduce-overhead"
-        compiler_config.debug.run_eagerly = True
-        compiler_config.debug.aclgraph.disable_reinplace_inplaceable_ops_pass = True
-        backend = torchair.get_npu_backend(compiler_config=compiler_config)
-        if self.log_enabled:
-            logger.info(
-                "FULL_DECODE_ONLY: enabling npugraph_ex FX optimization "
-                "with one outer ACLGraph per capture size."
-            )
-        return torch.compile(
-            model,
-            backend=backend,
-            fullgraph=False,
-            dynamic=False,
-        )
-
     def _allocate_entry(self, batch_size: int) -> FullDecodeGraphEntry:
         entry = FullDecodeGraphEntry.allocate(
             batch_size,
             self.max_block_columns,
-            self.selection_block_columns,
             self.device,
         )
         self._entries[batch_size] = entry
@@ -600,12 +491,10 @@ class FullDecodeOnlyGraphManager:
             kwargs.update(
                 index_block_tables=entry.index_block_tables,
                 dram_block_tables=entry.dram_block_tables,
-                selection_block_tables=entry.selection_block_tables,
                 req_pool_entries=entry.req_pool_entries,
                 candidate_lens=entry.candidate_lens,
                 candidate_query_lens=entry.candidate_query_lens,
                 needs_dsa_update=True,
-                dsa_offload_all_rows=True,
                 full_decode_graph=True,
             )
             if self.offload_mode == OFFLOAD_LIDU:
@@ -637,15 +526,10 @@ class FullDecodeOnlyGraphManager:
         self._ensure_capture_resources()
 
         if self.log_enabled:
-            callable_description = (
-                "npugraph_ex-optimized decode model"
-                if self.enable_npugraph_ex
-                else "raw decode model in one outer ACLGraph"
-            )
             logger.info(
                 "FULL_DECODE_ONLY: pre-capturing %s for sizes=%s, "
                 "offload_mode=%s",
-                callable_description,
+                "raw decode model in one outer ACLGraph",
                 self.capture_sizes,
                 self.offload_mode,
             )
@@ -665,12 +549,7 @@ class FullDecodeOnlyGraphManager:
         actual_seq_lens: list[int] | None = None,
     ) -> None:
         if actual_seq_lens is None:
-            dummy_kv_len = (
-                DSA_SELECTION_TOPK_TOKENS
-                if self.offload_mode == OFFLOAD_GS
-                else 1
-            )
-            actual_seq_lens = [dummy_kv_len] * entry.batch_size
+            actual_seq_lens = [1] * entry.batch_size
         self._set_capture_context(entry, actual_seq_lens)
         capture_context = get_context()
         model_warmup = getattr(
@@ -778,17 +657,7 @@ class FullDecodeOnlyGraphManager:
             self.eager_first_decode_count += 1
             return self._run_eager(input_ids, positions)
         batch_size = int(input_ids.shape[0])
-        if self.offload_mode == OFFLOAD_GS:
-            if not runtime_context.needs_dsa_update:
-                self.eager_no_dsa_count += 1
-                return self._run_eager(input_ids, positions)
-            if not runtime_context.dsa_offload_all_rows:
-                self.eager_mixed_batch_count += 1
-                return self._run_eager(input_ids, positions)
-            graph_batch_size = (
-                batch_size if batch_size in self.capture_sizes else None
-            )
-        elif self.offload_mode == OFFLOAD_LIDU:
+        if self.offload_mode == OFFLOAD_LIDU:
             if not runtime_context.needs_dsa_update:
                 self.eager_no_dsa_count += 1
                 return self._run_eager(input_ids, positions)
@@ -880,7 +749,6 @@ class FullDecodeOnlyGraphManager:
         return {
             "enabled": True,
             "mode": FULL_DECODE_ONLY,
-            "npugraph_ex": self.enable_npugraph_ex,
             "capture_sizes": list(self.capture_sizes),
             "offload_mode": self.offload_mode,
             "exact_size_only": self.stateful_offload,
@@ -889,7 +757,6 @@ class FullDecodeOnlyGraphManager:
             "eager_prefill": self.eager_prefill_count,
             "eager_first_decode": self.eager_first_decode_count,
             "eager_no_dsa": self.eager_no_dsa_count,
-            "eager_mixed_batch": self.eager_mixed_batch_count,
             "eager_lidu_uninitialized": self.eager_lidu_uninitialized_count,
             "eager_lidu_capture": self.eager_lidu_capture_count,
             "eager_uncaptured_batch": self.eager_uncaptured_batch_count,

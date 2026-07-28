@@ -17,8 +17,6 @@ torch.npu.config.allow_internal_format = True
 
 from nanovllm.config import Config
 from nanovllm.engine.dsa_offload import (
-    DSA_SELECTION_TOPK_TOKENS,
-    OFFLOAD_GS,
     OFFLOAD_LIDU,
     OFFLOAD_NONE,
     finalize_prefill_hbm_layout,
@@ -40,7 +38,6 @@ from nanovllm.engine.sequence import (
     decode_metadata_key,
 )
 from nanovllm.layers.sampler import Sampler
-from nanovllm.models.deepseek_v32 import DeepseekV32ForCausalLM
 from nanovllm.models.glm_moe_dsa import GlmMoeDsaForCausalLM
 from nanovllm.utils.context import get_context, set_context, reset_context
 from nanovllm.utils.loader import load_model
@@ -124,7 +121,6 @@ class _DecodeStaticMetadata:
     block_tables: torch.Tensor
     index_block_tables: torch.Tensor
     dram_block_tables: torch.Tensor
-    selection_block_tables: torch.Tensor
     req_pool_entries: torch.Tensor
     candidate_lens: torch.Tensor
     candidate_query_lens: torch.Tensor
@@ -149,14 +145,12 @@ class ModelRunner:
         dist.init_process_group("hccl", f"tcp://localhost:{config.hccl_port}", world_size=self.world_size, rank=rank)
         default_dtype = torch.get_default_dtype()
 
-        torch_dtype = self._set_torch_dtype(self.hf_config)
-        torch.set_default_dtype(torch_dtype)
+        torch.set_default_dtype(torch.bfloat16)
         torch.set_default_device(self.device)
 
-        self.model = self._load_default_strategy()
+        self.model = self._load_model()
         self.uses_sparse_and_tail_attention = (
             self.offload_mode == OFFLOAD_LIDU
-            and isinstance(self.model, GlmMoeDsaForCausalLM)
         )
 
         self.sampler = Sampler()
@@ -190,12 +184,6 @@ class ModelRunner:
                 ),
                 offload_mode=self.offload_mode,
                 uses_tensor_mla_lengths=self.uses_sparse_and_tail_attention,
-                # GLM W4A8 + EP16 is captured as one raw outer ACLGraph.
-                # TorchAir's optional FX lowering is left enabled for
-                # DeepSeek, where it is already validated and faster.
-                enable_npugraph_ex=not isinstance(
-                    self.model, GlmMoeDsaForCausalLM
-                ),
                 log_enabled=self.rank == 0,
             )
             if self.offload_mode == OFFLOAD_LIDU:
@@ -217,56 +205,34 @@ class ModelRunner:
         torch.set_default_dtype(default_dtype)
         self._share_memory(rank)
 
-    def _load_default_strategy(self):
-        arch = (getattr(self.hf_config, "architectures", None) or [""])[0]
-        model_type = getattr(self.hf_config, "model_type", "")
-        if model_type == "glm_moe_dsa" or arch == "GlmMoeDsaForCausalLM":
-            model = GlmMoeDsaForCausalLM(self.hf_config)
-            if self.rank == 0:
-                quant_metadata = getattr(
-                    self.hf_config, "nanovllm_quant_metadata", {}
+    def _load_model(self):
+        model = GlmMoeDsaForCausalLM(self.hf_config)
+        if self.rank == 0:
+            quant_metadata = getattr(
+                self.hf_config, "nanovllm_quant_metadata", {}
+            )
+            attention = "dense MLA (all KV)"
+            if self.offload_mode == OFFLOAD_LIDU:
+                attention = (
+                    "LIDU + fused SCATTER/sparse-and-tail MLA"
+                    if self.config.enable_lidu_fused_attention_scatter
+                    else "LIDU + SCATTER + sparse-and-tail MLA"
                 )
-                logger.info(
-                    "GLM-5.1 W4A8: %s decode, attention=%s, "
-                    "max_model_len=%d, "
-                    "EP%d (%d local experts/rank), "
-                    "ModelSlim version=%s group_size=%s; MTP is disabled.",
-                    (
-                        "eager"
-                        if self.config.enforce_eager
-                        else "FULL_DECODE_ONLY raw ACLGraph"
-                    ),
-                    (
-                        (
-                            "lidu offload + fused SCATTER/sparse-and-tail MLA "
-                            "(cached top-2048 + dense tail)"
-                            if self.config.enable_lidu_fused_attention_scatter
-                            else "lidu offload + sparse-and-tail MLA "
-                            "(cached top-2048 + dense tail)"
-                        )
-                        if self.offload_mode == OFFLOAD_LIDU
-                        else (
-                            f"{self.offload_mode} decode offload (topk=2048)"
-                            if self.uses_offload
-                            else "dense MLA (all KV)"
-                        )
-                    ),
-                    self.config.max_model_len,
-                    self.world_size,
-                    int(self.hf_config.n_routed_experts) // self.world_size,
-                    quant_metadata.get("version"),
-                    quant_metadata.get("group_size"),
-                )
-        elif arch in (
-            "DeepseekV32ForCausalLM",
-            "DeepseekV3ForCausalLM",
-            "",
-        ):
-            model = DeepseekV32ForCausalLM(self.hf_config)
-        else:
-            raise ValueError(
-                f"Unsupported architecture {arch!r}; expected DeepSeek-V3.2 "
-                "or GlmMoeDsaForCausalLM."
+            logger.info(
+                "GLM-5.1 W4A8: %s decode, attention=%s, max_model_len=%d, "
+                "EP%d (%d local experts/rank), ModelSlim version=%s "
+                "group_size=%s; MTP is disabled.",
+                (
+                    "eager"
+                    if self.config.enforce_eager
+                    else "FULL_DECODE_ONLY raw ACLGraph"
+                ),
+                attention,
+                self.config.max_model_len,
+                self.world_size,
+                int(self.hf_config.n_routed_experts) // self.world_size,
+                quant_metadata.get("version"),
+                quant_metadata.get("group_size"),
             )
         load_model(
             model,
@@ -294,32 +260,6 @@ class ModelRunner:
                 dist.barrier()
                 self.shm = SharedMemory(name=share_free_name)
                 self.loop()
-
-    @staticmethod
-    def _set_torch_dtype(hf_config):
-        torch_dtype = getattr(hf_config, "torch_dtype", None)
-        if torch_dtype is None:
-            torch_dtype = getattr(hf_config, "dtype", None)
-        if torch_dtype is None and hasattr(hf_config, "text_config"):
-            torch_dtype = getattr(hf_config.text_config, "torch_dtype", None)
-            if torch_dtype is None:
-                torch_dtype = getattr(hf_config.text_config, "dtype", None)
-        if isinstance(torch_dtype, str):
-            resolved_dtype = getattr(torch, torch_dtype, None)
-            if resolved_dtype is None:
-                alias_map = {
-                    "bf16": torch.bfloat16,
-                    "bfloat16": torch.bfloat16,
-                    "fp16": torch.float16,
-                    "float16": torch.float16,
-                    "fp32": torch.float32,
-                    "float32": torch.float32,
-                }
-                resolved_dtype = alias_map.get(torch_dtype.lower())
-            torch_dtype = resolved_dtype
-        if torch_dtype is None:
-            torch_dtype = torch.float16
-        return torch_dtype
 
     def exit(self):
         if self.rank == 0 and self.decode_graph_manager is not None:
@@ -524,53 +464,31 @@ class ModelRunner:
             return
 
         index_dim = int(text_config.index_head_dim)
-        if (
-            self.offload_mode == OFFLOAD_GS
-            and DSA_SELECTION_TOPK_TOKENS % self.block_size != 0
-        ):
-            raise ValueError(
-                "DSA gather_selection path expects 2048 to be divisible by "
-                f"kvcache block_size, got block_size={self.block_size}."
-            )
         if self.rank == 0:
             logger.info(
-                "Using explicit DSA cache blocks: hbm=%d, dram=%d, "
+                "Using LIDU cache blocks: hbm=%d, dram=%d, "
                 "index=%d, max_sparse_tokens=%d",
                 config.num_hbm_kvcache_blocks,
                 config.num_dram_kvcache_blocks,
                 config.num_dram_kvcache_blocks,
-                (
-                    DSA_SELECTION_TOPK_TOKENS
-                    if self.offload_mode == OFFLOAD_GS
-                    else max_lidu_cache_tokens(config.max_model_len)
-                ),
+                max_lidu_cache_tokens(config.max_model_len),
             )
 
         index_shape = (num_layers, config.num_dram_kvcache_blocks, self.block_size, 1, index_dim)
         dram_ckv_shape = (num_layers, config.num_dram_kvcache_blocks, self.block_size, 1, kv_lora_rank)
         dram_kpe_shape = (num_layers, config.num_dram_kvcache_blocks, self.block_size, 1, rope_dim)
-        gather_status_shape = None
-        lidu_slots_shape = None
-        if self.offload_mode == OFFLOAD_GS:
-            gather_status_shape = (
-                config.max_num_decode_seqs_per_step,
-                1,
-                1,
-                DSA_SELECTION_TOPK_TOKENS + 1,
-            )
-        else:
-            max_source_tokens = max(
-                self.block_size,
-                (
-                    (config.max_model_len + self.block_size - 1)
-                    // self.block_size
-                    * self.block_size
-                ),
-            )
-            lidu_slots_shape = (
-                config.max_num_decode_seqs_per_step,
-                max_source_tokens,
-            )
+        max_source_tokens = max(
+            self.block_size,
+            (
+                (config.max_model_len + self.block_size - 1)
+                // self.block_size
+                * self.block_size
+            ),
+        )
+        lidu_slots_shape = (
+            config.max_num_decode_seqs_per_step,
+            max_source_tokens,
+        )
         if self.rank == 0:
             logger.info(f"Single HBM KV Block Size: {hbm_kv_block_bytes / 1024 ** 2:.2f} MB")
             for name, shape in [
@@ -581,7 +499,7 @@ class ModelRunner:
                 ("DSA DRAM KPE cache", dram_kpe_shape),
                 (
                     "DSA request state",
-                    gather_status_shape or lidu_slots_shape,
+                    lidu_slots_shape,
                 ),
             ]:
                 logger.info(f"{name} shape: {shape}")
@@ -599,22 +517,12 @@ class ModelRunner:
                 index_cache = torch.empty(layer_shapes[2], dtype=cache_dtype, device=self.device)
                 dram_ckv_cache = torch_npu.empty_with_swapped_memory(layer_shapes[3], dtype=cache_dtype, device=self.device)
                 dram_kpe_cache = torch_npu.empty_with_swapped_memory(layer_shapes[4], dtype=cache_dtype, device=self.device)
-                gather_status = None
-                lidu_cache_slots = None
-                if self.offload_mode == OFFLOAD_GS:
-                    gather_status = torch.full(
-                        gather_status_shape,
-                        -1,
-                        dtype=torch.int32,
-                        device=self.device,
-                    )
-                else:
-                    lidu_cache_slots = torch.full(
-                        lidu_slots_shape,
-                        -1,
-                        dtype=torch.int32,
-                        device=self.device,
-                    )
+                lidu_cache_slots = torch.full(
+                    lidu_slots_shape,
+                    -1,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
                 ckv_cache.zero_()
                 kpe_cache.zero_()
                 index_cache.zero_()
@@ -624,7 +532,6 @@ class ModelRunner:
                     index_cache,
                     dram_ckv_cache,
                     dram_kpe_cache,
-                    gather_status,
                     lidu_cache_slots,
                 )
 
@@ -634,20 +541,6 @@ class ModelRunner:
         max_len = max(len(table) for table in tables)
         num_cols = max(max_len, static_max_block_cols)
         return torch.tensor([table + [0] * (num_cols - len(table)) for table in tables], dtype=torch.int32, pin_memory=True).to(device=self.device, non_blocking=True)
-
-    def prepare_selection_block_tables(self, seqs: list[Sequence]) -> torch.Tensor:
-        max_sparse_tokens = (
-            DSA_SELECTION_TOPK_TOKENS
-            if self.offload_mode == OFFLOAD_GS
-            else max_lidu_cache_tokens(self.config.max_model_len)
-        )
-        max_sparse_blocks = max(1, max_sparse_tokens // self.block_size)
-        tables = []
-        for seq in seqs:
-            sparse_blocks = min(int(seq.num_sparse_blocks), max_sparse_blocks)
-            table = list(seq.hbm_block_table[:sparse_blocks])
-            tables.append(table + [0] * (max_sparse_blocks - len(table)))
-        return torch.tensor(tables, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
 
     def _get_decode_dynamic_buffers(
         self,
@@ -691,7 +584,6 @@ class ModelRunner:
                 seqs,
                 "dram_block_table",
             ),
-            selection_block_tables=self.prepare_selection_block_tables(seqs),
             req_pool_entries=torch.tensor(
                 req_pool_entries,
                 dtype=torch.int32,
@@ -817,7 +709,6 @@ class ModelRunner:
         sparse_kv_lens = []
         req_pool_entries = []
         lidu_cache_tokens = []
-        offload_rows = []
         lidu_init_rows = []
         needs_dsa_update = False
         has_first_decode = False
@@ -837,7 +728,7 @@ class ModelRunner:
             candidate_len = seq.num_prefill_full_blocks * self.block_size
             sparse_selected_len = seq.num_sparse_tokens
             sparse_kv_len = sparse_selected_len + seq.prefill_tail_len + decode_len
-            if self.offload_mode == OFFLOAD_LIDU:
+            if self.uses_offload:
                 cache_tokens = int(seq.lidu_cache_tokens)
                 row_needs_offload = cache_tokens > 0
                 if row_needs_offload and not seq.lidu_cache_initialized:
@@ -847,22 +738,11 @@ class ModelRunner:
                 needs_dsa_update = needs_dsa_update or row_needs_offload
             else:
                 cache_tokens = 0
-                row_needs_offload = (
-                    self.offload_mode == OFFLOAD_GS
-                    and candidate_len > sparse_selected_len > 0
-                )
-                needs_dsa_update = needs_dsa_update or row_needs_offload
-            if row_needs_offload:
-                offload_rows.append(row)
 
             candidate_lens.append(candidate_len)
             sparse_kv_lens.append(sparse_kv_len)
             req_pool_entries.append(seq.offload_pool_entry)
             lidu_cache_tokens.append(cache_tokens)
-        dsa_offload_all_rows = (
-            (self.offload_mode == OFFLOAD_LIDU and needs_dsa_update)
-            or bool(offload_rows and len(offload_rows) == len(seqs))
-        )
         lidu_all_rows_ready = not lidu_init_rows
         use_persistent_decode_buffers = (
             self.decode_graph_manager is not None
@@ -873,12 +753,7 @@ class ModelRunner:
                     and lidu_all_rows_ready
                     and len(seqs) in self.decode_graph_manager.capture_sizes
                 )
-                if self.offload_mode == OFFLOAD_LIDU
-                else (
-                    dsa_offload_all_rows
-                    and len(seqs) in self.decode_graph_manager.capture_sizes
-                )
-                if self.offload_mode == OFFLOAD_GS
+                if self.uses_offload
                 else select_capture_size(
                     len(seqs), self.decode_graph_manager.capture_sizes
                 )
@@ -939,9 +814,6 @@ class ModelRunner:
             req_pool_entries,
             lidu_cache_tokens,
         )
-        dsa_offload_rows = None
-        if needs_dsa_update and not dsa_offload_all_rows:
-            dsa_offload_rows = torch.tensor(offload_rows, dtype=torch.long, pin_memory=True).to(self.device, non_blocking=True)
         lidu_init_rows_tensor = None
         if lidu_init_rows:
             lidu_init_rows_tensor = torch.tensor(
@@ -958,14 +830,11 @@ class ModelRunner:
             block_tables=static_metadata.block_tables,
             index_block_tables=static_metadata.index_block_tables,
             dram_block_tables=static_metadata.dram_block_tables,
-            selection_block_tables=static_metadata.selection_block_tables,
             req_pool_entries=static_metadata.req_pool_entries,
             candidate_lens=static_metadata.candidate_lens,
             candidate_query_lens=static_metadata.candidate_query_lens,
             lidu_cache_tokens=static_metadata.lidu_cache_tokens,
             needs_dsa_update=needs_dsa_update,
-            dsa_offload_rows=dsa_offload_rows,
-            dsa_offload_all_rows=dsa_offload_all_rows,
             lidu_init_rows=lidu_init_rows_tensor,
             lidu_all_rows_ready=lidu_all_rows_ready,
             has_first_decode=has_first_decode,

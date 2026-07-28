@@ -59,8 +59,6 @@ extern void mla_preprocess_impl(
 }  // namespace vllm_ascend
 
 #include "ops/batch_matmul_transpose/batch_matmul_transpose_torch_adpt.h"
-#include "ops/lightning_indexer/lightning_indexer_vllm_torch_adpt.h"
-#include "ops/gather_selection_kv_cache/gather_selection_kv_cache_torch_adpt.h"
 #include "ops/lightning_indexer_decode_update/lightning_indexer_decode_update_torch_adpt.h"
 #include "ops/kvcache_scatter_copy/kvcache_scatter_copy_torch_adpt.h"
 #include "ops/sparse_and_tail_attention/sparse_and_tail_attention_torch_adpt.h"
@@ -73,9 +71,6 @@ extern void mla_preprocess_impl(
 namespace py = pybind11;
 
 namespace {
-
-constexpr const char* kDsaIndexerProjectBindingVersion =
-    "dsa_indexer_project_post_csrc_v2";
 
 c10::optional<at::Tensor> optional_tensor(const py::object& obj) {
   if (obj.is_none()) {
@@ -92,172 +87,6 @@ c10::optional<c10::string_view> optional_string_view(
   }
   storage = obj.cast<std::string>();
   return c10::string_view(storage->data(), storage->size());
-}
-
-at::Tensor npu_lightning_indexer_py(
-    const at::Tensor& query,
-    const at::Tensor& key,
-    const at::Tensor& weights,
-    py::object actual_seq_lengths_query,
-    py::object actual_seq_lengths_key,
-    py::object block_table,
-    std::string layout_query,
-    std::string layout_key,
-    int64_t sparse_count,
-    int64_t sparse_mode) {
-  return vllm_ascend::npu_lightning_indexer(
-      query,
-      key,
-      weights,
-      optional_tensor(actual_seq_lengths_query),
-      optional_tensor(actual_seq_lengths_key),
-      optional_tensor(block_table),
-      c10::string_view(layout_query.data(), layout_query.size()),
-      c10::string_view(layout_key.data(), layout_key.size()),
-      sparse_count,
-      sparse_mode);
-}
-
-void npu_gather_selection_kv_cache_py(
-    const at::Tensor& selection_k_rope,
-    const at::Tensor& selection_kv_cache,
-    const at::Tensor& selection_kv_block_table,
-    const at::Tensor& selection_kv_block_status,
-    const at::Tensor& req_pool_entries,
-    const at::Tensor& selection_topk_indices,
-    const at::Tensor& full_k_rope,
-    const at::Tensor& full_kv_cache,
-    const at::Tensor& full_kv_block_table,
-    const at::Tensor& full_kv_actual_seq) {
-  vllm_ascend::npu_gather_selection_kv_cache(
-      selection_k_rope,
-      selection_kv_cache,
-      selection_kv_block_table,
-      selection_kv_block_status,
-      req_pool_entries,
-      selection_topk_indices,
-      full_k_rope,
-      full_kv_cache,
-      full_kv_block_table,
-      full_kv_actual_seq);
-}
-
-std::tuple<at::Tensor, at::Tensor> lightning_indexer_torch_op(
-    const at::Tensor& query,
-    const at::Tensor& key,
-    const at::Tensor& weights,
-    const at::Tensor& actual_seq_lengths_query,
-    const at::Tensor& actual_seq_lengths_key,
-    const at::Tensor& block_table,
-    c10::string_view layout_query,
-    c10::string_view layout_key,
-    int64_t sparse_count,
-    int64_t sparse_mode,
-    int64_t pre_tokens,
-    int64_t next_tokens,
-    bool return_value) {
-  (void)pre_tokens;
-  (void)next_tokens;
-  (void)return_value;
-  auto output = vllm_ascend::npu_lightning_indexer(
-      query,
-      key,
-      weights,
-      c10::optional<at::Tensor>(actual_seq_lengths_query),
-      c10::optional<at::Tensor>(actual_seq_lengths_key),
-      c10::optional<at::Tensor>(block_table),
-      layout_query,
-      layout_key,
-      sparse_count,
-      sparse_mode);
-  return std::make_tuple(output, output);
-}
-
-std::tuple<at::Tensor, at::Tensor> lightning_indexer_meta(
-    const at::Tensor& query,
-    const at::Tensor& key,
-    const at::Tensor& weights,
-    const at::Tensor& actual_seq_lengths_query,
-    const at::Tensor& actual_seq_lengths_key,
-    const at::Tensor& block_table,
-    c10::string_view layout_query,
-    c10::string_view layout_key,
-    int64_t sparse_count,
-    int64_t sparse_mode,
-    int64_t pre_tokens,
-    int64_t next_tokens,
-    bool return_value) {
-  (void)weights;
-  (void)actual_seq_lengths_query;
-  (void)actual_seq_lengths_key;
-  (void)block_table;
-  (void)sparse_mode;
-  (void)pre_tokens;
-  (void)next_tokens;
-  (void)return_value;
-  TORCH_CHECK(query.dim() >= 2, "lightning_indexer query must have at least 2 dims.");
-  TORCH_CHECK(key.dim() >= 3, "lightning_indexer key must have at least 3 dims.");
-  TORCH_CHECK(sparse_count > 0, "sparse_count must be > 0.");
-  at::Tensor output;
-  if (std::string(layout_query) == "BSND") {
-    output = at::empty({query.size(0), query.size(1), key.size(2), sparse_count}, query.options().dtype(at::kInt));
-  } else {
-    const int64_t n_dim_index = (std::string(layout_key) == "TND") ? 1 : 2;
-    output = at::empty({query.size(0), key.size(n_dim_index), sparse_count}, query.options().dtype(at::kInt));
-  }
-  // TorchAir's generic custom-op path expects tuple/list meta_outputs.
-  // The second tensor is intentionally ignored by Python callers.
-  return std::make_tuple(output, output);
-}
-
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> gather_selection_kv_cache_torch_op(
-    at::Tensor selection_k_rope,
-    at::Tensor selection_kv_cache,
-    const at::Tensor& selection_kv_block_table,
-    at::Tensor selection_kv_block_status,
-    const at::Tensor& req_pool_entries,
-    const at::Tensor& selection_topk_indices,
-    const at::Tensor& full_k_rope,
-    const at::Tensor& full_kv_cache,
-    const at::Tensor& full_kv_block_table,
-    const at::Tensor& full_kv_actual_seq) {
-  vllm_ascend::npu_gather_selection_kv_cache(
-      selection_k_rope,
-      selection_kv_cache,
-      selection_kv_block_table,
-      selection_kv_block_status,
-      req_pool_entries,
-      selection_topk_indices,
-      full_k_rope,
-      full_kv_cache,
-      full_kv_block_table,
-      full_kv_actual_seq);
-  return std::make_tuple(selection_k_rope, selection_kv_cache, selection_kv_block_table, selection_kv_block_status);
-}
-
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> gather_selection_kv_cache_meta(
-    at::Tensor selection_k_rope,
-    at::Tensor selection_kv_cache,
-    const at::Tensor& selection_kv_block_table,
-    at::Tensor selection_kv_block_status,
-    const at::Tensor& req_pool_entries,
-    const at::Tensor& selection_topk_indices,
-    const at::Tensor& full_k_rope,
-    const at::Tensor& full_kv_cache,
-    const at::Tensor& full_kv_block_table,
-    const at::Tensor& full_kv_actual_seq) {
-  (void)selection_kv_block_table;
-  (void)req_pool_entries;
-  (void)selection_topk_indices;
-  (void)full_k_rope;
-  (void)full_kv_cache;
-  (void)full_kv_block_table;
-  (void)full_kv_actual_seq;
-  return std::make_tuple(
-      at::empty_like(selection_k_rope),
-      at::empty_like(selection_kv_cache),
-      at::empty_like(selection_kv_block_table),
-      at::empty_like(selection_kv_block_status));
 }
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
@@ -630,19 +459,6 @@ mla_preprocess_py(
 
 TORCH_LIBRARY(nanovllm_dsa, ops) {
   ops.def(
-      "lightning_indexer(Tensor query, Tensor key, Tensor weights,"
-      " Tensor actual_seq_lengths_query, Tensor actual_seq_lengths_key,"
-      " Tensor block_table, str layout_query, str layout_key,"
-      " int sparse_count, int sparse_mode, int pre_tokens, int next_tokens,"
-      " bool return_value) -> (Tensor, Tensor)");
-  ops.def(
-      "gather_selection_kv_cache(Tensor! selection_k_rope,"
-      " Tensor! selection_kv_cache, Tensor selection_kv_block_table,"
-      " Tensor! selection_kv_block_status, Tensor req_pool_entries,"
-      " Tensor selection_topk_indices, Tensor full_k_rope, Tensor full_kv_cache,"
-      " Tensor full_kv_block_table, Tensor full_kv_actual_seq)"
-      " -> (Tensor, Tensor, Tensor, Tensor)");
-  ops.def(
       "lidu_decode_update(Tensor query, Tensor key, Tensor weights,"
       " Tensor req_pool_entries, Tensor(a!) cache_slots,"
       " Tensor cache_tokens, Tensor candidate_lens, Tensor block_table)"
@@ -678,8 +494,6 @@ TORCH_LIBRARY(nanovllm_dsa, ops) {
 }
 
 TORCH_LIBRARY_IMPL(nanovllm_dsa, PrivateUse1, ops) {
-  ops.impl("lightning_indexer", &lightning_indexer_torch_op);
-  ops.impl("gather_selection_kv_cache", &gather_selection_kv_cache_torch_op);
   ops.impl("lidu_decode_update", &lidu_decode_update_torch_op);
   ops.impl("lidu_decode_update_out", &lidu_decode_update_out_torch_op);
   ops.impl("scatter_copy", &scatter_copy_torch_op);
@@ -690,8 +504,6 @@ TORCH_LIBRARY_IMPL(nanovllm_dsa, PrivateUse1, ops) {
 }
 
 TORCH_LIBRARY_IMPL(nanovllm_dsa, Meta, ops) {
-  ops.impl("lightning_indexer", &lightning_indexer_meta);
-  ops.impl("gather_selection_kv_cache", &gather_selection_kv_cache_meta);
   ops.impl("lidu_decode_update", &lidu_decode_update_meta);
   ops.impl("lidu_decode_update_out", &lidu_decode_update_out_meta);
   ops.impl("scatter_copy", &scatter_copy_meta);
@@ -702,32 +514,6 @@ TORCH_LIBRARY_IMPL(nanovllm_dsa, Meta, ops) {
 }
 
 PYBIND11_MODULE(_C, m) {
-  m.def(
-      "npu_lightning_indexer",
-      &npu_lightning_indexer_py,
-      py::arg("query"),
-      py::arg("key"),
-      py::arg("weights"),
-      py::arg("actual_seq_lengths_query") = py::none(),
-      py::arg("actual_seq_lengths_key") = py::none(),
-      py::arg("block_table") = py::none(),
-      py::arg("layout_query") = "BSND",
-      py::arg("layout_key") = "BSND",
-      py::arg("sparse_count") = 2048,
-      py::arg("sparse_mode") = 3);
-  m.def(
-      "npu_gather_selection_kv_cache",
-      &npu_gather_selection_kv_cache_py,
-      py::arg("selection_k_rope"),
-      py::arg("selection_kv_cache"),
-      py::arg("selection_kv_block_table"),
-      py::arg("selection_kv_block_status"),
-      py::arg("req_pool_entries"),
-      py::arg("selection_topk_indices"),
-      py::arg("full_k_rope"),
-      py::arg("full_kv_cache"),
-      py::arg("full_kv_block_table"),
-      py::arg("full_kv_actual_seq"));
   m.def(
       "moe_gating_top_k",
       &moe_gating_top_k_py,
@@ -797,27 +583,10 @@ PYBIND11_MODULE(_C, m) {
       py::arg("quant_mode") = py::none(),
       py::arg("enable_inner_out") = false);
   m.def(
-      "dsa_indexer_project_binding_version",
-      []() { return kDsaIndexerProjectBindingVersion; });
-  m.def(
-      "dsa_indexer_project_post_out",
-      &vllm_ascend::dsa_indexer_project_post_out,
-      py::arg("q_in"),
-      py::arg("k_in"),
-      py::arg("weights_in"),
-      py::arg("cos"),
-      py::arg("sin"),
-      py::arg("q_out"),
-      py::arg("k_out"),
-      py::arg("weights_out"),
-      py::arg("score_scale"),
-      py::arg("rope_dim"));
-  m.def(
       "dsa_indexer_query_rope_inplace",
       &vllm_ascend::dsa_indexer_query_rope_inplace,
       py::arg("q_inout"),
       py::arg("cos"),
       py::arg("sin"),
-      py::arg("rope_dim"),
-      py::arg("rotary_mode"));
+      py::arg("rope_dim"));
 }

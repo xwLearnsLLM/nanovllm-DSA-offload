@@ -20,9 +20,9 @@ inline at::Tensor npu_sparse_and_tail_attention(
   TORCH_CHECK(query.dim() == 3 && query.size(2) == 512,
               "query must be [B, N, 512].");
   const auto num_heads = query.size(1);
-  TORCH_CHECK(num_heads > 0 && num_heads <= 64 &&
+  TORCH_CHECK(num_heads > 0 && num_heads <= 128 &&
                   (num_heads & (num_heads - 1)) == 0,
-              "query local head count must be a power of two in [1, 64].");
+              "query local head count must be a power of two in [1, 128].");
   TORCH_CHECK(key.dim() == 4 && key.size(1) == 128 &&
                   key.size(2) == 1 && key.size(3) == 512,
               "key must be [blocks, 128, 1, 512].");

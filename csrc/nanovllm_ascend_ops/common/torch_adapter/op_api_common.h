@@ -561,10 +561,7 @@ inline void UseStreamResIfNeeded(aclrtStream stream, bool enqueue) {
       ", detail:", aclGetRecentErrMsg());
 }
 
-// Queue-safe aclnn launch for consumers of torch-npu native operators. Keep
-// EXEC_NPU_CMD unchanged for the other integrated kernels; GLM's native
-// LightningIndexer -> GatherSelection edge is the only mixed launch boundary
-// that needs this path.
+// Queue-safe aclnn launch for stateful GLM decode operators.
 #define EXEC_NPU_CMD_ORDERED(aclnn_api, tensor_keepalive, ...)                \
   do {                                                                        \
     static const auto getWorkspaceSizeFuncAddr =                              \

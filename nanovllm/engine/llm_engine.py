@@ -9,7 +9,6 @@ from time import monotonic, perf_counter
 
 import torch
 import torch.multiprocessing as mp
-from transformers import AutoTokenizer
 
 from nanovllm.config import Config, merge_eos_token_ids
 from nanovllm.sampling_params import SamplingParams
@@ -24,30 +23,6 @@ from nanovllm.utils.glm_tokenizer import (
 from nanovllm.utils.logger import init_logger
 
 logger = init_logger(__name__)
-
-
-DEEPSEEK_V32_CHAT_TEMPLATE = """{% if not add_generation_prompt is defined %}{% set add_generation_prompt = false %}{% endif %}
-{% set ns = namespace(system_prompt='') %}
-{%- for message in messages %}
-    {%- if message['role'] == 'system' %}
-        {%- if ns.system_prompt %}
-            {% set ns.system_prompt = ns.system_prompt + '\\n\\n' + message['content'] %}
-        {%- else %}
-            {% set ns.system_prompt = message['content'] %}
-        {%- endif %}
-    {%- endif %}
-{%- endfor %}
-{{ bos_token }}{{ ns.system_prompt }}
-{%- for message in messages %}
-    {%- if message['role'] == 'user' %}
-        {{ '<\uFF5CUser\uFF5C>' + message['content'] }}
-    {%- elif message['role'] == 'assistant' %}
-        {{ '<\uFF5CAssistant\uFF5C>' + message['content'] + eos_token }}
-    {%- endif %}
-{%- endfor %}
-{%- if add_generation_prompt %}
-    {{ '<\uFF5CAssistant\uFF5C>' }}
-{%- endif %}"""
 
 
 class LLMEngine:
@@ -160,27 +135,16 @@ class LLMEngine:
             return default
         return value.lower() in ("1", "true", "yes", "on")
 
-    @staticmethod
-    def _format_deepseek_prompt(prompt: str, use_chat_template: bool) -> str:
-        if not use_chat_template:
-            return prompt
-        return f"<\uFF5CUser\uFF5C>{prompt}<\uFF5CAssistant\uFF5C>"
-
     def _encode_string_prompt(self, prompt: str) -> list[int]:
-        use_chat_template = self._is_true_env(
-            "NANOVLLM_USE_DEEPSEEK_CHAT",
-            False,
-        )
-        formatted_prompt = self._format_deepseek_prompt(prompt, use_chat_template)
         token_ids = normalize_token_ids(
             self.tokenizer.encode(
-                formatted_prompt,
+                prompt,
                 add_special_tokens=False,
             )
         )
         add_bos = self._is_true_env(
             "NANOVLLM_ADD_BOS",
-            use_chat_template,
+            False,
         )
         bos_token_id = self.tokenizer.bos_token_id
         if add_bos and bos_token_id is not None:
@@ -189,34 +153,21 @@ class LLMEngine:
 
     @staticmethod
     def _load_tokenizer(config: Config):
-        is_glm = getattr(config.hf_config, "model_type", "") == "glm_moe_dsa"
-        if is_glm:
-            tokenizer = load_glm_tokenizer(
-                config.model,
-                trust_remote_code=config.trust_remote_code,
-            )
-        else:
-            tokenizer = AutoTokenizer.from_pretrained(
-                config.model,
-                config=config.hf_config,
-                tokenizer_type="deepseek_v3",
-                trust_remote_code=config.trust_remote_code,
-                fix_mistral_regex=False,
-            )
+        tokenizer = load_glm_tokenizer(
+            config.model,
+            trust_remote_code=config.trust_remote_code,
+        )
         if not getattr(tokenizer, "chat_template", None):
-            if is_glm:
-                template_path = os.path.join(
-                    config.model, "chat_template.jinja"
+            template_path = os.path.join(
+                config.model, "chat_template.jinja"
+            )
+            if not os.path.isfile(template_path):
+                raise ValueError(
+                    "GLM tokenizer has no embedded chat template and "
+                    "chat_template.jinja is missing from the model directory."
                 )
-                if not os.path.isfile(template_path):
-                    raise ValueError(
-                        "GLM tokenizer has no embedded chat template and "
-                        "chat_template.jinja is missing from the model directory."
-                    )
-                with open(template_path, "r", encoding="utf-8") as file:
-                    tokenizer.chat_template = file.read()
-            else:
-                tokenizer.chat_template = DEEPSEEK_V32_CHAT_TEMPLATE
+            with open(template_path, "r", encoding="utf-8") as file:
+                tokenizer.chat_template = file.read()
         return tokenizer
 
     def _decode_token_ids(self, token_ids: list[int]) -> str:
@@ -499,12 +450,10 @@ class LLMEngine:
                 "lidu_fused_attention_scatter="
                 f"{graph_stats['lidu_fused_attention_scatter']}, "
                 f"capture_sizes={graph_stats['capture_sizes']}, "
-                f"npugraph_ex={graph_stats['npugraph_ex']}, "
                 f"captures={graph_stats['captures']}, "
                 f"replays={graph_stats['replays']}, "
                 f"eager_first_decode={graph_stats['eager_first_decode']}, "
                 f"eager_no_dsa={graph_stats['eager_no_dsa']}, "
-                f"eager_mixed_batch={graph_stats['eager_mixed_batch']}, "
                 f"eager_lidu_uninitialized="
                 f"{graph_stats['eager_lidu_uninitialized']}, "
                 f"eager_uncaptured_batch={graph_stats['eager_uncaptured_batch']}"

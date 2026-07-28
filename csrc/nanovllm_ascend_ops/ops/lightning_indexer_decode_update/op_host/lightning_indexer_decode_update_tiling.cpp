@@ -147,12 +147,12 @@ ge::graphStatus LightningIndexerDecodeUpdateTiling::CheckShape(LIU2TilingInfo &t
     const auto &cacheSlotsOutShape = op.cacheSlotsOut.shape->GetStorageShape();
 
     OPS_ERR_IF(qShape.GetDimNum() != DIM_NUM_THREE,
-               OPS_LOG_E(tilingInfo.opName, "query must be TND [B, 32|64, 128]."), return ge::GRAPH_FAILED);
+               OPS_LOG_E(tilingInfo.opName, "query must be TND [B, 32, 128]."), return ge::GRAPH_FAILED);
     OPS_ERR_IF(kShape.GetDimNum() != DIM_NUM_FOUR,
                OPS_LOG_E(tilingInfo.opName, "key must be PA_BSND [num_blocks, block_size, 1, 128]."),
                return ge::GRAPH_FAILED);
     OPS_ERR_IF(wShape.GetDimNum() != DIM_NUM_TWO,
-               OPS_LOG_E(tilingInfo.opName, "weights must be [B, 32|64]."), return ge::GRAPH_FAILED);
+               OPS_LOG_E(tilingInfo.opName, "weights must be [B, 32]."), return ge::GRAPH_FAILED);
     OPS_ERR_IF(cacheShape.GetDimNum() != DIM_NUM_TWO,
                OPS_LOG_E(tilingInfo.opName, "cache_slots must be [pool_size, source_capacity]."), return ge::GRAPH_FAILED);
     OPS_ERR_IF(reqPoolShape.GetDimNum() != DIM_NUM_ONE,
@@ -207,8 +207,8 @@ ge::graphStatus LightningIndexerDecodeUpdateTiling::CheckShape(LIU2TilingInfo &t
                return ge::GRAPH_FAILED);
     OPS_ERR_IF(tilingInfo.n2Size != DECODE_N2,
                OPS_LOG_E(tilingInfo.opName, "key N2 must be 1."), return ge::GRAPH_FAILED);
-    OPS_ERR_IF(tilingInfo.n1Size != 32 && tilingInfo.n1Size != 64,
-               OPS_LOG_E(tilingInfo.opName, "decode query N1 must be 32 or 64."), return ge::GRAPH_FAILED);
+    OPS_ERR_IF(tilingInfo.n1Size != 32,
+               OPS_LOG_E(tilingInfo.opName, "decode query N1 must be 32."), return ge::GRAPH_FAILED);
     OPS_ERR_IF(qShape.GetDim(DIM_IDX_TWO) != DECODE_HEAD_DIM || kShape.GetDim(DIM_IDX_THREE) != DECODE_HEAD_DIM,
                OPS_LOG_E(tilingInfo.opName, "head_dim must be 128."), return ge::GRAPH_FAILED);
     OPS_ERR_IF(wShape.GetDim(0) != tilingInfo.bSize || wShape.GetDim(1) != tilingInfo.n1Size,

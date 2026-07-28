@@ -238,7 +238,6 @@ op_add_subdirectory(OP_LIST OP_DIR_LIST)
 # Map framework-facing operator directories to their registered kernel entry
 # names.  The aliases are also used to install the generated dynamic Python and
 # to include the kernels in binary_info_config.json.
-set(lightning_indexer_kernel_aliases lightning_indexer_vllm)
 set(lightning_indexer_decode_update_kernel_aliases nanovllm_lidu_decode_update)
 set(kvcache_scatter_copy_kernel_aliases nanovllm_kvcache_scatter_copy)
 set(sparse_and_tail_attention_kernel_aliases nanovllm_sparse_and_tail_attention)

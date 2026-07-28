@@ -2,11 +2,9 @@
 
 `compare_glm_native_dsa.py` 用 vLLM-Ascend 0.19 对同一个 8200-token Hawthorn prompt 做原生 GLM DSA eager 推理。脚本显式传 token IDs，并打印完整 token 序列的 SHA-256，便于排除 prompt 或 tokenizer 漂移。
 
-在已安装 vLLM 0.19 和 vLLM-Ascend 0.19 的机器上，从 nano-vLLM 仓库根目录运行：
+在已安装 vLLM 0.19 和 vLLM-Ascend 0.19 的机器上，从本仓库根目录运行：
 
 ```bash
-cd /home/w00916487/nanovllm-dsa_offload
-
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export ASCEND_LAUNCH_BLOCKING=0
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15

@@ -1,16 +1,14 @@
 import os
 
 from _example_utils import (
-    DEEPSEEK_ASSISTANT_TOKEN,
-    DEEPSEEK_USER_TOKEN,
+    GLM_ASSISTANT_TOKEN,
+    GLM_USER_TOKEN,
     env_int,
     make_llm,
     print_outputs,
 )
 from nanovllm.engine.dsa_offload import (
-    OFFLOAD_GS,
     OFFLOAD_LIDU,
-    compute_sparse_blocks,
     lidu_cache_tokens,
 )
 from nanovllm import SamplingParams
@@ -25,8 +23,8 @@ def parse_prompt_lengths() -> list[int]:
 
 
 def _prompt_wrapper_ids(tokenizer) -> tuple[list[int], list[int]]:
-    prefix_ids = tokenizer.encode(DEEPSEEK_USER_TOKEN, add_special_tokens=False)
-    suffix_ids = tokenizer.encode(DEEPSEEK_ASSISTANT_TOKEN, add_special_tokens=False)
+    prefix_ids = tokenizer.encode(GLM_USER_TOKEN, add_special_tokens=False)
+    suffix_ids = tokenizer.encode(GLM_ASSISTANT_TOKEN, add_special_tokens=False)
     if tokenizer.bos_token_id is not None:
         prefix_ids = [tokenizer.bos_token_id] + prefix_ids
     return prefix_ids, suffix_ids
@@ -152,14 +150,7 @@ def print_prompt_plan(
     print("prompt plan:")
     for i, length in enumerate(lengths, 1):
         full_blocks = length // block_size
-        if offload_mode == OFFLOAD_GS:
-            sparse_blocks = compute_sparse_blocks(full_blocks, block_size)
-            release_blocks = max(0, full_blocks - sparse_blocks)
-            detail = (
-                f"sparse_blocks={sparse_blocks}, "
-                f"release_blocks={release_blocks}"
-            )
-        elif offload_mode == OFFLOAD_LIDU:
+        if offload_mode == OFFLOAD_LIDU:
             cache_tokens = lidu_cache_tokens(length)
             cache_blocks = (
                 cache_tokens // block_size

@@ -1,4 +1,4 @@
-"""Deterministic short-prompt smoke test for both supported model families."""
+"""Deterministic GLM-5.1 W4A8 short-prompt smoke test."""
 
 from _example_utils import env_bool, env_int, make_llm, print_outputs
 from nanovllm import SamplingParams

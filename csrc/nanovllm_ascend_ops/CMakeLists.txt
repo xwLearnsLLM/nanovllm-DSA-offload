@@ -104,8 +104,6 @@ target_include_directories(_C BEFORE PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/ops/mla_preprocess
   ${CMAKE_CURRENT_SOURCE_DIR}/ops/mla_preprocess/op_host
   ${CMAKE_CURRENT_SOURCE_DIR}/cann_ops
-  ${CMAKE_CURRENT_SOURCE_DIR}/ops/lightning_indexer
-  ${CMAKE_CURRENT_SOURCE_DIR}/ops/gather_selection_kv_cache
   ${CMAKE_CURRENT_SOURCE_DIR}/ops/lightning_indexer_decode_update
   ${CMAKE_CURRENT_SOURCE_DIR}/ops/kvcache_scatter_copy
   ${CMAKE_CURRENT_SOURCE_DIR}/ops/sparse_and_tail_attention

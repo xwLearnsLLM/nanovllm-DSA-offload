@@ -3,10 +3,10 @@ import os
 from nanovllm import LLM
 
 
-DEFAULT_MODEL_PATH = "/home/models/DeepSeek-V3.2-REAP-345B-A37B-BF16/"
+DEFAULT_MODEL_PATH = "/mnt/models/GLM-5.1-w4a8/"
 DEFAULT_TP_SIZE = 16
-DEEPSEEK_USER_TOKEN = "<\uFF5CUser\uFF5C>"
-DEEPSEEK_ASSISTANT_TOKEN = "<\uFF5CAssistant\uFF5C>"
+GLM_USER_TOKEN = "<\uFF5CUser\uFF5C>"
+GLM_ASSISTANT_TOKEN = "<\uFF5CAssistant\uFF5C>"
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -42,11 +42,6 @@ def make_llm(
     max_num_decode_seqs_per_step: int,
     enforce_eager: bool | None = None,
 ) -> LLM:
-    if "NANOVLLM_ENABLE_DSA_OFFLOAD" in os.environ:
-        raise ValueError(
-            "NANOVLLM_ENABLE_DSA_OFFLOAD was removed; use "
-            "NANOVLLM_OFFLOAD_MODE=none|gs|lidu."
-        )
     if enforce_eager is None:
         enforce_eager = env_bool("NANOVLLM_ENFORCE_EAGER", False)
     return LLM(

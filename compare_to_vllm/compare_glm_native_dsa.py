@@ -8,8 +8,8 @@ import struct
 
 
 DEFAULT_MODEL = "/mnt/models/GLM-5.1-w4a8/"
-DEEPSEEK_USER_TOKEN = "<\uFF5CUser\uFF5C>"
-DEEPSEEK_ASSISTANT_TOKEN = "<\uFF5CAssistant\uFF5C>"
+GLM_USER_TOKEN = "<\uFF5CUser\uFF5C>"
+GLM_ASSISTANT_TOKEN = "<\uFF5CAssistant\uFF5C>"
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -43,9 +43,9 @@ def _prompt_wrapper_ids(tokenizer) -> tuple[list[int], list[int]]:
     # Keep this byte-for-byte equivalent to example/test.py.  In particular,
     # this intentionally uses the same explicit wrapper instead of GLM's chat
     # template so the two runtimes receive identical token IDs.
-    prefix_ids = tokenizer.encode(DEEPSEEK_USER_TOKEN, add_special_tokens=False)
+    prefix_ids = tokenizer.encode(GLM_USER_TOKEN, add_special_tokens=False)
     suffix_ids = tokenizer.encode(
-        DEEPSEEK_ASSISTANT_TOKEN,
+        GLM_ASSISTANT_TOKEN,
         add_special_tokens=False,
     )
     if tokenizer.bos_token_id is not None:

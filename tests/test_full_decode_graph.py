@@ -1,5 +1,4 @@
 from contextlib import nullcontext
-import sys
 from types import SimpleNamespace
 
 import pytest
@@ -36,10 +35,6 @@ def _decode_context(
         block_tables=block_tables,
         index_block_tables=block_tables + 10,
         dram_block_tables=block_tables + 20,
-        selection_block_tables=torch.tensor(
-            [[row + 1, row + 2] for row in range(batch_size)],
-            dtype=torch.int32,
-        ),
         req_pool_entries=torch.arange(batch_size, dtype=torch.int32),
         candidate_lens=torch.arange(4096, 4096 + batch_size, dtype=torch.int32),
         candidate_query_lens=torch.arange(1, batch_size + 1, dtype=torch.int32),
@@ -48,7 +43,6 @@ def _decode_context(
             dtype=torch.int32,
         ),
         needs_dsa_update=True,
-        dsa_offload_all_rows=True,
         lidu_all_rows_ready=True,
         decode_metadata_key=metadata_key,
     )
@@ -64,15 +58,15 @@ def test_normalize_capture_sizes_rejects_invalid_values(values):
         normalize_capture_sizes(values)
 
 
-def test_static_entry_copies_all_dsa_metadata():
-    entry = FullDecodeGraphEntry.allocate(2, 4, 2, torch.device("cpu"))
+def test_static_entry_copies_all_lidu_metadata():
+    entry = FullDecodeGraphEntry.allocate(2, 4, torch.device("cpu"))
     context = _decode_context()
 
     seq_lens = entry.copy_runtime_inputs(
         torch.tensor([11, 12], dtype=torch.int64),
         torch.tensor([2199, 2200], dtype=torch.int64),
         context,
-        offload_mode="gs",
+        offload_mode="lidu",
     )
 
     assert seq_lens == [2200, 2201]
@@ -83,13 +77,12 @@ def test_static_entry_copies_all_dsa_metadata():
     assert entry.block_tables[:, 3].count_nonzero().item() == 0
     assert entry.index_block_tables[:, :3].equal(context.index_block_tables)
     assert entry.dram_block_tables[:, :3].equal(context.dram_block_tables)
-    assert entry.selection_block_tables.equal(context.selection_block_tables)
     assert entry.req_pool_entries.tolist() == [0, 1]
     assert entry.candidate_lens.tolist() == [4096, 4097]
 
 
 def test_static_entry_copies_lidu_tiers_for_mixed_batch():
-    entry = FullDecodeGraphEntry.allocate(2, 4, 2, torch.device("cpu"))
+    entry = FullDecodeGraphEntry.allocate(2, 4, torch.device("cpu"))
     context = _decode_context()
 
     entry.copy_runtime_inputs(
@@ -103,7 +96,7 @@ def test_static_entry_copies_lidu_tiers_for_mixed_batch():
 
 
 def test_static_entry_refreshes_tensor_mla_lengths_every_step():
-    entry = FullDecodeGraphEntry.allocate(2, 4, 2, torch.device("cpu"))
+    entry = FullDecodeGraphEntry.allocate(2, 4, torch.device("cpu"))
     key = ((10, 3), (11, 7))
     context = _decode_context(metadata_key=key)
 
@@ -130,14 +123,14 @@ def test_static_entry_refreshes_tensor_mla_lengths_every_step():
 
 
 def test_static_entry_reuses_unchanged_decode_metadata():
-    entry = FullDecodeGraphEntry.allocate(2, 4, 2, torch.device("cpu"))
+    entry = FullDecodeGraphEntry.allocate(2, 4, torch.device("cpu"))
     key = ((10, 3), (11, 7))
     first = _decode_context(metadata_key=key)
     entry.copy_runtime_inputs(
         torch.tensor([11, 12], dtype=torch.int64),
         torch.tensor([2199, 2200], dtype=torch.int64),
         first,
-        offload_mode="gs",
+        offload_mode="lidu",
     )
     original_tables = entry.block_tables.clone()
 
@@ -147,7 +140,7 @@ def test_static_entry_reuses_unchanged_decode_metadata():
         torch.tensor([21, 22], dtype=torch.int64),
         torch.tensor([2200, 2201], dtype=torch.int64),
         same_revision,
-        offload_mode="gs",
+        offload_mode="lidu",
     )
 
     assert entry.input_ids.tolist() == [21, 22]
@@ -162,20 +155,20 @@ def test_static_entry_reuses_unchanged_decode_metadata():
         torch.tensor([31, 32], dtype=torch.int64),
         torch.tensor([2201, 2202], dtype=torch.int64),
         next_revision,
-        offload_mode="gs",
+        offload_mode="lidu",
     )
     assert entry.block_tables[:, :3].equal(next_revision.block_tables)
     assert entry.metadata_refresh_count == 2
 
 
 def test_static_entry_rejects_bucket_padding():
-    entry = FullDecodeGraphEntry.allocate(4, 4, 2, torch.device("cpu"))
+    entry = FullDecodeGraphEntry.allocate(4, 4, torch.device("cpu"))
     with pytest.raises(ValueError, match="exact capture sizes"):
         entry.copy_runtime_inputs(
             torch.tensor([11, 12], dtype=torch.int64),
             torch.tensor([100, 200], dtype=torch.int64),
             _decode_context(),
-            offload_mode="gs",
+            offload_mode="lidu",
         )
 
 
@@ -222,50 +215,6 @@ def test_mla_task_refreshes_host_sequence_lengths(monkeypatch):
     assert attention_kwargs["block_table"] is task.block_table
 
 
-def test_ineligible_decode_paths_stay_eager():
-    manager = object.__new__(FullDecodeOnlyGraphManager)
-    manager.model = lambda input_ids, positions: input_ids + positions
-    manager.eager_prefill_count = 0
-    manager.eager_first_decode_count = 0
-    manager.eager_no_dsa_count = 0
-    manager.eager_mixed_batch_count = 0
-    manager.eager_uncaptured_batch_count = 0
-    manager.log_enabled = False
-    manager.capture_sizes = (16,)
-    manager.offload_mode = "gs"
-    manager.stateful_offload = True
-    manager.eager_lidu_uninitialized_count = 0
-    manager.eager_lidu_capture_count = 0
-
-    set_context(False, has_first_decode=True)
-    try:
-        assert manager.run(torch.tensor([2]), torch.tensor([3])).tolist() == [5]
-    finally:
-        reset_context()
-    assert manager.eager_first_decode_count == 1
-
-    set_context(False, needs_dsa_update=False)
-    try:
-        manager.run(torch.tensor([2]), torch.tensor([3]))
-    finally:
-        reset_context()
-    assert manager.eager_no_dsa_count == 1
-
-    set_context(False, needs_dsa_update=True, dsa_offload_all_rows=False)
-    try:
-        manager.run(torch.tensor([2]), torch.tensor([3]))
-    finally:
-        reset_context()
-    assert manager.eager_mixed_batch_count == 1
-
-    set_context(False, needs_dsa_update=True, dsa_offload_all_rows=True)
-    try:
-        manager.run(torch.tensor([2]), torch.tensor([3]))
-    finally:
-        reset_context()
-    assert manager.eager_uncaptured_batch_count == 1
-
-
 def test_lidu_noop_and_uninitialized_batches_stay_eager():
     manager = object.__new__(FullDecodeOnlyGraphManager)
     manager.model = lambda input_ids, positions: input_ids + positions
@@ -275,7 +224,6 @@ def test_lidu_noop_and_uninitialized_batches_stay_eager():
     manager.eager_prefill_count = 0
     manager.eager_first_decode_count = 0
     manager.eager_no_dsa_count = 0
-    manager.eager_mixed_batch_count = 0
     manager.eager_lidu_uninitialized_count = 0
     manager.eager_lidu_capture_count = 0
     manager.eager_uncaptured_batch_count = 0
@@ -311,7 +259,6 @@ def test_first_initialized_lidu_batch_is_captured_but_runs_eager():
     manager.eager_prefill_count = 0
     manager.eager_first_decode_count = 0
     manager.eager_no_dsa_count = 0
-    manager.eager_mixed_batch_count = 0
     manager.eager_lidu_uninitialized_count = 0
     manager.eager_lidu_capture_count = 0
     manager.eager_uncaptured_batch_count = 0
@@ -350,8 +297,7 @@ def test_first_initialized_lidu_batch_is_captured_but_runs_eager():
     assert manager.replay_count == 0
 
 
-@pytest.mark.parametrize("offload_mode", ["gs", "lidu"])
-def test_exact_eligible_batch_replays_graph(monkeypatch, offload_mode):
+def test_exact_eligible_lidu_batch_replays_graph(monkeypatch):
     calls = []
 
     class FakeGraph:
@@ -376,7 +322,7 @@ def test_exact_eligible_batch_replays_graph(monkeypatch, offload_mode):
         raising=False,
     )
 
-    entry = FullDecodeGraphEntry.allocate(2, 4, 2, torch.device("cpu"))
+    entry = FullDecodeGraphEntry.allocate(2, 4, torch.device("cpu"))
     entry.graph = FakeGraph()
     entry.output = torch.arange(6).view(2, 3)
     entry.mla_tasks = [FakeTask()]
@@ -390,10 +336,9 @@ def test_exact_eligible_batch_replays_graph(monkeypatch, offload_mode):
     manager.eager_prefill_count = 0
     manager.eager_first_decode_count = 0
     manager.eager_no_dsa_count = 0
-    manager.eager_mixed_batch_count = 0
     manager.eager_uncaptured_batch_count = 0
     manager.log_enabled = False
-    manager.offload_mode = offload_mode
+    manager.offload_mode = "lidu"
     manager.stateful_offload = True
     manager.eager_lidu_uninitialized_count = 0
     manager.eager_lidu_capture_count = 0
@@ -406,13 +351,11 @@ def test_exact_eligible_batch_replays_graph(monkeypatch, offload_mode):
         block_tables=context.block_tables,
         index_block_tables=context.index_block_tables,
         dram_block_tables=context.dram_block_tables,
-        selection_block_tables=context.selection_block_tables,
         req_pool_entries=context.req_pool_entries,
         candidate_lens=context.candidate_lens,
         candidate_query_lens=context.candidate_query_lens,
         lidu_cache_tokens=context.lidu_cache_tokens,
         needs_dsa_update=True,
-        dsa_offload_all_rows=True,
         lidu_all_rows_ready=True,
     )
     try:
@@ -450,7 +393,7 @@ def test_dense_mla_graph_pads_to_the_smallest_capture(monkeypatch):
         raising=False,
     )
 
-    entry = FullDecodeGraphEntry.allocate(4, 4, 1, torch.device("cpu"))
+    entry = FullDecodeGraphEntry.allocate(4, 4, torch.device("cpu"))
     entry.graph = FakeGraph()
     entry.output = torch.arange(12).view(4, 3)
     entry.mla_tasks = [FakeTask()]
@@ -468,7 +411,6 @@ def test_dense_mla_graph_pads_to_the_smallest_capture(monkeypatch):
     manager.eager_prefill_count = 0
     manager.eager_first_decode_count = 0
     manager.eager_no_dsa_count = 0
-    manager.eager_mixed_batch_count = 0
     manager.eager_uncaptured_batch_count = 0
     manager.log_enabled = False
 
@@ -497,87 +439,3 @@ def test_dense_mla_graph_pads_to_the_smallest_capture(monkeypatch):
         "replay",
         ("update", [2200, 2201, 0, 0]),
     ]
-
-
-def test_decode_callable_uses_npugraph_ex(monkeypatch):
-    calls = {}
-    fake_dynamo = SimpleNamespace(
-        config=SimpleNamespace(
-            cache_size_limit=64,
-            accumulated_cache_size_limit=256,
-        )
-    )
-
-    class FakeCompilerConfig:
-        def __init__(self):
-            self.mode = None
-            self.debug = SimpleNamespace(
-                run_eagerly=False,
-                aclgraph=SimpleNamespace(
-                    disable_reinplace_inplaceable_ops_pass=False
-                ),
-            )
-
-    def get_npu_backend(*, compiler_config):
-        calls["compiler_config"] = compiler_config
-        return "npugraph_ex-backend"
-
-    def compile_model(model, **kwargs):
-        calls["compile"] = (model, kwargs)
-        return "compiled-model"
-
-    fake_torchair = SimpleNamespace(
-        CompilerConfig=FakeCompilerConfig,
-        get_npu_backend=get_npu_backend,
-    )
-    fake_npu = SimpleNamespace(
-        set_compile_mode=lambda **kwargs: calls.setdefault("compile_mode", kwargs)
-    )
-    monkeypatch.setitem(torch.__dict__, "_dynamo", fake_dynamo)
-    monkeypatch.setitem(sys.modules, "torchair", fake_torchair)
-    monkeypatch.setattr(torch, "npu", fake_npu, raising=False)
-    monkeypatch.setattr(torch, "compile", compile_model)
-
-    manager = object.__new__(FullDecodeOnlyGraphManager)
-    manager.log_enabled = False
-    model = object()
-    compiled = manager._build_decode_callable(model)
-
-    compiler_config = calls["compiler_config"]
-    assert compiled == "compiled-model"
-    assert calls["compile_mode"] == {"jit_compile": False}
-    assert compiler_config.mode == "reduce-overhead"
-    assert compiler_config.debug.run_eagerly is True
-    assert (
-        compiler_config.debug.aclgraph.disable_reinplace_inplaceable_ops_pass
-        is True
-    )
-    assert calls["compile"] == (
-        model,
-        {
-            "backend": "npugraph_ex-backend",
-            "fullgraph": False,
-            "dynamic": False,
-        },
-    )
-
-
-def test_disabled_npugraph_ex_returns_raw_model(monkeypatch):
-    model = object()
-    manager = object.__new__(FullDecodeOnlyGraphManager)
-    manager.enable_npugraph_ex = False
-    manager.log_enabled = False
-    calls = {}
-    monkeypatch.setattr(
-        torch,
-        "npu",
-        SimpleNamespace(
-            set_compile_mode=lambda **kwargs: calls.setdefault(
-                "compile_mode", kwargs
-            )
-        ),
-        raising=False,
-    )
-
-    assert manager._build_decode_callable(model) is model
-    assert calls["compile_mode"] == {"jit_compile": False}

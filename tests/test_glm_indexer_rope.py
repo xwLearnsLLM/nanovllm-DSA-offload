@@ -68,7 +68,6 @@ def test_glm_interleaved_indexer_full_and_query_only_match_golden():
         head_dim=head_dim,
         rope_dim=rope_dim,
         score_scale=1.0,
-        rotary_mode="interleave",
     )
 
     q = F.linear(q_c, wq_b).view(tokens, n_head, head_dim)
@@ -102,7 +101,6 @@ def test_glm_interleaved_indexer_full_and_query_only_match_golden():
         head_dim=head_dim,
         rope_dim=rope_dim,
         score_scale=1.0,
-        rotary_mode="interleave",
     )
     torch.testing.assert_close(query_only_q, q_expected)
     torch.testing.assert_close(query_only_weights, weights_expected)

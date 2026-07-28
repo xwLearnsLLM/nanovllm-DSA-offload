@@ -1261,8 +1261,8 @@ ge::graphStatus SFATilingCheck::CheckDecodeOnly() const
     OPS_ERR_IF(sparseBlockSize_ != 1 || *opParamInfo_.sparseMode != 3,
         OPS_LOG_E(opName_, "sparse_block_size must be 1 and sparse_mode must be 3"),
         return ge::GRAPH_FAILED);
-    OPS_ERR_IF(n1Size_ == 0 || n1Size_ > 64 || n2Size_ != 1 || gSize_ != n1Size_,
-        OPS_LOG_E(opName_, "decode requires 1 <= N1 <= 64, N2=1 and group size=N1"),
+    OPS_ERR_IF(n1Size_ == 0 || n1Size_ > 128 || n2Size_ != 1 || gSize_ != n1Size_,
+        OPS_LOG_E(opName_, "decode requires 1 <= N1 <= 128, N2=1 and group size=N1"),
         return ge::GRAPH_FAILED);
     OPS_ERR_IF(qkHeadDim_ != 512 || vHeadDim_ != 512 || ropeHeadDim_ != 64,
         OPS_LOG_E(opName_, "decode requires qk/value head dim 512 and rope head dim 64"),

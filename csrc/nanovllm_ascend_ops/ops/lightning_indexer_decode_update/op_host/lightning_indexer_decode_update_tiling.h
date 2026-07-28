@@ -89,7 +89,7 @@ public:
     LIU2ParaInfo opParamInfo;
 
     uint32_t bSize = 0;
-    uint32_t n1Size = 64;
+    uint32_t n1Size = 32;
     uint32_t n2Size = DECODE_N2;
     uint32_t s2Size = 0;
     uint32_t blockSize = 0;

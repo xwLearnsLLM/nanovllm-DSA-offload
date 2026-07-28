@@ -18,8 +18,8 @@ inline void npu_lightning_indexer_decode_update_out(
   TORCH_CHECK(query.dim() == 3, "LIDU query must be [B, N, 128].");
   TORCH_CHECK(query.device().is_privateuseone(),
               "LIDU inputs must be on NPU.");
-  TORCH_CHECK(query.size(1) == 32 || query.size(1) == 64,
-              "LIDU supports 32 or 64 index heads.");
+  TORCH_CHECK(query.size(1) == 32,
+              "GLM-5.1 LIDU requires 32 index heads.");
   TORCH_CHECK(query.size(2) == 128, "LIDU head_dim must be 128.");
   TORCH_CHECK(key.dim() == 4 && key.size(1) == 128 && key.size(2) == 1 &&
                   key.size(3) == 128,

@@ -6,13 +6,12 @@ import pytest
 import nanovllm.engine.dsa_offload as dsa_offload
 from nanovllm.engine.dsa_offload import (
     LIDU_CACHE_TOKEN_BUDGETS,
-    OFFLOAD_GS,
     OFFLOAD_LIDU,
     OFFLOAD_MODES,
     finalize_prefill_hbm_layout,
     lidu_cache_tokens,
     normalize_offload_mode,
-    parse_gs_miss_rate_layers,
+    parse_lidu_miss_count_layers,
     validate_lidu_cache_token_budgets,
 )
 from nanovllm.config import Config
@@ -55,17 +54,15 @@ def _seq(length: int, request_id: str) -> Sequence:
     )
 
 
-def test_three_modes_and_default_public_api():
-    assert OFFLOAD_MODES == ("none", "gs", "lidu")
+def test_two_modes_and_default_public_api():
+    assert OFFLOAD_MODES == ("none", "lidu")
     assert Config.__dataclass_fields__["offload_mode"].default == "none"
     for mode in OFFLOAD_MODES:
         assert normalize_offload_mode(mode.upper()) == mode
-    with pytest.raises(ValueError, match="none.*gs.*lidu"):
+    with pytest.raises(ValueError, match="none.*lidu"):
         normalize_offload_mode("legacy")
     with pytest.raises(TypeError, match="must be a string"):
         normalize_offload_mode(True)
-    with pytest.raises(TypeError, match="enable_dsa_offload"):
-        Config("unused", enable_dsa_offload=True)
 
 
 @pytest.mark.parametrize(
@@ -140,17 +137,17 @@ def test_invalid_tuned_lidu_budgets_fail_at_startup(
         validate_lidu_cache_token_budgets(128)
 
 
-def test_lidu_reuses_gs_miss_rate_layer_switch():
-    assert parse_gs_miss_rate_layers(None, 78) == frozenset()
-    assert parse_gs_miss_rate_layers("0, 30,77,30", 78) == frozenset(
+def test_lidu_miss_count_layer_switch():
+    assert parse_lidu_miss_count_layers(None, 78) == frozenset()
+    assert parse_lidu_miss_count_layers("0, 30,77,30", 78) == frozenset(
         {0, 30, 77}
     )
     for value in ("0,,30", "layer0", "-1", "78"):
         with pytest.raises(
             ValueError,
-            match="NANOVLLM_GS_MISS_RATE_ON_LAYERS",
+            match="NANOVLLM_LIDU_MISS_COUNT_ON_LAYERS",
         ):
-            parse_gs_miss_rate_layers(value, 78)
+            parse_lidu_miss_count_layers(value, 78)
 
 
 def test_mixed_short_and_long_requests_get_unique_persistent_pool_rows():
@@ -439,7 +436,7 @@ def test_abort_releases_tail_and_pending_lidu_state():
     assert not scheduler.pool_entry_manager.used_entries
 
 
-def test_short_lidu_and_gs_final_layouts_are_unchanged():
+def test_short_lidu_final_layout_is_unchanged():
     short_scheduler = Scheduler(_config(max_decode_seqs=1))
     short = _seq(1024, "short-layout")
     short_scheduler._prepare_prefill_metadata(short)
@@ -449,22 +446,3 @@ def test_short_lidu_and_gs_final_layouts_are_unchanged():
     assert short.hbm_block_table == short_hbm
     assert short.hbm_blocks_to_release == []
     assert not short.lidu_decode_hbm_pending
-
-    gs_scheduler = Scheduler(
-        _config(max_decode_seqs=1, offload_mode=OFFLOAD_GS)
-    )
-    gs = _seq(9000, "gs-layout")
-    gs_scheduler._prepare_prefill_metadata(gs)
-    gs_scheduler._allocate_prefill(gs)
-    gs_hbm = list(gs.hbm_block_table)
-    finalize_prefill_hbm_layout(gs, OFFLOAD_GS)
-    prefix_blocks = 1
-    suffix_blocks = gs.num_sparse_blocks - prefix_blocks
-    assert gs.hbm_block_table == (
-        gs_hbm[:prefix_blocks]
-        + gs_hbm[
-            gs.num_prefill_full_blocks - suffix_blocks:
-            gs.num_prefill_blocks
-        ]
-    )
-    assert not gs.lidu_decode_hbm_pending

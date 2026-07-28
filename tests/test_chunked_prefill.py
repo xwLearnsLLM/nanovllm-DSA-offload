@@ -21,7 +21,7 @@ def make_config(
     block_size: int = 128,
     num_hbm_blocks: int = 256,
     num_dram_blocks: int = 256,
-    offload_mode: str = "gs",
+    offload_mode: str = "lidu",
 ):
     return SimpleNamespace(
         max_num_prefill_seqs_per_step=max_num_prefill_seqs_per_step,
@@ -184,7 +184,7 @@ def test_decode_worker_snapshot_drops_full_token_history():
     assert len(compact_payload) < len(full_payload) // 5
 
 
-def test_abort_releases_all_partially_prefilled_dsa_resources():
+def test_abort_releases_all_partially_prefilled_lidu_resources():
     scheduler = Scheduler(make_config())
     seq = make_sequence(1500, request_id="abort-me")
     scheduler.add(seq)
@@ -192,7 +192,9 @@ def test_abort_releases_all_partially_prefilled_dsa_resources():
     seqs, is_prefill = scheduler.schedule()
     scheduler.postprocess(seqs, None, is_prefill)
     assert seq.num_prefill_tokens_processed == 1024
-    assert all(used > 0 for used, _ in scheduler.cache_block_usage())
+    usage = scheduler.cache_block_usage()
+    assert usage[0][0] > 0
+    assert all(used == 0 for used, _ in usage[1:])
     assert scheduler.pool_entry_manager.used_entries
 
     scheduler.abort_seq_group("abort-me")

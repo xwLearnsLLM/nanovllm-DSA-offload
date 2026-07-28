@@ -8,7 +8,6 @@ from nanovllm.engine.dsa_offload import (
     OFFLOAD_NONE,
     PoolEntryManager,
     SimpleBlockManager,
-    compute_sparse_blocks,
     lidu_cache_tokens,
 )
 from nanovllm.engine.sequence import FinishReason, Sequence, SequenceStatus
@@ -88,21 +87,17 @@ class Scheduler:
         # The offload source is permanently bounded by the original prompt's
         # complete blocks.  If decode preemption triggers recomputation, the
         # already-generated tokens stay in the dense tail and never become
-        # LIDU/GS candidates.
+        # LIDU candidates.
         num_prefill_full_blocks = seq.num_prompt_tokens // seq.block_size
         prefill_tail_len = len(seq) - num_prefill_full_blocks * seq.block_size
         num_prefill_tail_blocks = num_prefill_blocks - num_prefill_full_blocks
         lidu_tokens = 0
-        if self.offload_mode == OFFLOAD_LIDU:
+        if self.uses_offload:
             lidu_tokens = lidu_cache_tokens(seq.num_prompt_tokens)
             num_sparse_blocks = (
                 lidu_tokens // seq.block_size
                 if lidu_tokens
                 else num_prefill_full_blocks
-            )
-        elif self.uses_offload:
-            num_sparse_blocks = compute_sparse_blocks(
-                num_prefill_full_blocks, seq.block_size
             )
         else:
             num_sparse_blocks = num_prefill_full_blocks
@@ -164,7 +159,7 @@ class Scheduler:
             return False
         if not self.uses_offload:
             return True
-        if self.offload_mode == OFFLOAD_LIDU and seq.lidu_cache_tokens == 0:
+        if seq.lidu_cache_tokens == 0:
             return self.pool_entry_manager.can_allocate()
         return (
             self.index_block_manager.can_allocate_blocks(seq.num_prefill_blocks)
@@ -184,10 +179,7 @@ class Scheduler:
         seq.block_table = seq.hbm_block_table
         if self.uses_offload:
             seq.offload_pool_entry = self.pool_entry_manager.allocate()
-            if not (
-                self.offload_mode == OFFLOAD_LIDU
-                and seq.lidu_cache_tokens == 0
-            ):
+            if seq.lidu_cache_tokens != 0:
                 seq.index_block_table = self.index_block_manager.allocate_blocks(
                     seq.num_prefill_blocks,
                 )

@@ -63,8 +63,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="npu:0")
     parser.add_argument(
         "--heads",
-        default="32,64",
-        help="Comma-separated index head counts; supported values are 32 and 64.",
+        default="32",
+        help="GLM-5.1 index head count; only 32 is supported.",
     )
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--warmup", type=int, default=2)
@@ -80,8 +80,8 @@ def parse_args() -> argparse.Namespace:
 
 def _parse_heads(value: str) -> tuple[int, ...]:
     heads = tuple(dict.fromkeys(int(item.strip()) for item in value.split(",")))
-    if not heads or any(item not in (32, 64) for item in heads):
-        raise ValueError("--heads only accepts 32 and/or 64.")
+    if heads != (32,):
+        raise ValueError("--heads only accepts 32.")
     return heads
 
 

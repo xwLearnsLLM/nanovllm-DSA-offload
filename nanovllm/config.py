@@ -8,7 +8,6 @@ from typing import Any
 from nanovllm.engine.dsa_offload import (
     DSA_SELECTION_TOPK_TOKENS,
     LIDU_MAX_SOURCE_TOKENS,
-    OFFLOAD_GS,
     OFFLOAD_LIDU,
     OFFLOAD_NONE,
     normalize_offload_mode,
@@ -152,11 +151,13 @@ class Config:
         if not isinstance(self.enforce_eager, bool):
             raise TypeError("enforce_eager must be a bool.")
         if (
-            os.environ.get("NANOVLLM_GS_MISS_RATE_ON_LAYERS", "").strip()
+            os.environ.get(
+                "NANOVLLM_LIDU_MISS_COUNT_ON_LAYERS", ""
+            ).strip()
             and not self.enforce_eager
         ):
             raise ValueError(
-                "NANOVLLM_GS_MISS_RATE_ON_LAYERS is eager-only; set "
+                "NANOVLLM_LIDU_MISS_COUNT_ON_LAYERS is eager-only; set "
                 "enforce_eager=True / NANOVLLM_ENFORCE_EAGER=1."
             )
         if self.enforce_eager:
@@ -166,24 +167,6 @@ class Config:
             raise ValueError(
                 "ASCEND_LAUNCH_BLOCKING=1 is incompatible with FULL_DECODE_ONLY."
             )
-        if (
-            self.offload_mode == OFFLOAD_GS
-            and self.max_model_len < DSA_SELECTION_TOPK_TOKENS
-        ):
-            raise ValueError(
-                "DSA FULL_DECODE_ONLY requires max_model_len >= "
-                f"{DSA_SELECTION_TOPK_TOKENS}, got {self.max_model_len}."
-            )
-        if (
-            self.offload_mode == OFFLOAD_GS
-            and DSA_SELECTION_TOPK_TOKENS % self.kvcache_block_size != 0
-        ):
-            raise ValueError(
-                "DSA FULL_DECODE_ONLY requires the 2048-token sparse budget "
-                "to be divisible by kvcache_block_size, got "
-                f"{self.kvcache_block_size}."
-            )
-
         self.decode_graph_capture_sizes = normalize_capture_sizes(
             self.decode_graph_capture_sizes
             or (self.max_num_decode_seqs_per_step,)
@@ -208,71 +191,58 @@ class Config:
             )
 
     def _validate_model_format(self):
-        if getattr(self.hf_config, "model_type", "") == "glm_moe_dsa":
-            description_path = os.path.join(
-                self.model, "quant_model_description.json"
-            )
-            if not os.path.isfile(description_path):
-                raise ValueError(
-                    "GLM-5.1-W4A8 requires quant_model_description.json "
-                    "from the ModelSlim checkpoint."
-                )
-            with open(description_path, "r", encoding="utf-8") as file:
-                description = json.load(file)
-            metadata = {
-                key: description.get(key)
-                for key in (
-                    "version",
-                    "model_quant_type",
-                    "group_size",
-                    "is_rot_used",
-                    "optional",
-                )
-            }
-            if metadata["version"] != "1.0.0":
-                raise ValueError(
-                    "GLM-5.1 support requires ModelSlim quant version 1.0.0 "
-                    f"only, got {metadata['version']!r}."
-                )
-            if metadata["model_quant_type"] != "W8A8_DYNAMIC":
-                raise ValueError(
-                    "GLM-5.1 support expects model_quant_type="
-                    f"'W8A8_DYNAMIC', got {metadata['model_quant_type']!r}."
-                )
-            if metadata["group_size"] != 0:
-                raise ValueError(
-                    "GLM-5.1 support expects per-channel W4A8 "
-                    f"(group_size=0), got {metadata['group_size']!r}."
-                )
-            setattr(
-                self.hf_config,
-                "nanovllm_quant_metadata",
-                metadata,
-            )
-            return
-
-        quantization_config = getattr(
+        dtype = getattr(
             self.hf_config,
-            "quantization_config",
-            None,
-        ) or {}
-        quant_method = str(
-            quantization_config.get("quant_method", "")
-        ).lower()
-        if quant_method != "fp8":
-            return
-        raise ValueError(
-            "nano-vllm-ascend currently expects the BF16-exported "
-            "DeepSeek-V3.2 checkpoint, not the original HF FP8 directory. "
-            "Convert it first with "
-            "`python scripts/export_deepseek_v32_to_hf_bf16.py "
-            "<source_model> <output_model>` and then point `model=` to the "
-            "BF16 output directory."
+            "torch_dtype",
+            getattr(self.hf_config, "dtype", None),
         )
+        if str(dtype).lower() not in (
+            "bf16",
+            "bfloat16",
+            "torch.bfloat16",
+        ):
+            raise ValueError(
+                "GLM-5.1-W4A8 requires BF16 runtime dtype, got "
+                f"{dtype!r}."
+            )
+        description_path = os.path.join(
+            self.model, "quant_model_description.json"
+        )
+        if not os.path.isfile(description_path):
+            raise ValueError(
+                "GLM-5.1-W4A8 requires quant_model_description.json "
+                "from the ModelSlim checkpoint."
+            )
+        with open(description_path, "r", encoding="utf-8") as file:
+            description = json.load(file)
+        metadata = {
+            key: description.get(key)
+            for key in (
+                "version",
+                "model_quant_type",
+                "group_size",
+                "is_rot_used",
+                "optional",
+            )
+        }
+        if metadata["version"] != "1.0.0":
+            raise ValueError(
+                "GLM-5.1 support requires ModelSlim quant version 1.0.0 "
+                f"only, got {metadata['version']!r}."
+            )
+        if metadata["model_quant_type"] != "W8A8_DYNAMIC":
+            raise ValueError(
+                "GLM-5.1 support expects model_quant_type="
+                f"'W8A8_DYNAMIC', got {metadata['model_quant_type']!r}."
+            )
+        if metadata["group_size"] != 0:
+            raise ValueError(
+                "GLM-5.1 support expects per-channel W4A8 "
+                f"(group_size=0), got {metadata['group_size']!r}."
+            )
+        setattr(self.hf_config, "nanovllm_quant_metadata", metadata)
 
     def _configure_glm_runtime(self) -> None:
-        if getattr(self.hf_config, "model_type", "") != "glm_moe_dsa":
-            return
         if not self.enable_expert_parallel:
             raise ValueError(
                 "GLM-5.1-W4A8 requires expert parallel; set "
@@ -328,9 +298,9 @@ class Config:
             )
         index_heads = int(getattr(text_config, "index_n_heads", 0))
         index_dim = int(getattr(text_config, "index_head_dim", 0))
-        if index_heads not in (32, 64) or index_dim != 128:
+        if index_heads != 32 or index_dim != 128:
             raise ValueError(
-                "LIDU requires index_n_heads in (32, 64) and "
+                "GLM-5.1 LIDU requires index_n_heads=32 and "
                 f"index_head_dim=128, got heads={index_heads}, dim={index_dim}."
             )
         max_source_tokens = (
@@ -351,11 +321,6 @@ class Config:
                 "enable_lidu_fused_attention_scatter requires "
                 "offload_mode='lidu'."
             )
-        if getattr(self.hf_config, "model_type", "") != "glm_moe_dsa":
-            raise ValueError(
-                "Fused LIDU Attention+SCATTER currently supports "
-                "GLM-5.1-w4a8 only."
-            )
 
     def _load_hf_config(self):
         config_path = os.path.join(self.model, "config.json")
@@ -374,28 +339,10 @@ class Config:
 
             return GlmMoeDsaConfig.from_pretrained(self.model)
 
-        deepseek_v32_like = (
-            raw_config.get("model_type") == "deepseek_v32"
-            or "DeepseekV32ForCausalLM"
-            in (raw_config.get("architectures") or [])
-            or all(
-                key in raw_config
-                for key in (
-                    "first_k_dense_replace",
-                    "q_lora_rank",
-                    "kv_lora_rank",
-                    "index_topk",
-                )
-            )
-        )
-        if deepseek_v32_like:
-            from nanovllm.models.deepseek_v32 import DeepseekV32Config
-
-            return DeepseekV32Config.from_pretrained(self.model)
-
         raise ValueError(
-            "nano-vllm-ascend supports DeepSeek-V3.2 and "
-            "GLM-5.1-W4A8. The model config did not match either architecture."
+            "nano-vllm-ascend supports GLM-5.1-W4A8 only. The model config "
+            "must use model_type='glm_moe_dsa' or architecture "
+            "'GlmMoeDsaForCausalLM'."
         )
 
     def __repr__(self):

@@ -24,6 +24,7 @@ SUPPORTED_TEST_HEADS = (8, 128)
 
 @dataclass
 class Case:
+    source_len: int
     query: torch.Tensor
     query_rope: torch.Tensor
     sparse_slots: torch.Tensor
@@ -105,10 +106,12 @@ def swapped_from_cpu(
 def make_case(args: argparse.Namespace) -> Case:
     if not 1 <= args.batch_size <= 24:
         raise ValueError("batch-size must be in [1,24].")
-    if args.source_len != 65536:
-        raise ValueError("This penetration experiment fixes source-len at 65536.")
+    if args.source_len <= 0 or args.source_len % BLOCK_SIZE != 0:
+        raise ValueError("source-len must be positive and block aligned.")
     if args.cache_tokens < SPARSE_COUNT or args.cache_tokens % BLOCK_SIZE != 0:
         raise ValueError("cache-tokens must be >=2048 and block aligned.")
+    if args.cache_tokens > args.source_len:
+        raise ValueError("cache-tokens must not exceed source-len.")
     if args.tail_tokens < 0:
         raise ValueError("tail-tokens must be non-negative.")
     if not 0 <= args.miss_min <= args.miss_max <= SPARSE_COUNT:
@@ -189,6 +192,7 @@ def make_case(args: argparse.Namespace) -> Case:
     torch.npu.synchronize()
 
     return Case(
+        source_len=args.source_len,
         query=query,
         query_rope=query_rope,
         sparse_slots=slots_cpu[:, None, :].to(device),
@@ -740,7 +744,7 @@ def benchmark(case: Case, warmup: int, iters: int) -> None:
     speedup = serial_ms / fused_ms
     print(
         "FUSED_SCATTER_ATTENTION_RESULT "
-        f"batch={batch} strategy={strategy} source_len=65536 "
+        f"batch={batch} strategy={strategy} source_len={case.source_len} "
         f"attended_tokens={SPARSE_COUNT + int(case.actual_kv[0]) - int(case.cache_tokens[0])} "
         f"miss_min={int(case.copy_counts.min())} "
         f"miss_max={int(case.copy_counts.max())} "
