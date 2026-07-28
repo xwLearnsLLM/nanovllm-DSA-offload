@@ -74,24 +74,25 @@ export NANOVLLM_PROMPT_LENGTHS=20000,20001,20002,20003,20004,20005,20006,20007,2
 python3 example/test.py
 ```
 
-测试非融合卸载路径时把 `NANOVLLM_OFFLOAD_MODE` 改为 `offload_split`；测试不卸载路径时改为 `none`。测试全 eager 时把 `NANOVLLM_ENFORCE_EAGER` 改为 `1`。
+如果要开启 profile :
 
-## Profile
-
-内置 profiler 只在 TP rank 0 启动。Eager 模式从第一次 decode 开始采集；图模式等到稳定 graph replay 可用后才开始，程序结束时自动停止：
-
-```bash
-mkdir -p profile
-export NANOVLLM_PROFILE_DECODE_OUTPUT=$PWD/profile
-python3 example/test.py
+```
+NANOVLLM_PROFILE_DECODE_OUTPUT=$PWD/profile python3 example/test.py
 ```
 
-关闭 profile：
 
-```bash
-unset NANOVLLM_PROFILE_DECODE_OUTPUT
+
+## LI+update 融合算子单测
+
+```
+python3 ut_ops/test_lidu_perf.py --heads 32 --batch-sizes 24 --seq-lens 20000 --cache-tokens 6144 --miss-ranges 0:200 --warmup 3 --iters 100 --seed 7
 ```
 
-Eager 模式下可用 `NANOVLLM_LIDU_MISS_COUNT_ON_LAYERS=0,30,60` 打印指定层当前 decode batch 的 miss count。
 
-算子验收命令见 [ut_ops/UT_OPS.md](ut_ops/UT_OPS.md)，支持矩阵见 [support.md](support.md)。
+
+## copy+SFA 融合算子单测
+
+```
+python3 ut_ops/test_fused_attention_scatter.py --mode all --batch-size 24 --heads 8 --source-len 20000 --cache-tokens 6144 --tail-tokens 64 --miss-min 0 --miss-max 200 --warmup 3 --iters 100 --seed 7
+```
+
