@@ -10,6 +10,7 @@ from nanovllm.engine.dsa_offload import (
     OFFLOAD_MODES,
     OFFLOAD_SPLIT,
     finalize_prefill_hbm_layout,
+    format_lidu_miss_count_report,
     lidu_cache_tokens,
     normalize_offload_mode,
     parse_lidu_miss_count_layers,
@@ -158,6 +159,23 @@ def test_lidu_miss_count_layer_switch():
             match="NANOVLLM_LIDU_MISS_COUNT_ON_LAYERS",
         ):
             parse_lidu_miss_count_layers(value, 78)
+
+
+def test_lidu_miss_count_report_is_compact_and_aggregates_all_layers():
+    lines = format_lidu_miss_count_report(
+        [[0, 2], [4, 6], [8, 10]],
+        frozenset({0, 2}),
+        decode_step=7,
+    )
+    assert lines == (
+        "LIDU_MISS_COUNT decode_step=7 layer=0 batch_size=2 "
+        "request_miss_tokens=[0, 2] mean_miss_tokens=1.00",
+        "LIDU_MISS_COUNT decode_step=7 layer=2 batch_size=2 "
+        "request_miss_tokens=[8, 10] mean_miss_tokens=9.00",
+        "LIDU_MISS_COUNT_ALL_LAYERS decode_step=7 batch_size=2 "
+        "num_layers=3 mean_miss_tokens_of_all_layers=5.00",
+    )
+    assert all("miss_rate" not in line for line in lines)
 
 
 def test_mixed_short_and_long_requests_get_unique_persistent_pool_rows():

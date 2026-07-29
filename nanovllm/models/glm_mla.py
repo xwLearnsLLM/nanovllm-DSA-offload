@@ -11,9 +11,9 @@ import torch.nn.functional as F
 
 import nanovllm.ops as ascend_ops
 from nanovllm.engine.dsa_offload import (
-    DSA_SELECTION_TOPK_TOKENS,
     OFFLOAD_FUSE,
     OFFLOAD_NONE,
+    format_lidu_miss_count_report,
     parse_lidu_miss_count_layers,
 )
 from nanovllm.engine.full_decode_graph import (
@@ -49,6 +49,7 @@ from nanovllm.utils.context import get_context
 ACL_FORMAT_FRACTAL_NZ = 29
 _NPU_MLA_ATTENTION_MASK_CACHE: dict[tuple[str, int], torch.Tensor] = {}
 _NPU_MLA_V2_WORKSPACE_CACHE: dict[tuple, torch.Tensor] = {}
+_LIDU_MISS_COUNT_SCRATCH_KEY = "lidu_miss_counts_by_layer"
 _LiduUpdateResult = tuple[
     torch.Tensor,
     torch.Tensor,
@@ -373,15 +374,17 @@ class GlmMLAAttention(nn.Module):
             config, "nanovllm_offload_mode", OFFLOAD_NONE
         )
         self.uses_offload = self.offload_mode != OFFLOAD_NONE
+        self.num_hidden_layers = int(config.num_hidden_layers)
         miss_count_layers = parse_lidu_miss_count_layers(
             os.environ.get("NANOVLLM_LIDU_MISS_COUNT_ON_LAYERS"),
-            int(config.num_hidden_layers),
+            self.num_hidden_layers,
         )
         tp_rank = dist.get_rank()
-        self._lidu_miss_count_enabled = (
+        self._lidu_miss_count_layers = miss_count_layers
+        self._lidu_miss_count_collect_all = (
             self.uses_offload
             and tp_rank == 0
-            and self.layer_idx in miss_count_layers
+            and bool(miss_count_layers)
         )
         self._lidu_miss_count_decode_step = 0
         if (
@@ -995,8 +998,8 @@ class GlmMLAAttention(nn.Module):
             source_ids, destination_slots, miss_counts, _ = (
                 lidu_decode_update(*lidu_args)
             )
-        if self._lidu_miss_count_enabled:
-            self._print_lidu_miss_counts(miss_counts, batch_size)
+        if self._lidu_miss_count_collect_all:
+            self._record_lidu_miss_counts(miss_counts, batch_size)
         use_fused_attention_scatter = (
             self._can_use_lidu_fused_attention_scatter(batch_size)
         )
@@ -1035,35 +1038,43 @@ class GlmMLAAttention(nn.Module):
         )
 
     @torch.compiler.disable
-    def _print_lidu_miss_counts(
+    def _record_lidu_miss_counts(
         self,
         miss_counts: torch.Tensor,
         batch_size: int,
     ) -> None:
-        if not self._lidu_miss_count_enabled:
+        if not self._lidu_miss_count_collect_all:
             return
-        values = [
-            int(value)
-            for value in miss_counts.reshape(-1)[:batch_size]
+        context = get_context()
+        by_layer = context.scratch.setdefault(
+            _LIDU_MISS_COUNT_SCRATCH_KEY,
+            [],
+        )
+        by_layer.append(
+            (self.layer_idx, miss_counts.reshape(-1)[:batch_size])
+        )
+        if self.layer_idx != self.num_hidden_layers - 1:
+            return
+        context.scratch.pop(_LIDU_MISS_COUNT_SCRATCH_KEY, None)
+        if [layer for layer, _ in by_layer] != list(
+            range(self.num_hidden_layers)
+        ):
+            raise RuntimeError(
+                "LIDU miss-count aggregation did not receive every layer."
+            )
+        per_layer_values = (
+            torch.stack([values for _, values in by_layer])
             .detach()
             .cpu()
             .tolist()
-        ]
-        mean_count = sum(values) / max(len(values), 1)
-        rates = [value / DSA_SELECTION_TOPK_TOKENS for value in values]
-        mean_rate = sum(rates) / max(len(rates), 1)
-        self._lidu_miss_count_decode_step += 1
-        print(
-            "LIDU_MISS_COUNT "
-            f"decode_step={self._lidu_miss_count_decode_step} "
-            f"layer={self.layer_idx} batch_size={batch_size} "
-            f"request_miss_tokens={values} "
-            f"mean_miss_tokens={mean_count:.2f} "
-            "request_miss_rate=["
-            + ", ".join(f"{rate:.6f}" for rate in rates)
-            + f"] mean_miss_rate={mean_rate:.6f}",
-            flush=True,
         )
+        self._lidu_miss_count_decode_step += 1
+        for line in format_lidu_miss_count_report(
+            per_layer_values,
+            self._lidu_miss_count_layers,
+            self._lidu_miss_count_decode_step,
+        ):
+            print(line, flush=True)
 
     def _decode_forward_mla(
         self,

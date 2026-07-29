@@ -56,6 +56,39 @@ def parse_lidu_miss_count_layers(
     return layers
 
 
+def format_lidu_miss_count_report(
+    per_layer_values: list[list[int]],
+    selected_layers: frozenset[int],
+    decode_step: int,
+) -> tuple[str, ...]:
+    """Format selected-layer details and one all-layer mean."""
+
+    if not per_layer_values or not per_layer_values[0]:
+        raise ValueError("LIDU miss-count report requires non-empty values.")
+    batch_size = len(per_layer_values[0])
+    if any(len(values) != batch_size for values in per_layer_values):
+        raise ValueError("LIDU miss-count layer batch sizes must match.")
+
+    lines = []
+    for layer in sorted(selected_layers):
+        values = per_layer_values[layer]
+        lines.append(
+            "LIDU_MISS_COUNT "
+            f"decode_step={decode_step} layer={layer} "
+            f"batch_size={batch_size} request_miss_tokens={values} "
+            f"mean_miss_tokens={sum(values) / batch_size:.2f}"
+        )
+    total = sum(sum(values) for values in per_layer_values)
+    lines.append(
+        "LIDU_MISS_COUNT_ALL_LAYERS "
+        f"decode_step={decode_step} batch_size={batch_size} "
+        f"num_layers={len(per_layer_values)} "
+        "mean_miss_tokens_of_all_layers="
+        f"{total / (len(per_layer_values) * batch_size):.2f}"
+    )
+    return tuple(lines)
+
+
 def normalize_offload_mode(value: str) -> str:
     if not isinstance(value, str):
         raise TypeError("offload_mode must be a string.")
