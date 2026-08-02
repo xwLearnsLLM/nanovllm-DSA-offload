@@ -123,6 +123,7 @@ def main() -> None:
             f"request={index} id={record['_id']} "
             f"dataset_length={int(record['length'])} prompt_len={len(ids)}"
         )
+        print("response :", repr(output["text"]))
         print("token_ids:", output["token_ids"])
 
 
