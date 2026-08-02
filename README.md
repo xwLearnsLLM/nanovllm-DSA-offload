@@ -63,6 +63,47 @@ NANOVLLM_PROFILE_DECODE_OUTPUT=$PWD/profile python3 example/test.py
 
 　
 
+## 非卸载 eager MTP 验收
+
+MTP 只支持 `GLM-5.1-w4a8`、`offload_mode=none`、eager、greedy，`NANOVLLM_NUM_SPECULATIVE_TOKENS` 可设为 `0..3`。K>0 时加载第 78 层 BF16 MTP 权重和模型根目录的 `rot.safetensors`；不需要重新编译算子。
+
+下面依次验证 K=0/3、chunk=0/1024。四次最终 `token_ids` 必须完全一致且均为 32 个；两次 K=3 的 accepted/total 和 acceptance rate 也应一致。
+
+```bash
+unset NANOVLLM_LIDU_MISS_COUNT_ON_LAYERS
+unset NANOVLLM_PROFILE_DECODE_OUTPUT
+unset NANOVLLM_DRAM_NUM_BLOCKS
+
+export ASCEND_HOME_PATH=/usr/local/Ascend/cann-8.5.1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH=$PWD:$PYTHONPATH
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export ASCEND_LAUNCH_BLOCKING=0
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+
+export NANOVLLM_MODEL=/mnt/models/GLM-5.1-w4a8/
+export NANOVLLM_TP_SIZE=16
+export NANOVLLM_ENABLE_EXPERT_PARALLEL=1
+export NANOVLLM_OFFLOAD_MODE=none
+export NANOVLLM_ENFORCE_EAGER=1
+export NANOVLLM_KVCACHE_BLOCK_SIZE=128
+export NANOVLLM_HBM_NUM_BLOCKS=96
+export NANOVLLM_MAX_MODEL_LEN=8256
+export NANOVLLM_MAX_GEN_TOKENS=32
+export NANOVLLM_PROMPT_LENGTHS=8200
+
+for CHUNK in 0 1024; do
+  for K in 0 3; do
+    echo "========== GLM MTP: chunk=$CHUNK K=$K =========="
+    export NANOVLLM_PREFILL_CHUNK_SIZE=$CHUNK
+    export NANOVLLM_NUM_SPECULATIVE_TOKENS=$K
+    python3 example/test.py
+  done
+done
+```
+
+　
+
 ## 推理 longbench/dureader
 
 ```bash

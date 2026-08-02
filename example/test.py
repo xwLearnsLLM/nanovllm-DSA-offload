@@ -177,7 +177,13 @@ def main() -> None:
     prompt_lengths = parse_prompt_lengths()
     max_prompt_len = max(prompt_lengths)
     max_gen_tokens = env_int("NANOVLLM_MAX_GEN_TOKENS", 16)
-    max_model_len = max_prompt_len + max_gen_tokens
+    minimum_model_len = max_prompt_len + max_gen_tokens
+    max_model_len = env_int("NANOVLLM_MAX_MODEL_LEN", minimum_model_len)
+    if max_model_len < minimum_model_len:
+        raise ValueError(
+            "NANOVLLM_MAX_MODEL_LEN must be at least prompt_max + "
+            f"max_gen_tokens ({minimum_model_len}), got {max_model_len}."
+        )
     max_num_prefill_seqs_per_step = 1
     max_num_decode_seqs_per_step = len(prompt_lengths)
     block_size = env_int("NANOVLLM_KVCACHE_BLOCK_SIZE", 128)
