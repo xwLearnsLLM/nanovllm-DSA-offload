@@ -217,14 +217,16 @@ def run_graph_replay_check(
         )
     )
     attention_op = torch_npu.npu_fused_infer_attention_score_v2.out
-    stream = torch.npu.current_stream()
-    event = torch.npu.ExternalEvent()
     graph = torch.npu.NPUGraph()
     pool = torch.npu.graph_pool_handle()
     with torch.npu.graph(graph, pool=pool):
-        event.wait(stream)
-        event.reset(stream)
-        torch.npu.graph_task_group_begin(stream)
+        # torch.npu.graph may switch to its capture stream. Resolve the
+        # stream inside the context, exactly as the model attention path does.
+        capture_stream = torch.npu.current_stream()
+        event = torch.npu.ExternalEvent()
+        event.wait(capture_stream)
+        event.reset(capture_stream)
+        torch.npu.graph_task_group_begin(capture_stream)
         attention_op(
             flat_query,
             key_cache,
@@ -233,7 +235,7 @@ def run_graph_replay_check(
             workspace=workspace,
             out=[graph_output, graph_lse],
         )
-        task_handle = torch.npu.graph_task_group_end(stream)
+        task_handle = torch.npu.graph_task_group_end(capture_stream)
     torch.npu.synchronize()
     torch.testing.assert_close(
         graph_output.float().cpu(),
