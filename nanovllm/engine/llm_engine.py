@@ -490,10 +490,15 @@ class LLMEngine:
             + f"    e2e input TPS = {e2e_input_tps:.2f} tok/s, "
             f"e2e output TPS = {e2e_output_tps:.2f} tok/s\n"
             + (
-                "    PREFILL_STEP is one chunk latency; TPOT is the per-step "
-                "decode latency printed above."
+                "    PREFILL_STEP is one chunk latency; "
                 if self.config.prefill_chunk_size
-                else "    TTFT/TPOT are per-step request latencies printed above."
+                else "    TTFT is one prefill request latency; "
+            )
+            + (
+                "step_latency is one MTP request-step; TPOT is effective "
+                "emitted-token latency."
+                if self.config.num_speculative_tokens
+                else "TPOT is one decode request-step latency."
             )
         )
         if graph_stats.get("enabled"):

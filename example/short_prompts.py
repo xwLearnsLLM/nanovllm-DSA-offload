@@ -1,6 +1,12 @@
 """Deterministic GLM-5.1 W4A8 short-prompt smoke test."""
 
-from _example_utils import env_bool, env_int, make_llm, print_outputs
+from _example_utils import (
+    decode_step_limits,
+    env_bool,
+    env_int,
+    make_llm,
+    print_outputs,
+)
 from nanovllm import SamplingParams
 
 
@@ -17,7 +23,7 @@ def main() -> None:
         "NANOVLLM_MAX_MODEL_LEN",
         512 if enforce_eager else 2048,
     )
-    max_tokens = env_int("NANOVLLM_MAX_GEN_TOKENS", 8)
+    max_steps, max_tokens = decode_step_limits(8)
     llm = make_llm(
         max_model_len=max_model_len,
         max_num_prefill_seqs_per_step=1,
@@ -47,7 +53,8 @@ def main() -> None:
     print(
         "short-sequence smoke: "
         f"model_type={model_type}, batch={len(PROMPTS)}, "
-        f"prompt_max={longest}, max_tokens={max_tokens}, "
+        f"prompt_max={longest}, max_steps={max_steps}, "
+        f"max_completion_tokens={max_tokens}, "
         f"max_model_len={max_model_len}, "
         f"offload_mode={llm.config.offload_mode}, "
         f"mode={'eager' if enforce_eager else 'full_decode_only'}"
@@ -57,6 +64,7 @@ def main() -> None:
         SamplingParams(
             temperature=0.0,
             max_tokens=max_tokens,
+            max_steps=max_steps,
             ignore_eos=env_bool("NANOVLLM_IGNORE_EOS", False),
         ),
     )

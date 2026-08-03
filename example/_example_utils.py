@@ -31,6 +31,28 @@ def env_int(name: str, default: int) -> int:
         raise ValueError(f"{name} must be an integer, got {value!r}.") from exc
 
 
+def decode_step_limits(default_steps: int) -> tuple[int, int]:
+    """Return (decode steps, safe completion-token cap) for examples."""
+
+    if "NANOVLLM_MAX_GEN_TOKENS" in os.environ:
+        raise ValueError(
+            "NANOVLLM_MAX_GEN_TOKENS was replaced by "
+            "NANOVLLM_MAX_STEPS; unset the old variable."
+        )
+    max_steps = env_int("NANOVLLM_MAX_STEPS", default_steps)
+    if max_steps <= 0:
+        raise ValueError("NANOVLLM_MAX_STEPS must be positive.")
+    speculative_tokens = env_int("NANOVLLM_NUM_SPECULATIVE_TOKENS", 0)
+    if not 0 <= speculative_tokens <= 3:
+        raise ValueError(
+            "NANOVLLM_NUM_SPECULATIVE_TOKENS must be in [0, 3]."
+        )
+    # Final prefill emits one token. Each decode request-step can then emit at
+    # most K accepted drafts plus one target bonus/mismatch token.
+    max_tokens = 1 + max_steps * (speculative_tokens + 1)
+    return max_steps, max_tokens
+
+
 def model_path() -> str:
     return os.environ.get("NANOVLLM_MODEL", DEFAULT_MODEL_PATH)
 

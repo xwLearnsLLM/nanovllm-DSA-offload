@@ -9,7 +9,7 @@ from pathlib import Path
 from _example_utils import (
     GLM_ASSISTANT_TOKEN,
     GLM_USER_TOKEN,
-    env_int,
+    decode_step_limits,
     make_llm,
 )
 from nanovllm import SamplingParams
@@ -75,12 +75,16 @@ def build_prompt_token_ids(tokenizer, record: dict) -> list[int]:
 def main() -> None:
     args = parse_args()
     records = load_requests(args.prompt_count)
-    max_gen_tokens = env_int("NANOVLLM_MAX_GEN_TOKENS", 16)
+    max_steps, max_tokens = decode_step_limits(16)
 
     # The input IDs are built after LLM initialization, so use the dataset
     # length as a safe initial model-length bound. The script verifies the
     # final tokenizer lengths immediately afterward.
-    max_model_len = max(int(record["length"]) for record in records) + max_gen_tokens + 128
+    max_model_len = (
+        max(int(record["length"]) for record in records)
+        + max_tokens
+        + 128
+    )
     llm = make_llm(
         max_model_len=max_model_len,
         max_num_prefill_seqs_per_step=1,
@@ -89,7 +93,7 @@ def main() -> None:
     prompt_token_ids = [
         build_prompt_token_ids(llm.tokenizer, record) for record in records
     ]
-    actual_max_len = max(len(ids) for ids in prompt_token_ids) + max_gen_tokens
+    actual_max_len = max(len(ids) for ids in prompt_token_ids) + max_tokens
     if actual_max_len > llm.config.max_model_len:
         raise RuntimeError(
             "Tokenized DuReader prompt exceeds max_model_len: "
@@ -104,14 +108,16 @@ def main() -> None:
         f"prompt_token_range={min(map(len, prompt_token_ids))}-"
         f"{max(map(len, prompt_token_ids))}, "
         f"max_model_len={llm.config.max_model_len}, "
-        f"max_gen_tokens={max_gen_tokens}"
+        f"max_steps={max_steps}, "
+        f"max_completion_tokens={max_tokens}"
     )
 
     outputs = llm.generate(
         prompt_token_ids,
         SamplingParams(
             temperature=0.0,
-            max_tokens=max_gen_tokens,
+            max_tokens=max_tokens,
+            max_steps=max_steps,
             ignore_eos=True,
         ),
     )

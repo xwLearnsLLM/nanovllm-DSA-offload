@@ -9,6 +9,7 @@ from nanovllm.config import Config
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.sequence import (
     DecodeBatchDelta,
+    FinishReason,
     Sequence,
     SequenceStatus,
     SpeculativeStepOutput,
@@ -42,6 +43,7 @@ def _sequence(
     length=11,
     *,
     max_tokens=32,
+    max_steps=None,
     ignore_eos=True,
     block_size=8,
     request_id="mtp",
@@ -51,6 +53,7 @@ def _sequence(
         SamplingParams(
             temperature=0.0,
             max_tokens=max_tokens,
+            max_steps=max_steps,
             ignore_eos=ignore_eos,
         ),
         request_id=request_id,
@@ -67,6 +70,17 @@ def test_num_speculative_tokens_accepts_zero_through_three(value):
 def test_num_speculative_tokens_rejects_other_values(value):
     with pytest.raises((TypeError, ValueError)):
         Config._validate_num_speculative_tokens(value)
+
+
+@pytest.mark.parametrize("value", [None, 1, 2, 32])
+def test_sampling_params_accepts_optional_positive_max_steps(value):
+    assert SamplingParams(max_steps=value).max_steps == value
+
+
+@pytest.mark.parametrize("value", [0, -1, True, 1.0, "3"])
+def test_sampling_params_rejects_invalid_max_steps(value):
+    with pytest.raises(ValueError, match="max_steps"):
+        SamplingParams(max_steps=value)
 
 
 @pytest.mark.parametrize(
@@ -127,10 +141,13 @@ def test_final_mtp_prefill_requires_target_sample_and_intermediate_forbids_it():
 
 
 def test_drafts_survive_sequence_and_compact_decode_ipc_round_trip():
-    seq = _sequence()
+    seq = _sequence(max_steps=7)
     seq.draft_token_ids = [101, 102, 103]
+    seq.num_decode_steps = 2
     restored = pickle.loads(pickle.dumps(seq))
     assert restored.draft_token_ids == [101, 102, 103]
+    assert restored.max_steps == 7
+    assert restored.num_decode_steps == 2
 
     snapshot, key = build_decode_batch_packet([seq], None)
     cached, _ = apply_decode_batch_packet(snapshot, None)
@@ -157,6 +174,7 @@ def test_scheduler_reserves_verify_and_worst_case_mtp_recurrence_slots():
         SpeculativeStepOutput([[99]], [[1, 2, 3]], [0]),
         is_prefill=True,
     )
+    assert seq.num_decode_steps == 0
 
     # L=12, K=3: target verification + full-accept recurrence can touch
     # through position L+2K-2=16, hence 17 slots / three 8-token blocks.
@@ -190,6 +208,79 @@ def test_scheduler_commits_multiple_tokens_and_truncates_at_max_tokens():
     assert seq.draft_token_ids == []
     assert scheduler.last_speculative_stats["emitted_tokens"] == 3
     assert scheduler.last_speculative_stats["accepted_drafts"] == 3
+
+
+def test_mtp_max_steps_commits_the_complete_final_step():
+    scheduler = Scheduler(_scheduler_config())
+    seq = _sequence(max_tokens=16, max_steps=1)
+    scheduler._prepare_prefill_metadata(seq)
+    scheduler._allocate_prefill(seq)
+    seq.num_prefill_tokens_processed = len(seq)
+    seq.status = SequenceStatus.RUNNING
+    scheduler.running.append(seq)
+
+    scheduler.postprocess(
+        [seq],
+        SpeculativeStepOutput(
+            token_ids=[[10, 11, 12, 13]],
+            draft_token_ids=[[20, 21, 22]],
+            accepted_draft_counts=[3],
+        ),
+        is_prefill=False,
+    )
+
+    assert seq.completion_token_ids == [10, 11, 12, 13]
+    assert seq.num_decode_steps == 1
+    assert seq.is_finished
+    assert seq.finish_reason is FinishReason.LENGTH
+
+
+def test_mtp_max_steps_finishes_mixed_acceptance_batch_together():
+    scheduler = Scheduler(_scheduler_config())
+    seqs = [
+        _sequence(max_tokens=32, max_steps=2, request_id="short-accept"),
+        _sequence(max_tokens=32, max_steps=2, request_id="full-accept"),
+    ]
+    for seq in seqs:
+        scheduler._prepare_prefill_metadata(seq)
+        scheduler._allocate_prefill(seq)
+        seq.num_prefill_tokens_processed = len(seq)
+        seq.status = SequenceStatus.RUNNING
+        scheduler.running.append(seq)
+
+    for step in range(2):
+        scheduler.postprocess(
+            seqs,
+            SpeculativeStepOutput(
+                token_ids=[[10 + step], [20, 21, 22, 23]],
+                draft_token_ids=[[30, 31, 32], [40, 41, 42]],
+                accepted_draft_counts=[0, 3],
+            ),
+            is_prefill=False,
+        )
+        assert [seq.num_decode_steps for seq in seqs] == [step + 1] * 2
+        assert [seq.is_finished for seq in seqs] == [step == 1] * 2
+
+    assert [len(seq.completion_token_ids) for seq in seqs] == [2, 8]
+    assert not scheduler.running
+
+
+def test_non_mtp_decode_honors_max_steps_without_counting_prefill():
+    scheduler = Scheduler(_scheduler_config())
+    seq = _sequence(max_tokens=16, max_steps=2)
+    scheduler._prepare_prefill_metadata(seq)
+    scheduler._allocate_prefill(seq)
+    seq.status = SequenceStatus.RUNNING
+    scheduler.running.append(seq)
+
+    scheduler.postprocess([seq], [9], is_prefill=True)
+    assert seq.num_decode_steps == 0
+    scheduler.postprocess([seq], [10], is_prefill=False)
+    assert seq.num_decode_steps == 1
+    assert not seq.is_finished
+    scheduler.postprocess([seq], [11], is_prefill=False)
+    assert seq.num_decode_steps == 2
+    assert seq.is_finished
 
 
 def test_scheduler_stops_inside_an_accepted_prefix_at_eos():

@@ -452,7 +452,16 @@ class Scheduler:
         for seq, token_id in zip(seqs, token_ids):
             if is_prefill:
                 seq.num_prefill_tokens_processed = len(seq)
-            if self._append_sampled_token(seq, token_id):
+            else:
+                seq.num_decode_steps += 1
+            finished = self._append_sampled_token(seq, token_id)
+            if (
+                not finished
+                and not is_prefill
+                and self._finish_at_step_limit(seq)
+            ):
+                finished = True
+            if finished:
                 self.running.remove(seq)
 
     def _postprocess_chunked_prefill(
@@ -520,6 +529,8 @@ class Scheduler:
         ):
             if is_prefill:
                 seq.num_prefill_tokens_processed = len(seq)
+            else:
+                seq.num_decode_steps += 1
             if not accepted:
                 raise RuntimeError("MTP must commit at least one token.")
             finished = False
@@ -528,6 +539,12 @@ class Scheduler:
                 if self._append_sampled_token(seq, int(token_id)):
                     finished = True
                     break
+            if (
+                not finished
+                and not is_prefill
+                and self._finish_at_step_limit(seq)
+            ):
+                finished = True
             if not finished:
                 seq.draft_token_ids = [int(token_id) for token_id in drafts]
             else:
@@ -547,6 +564,15 @@ class Scheduler:
             "accepted_drafts": accepted_drafts,
             "proposed_drafts": proposed,
         }
+
+    def _finish_at_step_limit(self, seq: Sequence) -> bool:
+        if (
+            seq.max_steps is not None
+            and seq.num_decode_steps >= seq.max_steps
+        ):
+            self.free_seq(seq, FinishReason.LENGTH)
+            return True
+        return False
 
     def _append_sampled_token(self, seq: Sequence, token_id: int) -> bool:
         seq.append_token(token_id)

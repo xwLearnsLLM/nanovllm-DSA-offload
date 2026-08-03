@@ -17,7 +17,7 @@ class SequenceStatus(Enum):
 
 class FinishReason(Enum):
     EOS = auto()  # 模型生成了停止符
-    LENGTH = auto()  # 达到 max_tokens 或 max_model_len
+    LENGTH = auto()  # 达到 max_tokens、max_steps 或 max_model_len
     ABORTED = auto()  # 外部取消
     PREEMPTED = auto()  # 被调度器抢占（虽然通常会回到 WAITING，但在某些统计中也算结束）
 
@@ -69,6 +69,8 @@ class Sequence:
         self.decode_metadata_version = 0
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
+        self.max_steps = sampling_params.max_steps
+        self.num_decode_steps = 0
         self.ignore_eos = sampling_params.ignore_eos
         self.finish_reason = None
 
@@ -208,6 +210,8 @@ class Sequence:
             "status": self.status,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
+            "max_steps": self.max_steps,
+            "num_decode_steps": self.num_decode_steps,
             "ignore_eos": self.ignore_eos,
             "block_size": self.block_size,
             "finish_reason": self.finish_reason,
@@ -250,6 +254,8 @@ class Sequence:
         self.status = state["status"]
         self.temperature = state["temperature"]
         self.max_tokens = state["max_tokens"]
+        self.max_steps = state.get("max_steps")
+        self.num_decode_steps = state.get("num_decode_steps", 0)
         self.ignore_eos = state["ignore_eos"]
         self.block_size = state["block_size"]
         self.finish_reason = state["finish_reason"]

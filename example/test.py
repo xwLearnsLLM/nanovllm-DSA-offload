@@ -3,6 +3,7 @@ import os
 from _example_utils import (
     GLM_ASSISTANT_TOKEN,
     GLM_USER_TOKEN,
+    decode_step_limits,
     env_int,
     make_llm,
     print_outputs,
@@ -176,13 +177,14 @@ def print_prompt_plan(
 def main() -> None:
     prompt_lengths = parse_prompt_lengths()
     max_prompt_len = max(prompt_lengths)
-    max_gen_tokens = env_int("NANOVLLM_MAX_GEN_TOKENS", 16)
-    minimum_model_len = max_prompt_len + max_gen_tokens
+    max_steps, max_tokens = decode_step_limits(16)
+    minimum_model_len = max_prompt_len + max_tokens
     max_model_len = env_int("NANOVLLM_MAX_MODEL_LEN", minimum_model_len)
     if max_model_len < minimum_model_len:
         raise ValueError(
             "NANOVLLM_MAX_MODEL_LEN must be at least prompt_max + "
-            f"max_gen_tokens ({minimum_model_len}), got {max_model_len}."
+            f"max completion tokens ({minimum_model_len}), got "
+            f"{max_model_len}."
         )
     max_num_prefill_seqs_per_step = 1
     max_num_decode_seqs_per_step = len(prompt_lengths)
@@ -217,7 +219,8 @@ def main() -> None:
         f"num_speculative_tokens={llm.config.num_speculative_tokens}, "
         f"max_num_decode_seqs_per_step={max_num_decode_seqs_per_step}, "
         f"offload_mode={llm.config.offload_mode}, "
-        f"max_gen_tokens={max_gen_tokens}, "
+        f"max_steps={max_steps}, "
+        f"max_completion_tokens={max_tokens}, "
         f"meaningful_base_tokens={len(base_ids)}"
     )
     print_prompt_plan(
@@ -232,7 +235,8 @@ def main() -> None:
         prompt_token_ids,
         SamplingParams(
             temperature=0.0,
-            max_tokens=max_gen_tokens,
+            max_tokens=max_tokens,
+            max_steps=max_steps,
             ignore_eos=True,
         ),
     )

@@ -32,9 +32,15 @@ PYTHONPATH=$PWD:$PYTHONPATH PYTHONUNBUFFERED=1 NANOVLLM_CANN_BUILD_JOBS=64 SOC_V
 
 ## 推理
 
+示例统一使用 `NANOVLLM_MAX_STEPS` 限制 decode request-step 数；prefill
+产生的首 token 不计入。MTP 每轮无论提交 1～4 个 token 都只计一步，最后
+一轮会完整提交后再结束。
+
 下面是 TP16、LIDU、融合算子、24 个约 20K prompt、`FULL_DECODE_ONLY` 的完整配置：
 
 ```bash
+unset NANOVLLM_MAX_GEN_TOKENS
+
 export ASCEND_HOME_PATH=/usr/local/Ascend/cann-8.5.1
 export PYTHONUNBUFFERED=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
@@ -50,7 +56,7 @@ export NANOVLLM_HBM_NUM_BLOCKS=1190
 export NANOVLLM_DRAM_NUM_BLOCKS=3800
 export NANOVLLM_PREFILL_CHUNK_SIZE=1024
 export NANOVLLM_IGNORE_EOS=1
-export NANOVLLM_MAX_GEN_TOKENS=20
+export NANOVLLM_MAX_STEPS=20
 
 PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_PROMPT_LENGTHS=20000,20001,20002,20003,20004,20005,20006,20007,20008,20009,20010,20011,20012,20013,20014,20015,20016,20017,20018,20019,20020,20021,20022,20023 python3 example/test.py
 ```
@@ -74,6 +80,7 @@ unset NANOVLLM_LIDU_MISS_COUNT_ON_LAYERS
 unset NANOVLLM_PROFILE_DECODE_OUTPUT
 unset NANOVLLM_CUST_OPAPI_LIB
 unset ASCEND_CUSTOM_OPP_PATH
+unset NANOVLLM_MAX_GEN_TOKENS
 
 export ASCEND_HOME_PATH=/usr/local/Ascend/cann-8.5.1
 export PYTHONUNBUFFERED=1
@@ -95,7 +102,7 @@ python3 ut_ops/test_glm_mtp_target_verify.py \
   --min-cosine 0.999
 ```
 
-下面使用 8 条 DuReader 请求验收 K=3 的完整图模式。稳定 batch=8 时应看到一次 paired capture，随后 `mtp_target_replays` 和 `mtp_draft_replays` 均大于 0；请求结束导致 batch 缩小时走 eager 属于预期行为。
+下面使用 8 条 DuReader 请求验收 K=3 的完整图模式。`NANOVLLM_MAX_STEPS=32` 表示每个请求执行 32 轮 decode；在 `ignore_eos=1` 下，8 个请求会在同一轮结束，即使命中率不同、最终输出 token 数不同。应看到一次 paired capture，随后 `mtp_target_replays` 和 `mtp_draft_replays` 均大于 0，且末尾不再因 token 上限不同出现 batch=7/6/... 的 eager 尾巴。
 
 ```bash
 unset NANOVLLM_LIDU_MISS_COUNT_ON_LAYERS
@@ -103,6 +110,7 @@ unset NANOVLLM_PROFILE_DECODE_OUTPUT
 unset NANOVLLM_DRAM_NUM_BLOCKS
 unset NANOVLLM_CUST_OPAPI_LIB
 unset ASCEND_CUSTOM_OPP_PATH
+unset NANOVLLM_MAX_GEN_TOKENS
 
 export ASCEND_HOME_PATH=/usr/local/Ascend/cann-8.5.1
 export PYTHONUNBUFFERED=1
@@ -118,7 +126,7 @@ export NANOVLLM_OFFLOAD_MODE=none
 export NANOVLLM_ENFORCE_EAGER=0
 export NANOVLLM_KVCACHE_BLOCK_SIZE=128
 export NANOVLLM_HBM_NUM_BLOCKS=1200
-export NANOVLLM_MAX_GEN_TOKENS=32
+export NANOVLLM_MAX_STEPS=32
 export NANOVLLM_PREFILL_CHUNK_SIZE=1024
 export NANOVLLM_NUM_SPECULATIVE_TOKENS=3
 export NANOVLLM_IGNORE_EOS=1
@@ -131,6 +139,8 @@ python3 example/test_dureader.py --prompt_count 8
 ## 推理 longbench/dureader
 
 ```bash
+unset NANOVLLM_MAX_GEN_TOKENS
+
 export ASCEND_HOME_PATH=/usr/local/Ascend/cann-8.5.1
 export PYTHONUNBUFFERED=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
@@ -146,7 +156,7 @@ export NANOVLLM_HBM_NUM_BLOCKS=500
 export NANOVLLM_DRAM_NUM_BLOCKS=1000
 export NANOVLLM_PREFILL_CHUNK_SIZE=1024
 export NANOVLLM_IGNORE_EOS=1
-export NANOVLLM_MAX_GEN_TOKENS=50
+export NANOVLLM_MAX_STEPS=50
 
 PYTHONPATH=$PWD:$PYTHONPATH python3 example/test_dureader.py --prompt_count 2
 ```
