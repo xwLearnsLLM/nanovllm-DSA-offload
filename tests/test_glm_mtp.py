@@ -306,7 +306,13 @@ def test_glm_mtp_runtime_accepts_nonoffload_eager(tmp_path):
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
-        ({"offload_mode": "gs", "num_dram_kvcache_blocks": 64}, "offload_mode='none'"),
+        (
+            {
+                "offload_mode": "offload_split",
+                "num_dram_kvcache_blocks": 64,
+            },
+            "offload_mode='none'",
+        ),
         ({"enforce_eager": False}, "eager-only"),
     ],
 )

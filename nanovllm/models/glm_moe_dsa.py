@@ -521,6 +521,7 @@ class GlmFloatSparseMoeBlock(nn.Module):
             return
         dtype = first_weight.dtype
         device = first_weight.device
+        del first_weight
 
         cpu_w13_parts = [
             expert.gate_up_proj.weight.detach().cpu()
