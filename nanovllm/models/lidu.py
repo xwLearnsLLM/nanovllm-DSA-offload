@@ -4,6 +4,8 @@ import torch
 
 
 LIDU_TOPK = 2048
+LIDU_MTP_QUERY_COUNT = 4
+LIDU_MTP_UNION_CAPACITY = LIDU_TOPK * LIDU_MTP_QUERY_COUNT
 _INIT_SCORE_CHUNK_TOKENS = 16 * 1024
 
 
@@ -63,6 +65,80 @@ def lidu_decode_update_out(
         block_table,
         source_ids,
         destination_slots,
+        miss_counts,
+    )
+
+
+def lidu_decode_update_mtp(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    weights: torch.Tensor,
+    req_pool_entries: torch.Tensor,
+    cache_slots_pool: torch.Tensor,
+    cache_tokens: torch.Tensor,
+    candidate_lens: torch.Tensor,
+    block_table: torch.Tensor,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Run the fixed-width GLM MTP3 LIDU update.
+
+    Four consecutive query rows belong to one request. ``topk_slots`` is
+    shaped ``[4 * B, 1, 2048]``. Only the first ``miss_counts[b]`` entries of
+    each request-level miss row are valid. The final tensor aliases the
+    mutable request-state pool for graph dependency tracking.
+    """
+
+    return torch.ops.nanovllm_dsa.lidu_decode_update_mtp.default(
+        query,
+        key,
+        weights,
+        req_pool_entries,
+        cache_slots_pool,
+        cache_tokens,
+        candidate_lens,
+        block_table,
+    )
+
+
+def lidu_decode_update_mtp_out(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    weights: torch.Tensor,
+    req_pool_entries: torch.Tensor,
+    cache_slots_pool: torch.Tensor,
+    cache_tokens: torch.Tensor,
+    candidate_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    topk_slots: torch.Tensor,
+    miss_source_ids: torch.Tensor,
+    miss_destination_slots: torch.Tensor,
+    miss_counts: torch.Tensor,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Run MTP-LIDU into graph-stable caller-owned output buffers."""
+
+    return torch.ops.nanovllm_dsa.lidu_decode_update_mtp_out.default(
+        query,
+        key,
+        weights,
+        req_pool_entries,
+        cache_slots_pool,
+        cache_tokens,
+        candidate_lens,
+        block_table,
+        topk_slots,
+        miss_source_ids,
+        miss_destination_slots,
         miss_counts,
     )
 

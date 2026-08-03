@@ -293,6 +293,8 @@ __aicore__ inline void LIPreload<LIT>::ProcessMain()
             LICommon::RunInfo runInfo{};
             runInfo.loop = loop++;
             runInfo.bIdx = bIdx;
+            runInfo.queryRow = bIdx;
+            runInfo.queryIdx = 0;
             runInfo.s2Idx = chunkIdx;
             runInfo.segmentChunkIdx = chunkIdx;
             runInfo.actS2Size = processSeqLen;
@@ -346,6 +348,8 @@ __aicore__ inline void LIPreload<LIT>::ProcessRequestSegment(
         LICommon::RunInfo runInfo{};
         runInfo.loop = loop++;
         runInfo.bIdx = bIdx;
+        runInfo.queryRow = bIdx;
+        runInfo.queryIdx = 0;
         runInfo.cacheRowIdx = cacheRowIdx;
         runInfo.s2Idx = chunkIdx;
         runInfo.segmentChunkIdx = chunkIdx - chunkStart;

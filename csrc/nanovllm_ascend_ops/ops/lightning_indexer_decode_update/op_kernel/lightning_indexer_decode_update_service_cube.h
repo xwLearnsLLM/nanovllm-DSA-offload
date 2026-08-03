@@ -223,7 +223,7 @@ __aicore__ inline void LIMatmul<LIT>::QueryNd2Nz(const LICommon::RunInfo &runInf
     nd2nzPara.dstNzNStride = 1;
     nd2nzPara.srcNdMatrixStride = 0;
     nd2nzPara.dstNzMatrixStride = 0;
-    DataCopy(queryL1_, queryGm_[static_cast<uint64_t>(runInfo.bIdx) * constInfo_.qHeadNum * constInfo_.headDim],
+    DataCopy(queryL1_, queryGm_[static_cast<uint64_t>(runInfo.queryRow) * constInfo_.qHeadNum * constInfo_.headDim],
              nd2nzPara);
 }
 

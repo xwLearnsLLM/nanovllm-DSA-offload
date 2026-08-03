@@ -28,7 +28,46 @@ export ASCEND_HOME_PATH=/usr/local/Ascend/cann-8.5.1
 PYTHONPATH=$PWD:$PYTHONPATH PYTHONUNBUFFERED=1 NANOVLLM_CANN_BUILD_JOBS=64 SOC_VERSION=ascend910_9391 bash scripts/build_nanovllm_ops.sh
 ```
 
-　
+
+
+## MTP-LIDU 算子验收
+
+仓库内置 `NanovllmLiduDecodeUpdateMtp`，固定处理 GLM MTP3 的每请求 4 个 query。四路 top-2048 先求有序并集，再做一次 request-pool 命中、淘汰和状态更新。活跃请求要求 `C >= min(candidate_len, 8192)`。当前阶段只提供算子及 UT，尚未接入 SCATTER、MTP sparse attention 或整网推理。
+
+修改或首次拉取该算子后先执行上面的完整编译，再运行：
+
+```bash
+unset NANOVLLM_ENABLE_DSA_OFFLOAD
+unset NANOVLLM_OFFLOAD_MODE
+unset NANOVLLM_GS_MISS_RATE_ON_LAYERS
+unset NANOVLLM_LIDU_MISS_COUNT_ON_LAYERS
+unset NANOVLLM_PROFILE_DECODE_OUTPUT
+unset NANOVLLM_CUST_OPAPI_LIB
+unset ASCEND_CUSTOM_OPP_PATH
+unset NANOVLLM_DSA_BOUNDARY_PROBE
+
+export ASCEND_HOME_PATH=/usr/local/Ascend/cann-8.5.1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH=$PWD:$PYTHONPATH
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export ASCEND_LAUNCH_BLOCKING=0
+export ASCEND_RT_VISIBLE_DEVICES=4
+
+python3 ut_ops/test_lidu_mtp.py \
+  --device npu:0 \
+  --batch-size 24 \
+  --source-len 20992 \
+  --cache-tokens 8192 \
+  --graph-replays 3 \
+  --warmup 10 \
+  --iters 100 \
+  --min-speedup 1.0 \
+  --seed 7
+```
+
+成功标志为最后输出 `MTP_LIDU_UT_OK`。UT 覆盖 BF16/FP16、混合缓存档位、乱序 request-pool、重复更新、普通接口与 `_out`、动态 metadata 图回放，以及 B=24 下与四次串行单-query LIDU 的时延对比。
+
+
 
 ## 推理
 

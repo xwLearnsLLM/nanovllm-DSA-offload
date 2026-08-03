@@ -60,6 +60,7 @@ extern void mla_preprocess_impl(
 
 #include "ops/batch_matmul_transpose/batch_matmul_transpose_torch_adpt.h"
 #include "ops/lightning_indexer_decode_update/lightning_indexer_decode_update_torch_adpt.h"
+#include "ops/lightning_indexer_decode_update_mtp/lightning_indexer_decode_update_mtp_torch_adpt.h"
 #include "ops/kvcache_scatter_copy/kvcache_scatter_copy_torch_adpt.h"
 #include "ops/sparse_and_tail_attention/sparse_and_tail_attention_torch_adpt.h"
 #include "ops/sparse_and_tail_attention_and_scatter_copy/sparse_and_tail_attention_and_scatter_copy_torch_adpt.h"
@@ -173,6 +174,98 @@ lidu_decode_update_out_meta(
   (void)block_table;
   return std::make_tuple(
       source_ids, destination_slots, miss_counts, cache_slots);
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+lidu_decode_update_mtp_torch_op(
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& weights,
+    const at::Tensor& req_pool_entries,
+    at::Tensor cache_slots,
+    const at::Tensor& cache_tokens,
+    const at::Tensor& candidate_lens,
+    const at::Tensor& block_table) {
+  auto outputs = vllm_ascend::npu_lightning_indexer_decode_update_mtp(
+      query, key, weights, req_pool_entries, cache_slots, cache_tokens,
+      candidate_lens, block_table);
+  return std::make_tuple(
+      std::get<0>(outputs), std::get<1>(outputs), std::get<2>(outputs),
+      std::get<3>(outputs), cache_slots);
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+lidu_decode_update_mtp_meta(
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& weights,
+    const at::Tensor& req_pool_entries,
+    at::Tensor cache_slots,
+    const at::Tensor& cache_tokens,
+    const at::Tensor& candidate_lens,
+    const at::Tensor& block_table) {
+  (void)key;
+  (void)weights;
+  (void)cache_tokens;
+  (void)candidate_lens;
+  (void)block_table;
+  auto options = query.options().dtype(at::kInt);
+  auto topk_slots = at::empty({query.size(0), 1, 2048}, options);
+  auto miss_source_ids = at::empty({req_pool_entries.size(0), 8192}, options);
+  auto miss_destination_slots = at::empty_like(miss_source_ids);
+  auto miss_counts = at::empty({req_pool_entries.size(0)}, options);
+  return std::make_tuple(
+      topk_slots, miss_source_ids, miss_destination_slots, miss_counts,
+      cache_slots);
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+lidu_decode_update_mtp_out_torch_op(
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& weights,
+    const at::Tensor& req_pool_entries,
+    at::Tensor cache_slots,
+    const at::Tensor& cache_tokens,
+    const at::Tensor& candidate_lens,
+    const at::Tensor& block_table,
+    at::Tensor topk_slots,
+    at::Tensor miss_source_ids,
+    at::Tensor miss_destination_slots,
+    at::Tensor miss_counts) {
+  vllm_ascend::npu_lightning_indexer_decode_update_mtp_out(
+      query, key, weights, req_pool_entries, cache_slots, cache_tokens,
+      candidate_lens, block_table, topk_slots, miss_source_ids,
+      miss_destination_slots, miss_counts);
+  return std::make_tuple(
+      topk_slots, miss_source_ids, miss_destination_slots, miss_counts,
+      cache_slots);
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+lidu_decode_update_mtp_out_meta(
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& weights,
+    const at::Tensor& req_pool_entries,
+    at::Tensor cache_slots,
+    const at::Tensor& cache_tokens,
+    const at::Tensor& candidate_lens,
+    const at::Tensor& block_table,
+    at::Tensor topk_slots,
+    at::Tensor miss_source_ids,
+    at::Tensor miss_destination_slots,
+    at::Tensor miss_counts) {
+  (void)query;
+  (void)key;
+  (void)weights;
+  (void)req_pool_entries;
+  (void)cache_tokens;
+  (void)candidate_lens;
+  (void)block_table;
+  return std::make_tuple(
+      topk_slots, miss_source_ids, miss_destination_slots, miss_counts,
+      cache_slots);
 }
 
 std::tuple<at::Tensor, at::Tensor> scatter_copy_torch_op(
@@ -471,6 +564,18 @@ TORCH_LIBRARY(nanovllm_dsa, ops) {
       " Tensor(d!) miss_counts)"
       " -> (Tensor(b!), Tensor(c!), Tensor(d!), Tensor(a!))");
   ops.def(
+      "lidu_decode_update_mtp(Tensor query, Tensor key, Tensor weights,"
+      " Tensor req_pool_entries, Tensor(a!) cache_slots,"
+      " Tensor cache_tokens, Tensor candidate_lens, Tensor block_table)"
+      " -> (Tensor, Tensor, Tensor, Tensor, Tensor(a!))");
+  ops.def(
+      "lidu_decode_update_mtp_out(Tensor query, Tensor key, Tensor weights,"
+      " Tensor req_pool_entries, Tensor(a!) cache_slots,"
+      " Tensor cache_tokens, Tensor candidate_lens, Tensor block_table,"
+      " Tensor(b!) topk_slots, Tensor(c!) miss_source_ids,"
+      " Tensor(d!) miss_destination_slots, Tensor(e!) miss_counts)"
+      " -> (Tensor(b!), Tensor(c!), Tensor(d!), Tensor(e!), Tensor(a!))");
+  ops.def(
       "scatter_copy(Tensor(a!) hbm_k_rope, Tensor(b!) hbm_kv_cache,"
       " Tensor dram_k_rope, Tensor dram_kv_cache, Tensor hbm_block_table,"
       " Tensor dram_block_table, Tensor source_token_ids,"
@@ -496,6 +601,8 @@ TORCH_LIBRARY(nanovllm_dsa, ops) {
 TORCH_LIBRARY_IMPL(nanovllm_dsa, PrivateUse1, ops) {
   ops.impl("lidu_decode_update", &lidu_decode_update_torch_op);
   ops.impl("lidu_decode_update_out", &lidu_decode_update_out_torch_op);
+  ops.impl("lidu_decode_update_mtp", &lidu_decode_update_mtp_torch_op);
+  ops.impl("lidu_decode_update_mtp_out", &lidu_decode_update_mtp_out_torch_op);
   ops.impl("scatter_copy", &scatter_copy_torch_op);
   ops.impl("sparse_and_tail_attention", &sparse_and_tail_attention_torch_op);
   ops.impl(
@@ -506,6 +613,8 @@ TORCH_LIBRARY_IMPL(nanovllm_dsa, PrivateUse1, ops) {
 TORCH_LIBRARY_IMPL(nanovllm_dsa, Meta, ops) {
   ops.impl("lidu_decode_update", &lidu_decode_update_meta);
   ops.impl("lidu_decode_update_out", &lidu_decode_update_out_meta);
+  ops.impl("lidu_decode_update_mtp", &lidu_decode_update_mtp_meta);
+  ops.impl("lidu_decode_update_mtp_out", &lidu_decode_update_mtp_out_meta);
   ops.impl("scatter_copy", &scatter_copy_meta);
   ops.impl("sparse_and_tail_attention", &sparse_and_tail_attention_meta);
   ops.impl(
