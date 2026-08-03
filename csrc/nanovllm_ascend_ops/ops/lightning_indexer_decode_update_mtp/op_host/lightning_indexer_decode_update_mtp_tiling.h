@@ -11,6 +11,7 @@
 #include "register/op_def_registry.h"
 #include "register/tilingdata_base.h"
 #include "tiling/platform/platform_ascendc.h"
+#include "tiling/tiling_api.h"
 
 namespace optiling {
 

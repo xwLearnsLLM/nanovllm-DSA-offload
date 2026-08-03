@@ -104,19 +104,19 @@ ge::graphStatus LIUMtpTiling::CheckDtypes(const LIUMtpTilingInfo &info) const
 ge::graphStatus LIUMtpTiling::CheckShapes(LIUMtpTilingInfo &info) const
 {
     const auto &t = info.tensors;
-    const auto &q = *t.query.shape;
-    const auto &k = *t.key.shape;
-    const auto &w = *t.weights.shape;
-    const auto &req = *t.reqPoolEntries.shape;
-    const auto &cache = *t.cacheSlots.shape;
-    const auto &cacheTokens = *t.cacheTokens.shape;
-    const auto &lens = *t.candidateLens.shape;
-    const auto &blocks = *t.blockTable.shape;
-    const auto &topkSlots = *t.topkSlots.shape;
-    const auto &missSource = *t.missSource.shape;
-    const auto &missSlots = *t.missSlots.shape;
-    const auto &missCounts = *t.missCounts.shape;
-    const auto &cacheOut = *t.cacheSlotsOut.shape;
+    const auto &q = t.query.shape->GetStorageShape();
+    const auto &k = t.key.shape->GetStorageShape();
+    const auto &w = t.weights.shape->GetStorageShape();
+    const auto &req = t.reqPoolEntries.shape->GetStorageShape();
+    const auto &cache = t.cacheSlots.shape->GetStorageShape();
+    const auto &cacheTokens = t.cacheTokens.shape->GetStorageShape();
+    const auto &lens = t.candidateLens.shape->GetStorageShape();
+    const auto &blocks = t.blockTable.shape->GetStorageShape();
+    const auto &topkSlots = t.topkSlots.shape->GetStorageShape();
+    const auto &missSource = t.missSource.shape->GetStorageShape();
+    const auto &missSlots = t.missSlots.shape->GetStorageShape();
+    const auto &missCounts = t.missCounts.shape->GetStorageShape();
+    const auto &cacheOut = t.cacheSlotsOut.shape->GetStorageShape();
 
     OPS_ERR_IF(q.GetDimNum() != 3 || k.GetDimNum() != 4 ||
                    w.GetDimNum() != 2 || req.GetDimNum() != 1 ||
