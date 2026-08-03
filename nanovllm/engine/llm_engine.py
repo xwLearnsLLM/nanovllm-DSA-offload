@@ -406,6 +406,7 @@ class LLMEngine:
                         f"HBM_INDEX={index_used}/{index_total}, "
                     )
                 spec_text = ""
+                step_latency_text = ""
                 latency_value = step_elapsed
                 if not is_prefill and self._last_speculative_stats is not None:
                     emitted = self._last_speculative_stats["emitted_tokens"]
@@ -413,17 +414,15 @@ class LLMEngine:
                     latency_value = step_elapsed / max(mean_emitted, 1e-9)
                     proposed = self._last_speculative_stats["proposed_drafts"]
                     accepted = self._last_speculative_stats["accepted_drafts"]
-                    acceptance = accepted / proposed if proposed else 0.0
-                    spec_text = (
-                        f", step_latency={step_elapsed:.4f} sec, "
-                        f"mean_emitted={mean_emitted:.3f}, "
-                        f"accepted_drafts={accepted}/{proposed}, "
-                        f"acceptance={acceptance:.3f}"
+                    step_latency_text = (
+                        f"step_latency={step_elapsed:.4f} sec, "
                     )
+                    spec_text = f", accepted_drafts={accepted}/{proposed}"
                 print(
                     f"[step{i_step:4d} {'Prefill' if is_prefill else ' Decode'}] "
                     f"bsz={batch_size}, num_tokens={step_tokens}{progress_text}, "
                     f"{cache_text}"
+                    f"{step_latency_text}"
                     f"{latency_name}={latency_value:.4f} sec, "
                     f"TPS={step_tps:.2f} tok/s{spec_text}"
                 )
