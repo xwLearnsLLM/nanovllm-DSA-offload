@@ -524,11 +524,11 @@ class GlmFloatSparseMoeBlock(nn.Module):
         del first_weight
 
         cpu_w13_parts = [
-            expert.gate_up_proj.weight.detach().cpu()
+            expert.gate_up_proj.weight.detach().cpu().transpose(0, 1).contiguous()
             for expert in self.local_expert_layers
         ]
         cpu_w2_parts = [
-            expert.down_proj.weight.detach().cpu()
+            expert.down_proj.weight.detach().cpu().transpose(0, 1).contiguous()
             for expert in self.local_expert_layers
         ]
         for expert in self.local_expert_layers:
@@ -560,8 +560,12 @@ class GlmFloatSparseMoeBlock(nn.Module):
         for local_idx, (w13_part, w2_part) in enumerate(
             zip(cpu_w13_parts, cpu_w2_parts)
         ):
-            w13[local_idx].copy_(w13_part.transpose(0, 1))
-            w2[local_idx].copy_(w2_part.transpose(0, 1))
+            # A non-contiguous host transpose is handled by an asynchronous
+            # AICPU copy on Ascend.  Keep the contiguous host sources alive and
+            # finish all transfers before releasing their lists.
+            w13[local_idx].copy_(w13_part)
+            w2[local_idx].copy_(w2_part)
+        torch.npu.synchronize()
         self.grouped_w13_weight = nn.Parameter(w13, requires_grad=False)
         self.grouped_w2_weight = nn.Parameter(w2, requires_grad=False)
         del cpu_w13_parts, cpu_w2_parts
