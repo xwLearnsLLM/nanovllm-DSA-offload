@@ -61,12 +61,12 @@ def _sequence(
     )
 
 
-@pytest.mark.parametrize("value", [0, 1, 2, 3])
-def test_num_speculative_tokens_accepts_zero_through_three(value):
+@pytest.mark.parametrize("value", [0, 3])
+def test_num_speculative_tokens_accepts_disabled_or_mtp3(value):
     Config._validate_num_speculative_tokens(value)
 
 
-@pytest.mark.parametrize("value", [-1, 4, True, 1.0, "3"])
+@pytest.mark.parametrize("value", [1, 2, -1, 4, True, 1.0, "3"])
 def test_num_speculative_tokens_rejects_other_values(value):
     with pytest.raises((TypeError, ValueError)):
         Config._validate_num_speculative_tokens(value)
@@ -414,12 +414,13 @@ def test_glm_mtp_runtime_rejects_offload(tmp_path, overrides, message):
 
 
 @pytest.mark.parametrize("k", [1, 2])
-def test_glm_mtp_graph_requires_k3(tmp_path, k):
+@pytest.mark.parametrize("enforce_eager", [True, False])
+def test_glm_mtp_rejects_k1_and_k2(tmp_path, k, enforce_eager):
     _write_mtp_config(tmp_path)
-    with pytest.raises(ValueError, match="requires num_speculative_tokens=3"):
+    with pytest.raises(ValueError, match="either 0 or 3"):
         _mtp_config(
             tmp_path,
-            enforce_eager=False,
+            enforce_eager=enforce_eager,
             num_speculative_tokens=k,
         )
 

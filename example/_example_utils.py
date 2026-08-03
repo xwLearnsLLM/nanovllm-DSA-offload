@@ -43,9 +43,9 @@ def decode_step_limits(default_steps: int) -> tuple[int, int]:
     if max_steps <= 0:
         raise ValueError("NANOVLLM_MAX_STEPS must be positive.")
     speculative_tokens = env_int("NANOVLLM_NUM_SPECULATIVE_TOKENS", 0)
-    if not 0 <= speculative_tokens <= 3:
+    if speculative_tokens not in (0, 3):
         raise ValueError(
-            "NANOVLLM_NUM_SPECULATIVE_TOKENS must be in [0, 3]."
+            "NANOVLLM_NUM_SPECULATIVE_TOKENS must be either 0 or 3."
         )
     # Final prefill emits one token. Each decode request-step can then emit at
     # most K accepted drafts plus one target bonus/mismatch token.

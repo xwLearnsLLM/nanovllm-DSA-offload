@@ -71,9 +71,9 @@ NANOVLLM_PROFILE_DECODE_OUTPUT=$PWD/profile python3 example/test.py
 
 ## 非卸载 MTP 验收
 
-MTP 只支持 `GLM-5.1-w4a8`、`offload_mode=none` 和 greedy。`NANOVLLM_NUM_SPECULATIVE_TOKENS=1..3` 均支持 eager；`K=3` 还支持 `FULL_DECODE_ONLY`。图模式只捕获 exact batch：该 batch 的第一次 MTP decode 保持 eager，随后懒 capture target verification 图和三步 draft 图；batch 缩小时自动回到 eager。
+MTP 只支持 `GLM-5.1-w4a8`、`offload_mode=none` 和 greedy。`NANOVLLM_NUM_SPECULATIVE_TOKENS` 仅接受 `0`（关闭）或 `3`（MTP3）；MTP3 同时支持 eager 和 `FULL_DECODE_ONLY`。图模式只捕获 exact batch：该 batch 的第一次 MTP decode 保持 eager，随后懒 capture target verification 图和三步 draft 图；batch 缩小时自动回到 eager。
 
-K>0 时加载第 78 层 BF16 MTP 权重和模型根目录的 `rot.safetensors`。本功能只修改 Python，无需重新编译 Ascend 自定义算子。先验证 qlen=4 的 target attention 能 capture、动态刷新 KV 长度并 replay：
+MTP3 加载第 78 层 BF16 MTP 权重和模型根目录的 `rot.safetensors`。本功能只修改 Python，无需重新编译 Ascend 自定义算子。先验证 qlen=4 的 target attention 能 capture、动态刷新 KV 长度并 replay：
 
 ```bash
 unset NANOVLLM_LIDU_MISS_COUNT_ON_LAYERS

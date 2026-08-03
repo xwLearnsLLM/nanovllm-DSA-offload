@@ -141,9 +141,9 @@ class Config:
     def _validate_num_speculative_tokens(value: int) -> None:
         if type(value) is not int:
             raise TypeError("num_speculative_tokens must be an int.")
-        if not 0 <= value <= 3:
+        if value not in (0, 3):
             raise ValueError(
-                "num_speculative_tokens must be between 0 and 3."
+                "num_speculative_tokens must be either 0 or 3."
             )
 
     def _validate_mtp_runtime(self) -> None:
@@ -159,11 +159,6 @@ class Config:
         if self.offload_mode != OFFLOAD_NONE:
             raise ValueError(
                 "GLM MTP currently requires offload_mode='none'."
-            )
-        if not self.enforce_eager and k != 3:
-            raise ValueError(
-                "GLM MTP FULL_DECODE_ONLY currently requires "
-                "num_speculative_tokens=3. K=1/2 remain eager-only."
             )
         if int(getattr(self.hf_config, "num_nextn_predict_layers", 0)) != 1:
             raise ValueError(
