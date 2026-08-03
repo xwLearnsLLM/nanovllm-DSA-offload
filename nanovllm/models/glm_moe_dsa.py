@@ -591,6 +591,17 @@ class GlmFloatSparseMoeBlock(nn.Module):
             eps=1e-20,
             bias_opt=getattr(self.gate, "e_score_correction_bias", None),
         )
+        balanced_ids = get_context().scratch.get(
+            GLM_BALANCED_MOE_EXPERT_IDS_KEY
+        )
+        if balanced_ids is not None:
+            if balanced_ids.shape != topk_ids.shape:
+                raise RuntimeError(
+                    "GLM MTP balanced MoE warmup route shape changed: "
+                    f"expected={tuple(topk_ids.shape)}, "
+                    f"actual={tuple(balanced_ids.shape)}."
+                )
+            topk_ids = balanced_ids
         return topk_weights.to(output_dtype), topk_ids
 
     def _grouped_experts_forward(

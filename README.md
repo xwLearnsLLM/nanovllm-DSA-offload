@@ -63,16 +63,46 @@ NANOVLLM_PROFILE_DECODE_OUTPUT=$PWD/profile python3 example/test.py
 
 　
 
-## 非卸载 eager MTP 验收
+## 非卸载 MTP 验收
 
-MTP 只支持 `GLM-5.1-w4a8`、`offload_mode=none`、eager、greedy，`NANOVLLM_NUM_SPECULATIVE_TOKENS` 可设为 `0..3`。K>0 时加载第 78 层 BF16 MTP 权重和模型根目录的 `rot.safetensors`；不需要重新编译算子。
+MTP 只支持 `GLM-5.1-w4a8`、`offload_mode=none` 和 greedy。`NANOVLLM_NUM_SPECULATIVE_TOKENS=1..3` 均支持 eager；`K=3` 还支持 `FULL_DECODE_ONLY`。图模式只捕获 exact batch：该 batch 的第一次 MTP decode 保持 eager，随后懒 capture target verification 图和三步 draft 图；batch 缩小时自动回到 eager。
 
-下面依次验证 K=0/3、chunk=0/1024。四次最终 `token_ids` 必须完全一致且均为 32 个；两次 K=3 的 accepted/total 和 acceptance rate 也应一致。
+K>0 时加载第 78 层 BF16 MTP 权重和模型根目录的 `rot.safetensors`。本功能只修改 Python，无需重新编译 Ascend 自定义算子。先验证 qlen=4 的 target attention 能 capture、动态刷新 KV 长度并 replay：
+
+```bash
+unset NANOVLLM_LIDU_MISS_COUNT_ON_LAYERS
+unset NANOVLLM_PROFILE_DECODE_OUTPUT
+unset NANOVLLM_CUST_OPAPI_LIB
+unset ASCEND_CUSTOM_OPP_PATH
+
+export ASCEND_HOME_PATH=/usr/local/Ascend/cann-8.5.1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH=$PWD:$PYTHONPATH
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export ASCEND_LAUNCH_BLOCKING=0
+export ASCEND_RT_VISIBLE_DEVICES=4
+
+python3 ut_ops/test_glm_mtp_target_verify.py \
+  --device npu:0 \
+  --batch-size 4 \
+  --heads 2 \
+  --prefix-len 4096 \
+  --query-lens 2,4 \
+  --graph-replays 3 \
+  --seed 7 \
+  --atol 0.04 \
+  --rtol 0.02 \
+  --min-cosine 0.999
+```
+
+下面使用 8 条 DuReader 请求验收 K=3 的完整图模式。稳定 batch=8 时应看到一次 paired capture，随后 `mtp_target_replays` 和 `mtp_draft_replays` 均大于 0；请求结束导致 batch 缩小时走 eager 属于预期行为。
 
 ```bash
 unset NANOVLLM_LIDU_MISS_COUNT_ON_LAYERS
 unset NANOVLLM_PROFILE_DECODE_OUTPUT
 unset NANOVLLM_DRAM_NUM_BLOCKS
+unset NANOVLLM_CUST_OPAPI_LIB
+unset ASCEND_CUSTOM_OPP_PATH
 
 export ASCEND_HOME_PATH=/usr/local/Ascend/cann-8.5.1
 export PYTHONUNBUFFERED=1
@@ -85,21 +115,15 @@ export NANOVLLM_MODEL=/mnt/models/GLM-5.1-w4a8/
 export NANOVLLM_TP_SIZE=16
 export NANOVLLM_ENABLE_EXPERT_PARALLEL=1
 export NANOVLLM_OFFLOAD_MODE=none
-export NANOVLLM_ENFORCE_EAGER=1
+export NANOVLLM_ENFORCE_EAGER=0
 export NANOVLLM_KVCACHE_BLOCK_SIZE=128
-export NANOVLLM_HBM_NUM_BLOCKS=96
-export NANOVLLM_MAX_MODEL_LEN=8256
+export NANOVLLM_HBM_NUM_BLOCKS=1200
 export NANOVLLM_MAX_GEN_TOKENS=32
-export NANOVLLM_PROMPT_LENGTHS=8200
+export NANOVLLM_PREFILL_CHUNK_SIZE=1024
+export NANOVLLM_NUM_SPECULATIVE_TOKENS=3
+export NANOVLLM_IGNORE_EOS=1
 
-for CHUNK in 0 1024; do
-  for K in 0 3; do
-    echo "========== GLM MTP: chunk=$CHUNK K=$K =========="
-    export NANOVLLM_PREFILL_CHUNK_SIZE=$CHUNK
-    export NANOVLLM_NUM_SPECULATIVE_TOKENS=$K
-    python3 example/test.py
-  done
-done
+python3 example/test_dureader.py --prompt_count 8
 ```
 
 　

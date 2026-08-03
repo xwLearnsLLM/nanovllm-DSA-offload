@@ -523,4 +523,13 @@ class LLMEngine:
                 f"graph_metadata_refreshes={graph_stats['metadata_refreshes']}, "
                 f"graph_metadata_reuses={graph_stats['metadata_reuses']}"
             )
+            if "mtp_target_replays" in graph_stats:
+                print(
+                    "    MTP graph proof: "
+                    f"target_captures={graph_stats['mtp_target_captures']}, "
+                    f"draft_captures={graph_stats['mtp_draft_captures']}, "
+                    f"target_replays={graph_stats['mtp_target_replays']}, "
+                    f"draft_replays={graph_stats['mtp_draft_replays']}, "
+                    f"eager_capture={graph_stats['eager_mtp_capture']}"
+                )
         return outputs

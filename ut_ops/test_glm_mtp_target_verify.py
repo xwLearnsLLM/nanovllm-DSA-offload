@@ -32,6 +32,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--atol", type=float, default=0.04)
     parser.add_argument("--rtol", type=float, default=0.02)
     parser.add_argument("--min-cosine", type=float, default=0.999)
+    parser.add_argument(
+        "--graph-replays",
+        type=int,
+        default=0,
+        help=(
+            "Capture the largest query length with FIA-v2 external-task "
+            "refresh and replay it this many times."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -119,9 +128,12 @@ def run_batched_verify(
     block_table: torch.Tensor,
     prefix_len: int,
     mask: torch.Tensor,
+    actual_seq_kvlen: list[int] | None = None,
 ) -> torch.Tensor:
     batch_size, query_len, heads, _ = query.shape
     total_tokens = batch_size * query_len
+    if actual_seq_kvlen is None:
+        actual_seq_kvlen = [prefix_len + query_len] * batch_size
     output, _ = torch_npu.npu_fused_infer_attention_score_v2(
         query.view(total_tokens, heads, CKV_DIM).contiguous(),
         key_cache,
@@ -141,11 +153,147 @@ def run_batched_verify(
         actual_seq_qlen=[
             (row + 1) * query_len for row in range(batch_size)
         ],
-        actual_seq_kvlen=[prefix_len + query_len] * batch_size,
+        actual_seq_kvlen=actual_seq_kvlen,
     )
     return output.view(
         heads, batch_size, query_len, CKV_DIM
     ).permute(1, 2, 0, 3).contiguous()
+
+
+def run_graph_replay_check(
+    query: torch.Tensor,
+    query_rope: torch.Tensor,
+    key_cache: torch.Tensor,
+    key_rope_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    prefix_len: int,
+    mask: torch.Tensor,
+    replays: int,
+    atol: float,
+    rtol: float,
+) -> None:
+    """Exercise the same FIA-v2 external-task pattern used by MTP graphs."""
+
+    batch_size, query_len, heads, _ = query.shape
+    total_tokens = batch_size * query_len
+    flat_query = query.view(total_tokens, heads, CKV_DIM).contiguous()
+    flat_query_rope = query_rope.view(
+        total_tokens, heads, KPE_DIM
+    ).contiguous()
+    actual_seq_qlen = [
+        (row + 1) * query_len for row in range(batch_size)
+    ]
+    capture_kvlen = [prefix_len + query_len] * batch_size
+    kwargs = {
+        "query_rope": flat_query_rope,
+        "key_rope": key_rope_cache,
+        "num_query_heads": heads,
+        "num_key_value_heads": 1,
+        "input_layout": "TND_NTD",
+        "atten_mask": mask,
+        "sparse_mode": 3,
+        "softmax_scale": 1.0 / math.sqrt(QK_HEAD_DIM),
+        "block_table": block_table,
+        "block_size": BLOCK_SIZE,
+        "actual_seq_qlen": actual_seq_qlen,
+        "actual_seq_kvlen": capture_kvlen,
+    }
+    eager_output, eager_lse = (
+        torch_npu.npu_fused_infer_attention_score_v2(
+            flat_query,
+            key_cache,
+            key_cache,
+            **kwargs,
+        )
+    )
+    graph_output = torch.empty_like(eager_output)
+    graph_lse = torch.empty_like(eager_lse)
+    workspace = (
+        torch_npu._npu_fused_infer_attention_score_v2_get_max_workspace(
+            flat_query,
+            key_cache,
+            key_cache,
+            **kwargs,
+        )
+    )
+    attention_op = torch_npu.npu_fused_infer_attention_score_v2.out
+    stream = torch.npu.current_stream()
+    event = torch.npu.ExternalEvent()
+    graph = torch.npu.NPUGraph()
+    pool = torch.npu.graph_pool_handle()
+    with torch.npu.graph(graph, pool=pool):
+        event.wait(stream)
+        event.reset(stream)
+        torch.npu.graph_task_group_begin(stream)
+        attention_op(
+            flat_query,
+            key_cache,
+            key_cache,
+            **kwargs,
+            workspace=workspace,
+            out=[graph_output, graph_lse],
+        )
+        task_handle = torch.npu.graph_task_group_end(stream)
+    torch.npu.synchronize()
+    torch.testing.assert_close(
+        graph_output.float().cpu(),
+        eager_output.float().cpu(),
+        atol=atol,
+        rtol=rtol,
+    )
+
+    update_stream = torch.npu.Stream()
+    max_abs = 0.0
+    for replay in range(replays):
+        # Change both device input data and host-side KV-length attributes.
+        flat_query.mul_(-1)
+        kv_lengths = [
+            prefix_len + query_len - ((replay + row) % 3)
+            for row in range(batch_size)
+        ]
+        torch.npu.current_stream().synchronize()
+        graph.replay()
+        with torch.npu.stream(update_stream):
+            torch.npu.graph_task_update_begin(update_stream, task_handle)
+            try:
+                attention_op(
+                    flat_query,
+                    key_cache,
+                    key_cache,
+                    **(kwargs | {"actual_seq_kvlen": kv_lengths}),
+                    workspace=workspace,
+                    out=[graph_output, graph_lse],
+                )
+            finally:
+                torch.npu.graph_task_update_end(update_stream)
+            event.record(update_stream)
+        torch.npu.synchronize()
+        golden = run_batched_verify(
+            query,
+            query_rope,
+            key_cache,
+            key_rope_cache,
+            block_table,
+            prefix_len,
+            mask,
+            kv_lengths,
+        )
+        actual = graph_output.view(
+            heads, batch_size, query_len, CKV_DIM
+        ).permute(1, 2, 0, 3).contiguous()
+        torch.npu.synchronize()
+        actual_cpu = actual.float().cpu()
+        golden_cpu = golden.float().cpu()
+        replay_max_abs = float((actual_cpu - golden_cpu).abs().max())
+        max_abs = max(max_abs, replay_max_abs)
+        torch.testing.assert_close(
+            actual_cpu, golden_cpu, atol=atol, rtol=rtol
+        )
+    print(
+        "GLM_MTP_TARGET_VERIFY_GRAPH_CHECK "
+        f"query_len={query_len} replays={replays} "
+        f"max_abs={max_abs:.9f} dynamic_kvlen=1 ok=1"
+    )
 
 
 def run_sequential_decode(
@@ -231,6 +379,7 @@ def main() -> None:
         or args.prefix_len <= 0
         or args.atol < 0
         or args.rtol < 0
+        or args.graph_replays < 0
         or not 0 <= args.min_cosine <= 1
     ):
         raise ValueError(
@@ -278,6 +427,24 @@ def main() -> None:
             args.min_cosine,
         )
         del inputs, batched, sequential
+    if args.graph_replays:
+        query_len = max(query_lens)
+        inputs = make_inputs(
+            args.batch_size,
+            args.heads,
+            args.prefix_len,
+            query_len,
+            args.seed + 1000,
+            device,
+        )
+        run_graph_replay_check(
+            *inputs,
+            args.prefix_len,
+            mask,
+            args.graph_replays,
+            args.atol,
+            args.rtol,
+        )
     print("GLM_MTP_TARGET_VERIFY_UT_OK")
 
 

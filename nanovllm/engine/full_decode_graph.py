@@ -73,6 +73,10 @@ class MLAGraphTask:
     num_query_heads: int
     block_size: int
     softmax_scale: float
+    input_layout: str = "BNSD_NBSD"
+    atten_mask: torch.Tensor | None = None
+    sparse_mode: int = 0
+    actual_seq_qlen: list[int] | None = None
 
     def update(self, update_stream: Any, actual_seq_kvlen: list[int]) -> None:
         torch.npu.graph_task_update_begin(update_stream, self.handle)
@@ -85,13 +89,13 @@ class MLAGraphTask:
                 key_rope=self.key_rope_cache,
                 num_query_heads=self.num_query_heads,
                 num_key_value_heads=1,
-                input_layout="BNSD_NBSD",
-                atten_mask=None,
-                sparse_mode=0,
+                input_layout=self.input_layout,
+                atten_mask=self.atten_mask,
+                sparse_mode=self.sparse_mode,
                 softmax_scale=self.softmax_scale,
                 block_table=self.block_table,
                 block_size=self.block_size,
-                actual_seq_qlen=None,
+                actual_seq_qlen=self.actual_seq_qlen,
                 actual_seq_kvlen=actual_seq_kvlen,
                 workspace=self.workspace,
                 out=[self.output, self.softmax_lse],
@@ -762,4 +766,564 @@ class FullDecodeOnlyGraphManager:
             "metadata_reuses": sum(
                 entry.metadata_reuse_count for entry in self._entries.values()
             ),
+        }
+
+
+@dataclass
+class MTPDecodeGraphEntry:
+    """Fixed-address inputs and outputs for one exact MTP batch size."""
+
+    batch_size: int
+    speculative_tokens: int
+    max_block_columns: int
+    input_ids: torch.Tensor
+    positions: torch.Tensor
+    draft_token_ids: torch.Tensor
+    flat_slot_mapping: torch.Tensor
+    flat_slot_mapping_i32: torch.Tensor
+    cu_seqlens_q: torch.Tensor
+    block_tables: torch.Tensor
+    target_graph: Any | None = None
+    draft_graph: Any | None = None
+    target_tokens: torch.Tensor | None = None
+    accepted_counts: torch.Tensor | None = None
+    next_token_ids: torch.Tensor | None = None
+    selected_hidden_states: torch.Tensor | None = None
+    selected_positions: torch.Tensor | None = None
+    next_drafts: torch.Tensor | None = None
+    target_tasks: list[MLAGraphTask] = field(default_factory=list)
+    draft_tasks: list[MLAGraphTask] = field(default_factory=list)
+    replay_count: int = 0
+    metadata_refresh_count: int = 0
+
+    @property
+    def query_len(self) -> int:
+        return self.speculative_tokens + 1
+
+    @classmethod
+    def allocate(
+        cls,
+        batch_size: int,
+        speculative_tokens: int,
+        max_block_columns: int,
+        device: torch.device,
+    ) -> "MTPDecodeGraphEntry":
+        query_len = speculative_tokens + 1
+        total_tokens = batch_size * query_len
+        return cls(
+            batch_size=batch_size,
+            speculative_tokens=speculative_tokens,
+            max_block_columns=max_block_columns,
+            input_ids=torch.zeros(
+                total_tokens, dtype=torch.int64, device=device
+            ),
+            positions=torch.zeros(
+                total_tokens, dtype=torch.int64, device=device
+            ),
+            draft_token_ids=torch.zeros(
+                batch_size,
+                speculative_tokens,
+                dtype=torch.int64,
+                device=device,
+            ),
+            flat_slot_mapping=torch.zeros(
+                total_tokens, dtype=torch.int64, device=device
+            ),
+            flat_slot_mapping_i32=torch.zeros(
+                total_tokens, dtype=torch.int32, device=device
+            ),
+            cu_seqlens_q=torch.arange(
+                0,
+                total_tokens + 1,
+                query_len,
+                dtype=torch.int32,
+                device=device,
+            ),
+            block_tables=torch.zeros(
+                batch_size,
+                max_block_columns,
+                dtype=torch.int32,
+                device=device,
+            ),
+        )
+
+    def copy_runtime_inputs(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        draft_token_ids: torch.Tensor,
+        context: Context,
+    ) -> None:
+        expected_tokens = self.batch_size * self.query_len
+        if tuple(input_ids.shape) != (expected_tokens,):
+            raise ValueError(
+                "MTP target graph input shape changed: "
+                f"expected={(expected_tokens,)}, actual={tuple(input_ids.shape)}."
+            )
+        if tuple(positions.shape) != (expected_tokens,):
+            raise ValueError(
+                "MTP target graph position shape changed: "
+                f"expected={(expected_tokens,)}, actual={tuple(positions.shape)}."
+            )
+        if tuple(draft_token_ids.shape) != (
+            self.batch_size,
+            self.speculative_tokens,
+        ):
+            raise ValueError(
+                "MTP draft shape changed: expected="
+                f"{(self.batch_size, self.speculative_tokens)}, "
+                f"actual={tuple(draft_token_ids.shape)}."
+            )
+        if context.flat_slot_mapping is None or context.block_tables is None:
+            raise RuntimeError(
+                "MTP target graph requires slot mapping and block tables."
+            )
+        if tuple(context.flat_slot_mapping.shape) != (expected_tokens,):
+            raise ValueError(
+                "MTP target graph slot shape changed: "
+                f"expected={(expected_tokens,)}, "
+                f"actual={tuple(context.flat_slot_mapping.shape)}."
+            )
+        if int(context.block_tables.shape[0]) != self.batch_size:
+            raise ValueError(
+                "MTP block-table batch changed: "
+                f"expected={self.batch_size}, "
+                f"actual={context.block_tables.shape[0]}."
+            )
+        columns = int(context.block_tables.shape[1])
+        if columns > self.max_block_columns:
+            raise ValueError(
+                "MTP block table is wider than its graph buffer: "
+                f"runtime={columns}, graph={self.max_block_columns}."
+            )
+
+        self.input_ids.copy_(input_ids)
+        self.positions.copy_(positions)
+        self.draft_token_ids.copy_(draft_token_ids)
+        self.flat_slot_mapping.copy_(context.flat_slot_mapping)
+        runtime_slots_i32 = context.flat_slot_mapping_i32
+        if runtime_slots_i32 is None:
+            runtime_slots_i32 = context.flat_slot_mapping.to(torch.int32)
+        self.flat_slot_mapping_i32.copy_(runtime_slots_i32)
+        self.block_tables.zero_()
+        self.block_tables[:, :columns].copy_(context.block_tables)
+        self.metadata_refresh_count += 1
+
+
+class MTPDecodeOnlyGraphManager:
+    """Two exact-size graphs for steady GLM MTP verification and drafting.
+
+    Target verification determines how many draft tokens were accepted. FIA-v2
+    exposes KV lengths as host attributes, so one synchronization between the
+    target and draft graphs is intentional: it refreshes the three draft FIA
+    tasks with the current accepted prefix lengths.
+    """
+
+    def __init__(
+        self,
+        *,
+        target_forward: Callable[..., tuple[torch.Tensor, ...]],
+        draft_forward: Callable[..., torch.Tensor],
+        target_warmup: Callable[..., int] | None,
+        draft_warmup: Callable[..., int] | None,
+        capture_sizes: Iterable[int],
+        max_model_len: int,
+        block_size: int,
+        device: str,
+        speculative_tokens: int,
+        expected_target_tasks: int,
+        log_enabled: bool = True,
+    ) -> None:
+        if int(speculative_tokens) != 3:
+            raise ValueError(
+                "MTP FULL_DECODE_ONLY currently supports K=3 only."
+            )
+        self.target_forward = target_forward
+        self.draft_forward = draft_forward
+        self.target_warmup = target_warmup
+        self.draft_warmup = draft_warmup
+        self.capture_sizes = normalize_capture_sizes(capture_sizes)
+        self.max_block_columns = (
+            int(max_model_len) + int(block_size) - 1
+        ) // int(block_size)
+        self.block_size = int(block_size)
+        self.device = torch.device(device)
+        self.speculative_tokens = int(speculative_tokens)
+        self.expected_target_tasks = int(expected_target_tasks)
+        self.log_enabled = bool(log_enabled)
+        self.offload_mode = OFFLOAD_NONE
+        self.stateful_offload = False
+        self._entries: dict[int, MTPDecodeGraphEntry] = {}
+        self._eager_seen: set[int] = set()
+        self._graph_pool = None
+        self._update_stream = None
+        self.capture_count = 0
+        self.replay_count = 0
+        self.target_replay_count = 0
+        self.draft_replay_count = 0
+        self.eager_first_decode_count = 0
+        self.eager_uncaptured_batch_count = 0
+        self.eager_capture_count = 0
+
+    def should_use_graph(self, batch_size: int) -> bool:
+        """Keep the first exact-size verification eager, then graph it."""
+
+        batch_size = int(batch_size)
+        if batch_size not in self.capture_sizes:
+            self.eager_uncaptured_batch_count += 1
+            return False
+        if batch_size not in self._eager_seen:
+            self._eager_seen.add(batch_size)
+            self.eager_first_decode_count += 1
+            return False
+        return True
+
+    def _ensure_capture_resources(self) -> None:
+        if self._graph_pool is None:
+            self._graph_pool = torch.npu.graph_pool_handle()
+        if self._update_stream is None:
+            self._update_stream = torch.npu.Stream()
+
+    def _allocate_entry(self, batch_size: int) -> MTPDecodeGraphEntry:
+        entry = MTPDecodeGraphEntry.allocate(
+            batch_size,
+            self.speculative_tokens,
+            self.max_block_columns,
+            self.device,
+        )
+        self._entries[batch_size] = entry
+        return entry
+
+    @staticmethod
+    def _target_seq_lengths(
+        base_seq_lengths: list[int], speculative_tokens: int
+    ) -> list[int]:
+        return [
+            int(length) + int(speculative_tokens)
+            for length in base_seq_lengths
+        ]
+
+    @staticmethod
+    def _draft_seq_lengths(
+        base_seq_lengths: list[int],
+        accepted_counts: list[int],
+        speculative_tokens: int,
+    ) -> list[list[int]]:
+        if len(base_seq_lengths) != len(accepted_counts):
+            raise ValueError("MTP accepted-count batch size changed.")
+        return [
+            [
+                int(length) + int(accepted) + step
+                for length, accepted in zip(
+                    base_seq_lengths, accepted_counts
+                )
+            ]
+            for step in range(int(speculative_tokens))
+        ]
+
+    def _set_target_context(
+        self,
+        entry: MTPDecodeGraphEntry,
+        target_seq_lengths: list[int],
+    ) -> None:
+        query_len = entry.query_len
+        actual_seq_lengths_q = [
+            (row + 1) * query_len for row in range(entry.batch_size)
+        ]
+        set_context(
+            False,
+            is_spec_decode=True,
+            cu_seqlens_q=entry.cu_seqlens_q,
+            actual_seq_lengths_q=actual_seq_lengths_q,
+            flat_slot_mapping=entry.flat_slot_mapping,
+            flat_slot_mapping_i32=entry.flat_slot_mapping_i32,
+            actual_seq_lengths_kv=target_seq_lengths,
+            block_tables=entry.block_tables,
+            full_decode_graph=True,
+        )
+
+    @staticmethod
+    def _validate_target_outputs(
+        entry: MTPDecodeGraphEntry,
+        outputs: tuple[torch.Tensor, ...],
+    ) -> None:
+        if not isinstance(outputs, tuple) or len(outputs) != 5:
+            raise RuntimeError(
+                "MTP target graph must return target tokens, accepted counts, "
+                "next token IDs, selected hidden states and positions."
+            )
+        (
+            entry.target_tokens,
+            entry.accepted_counts,
+            entry.next_token_ids,
+            entry.selected_hidden_states,
+            entry.selected_positions,
+        ) = outputs
+        if tuple(entry.target_tokens.shape) != (
+            entry.batch_size,
+            entry.query_len,
+        ):
+            raise RuntimeError(
+                "MTP target graph returned an unexpected token shape: "
+                f"{tuple(entry.target_tokens.shape)}."
+            )
+        if tuple(entry.accepted_counts.shape) != (entry.batch_size,):
+            raise RuntimeError(
+                "MTP target graph returned an unexpected acceptance shape: "
+                f"{tuple(entry.accepted_counts.shape)}."
+            )
+
+    def _capture(
+        self,
+        entry: MTPDecodeGraphEntry,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        draft_token_ids: torch.Tensor,
+        runtime_context: Context,
+        base_seq_lengths: list[int],
+    ) -> None:
+        self._ensure_capture_resources()
+        distributed = dist.is_initialized() and dist.get_world_size() > 1
+        torch.npu.current_stream().synchronize()
+        if distributed:
+            dist.barrier()
+        try:
+            with preserve_context(), torch.inference_mode():
+                entry.copy_runtime_inputs(
+                    input_ids,
+                    positions,
+                    draft_token_ids,
+                    runtime_context,
+                )
+                target_seq_lengths = self._target_seq_lengths(
+                    base_seq_lengths, self.speculative_tokens
+                )
+                self._set_target_context(entry, target_seq_lengths)
+                if self.target_warmup is not None:
+                    self.target_warmup(entry.input_ids, entry.positions)
+                    entry.copy_runtime_inputs(
+                        input_ids,
+                        positions,
+                        draft_token_ids,
+                        runtime_context,
+                    )
+                    self._set_target_context(entry, target_seq_lengths)
+
+                # Allocate FIA workspaces and output buffers before capture.
+                self.target_forward(
+                    entry.input_ids,
+                    entry.positions,
+                    entry.draft_token_ids,
+                )
+                torch.npu.synchronize()
+                gc.collect()
+                torch.npu.empty_cache()
+
+                entry.target_tasks.clear()
+                entry.target_graph = torch.npu.NPUGraph()
+                self._set_target_context(entry, target_seq_lengths)
+                with _record_graph_tasks(entry.target_tasks):
+                    with torch.npu.graph(
+                        entry.target_graph, pool=self._graph_pool
+                    ):
+                        target_outputs = self.target_forward(
+                            entry.input_ids,
+                            entry.positions,
+                            entry.draft_token_ids,
+                        )
+                torch.npu.synchronize()
+                self._validate_target_outputs(entry, target_outputs)
+                if len(entry.target_tasks) != self.expected_target_tasks:
+                    raise RuntimeError(
+                        "MTP target graph captured an unexpected number of "
+                        f"FIA tasks: expected={self.expected_target_tasks}, "
+                        f"actual={len(entry.target_tasks)}."
+                    )
+
+                accepted_counts = entry.accepted_counts.cpu().tolist()
+                draft_seq_lengths = self._draft_seq_lengths(
+                    base_seq_lengths,
+                    accepted_counts,
+                    self.speculative_tokens,
+                )
+                if self.draft_warmup is not None:
+                    self.draft_warmup(
+                        entry.next_token_ids,
+                        entry.selected_positions,
+                        entry.selected_hidden_states,
+                        entry.block_tables,
+                        draft_seq_lengths,
+                    )
+                else:
+                    self.draft_forward(
+                        entry.next_token_ids,
+                        entry.selected_positions,
+                        entry.selected_hidden_states,
+                        entry.block_tables,
+                        draft_seq_lengths,
+                    )
+                torch.npu.synchronize()
+                gc.collect()
+                torch.npu.empty_cache()
+
+                entry.draft_tasks.clear()
+                entry.draft_graph = torch.npu.NPUGraph()
+                with _record_graph_tasks(entry.draft_tasks):
+                    with torch.npu.graph(
+                        entry.draft_graph, pool=self._graph_pool
+                    ):
+                        entry.next_drafts = self.draft_forward(
+                            entry.next_token_ids,
+                            entry.selected_positions,
+                            entry.selected_hidden_states,
+                            entry.block_tables,
+                            draft_seq_lengths,
+                        )
+                torch.npu.synchronize()
+                if len(entry.draft_tasks) != self.speculative_tokens:
+                    raise RuntimeError(
+                        "MTP draft graph captured an unexpected number of FIA "
+                        f"tasks: expected={self.speculative_tokens}, "
+                        f"actual={len(entry.draft_tasks)}."
+                    )
+                if tuple(entry.next_drafts.shape) != (
+                    entry.batch_size,
+                    self.speculative_tokens,
+                ):
+                    raise RuntimeError(
+                        "MTP draft graph returned an unexpected shape: "
+                        f"{tuple(entry.next_drafts.shape)}."
+                    )
+                self.capture_count += 1
+                self.eager_capture_count += 1
+                if self.log_enabled:
+                    logger.info(
+                        "FULL_DECODE_ONLY MTP: captured exact batch_size=%d "
+                        "as target(%d FIA tasks) + draft(%d FIA tasks).",
+                        entry.batch_size,
+                        len(entry.target_tasks),
+                        len(entry.draft_tasks),
+                    )
+        finally:
+            if distributed:
+                dist.barrier()
+
+    def _replay(
+        self,
+        entry: MTPDecodeGraphEntry,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        draft_token_ids: torch.Tensor,
+        runtime_context: Context,
+        base_seq_lengths: list[int],
+    ) -> None:
+        entry.copy_runtime_inputs(
+            input_ids,
+            positions,
+            draft_token_ids,
+            runtime_context,
+        )
+        target_seq_lengths = self._target_seq_lengths(
+            base_seq_lengths, self.speculative_tokens
+        )
+        torch.npu.current_stream().synchronize()
+        entry.target_graph.replay()
+        with torch.npu.stream(self._update_stream):
+            for task in entry.target_tasks:
+                task.update(self._update_stream, target_seq_lengths)
+        accepted_counts = entry.accepted_counts.cpu().tolist()
+
+        draft_seq_lengths = self._draft_seq_lengths(
+            base_seq_lengths,
+            accepted_counts,
+            self.speculative_tokens,
+        )
+        if len(entry.draft_tasks) != len(draft_seq_lengths):
+            raise RuntimeError(
+                "MTP draft graph task count changed before replay: "
+                f"tasks={len(entry.draft_tasks)}, "
+                f"steps={len(draft_seq_lengths)}."
+            )
+        entry.draft_graph.replay()
+        with torch.npu.stream(self._update_stream):
+            for task, seq_lengths in zip(
+                entry.draft_tasks, draft_seq_lengths
+            ):
+                task.update(self._update_stream, seq_lengths)
+        entry.replay_count += 1
+        self.replay_count += 1
+        self.target_replay_count += 1
+        self.draft_replay_count += 1
+        if self.log_enabled and self.replay_count == 1:
+            logger.info(
+                "FULL_DECODE_ONLY MTP: first target+draft replay entered for "
+                "exact batch_size=%d.",
+                entry.batch_size,
+            )
+
+    def run(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        draft_token_ids: torch.Tensor,
+        runtime_context: Context,
+        base_seq_lengths: list[int],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size = len(base_seq_lengths)
+        if batch_size not in self.capture_sizes:
+            raise ValueError(
+                "MTP graph run requires an exact configured batch size: "
+                f"runtime={batch_size}, capture_sizes={self.capture_sizes}."
+            )
+        entry = self._entries.get(batch_size)
+        if entry is None:
+            entry = self._allocate_entry(batch_size)
+        if entry.target_graph is None or entry.draft_graph is None:
+            self._capture(
+                entry,
+                input_ids,
+                positions,
+                draft_token_ids,
+                runtime_context,
+                base_seq_lengths,
+            )
+        else:
+            self._replay(
+                entry,
+                input_ids,
+                positions,
+                draft_token_ids,
+                runtime_context,
+                base_seq_lengths,
+            )
+        return entry.target_tokens, entry.accepted_counts, entry.next_drafts
+
+    def is_stable_replay_ready(self, runtime_batch_size: int) -> bool:
+        entry = self._entries.get(int(runtime_batch_size))
+        return bool(entry is not None and entry.replay_count > 0)
+
+    def stats(self) -> dict[str, Any]:
+        return {
+            "enabled": True,
+            "mode": FULL_DECODE_ONLY,
+            "capture_sizes": list(self.capture_sizes),
+            "offload_mode": OFFLOAD_NONE,
+            "exact_size_only": True,
+            "captures": self.capture_count,
+            "replays": self.replay_count,
+            "mtp_target_captures": self.capture_count,
+            "mtp_draft_captures": self.capture_count,
+            "mtp_target_replays": self.target_replay_count,
+            "mtp_draft_replays": self.draft_replay_count,
+            "eager_prefill": 0,
+            "eager_first_decode": self.eager_first_decode_count,
+            "eager_no_dsa": 0,
+            "eager_lidu_uninitialized": 0,
+            "eager_lidu_capture": 0,
+            "eager_uncaptured_batch": self.eager_uncaptured_batch_count,
+            "eager_mtp_capture": self.eager_capture_count,
+            "metadata_refreshes": sum(
+                entry.metadata_refresh_count for entry in self._entries.values()
+            ),
+            "metadata_reuses": 0,
         }

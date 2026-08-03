@@ -460,6 +460,8 @@ class GlmMLAAttention(nn.Module):
         self._decode_mlapo_inner_out = None
         self._decode_mla_v2_out = None
         self._decode_mla_v2_lse = None
+        self._spec_decode_mla_v2_out = None
+        self._spec_decode_mla_v2_lse = None
 
     def can_fuse_o_proj_add_rms_norm(self) -> bool:
         return not self.o_proj.disable_tp and self.o_proj.tp_size > 1 and self.o_proj.reduce_results and self.o_proj.bias is None and hasattr(ascend_ops, "matmul_allreduce_add_rmsnorm")
@@ -775,7 +777,17 @@ class GlmMLAAttention(nn.Module):
         return self._decode_mla_v2_out, self._decode_mla_v2_lse
 
     def _decode_mla_v2_workspace_get(self, batch_size: int, query: torch.Tensor, key_cache: torch.Tensor, kwargs: dict) -> torch.Tensor:
-        key = (batch_size, str(query.device), query.dtype, self.block_size, self.num_local_heads, self.kv_lora_rank)
+        key = (
+            batch_size,
+            tuple(query.shape),
+            str(query.device),
+            query.dtype,
+            self.block_size,
+            self.num_local_heads,
+            self.kv_lora_rank,
+            kwargs.get("input_layout"),
+            kwargs.get("sparse_mode"),
+        )
         workspace = _NPU_MLA_V2_WORKSPACE_CACHE.get(key)
         if workspace is None:
             # The FIA v2 workspace depends on operator shape/attrs, not layer
@@ -942,26 +954,100 @@ class GlmMLAAttention(nn.Module):
         key_rope_cache = self.kpe_cache.view(
             -1, 1, self.block_size, self.qk_rope_head_dim
         )
-        actual_seq_qlen = (
-            context.cu_seqlens_q[1:].detach().cpu().tolist()
-        )
-        latent, _ = torch_npu.npu_fused_infer_attention_score_v2(
-            query,
-            key_cache,
-            key_cache,
-            query_rope=query_rope,
-            key_rope=key_rope_cache,
-            num_query_heads=self.num_local_heads,
-            num_key_value_heads=1,
-            input_layout="TND_NTD",
-            atten_mask=_get_npu_mla_attention_mask(query.device, 2048),
-            sparse_mode=3,
-            softmax_scale=float(self.scale),
-            block_table=context.block_tables,
-            block_size=self.block_size,
-            actual_seq_qlen=actual_seq_qlen,
-            actual_seq_kvlen=context.actual_seq_lengths_kv,
-        )
+        actual_seq_qlen = context.actual_seq_lengths_q
+        if actual_seq_qlen is None:
+            actual_seq_qlen = (
+                context.cu_seqlens_q[1:].detach().cpu().tolist()
+            )
+        atten_mask = _get_npu_mla_attention_mask(query.device, 2048)
+        kwargs = {
+            "query_rope": query_rope,
+            "key_rope": key_rope_cache,
+            "num_query_heads": self.num_local_heads,
+            "num_key_value_heads": 1,
+            "input_layout": "TND_NTD",
+            "atten_mask": atten_mask,
+            "sparse_mode": 3,
+            "softmax_scale": float(self.scale),
+            "block_table": context.block_tables,
+            "block_size": self.block_size,
+            "actual_seq_qlen": actual_seq_qlen,
+            "actual_seq_kvlen": context.actual_seq_lengths_kv,
+        }
+        if is_full_decode_graph_capturing():
+            if (
+                self._spec_decode_mla_v2_out is None
+                or self._spec_decode_mla_v2_lse is None
+            ):
+                raise RuntimeError(
+                    "MTP target FIA-v2 graph buffers were not warmed before "
+                    "capture."
+                )
+            out = self._spec_decode_mla_v2_out
+            lse = self._spec_decode_mla_v2_lse
+            workspace = self._decode_mla_v2_workspace_get(
+                num_tokens, query, key_cache, kwargs
+            )
+            attention_op = torch_npu.npu_fused_infer_attention_score_v2.out
+            stream = torch.npu.current_stream()
+            event = torch.npu.ExternalEvent()
+            event.wait(stream)
+            event.reset(stream)
+            torch.npu.graph_task_group_begin(stream)
+            attention_op(
+                query,
+                key_cache,
+                key_cache,
+                **kwargs,
+                workspace=workspace,
+                out=[out, lse],
+            )
+            handle = torch.npu.graph_task_group_end(stream)
+            record_mla_graph_task(
+                MLAGraphTask(
+                    handle=handle,
+                    event=event,
+                    op=attention_op,
+                    query=query,
+                    key_cache=key_cache,
+                    query_rope=query_rope,
+                    key_rope_cache=key_rope_cache,
+                    block_table=context.block_tables,
+                    workspace=workspace,
+                    output=out,
+                    softmax_lse=lse,
+                    num_query_heads=self.num_local_heads,
+                    block_size=self.block_size,
+                    softmax_scale=float(self.scale),
+                    input_layout="TND_NTD",
+                    atten_mask=atten_mask,
+                    sparse_mode=3,
+                    actual_seq_qlen=actual_seq_qlen,
+                )
+            )
+            latent = out
+        else:
+            latent, lse = torch_npu.npu_fused_infer_attention_score_v2(
+                query,
+                key_cache,
+                key_cache,
+                **kwargs,
+            )
+            if (
+                self._spec_decode_mla_v2_out is None
+                or tuple(self._spec_decode_mla_v2_out.shape)
+                != tuple(latent.shape)
+            ):
+                self._spec_decode_mla_v2_out = torch.empty_like(latent)
+            if (
+                self._spec_decode_mla_v2_lse is None
+                or tuple(self._spec_decode_mla_v2_lse.shape)
+                != tuple(lse.shape)
+            ):
+                self._spec_decode_mla_v2_lse = torch.empty_like(lse)
+            self._decode_mla_v2_workspace_get(
+                num_tokens, query, key_cache, kwargs
+            )
         latent = latent.view(
             self.num_local_heads, num_tokens, self.kv_lora_rank
         )

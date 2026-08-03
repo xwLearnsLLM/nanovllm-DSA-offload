@@ -8,6 +8,8 @@ from nanovllm.engine.full_decode_graph import (
     FullDecodeGraphEntry,
     FullDecodeOnlyGraphManager,
     MLAGraphTask,
+    MTPDecodeGraphEntry,
+    MTPDecodeOnlyGraphManager,
     normalize_capture_sizes,
 )
 from nanovllm.utils.context import Context, reset_context, set_context
@@ -56,6 +58,57 @@ def test_normalize_capture_sizes():
 def test_normalize_capture_sizes_rejects_invalid_values(values):
     with pytest.raises(ValueError):
         normalize_capture_sizes(values)
+
+
+def test_mtp_entry_copies_exact_target_inputs():
+    entry = MTPDecodeGraphEntry.allocate(
+        batch_size=2,
+        speculative_tokens=3,
+        max_block_columns=4,
+        device=torch.device("cpu"),
+    )
+    context = Context(
+        flat_slot_mapping=torch.arange(8, dtype=torch.int64) + 20,
+        block_tables=torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int32),
+    )
+    entry.copy_runtime_inputs(
+        torch.arange(8, dtype=torch.int64) + 100,
+        torch.arange(8, dtype=torch.int64) + 1000,
+        torch.tensor([[7, 8, 9], [10, 11, 12]], dtype=torch.int64),
+        context,
+    )
+
+    assert entry.input_ids.tolist() == list(range(100, 108))
+    assert entry.positions.tolist() == list(range(1000, 1008))
+    assert entry.draft_token_ids.tolist() == [[7, 8, 9], [10, 11, 12]]
+    assert entry.flat_slot_mapping_i32.tolist() == list(range(20, 28))
+    assert entry.cu_seqlens_q.tolist() == [0, 4, 8]
+    assert entry.block_tables[:, :3].equal(context.block_tables)
+    assert entry.block_tables[:, 3].count_nonzero().item() == 0
+
+
+def test_mtp_graph_uses_only_exact_batch_after_one_eager_step():
+    manager = MTPDecodeOnlyGraphManager(
+        target_forward=lambda *_args: (),
+        draft_forward=lambda *_args: torch.empty(0),
+        target_warmup=None,
+        draft_warmup=None,
+        capture_sizes=(8,),
+        max_model_len=4096,
+        block_size=128,
+        device="cpu",
+        speculative_tokens=3,
+        expected_target_tasks=78,
+        log_enabled=False,
+    )
+
+    assert not manager.should_use_graph(8)
+    assert manager.should_use_graph(8)
+    assert not manager.should_use_graph(7)
+    stats = manager.stats()
+    assert stats["eager_first_decode"] == 1
+    assert stats["eager_uncaptured_batch"] == 1
+    assert stats["exact_size_only"] is True
 
 
 def test_static_entry_copies_all_lidu_metadata():
@@ -213,6 +266,56 @@ def test_mla_task_refreshes_host_sequence_lengths(monkeypatch):
     attention_kwargs = calls[1][2]
     assert attention_kwargs["actual_seq_kvlen"] == [16001, 16002]
     assert attention_kwargs["block_table"] is task.block_table
+
+
+def test_mla_task_refresh_preserves_tnd_decode_arguments(monkeypatch):
+    calls = []
+    fake_npu = SimpleNamespace(
+        graph_task_update_begin=lambda stream, handle: calls.append(
+            ("begin", stream, handle)
+        ),
+        graph_task_update_end=lambda stream: calls.append(("end", stream)),
+    )
+    monkeypatch.setattr(torch, "npu", fake_npu, raising=False)
+
+    class FakeEvent:
+        def record(self, stream):
+            calls.append(("event", stream))
+
+    def fake_attention(*args, **kwargs):
+        calls.append(("attention", args, kwargs))
+
+    tensor = torch.empty(1)
+    mask = torch.ones(4, 4, dtype=torch.bool)
+    task = MLAGraphTask(
+        handle="tnd-handle",
+        event=FakeEvent(),
+        op=fake_attention,
+        query=tensor,
+        key_cache=tensor,
+        query_rope=tensor,
+        key_rope_cache=tensor,
+        block_table=torch.zeros(2, 2, dtype=torch.int32),
+        workspace=tensor,
+        output=tensor,
+        softmax_lse=tensor,
+        num_query_heads=4,
+        block_size=128,
+        softmax_scale=0.25,
+        input_layout="TND_NTD",
+        atten_mask=mask,
+        sparse_mode=3,
+        actual_seq_qlen=[4, 8],
+    )
+
+    task.update("update-stream", [16003, 32006])
+
+    attention_kwargs = calls[1][2]
+    assert attention_kwargs["input_layout"] == "TND_NTD"
+    assert attention_kwargs["atten_mask"] is mask
+    assert attention_kwargs["sparse_mode"] == 3
+    assert attention_kwargs["actual_seq_qlen"] == [4, 8]
+    assert attention_kwargs["actual_seq_kvlen"] == [16003, 32006]
 
 
 def test_lidu_noop_and_uninitialized_batches_stay_eager():
@@ -439,3 +542,91 @@ def test_dense_mla_graph_pads_to_the_smallest_capture(monkeypatch):
         "replay",
         ("update", [2200, 2201, 0, 0]),
     ]
+
+
+def test_mtp_graph_replays_target_then_refreshes_three_draft_steps(
+    monkeypatch,
+):
+    calls = []
+
+    class FakeGraph:
+        def __init__(self, name):
+            self.name = name
+
+        def replay(self):
+            calls.append(("replay", self.name))
+
+    class FakeStream:
+        def synchronize(self):
+            calls.append("synchronize")
+
+    class FakeTask:
+        def __init__(self, name):
+            self.name = name
+
+        def update(self, _stream, seq_lengths):
+            calls.append(("update", self.name, list(seq_lengths)))
+
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        SimpleNamespace(
+            current_stream=lambda: FakeStream(),
+            stream=lambda _stream: nullcontext(),
+        ),
+        raising=False,
+    )
+
+    entry = MTPDecodeGraphEntry.allocate(2, 3, 4, torch.device("cpu"))
+    entry.target_graph = FakeGraph("target")
+    entry.draft_graph = FakeGraph("draft")
+    entry.target_tokens = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]])
+    entry.accepted_counts = torch.tensor([0, 2])
+    entry.next_token_ids = torch.tensor([1, 7])
+    entry.selected_hidden_states = torch.zeros(2, 4)
+    entry.selected_positions = torch.tensor([99, 201])
+    entry.next_drafts = torch.tensor([[9, 10, 11], [12, 13, 14]])
+    entry.target_tasks = [FakeTask("target")]
+    entry.draft_tasks = [FakeTask(f"draft-{step}") for step in range(3)]
+
+    manager = MTPDecodeOnlyGraphManager(
+        target_forward=lambda *_args: (),
+        draft_forward=lambda *_args: torch.empty(0),
+        target_warmup=None,
+        draft_warmup=None,
+        capture_sizes=(2,),
+        max_model_len=512,
+        block_size=128,
+        device="cpu",
+        speculative_tokens=3,
+        expected_target_tasks=1,
+        log_enabled=False,
+    )
+    manager._entries[2] = entry
+    manager._update_stream = object()
+    context = Context(
+        flat_slot_mapping=torch.arange(8, dtype=torch.int64),
+        block_tables=torch.tensor([[1, 2], [3, 4]], dtype=torch.int32),
+    )
+
+    outputs = manager.run(
+        torch.arange(8, dtype=torch.int64),
+        torch.arange(8, dtype=torch.int64) + 99,
+        torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int64),
+        context,
+        [100, 200],
+    )
+
+    assert outputs[0] is entry.target_tokens
+    assert outputs[1] is entry.accepted_counts
+    assert outputs[2] is entry.next_drafts
+    assert calls == [
+        "synchronize",
+        ("replay", "target"),
+        ("update", "target", [103, 203]),
+        ("replay", "draft"),
+        ("update", "draft-0", [100, 202]),
+        ("update", "draft-1", [101, 203]),
+        ("update", "draft-2", [102, 204]),
+    ]
+    assert manager.replay_count == 1

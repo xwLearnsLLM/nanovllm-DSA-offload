@@ -24,6 +24,8 @@ from nanovllm.engine.dsa_offload import (
 )
 from nanovllm.engine.full_decode_graph import (
     FullDecodeOnlyGraphManager,
+    MTPDecodeOnlyGraphManager,
+    is_full_decode_graph_capturing,
     select_capture_size,
 )
 from nanovllm.engine.sequence import (
@@ -46,6 +48,10 @@ from nanovllm.engine.speculative import (
 from nanovllm.layers.sampler import Sampler
 from nanovllm.models.glm_moe_dsa import GlmMoeDsaForCausalLM
 from nanovllm.utils.context import get_context, set_context, reset_context
+from nanovllm.utils.glm_quant import (
+    GLM_BALANCED_MOE_EXPERT_IDS_KEY,
+    balanced_moe_expert_ids,
+)
 from nanovllm.utils.loader import load_model
 from nanovllm.utils.logger import init_logger
 
@@ -171,40 +177,63 @@ class ModelRunner:
         self._decode_ipc_delta_bytes = 0
         self._worker_decode_metadata_key: DecodeMetadataKey | None = None
         self._worker_decode_sequences: list[DecodeSequenceMetadata] | None = None
+        self._mtp_decode_cu_seqlens: dict[int, torch.Tensor] = {}
         torch.npu.empty_cache()
         self._allocate_mla_cache()
         self.decode_graph_manager = None
         if not config.enforce_eager:
             text_config = getattr(config.hf_config, "text_config", config.hf_config)
-            self.decode_graph_manager = FullDecodeOnlyGraphManager(
-                self.model,
-                capture_sizes=config.decode_graph_capture_sizes,
-                max_model_len=config.max_model_len,
-                block_size=config.kvcache_block_size,
-                device=self.device,
-                expected_mla_tasks=(
-                    0
-                    if self.uses_sparse_and_tail_attention
-                    else int(text_config.num_hidden_layers)
-                ),
-                offload_mode=self.offload_mode,
-                uses_tensor_mla_lengths=self.uses_sparse_and_tail_attention,
-                log_enabled=self.rank == 0,
-            )
-            if self.uses_offload:
+            if self.num_speculative_tokens:
+                self.decode_graph_manager = MTPDecodeOnlyGraphManager(
+                    target_forward=self._mtp_target_forward,
+                    draft_forward=self._mtp_draft_graph_forward,
+                    target_warmup=self.model.full_decode_graph_eager_warmup,
+                    draft_warmup=self._mtp_draft_graph_eager_warmup,
+                    capture_sizes=config.decode_graph_capture_sizes,
+                    max_model_len=config.max_model_len,
+                    block_size=config.kvcache_block_size,
+                    device=self.device,
+                    speculative_tokens=self.num_speculative_tokens,
+                    expected_target_tasks=int(text_config.num_hidden_layers),
+                    log_enabled=self.rank == 0,
+                )
                 if self.rank == 0:
                     logger.info(
-                        "FULL_DECODE_ONLY: deferring LIDU graph capture until "
-                        "the first initialized stable decode batch."
+                        "FULL_DECODE_ONLY MTP: first exact-size verify stays "
+                        "eager; target and draft graphs are captured lazily."
                     )
                 if self.world_size > 1:
                     dist.barrier()
             else:
-                if self.world_size > 1:
-                    dist.barrier()
-                self.decode_graph_manager.capture_all()
-                if self.world_size > 1:
-                    dist.barrier()
+                self.decode_graph_manager = FullDecodeOnlyGraphManager(
+                    self.model,
+                    capture_sizes=config.decode_graph_capture_sizes,
+                    max_model_len=config.max_model_len,
+                    block_size=config.kvcache_block_size,
+                    device=self.device,
+                    expected_mla_tasks=(
+                        0
+                        if self.uses_sparse_and_tail_attention
+                        else int(text_config.num_hidden_layers)
+                    ),
+                    offload_mode=self.offload_mode,
+                    uses_tensor_mla_lengths=self.uses_sparse_and_tail_attention,
+                    log_enabled=self.rank == 0,
+                )
+                if self.uses_offload:
+                    if self.rank == 0:
+                        logger.info(
+                            "FULL_DECODE_ONLY: deferring LIDU graph capture "
+                            "until the first initialized stable decode batch."
+                        )
+                    if self.world_size > 1:
+                        dist.barrier()
+                else:
+                    if self.world_size > 1:
+                        dist.barrier()
+                    self.decode_graph_manager.capture_all()
+                    if self.world_size > 1:
+                        dist.barrier()
 
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
@@ -754,6 +783,7 @@ class ModelRunner:
         lidu_all_rows_ready = not lidu_init_rows
         use_persistent_decode_buffers = (
             self.decode_graph_manager is not None
+            and not self.num_speculative_tokens
             and not has_first_decode
             and (
                 (
@@ -902,27 +932,41 @@ class ModelRunner:
             + torch.remainder(positions, self.block_size)
         )
 
+    def _get_mtp_decode_cu_seqlens(self, batch_size: int) -> torch.Tensor:
+        cu_seqlens = self._mtp_decode_cu_seqlens.get(batch_size)
+        if cu_seqlens is None:
+            cu_seqlens = torch.arange(
+                batch_size + 1,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self._mtp_decode_cu_seqlens[batch_size] = cu_seqlens
+        return cu_seqlens
+
     def _set_mtp_decode_context(
         self,
         block_tables: torch.Tensor,
         positions: torch.Tensor,
+        actual_seq_lengths_kv: list[int] | None = None,
     ) -> None:
         batch_size = int(positions.numel())
         slots = self._slots_from_positions(block_tables, positions)
-        cu_seqlens_q = torch.arange(
-            batch_size + 1,
-            dtype=torch.int32,
-            device=self.device,
-        )
+        cu_seqlens_q = self._get_mtp_decode_cu_seqlens(batch_size)
+        if actual_seq_lengths_kv is None:
+            actual_seq_lengths_kv = positions.add(1).detach().cpu().tolist()
+        if len(actual_seq_lengths_kv) != batch_size:
+            raise ValueError(
+                "MTP recurrence KV-length batch changed: "
+                f"expected={batch_size}, actual={len(actual_seq_lengths_kv)}."
+            )
         set_context(
             False,
             cu_seqlens_q=cu_seqlens_q,
             flat_slot_mapping=slots,
             flat_slot_mapping_i32=slots.to(torch.int32),
-            actual_seq_lengths_kv=(
-                positions.add(1).detach().cpu().tolist()
-            ),
+            actual_seq_lengths_kv=actual_seq_lengths_kv,
             block_tables=block_tables,
+            full_decode_graph=is_full_decode_graph_capturing(),
         )
 
     def _run_mtp_recurrence(
@@ -932,13 +976,49 @@ class ModelRunner:
         previous_hidden_states: torch.Tensor,
         block_tables: torch.Tensor,
         steps: int,
+        actual_seq_lengths_by_step: list[list[int]] | None = None,
+        balanced_route_offset: int | None = None,
     ) -> torch.Tensor:
         mtp = getattr(self.model, "mtp", None)
         if mtp is None:
             raise RuntimeError("MTP recurrence requested without an MTP model.")
+        if (
+            actual_seq_lengths_by_step is not None
+            and len(actual_seq_lengths_by_step) != steps
+        ):
+            raise ValueError(
+                "MTP recurrence requires one KV-length row per step: "
+                f"steps={steps}, rows={len(actual_seq_lengths_by_step)}."
+            )
         drafts: list[torch.Tensor] = []
-        for _ in range(steps):
-            self._set_mtp_decode_context(block_tables, positions)
+        for step in range(steps):
+            seq_lengths = (
+                None
+                if actual_seq_lengths_by_step is None
+                else actual_seq_lengths_by_step[step]
+            )
+            self._set_mtp_decode_context(
+                block_tables,
+                positions,
+                actual_seq_lengths_kv=seq_lengths,
+            )
+            if balanced_route_offset is not None:
+                moe = mtp.mtp_block.mlp
+                routes_per_step = int(input_ids.shape[0]) * int(moe.top_k)
+                get_context().scratch[GLM_BALANCED_MOE_EXPERT_IDS_KEY] = (
+                    balanced_moe_expert_ids(
+                        rows=int(input_ids.shape[0]),
+                        top_k=int(moe.top_k),
+                        num_experts=int(moe.num_experts),
+                        ep_size=int(moe.ep_size),
+                        route_offset=(
+                            int(balanced_route_offset)
+                            + step * routes_per_step
+                        ),
+                        device=input_ids.device,
+                        dtype=torch.int32,
+                    )
+                )
             previous_hidden_states = mtp(
                 input_ids, positions, previous_hidden_states
             )
@@ -1072,6 +1152,7 @@ class ModelRunner:
             False,
             is_spec_decode=True,
             cu_seqlens_q=cu_seqlens_tensor,
+            actual_seq_lengths_q=cu_seqlens_q[1:],
             flat_slot_mapping=slots_tensor,
             flat_slot_mapping_i32=slots_tensor.to(torch.int32),
             actual_seq_lengths_kv=[len(seq) + k for seq in seqs],
@@ -1084,44 +1165,153 @@ class ModelRunner:
         )
         return input_ids_tensor, positions_tensor, drafts, block_tables
 
+    def _mtp_target_forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        draft_token_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
+        batch_size = int(draft_token_ids.shape[0])
+        k = int(draft_token_ids.shape[1])
+        if k != self.num_speculative_tokens:
+            raise RuntimeError(
+                "MTP target draft width changed: "
+                f"expected={self.num_speculative_tokens}, actual={k}."
+            )
+        target_hidden_states = self.model(input_ids, positions)
+        target_tokens = self._greedy_sample(
+            self.model.compute_logits(target_hidden_states)
+        ).view(batch_size, k + 1)
+        accepted_counts, next_token_ids = greedy_prefix_accept(
+            target_tokens, draft_token_ids
+        )
+        rows = torch.arange(
+            batch_size, dtype=torch.long, device=input_ids.device
+        )
+        hidden_by_request = target_hidden_states.view(
+            batch_size, k + 1, -1
+        )
+        selected_hidden_states = hidden_by_request[rows, accepted_counts]
+        base_positions = positions.view(batch_size, k + 1)[:, 0]
+        selected_positions = base_positions + accepted_counts
+        return (
+            target_tokens,
+            accepted_counts,
+            next_token_ids,
+            selected_hidden_states,
+            selected_positions,
+        )
+
+    def _mtp_draft_graph_forward(
+        self,
+        next_token_ids: torch.Tensor,
+        selected_positions: torch.Tensor,
+        selected_hidden_states: torch.Tensor,
+        block_tables: torch.Tensor,
+        actual_seq_lengths_by_step: list[list[int]],
+    ) -> torch.Tensor:
+        return self._run_mtp_recurrence(
+            next_token_ids,
+            selected_positions,
+            selected_hidden_states,
+            block_tables,
+            self.num_speculative_tokens,
+            actual_seq_lengths_by_step=actual_seq_lengths_by_step,
+        )
+
+    def _mtp_draft_graph_eager_warmup(
+        self,
+        next_token_ids: torch.Tensor,
+        selected_positions: torch.Tensor,
+        selected_hidden_states: torch.Tensor,
+        block_tables: torch.Tensor,
+        actual_seq_lengths_by_step: list[list[int]],
+    ) -> int:
+        mtp = getattr(self.model, "mtp", None)
+        if mtp is None:
+            raise RuntimeError("MTP graph warmup requested without MTP weights.")
+        moe = mtp.mtp_block.mlp
+        routes_per_pass = int(next_token_ids.shape[0]) * int(moe.top_k)
+        warmup_passes = max(
+            1,
+            (int(moe.ep_size) + routes_per_pass - 1) // routes_per_pass,
+        )
+        for pass_index in range(warmup_passes):
+            self._run_mtp_recurrence(
+                next_token_ids,
+                selected_positions,
+                selected_hidden_states,
+                block_tables,
+                self.num_speculative_tokens,
+                actual_seq_lengths_by_step=actual_seq_lengths_by_step,
+                balanced_route_offset=pass_index * routes_per_pass,
+            )
+            torch.npu.synchronize()
+        reset_context()
+        return warmup_passes
+
+    @staticmethod
+    def _mtp_draft_seq_lengths(
+        base_seq_lengths: list[int],
+        accepted_counts: list[int],
+        steps: int,
+    ) -> list[list[int]]:
+        return [
+            [
+                int(length) + int(accepted) + step
+                for length, accepted in zip(
+                    base_seq_lengths, accepted_counts
+                )
+            ]
+            for step in range(steps)
+        ]
+
     def _run_mtp_verify(
         self,
         seqs: list[Sequence | DecodeSequenceMetadata],
     ) -> SpeculativeStepOutput | None:
-        k = self.num_speculative_tokens
         (
             input_ids,
             positions,
             draft_token_ids,
             block_tables,
         ) = self._prepare_mtp_verify(seqs)
-        target_hidden_states = self.model(input_ids, positions)
-        target_tokens = self._greedy_sample(
-            self.model.compute_logits(target_hidden_states)
-        ).view(len(seqs), k + 1)
-        accepted_counts, next_token_ids = greedy_prefix_accept(
-            target_tokens, draft_token_ids
-        )
-        rows = torch.arange(
-            len(seqs), dtype=torch.long, device=self.device
-        )
-        hidden_by_request = target_hidden_states.view(
-            len(seqs), k + 1, -1
-        )
-        selected_hidden_states = hidden_by_request[rows, accepted_counts]
-        base_positions = torch.tensor(
-            [len(seq) - 1 for seq in seqs],
-            dtype=torch.long,
-            device=self.device,
-        )
-        selected_positions = base_positions + accepted_counts
-        next_drafts = self._run_mtp_recurrence(
-            next_token_ids,
-            selected_positions,
-            selected_hidden_states,
-            block_tables,
-            k,
-        )
+        base_seq_lengths = [len(seq) for seq in seqs]
+        graph_manager = self.decode_graph_manager
+        if (
+            isinstance(graph_manager, MTPDecodeOnlyGraphManager)
+            and graph_manager.should_use_graph(len(seqs))
+        ):
+            target_tokens, accepted_counts, next_drafts = graph_manager.run(
+                input_ids,
+                positions,
+                draft_token_ids,
+                get_context(),
+                base_seq_lengths,
+            )
+        else:
+            (
+                target_tokens,
+                accepted_counts,
+                next_token_ids,
+                selected_hidden_states,
+                selected_positions,
+            ) = self._mtp_target_forward(
+                input_ids, positions, draft_token_ids
+            )
+            accepted_counts_host = accepted_counts.cpu().tolist()
+            next_drafts = self._run_mtp_recurrence(
+                next_token_ids,
+                selected_positions,
+                selected_hidden_states,
+                block_tables,
+                self.num_speculative_tokens,
+                actual_seq_lengths_by_step=self._mtp_draft_seq_lengths(
+                    base_seq_lengths,
+                    accepted_counts_host,
+                    self.num_speculative_tokens,
+                ),
+            )
 
         if self.rank != 0:
             return None
@@ -1189,7 +1379,11 @@ class ModelRunner:
                 if static_metadata is None:
                     raise RuntimeError("Decode sampling metadata was not prepared.")
                 temperatures = static_metadata.temperatures
-            if is_prefill or self.decode_graph_manager is None:
+            if (
+                is_prefill
+                or self.decode_graph_manager is None
+                or self.num_speculative_tokens
+            ):
                 hidden_states = self.model(input_ids, positions)
             else:
                 hidden_states = self.decode_graph_manager.run(input_ids, positions)

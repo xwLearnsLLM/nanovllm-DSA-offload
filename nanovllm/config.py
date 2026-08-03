@@ -158,12 +158,12 @@ class Config:
             )
         if self.offload_mode != OFFLOAD_NONE:
             raise ValueError(
-                "GLM MTP phase 1 requires offload_mode='none'."
+                "GLM MTP currently requires offload_mode='none'."
             )
-        if not self.enforce_eager:
+        if not self.enforce_eager and k != 3:
             raise ValueError(
-                "GLM MTP phase 1 is eager-only; set enforce_eager=True / "
-                "NANOVLLM_ENFORCE_EAGER=1."
+                "GLM MTP FULL_DECODE_ONLY currently requires "
+                "num_speculative_tokens=3. K=1/2 remain eager-only."
             )
         if int(getattr(self.hf_config, "num_nextn_predict_layers", 0)) != 1:
             raise ValueError(

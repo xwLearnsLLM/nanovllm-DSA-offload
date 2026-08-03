@@ -11,6 +11,7 @@ class Context:
     is_prefill: bool = False
     is_spec_decode: bool = False
     cu_seqlens_q: torch.Tensor | None = None
+    actual_seq_lengths_q: list[int] | None = None
     flat_slot_mapping: torch.Tensor | None = None
     flat_slot_mapping_i32: torch.Tensor | None = None
     flat_index_slot_mapping: torch.Tensor | None = None
@@ -44,6 +45,7 @@ def set_context(
     *,
     is_spec_decode=False,
     cu_seqlens_q=None,
+    actual_seq_lengths_q=None,
     flat_slot_mapping=None,
     flat_slot_mapping_i32=None,
     flat_index_slot_mapping=None,
@@ -68,6 +70,7 @@ def set_context(
         is_prefill=is_prefill,
         is_spec_decode=bool(is_spec_decode),
         cu_seqlens_q=cu_seqlens_q,
+        actual_seq_lengths_q=actual_seq_lengths_q,
         flat_slot_mapping=flat_slot_mapping,
         flat_slot_mapping_i32=flat_slot_mapping_i32,
         flat_index_slot_mapping=flat_index_slot_mapping,

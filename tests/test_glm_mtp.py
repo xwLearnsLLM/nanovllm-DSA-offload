@@ -296,9 +296,10 @@ def _mtp_config(path, **overrides):
     return Config(str(path), **kwargs)
 
 
-def test_glm_mtp_runtime_accepts_nonoffload_eager(tmp_path):
+@pytest.mark.parametrize("enforce_eager", [True, False])
+def test_glm_mtp_runtime_accepts_nonoffload_k3(tmp_path, enforce_eager):
     _write_mtp_config(tmp_path)
-    config = _mtp_config(tmp_path)
+    config = _mtp_config(tmp_path, enforce_eager=enforce_eager)
     assert config.num_speculative_tokens == 3
     assert config.hf_config.nanovllm_num_speculative_tokens == 3
 
@@ -313,13 +314,23 @@ def test_glm_mtp_runtime_accepts_nonoffload_eager(tmp_path):
             },
             "offload_mode='none'",
         ),
-        ({"enforce_eager": False}, "eager-only"),
     ],
 )
-def test_glm_mtp_runtime_rejects_offload_and_graph(tmp_path, overrides, message):
+def test_glm_mtp_runtime_rejects_offload(tmp_path, overrides, message):
     _write_mtp_config(tmp_path)
     with pytest.raises(ValueError, match=message):
         _mtp_config(tmp_path, **overrides)
+
+
+@pytest.mark.parametrize("k", [1, 2])
+def test_glm_mtp_graph_requires_k3(tmp_path, k):
+    _write_mtp_config(tmp_path)
+    with pytest.raises(ValueError, match="requires num_speculative_tokens=3"):
+        _mtp_config(
+            tmp_path,
+            enforce_eager=False,
+            num_speculative_tokens=k,
+        )
 
 
 def test_glm_mtp_requires_root_rotation_and_float_layer_78(tmp_path):
