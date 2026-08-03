@@ -1027,24 +1027,36 @@ class GlmMLAAttention(nn.Module):
             )
             latent = out
         else:
-            latent, lse = torch_npu.npu_fused_infer_attention_score_v2(
+            latent, _ = torch_npu.npu_fused_infer_attention_score_v2(
                 query,
                 key_cache,
                 key_cache,
                 **kwargs,
             )
+            out_shape = (
+                self.num_local_heads,
+                num_tokens,
+                self.kv_lora_rank,
+            )
             if (
                 self._spec_decode_mla_v2_out is None
                 or tuple(self._spec_decode_mla_v2_out.shape)
-                != tuple(latent.shape)
+                != out_shape
             ):
-                self._spec_decode_mla_v2_out = torch.empty_like(latent)
+                self._spec_decode_mla_v2_out = torch.empty(
+                    out_shape,
+                    dtype=query.dtype,
+                    device=query.device,
+                )
             if (
                 self._spec_decode_mla_v2_lse is None
-                or tuple(self._spec_decode_mla_v2_lse.shape)
-                != tuple(lse.shape)
+                or tuple(self._spec_decode_mla_v2_lse.shape) != (num_tokens,)
             ):
-                self._spec_decode_mla_v2_lse = torch.empty_like(lse)
+                self._spec_decode_mla_v2_lse = torch.empty(
+                    num_tokens,
+                    dtype=query.dtype,
+                    device=query.device,
+                )
             self._decode_mla_v2_workspace_get(
                 num_tokens, query, key_cache, kwargs
             )

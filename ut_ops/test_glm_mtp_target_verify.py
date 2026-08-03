@@ -198,7 +198,7 @@ def run_graph_replay_check(
         "actual_seq_qlen": actual_seq_qlen,
         "actual_seq_kvlen": capture_kvlen,
     }
-    eager_output, eager_lse = (
+    eager_output, _ = (
         torch_npu.npu_fused_infer_attention_score_v2(
             flat_query,
             key_cache,
@@ -206,8 +206,16 @@ def run_graph_replay_check(
             **kwargs,
         )
     )
-    graph_output = torch.empty_like(eager_output)
-    graph_lse = torch.empty_like(eager_lse)
+    graph_output = torch.empty(
+        (heads, total_tokens, CKV_DIM),
+        dtype=flat_query.dtype,
+        device=flat_query.device,
+    )
+    graph_lse = torch.empty(
+        total_tokens,
+        dtype=flat_query.dtype,
+        device=flat_query.device,
+    )
     workspace = (
         torch_npu._npu_fused_infer_attention_score_v2_get_max_workspace(
             flat_query,
@@ -217,6 +225,29 @@ def run_graph_replay_check(
         )
     )
     attention_op = torch_npu.npu_fused_infer_attention_score_v2.out
+
+    # Separate the out-variant contract from graph capture. This mirrors the
+    # output/LSE allocation used by vLLM-Ascend's MLA graph implementation.
+    attention_op(
+        flat_query,
+        key_cache,
+        key_cache,
+        **kwargs,
+        workspace=workspace,
+        out=[graph_output, graph_lse],
+    )
+    torch.npu.synchronize()
+    torch.testing.assert_close(
+        graph_output.float().cpu(),
+        eager_output.float().cpu(),
+        atol=atol,
+        rtol=rtol,
+    )
+    print(
+        "GLM_MTP_TARGET_VERIFY_OUT_CHECK "
+        f"query_len={query_len} ok=1"
+    )
+
     graph = torch.npu.NPUGraph()
     pool = torch.npu.graph_pool_handle()
     with torch.npu.graph(graph, pool=pool):
@@ -237,22 +268,10 @@ def run_graph_replay_check(
         )
         task_handle = torch.npu.graph_task_group_end(capture_stream)
     torch.npu.synchronize()
-    torch.testing.assert_close(
-        graph_output.float().cpu(),
-        eager_output.float().cpu(),
-        atol=atol,
-        rtol=rtol,
-    )
 
     update_stream = torch.npu.Stream()
-    max_abs = 0.0
-    for replay in range(replays):
-        # Change both device input data and host-side KV-length attributes.
-        flat_query.mul_(-1)
-        kv_lengths = [
-            prefix_len + query_len - ((replay + row) % 3)
-            for row in range(batch_size)
-        ]
+
+    def replay_graph(kv_lengths: list[int]) -> None:
         torch.npu.current_stream().synchronize()
         graph.replay()
         with torch.npu.stream(update_stream):
@@ -270,6 +289,26 @@ def run_graph_replay_check(
                 torch.npu.graph_task_update_end(update_stream)
             event.record(update_stream)
         torch.npu.synchronize()
+
+    # Capturing an external task does not make its capture-time output a valid
+    # inference result. Validate only after a real replay plus task refresh.
+    replay_graph(capture_kvlen)
+    torch.testing.assert_close(
+        graph_output.float().cpu(),
+        eager_output.float().cpu(),
+        atol=atol,
+        rtol=rtol,
+    )
+
+    max_abs = 0.0
+    for replay in range(replays):
+        # Change both device input data and host-side KV-length attributes.
+        flat_query.mul_(-1)
+        kv_lengths = [
+            prefix_len + query_len - ((replay + row) % 3)
+            for row in range(batch_size)
+        ]
+        replay_graph(kv_lengths)
         golden = run_batched_verify(
             query,
             query_rope,

@@ -1073,6 +1073,41 @@ class MTPDecodeOnlyGraphManager:
                 f"{tuple(entry.accepted_counts.shape)}."
             )
 
+    def _replay_target_graph(
+        self,
+        entry: MTPDecodeGraphEntry,
+        target_seq_lengths: list[int],
+    ) -> None:
+        torch.npu.current_stream().synchronize()
+        entry.target_graph.replay()
+        with torch.npu.stream(self._update_stream):
+            for task in entry.target_tasks:
+                task.update(self._update_stream, target_seq_lengths)
+
+    def _replay_draft_graph(
+        self,
+        entry: MTPDecodeGraphEntry,
+        draft_seq_lengths: list[list[int]],
+    ) -> None:
+        if len(entry.draft_tasks) != len(draft_seq_lengths):
+            raise RuntimeError(
+                "MTP draft graph task count changed before replay: "
+                f"tasks={len(entry.draft_tasks)}, "
+                f"steps={len(draft_seq_lengths)}."
+            )
+        entry.draft_graph.replay()
+        with torch.npu.stream(self._update_stream):
+            for task, seq_lengths in zip(
+                entry.draft_tasks, draft_seq_lengths
+            ):
+                task.update(self._update_stream, seq_lengths)
+
+    def _record_complete_replay(self, entry: MTPDecodeGraphEntry) -> None:
+        entry.replay_count += 1
+        self.replay_count += 1
+        self.target_replay_count += 1
+        self.draft_replay_count += 1
+
     def _capture(
         self,
         entry: MTPDecodeGraphEntry,
@@ -1140,6 +1175,9 @@ class MTPDecodeOnlyGraphManager:
                         f"actual={len(entry.target_tasks)}."
                     )
 
+                # External FIA tasks do not guarantee usable capture-time
+                # outputs. Replay target once before consuming acceptance.
+                self._replay_target_graph(entry, target_seq_lengths)
                 accepted_counts = entry.accepted_counts.cpu().tolist()
                 draft_seq_lengths = self._draft_seq_lengths(
                     base_seq_lengths,
@@ -1194,6 +1232,11 @@ class MTPDecodeOnlyGraphManager:
                         "MTP draft graph returned an unexpected shape: "
                         f"{tuple(entry.next_drafts.shape)}."
                     )
+                # For the same reason, the capture step returns only the first
+                # real replay of the draft graph, never capture-time storage.
+                self._replay_draft_graph(entry, draft_seq_lengths)
+                torch.npu.synchronize()
+                self._record_complete_replay(entry)
                 self.capture_count += 1
                 self.eager_capture_count += 1
                 if self.log_enabled:
@@ -1226,11 +1269,7 @@ class MTPDecodeOnlyGraphManager:
         target_seq_lengths = self._target_seq_lengths(
             base_seq_lengths, self.speculative_tokens
         )
-        torch.npu.current_stream().synchronize()
-        entry.target_graph.replay()
-        with torch.npu.stream(self._update_stream):
-            for task in entry.target_tasks:
-                task.update(self._update_stream, target_seq_lengths)
+        self._replay_target_graph(entry, target_seq_lengths)
         accepted_counts = entry.accepted_counts.cpu().tolist()
 
         draft_seq_lengths = self._draft_seq_lengths(
@@ -1238,22 +1277,8 @@ class MTPDecodeOnlyGraphManager:
             accepted_counts,
             self.speculative_tokens,
         )
-        if len(entry.draft_tasks) != len(draft_seq_lengths):
-            raise RuntimeError(
-                "MTP draft graph task count changed before replay: "
-                f"tasks={len(entry.draft_tasks)}, "
-                f"steps={len(draft_seq_lengths)}."
-            )
-        entry.draft_graph.replay()
-        with torch.npu.stream(self._update_stream):
-            for task, seq_lengths in zip(
-                entry.draft_tasks, draft_seq_lengths
-            ):
-                task.update(self._update_stream, seq_lengths)
-        entry.replay_count += 1
-        self.replay_count += 1
-        self.target_replay_count += 1
-        self.draft_replay_count += 1
+        self._replay_draft_graph(entry, draft_seq_lengths)
+        self._record_complete_replay(entry)
         if self.log_enabled and self.replay_count == 1:
             logger.info(
                 "FULL_DECODE_ONLY MTP: first target+draft replay entered for "
