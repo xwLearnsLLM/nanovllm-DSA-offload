@@ -77,6 +77,7 @@ public:
     __aicore__ inline void ProcessVec(const LICommon::RunInfo &info);
     __aicore__ inline void ProcessVecMtp(const LICommon::RunInfo &info);
     __aicore__ inline void InitBuffers(TPipe *pipe);
+    __aicore__ inline void InitMtpBuffers(TPipe *pipe);
     __aicore__ inline void InitParams(
         uint32_t kSeqSize, uint32_t qHeadNum, uint32_t cacheSlotsSize);
     __aicore__ inline void InitVec1GlobalTensor(GlobalTensor<MM1_OUT_T> mm1ResGm, GlobalTensor<K_T> weightsGm,
@@ -126,6 +127,7 @@ private:
     // tmp buff for vector
     TBuf<TPosition::VECCALC> sortOutBuf_;
     TBuf<TPosition::VECCALC> indexBuf_;
+    TBuf<TPosition::VECCALC> aggregateScoreBuf_;
     TBuf<TPosition::VECCALC> payloadBuf_;
     TBuf<TPosition::VECCALC> reduceOutBuf_;
     TBuf<TPosition::VECCALC> brcBuf_;
@@ -226,6 +228,18 @@ __aicore__ inline void LIVector<LIT>::InitBuffers(TPipe *pipe)
 
     ArithProgression<int32_t>(globalTopkIndice_, 0, 1, S2_BASE_SIZE);
     PipeBarrier<PIPE_V>();
+}
+
+template <typename LIT>
+__aicore__ inline void LIVector<LIT>::InitMtpBuffers(TPipe *pipe)
+{
+    if ((GetBlockIdx() & 1U) != 0U) {
+        return;
+    }
+    InitBuffers(pipe);
+    // Only MTP needs the fourth-query aggregate-score scratch.  Keep it out
+    // of the single-query LIDU UB footprint.
+    pipe->InitBuffer(aggregateScoreBuf_, S2_BASE_SIZE * sizeof(float));
 }
 
 template <typename LIT>
@@ -383,7 +397,11 @@ __aicore__ inline void LIVector<LIT>::WriteMtpAggregateScoreChunk(
         return;
     }
 
-    LocalTensor<float> previousScore = globalTopkIndice_.template ReinterpretCast<float>();
+    // Do not borrow globalTopkIndice_ here.  FinishPayload relies on that
+    // buffer remaining the exact 0..511 progression across all four MTP
+    // queries; using it as async GM scratch corrupts query 1+ payloads on
+    // Ascend910_93 even when it is rewritten before the next chunk.
+    LocalTensor<float> previousScore = aggregateScoreBuf_.Get<float>();
     SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
     DataCopyPad(previousScore, scoresGm[gmOffset],
                 AscendC::DataCopyExtParams{
@@ -396,9 +414,6 @@ __aicore__ inline void LIVector<LIT>::WriteMtpAggregateScoreChunk(
     LIServiceVec::CopyOut(scoresGm[gmOffset], previousScore, alignedLen);
     SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
 
-    // FinishPayload needs this 0..511 progression for every following chunk.
-    ArithProgression<int32_t>(globalTopkIndice_, 0, 1, S2_BASE_SIZE);
-    PipeBarrier<PIPE_V>();
 }
 
 template <typename LIT>

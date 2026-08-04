@@ -551,8 +551,14 @@ def validate_result(
                 or bool((actual_slots >= budget).any())
                 or torch.unique(actual_slots).numel() != TOPK
             ):
+                negative = int((actual_slots < 0).sum())
+                out_of_range = int((actual_slots >= budget).sum())
+                unique = int(torch.unique(actual_slots).numel())
                 raise AssertionError(
-                    f"{label}: request={request} query={query_idx} slots invalid"
+                    f"{label}: request={request} query={query_idx} slots invalid "
+                    f"(negative={negative}, out_of_range={out_of_range}, "
+                    f"unique={unique}/{TOPK}, min={int(actual_slots.min())}, "
+                    f"max={int(actual_slots.max())})"
                 )
             actual_tokens = slot_to_token[actual_slots]
             golden_tokens = case.topk_cpu[query_row]

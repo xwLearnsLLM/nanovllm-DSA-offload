@@ -157,7 +157,7 @@ __aicore__ inline void LIMtpPreload<LIT>::Init(
             mm1ResGm, weightsGm, cacheSlotsGm, topkSlotsGm,
             missSourceIdsGm, missDestinationSlotsGm, missCountsGm,
             aggregateScoresGm, internalTopkIndicesGm);
-        vectorService.InitBuffers(pipe);
+        vectorService.InitMtpBuffers(pipe);
     } else {
         matmulService.InitParams(constInfo);
         queryGm.SetGlobalBuffer((__gm__ Q_T *)query);
