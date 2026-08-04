@@ -104,7 +104,11 @@ __aicore__ inline void LIMtpPreload<LIT>::Init(
     const LIUMtpTilingData *__restrict tiling, TPipe *pipe)
 {
     tmpBlockIdx = GetBlockIdx();
-    aiCoreIdx = ASCEND_IS_AIV ? tmpBlockIdx / 2U : tmpBlockIdx;
+    if ASCEND_IS_AIV {
+        aiCoreIdx = tmpBlockIdx / 2U;
+    } else {
+        aiCoreIdx = tmpBlockIdx;
+    }
 
     constInfo.batchSize = tiling->bSize;
     constInfo.kSeqSize = tiling->s2Size;
@@ -235,7 +239,7 @@ __aicore__ inline void LIMtpPreload<LIT>::ProcessMain()
                 uint32_t chunkStart = chunkIdx * constInfo.s2BaseSize;
                 runInfo.actualSingleProcessSInnerSize =
                     Min(constInfo.s2BaseSize, candidateLen - chunkStart);
-                runInfo.actualSingleProcessSInnerSizeAlign = Align(
+                runInfo.actualSingleProcessSInnerSizeAlign = LICommon::Align(
                     runInfo.actualSingleProcessSInnerSize,
                     ConstInfo::BUFFER_SIZE_BYTE_32B);
                 runInfo.isFirstS2InnerLoop = chunkIdx == 0U;
