@@ -8,8 +8,8 @@
 #include "kernel_operator.h"
 #include "lib/matmul_intf.h"
 #include "../lightning_indexer_decode_update/lightning_indexer_decode_update_common.h"
-#include "../lightning_indexer_decode_update/lightning_indexer_decode_update_service_cube.h"
 #include "../lightning_indexer_decode_update/lightning_indexer_decode_update_service_vector.h"
+#include "../lightning_indexer_decode_update/lightning_indexer_decode_update_service_cube.h"
 
 namespace LIMtpKernel {
 using namespace AscendC;
