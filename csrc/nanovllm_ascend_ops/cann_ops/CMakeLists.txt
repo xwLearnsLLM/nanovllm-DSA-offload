@@ -240,6 +240,15 @@ op_add_subdirectory(OP_LIST OP_DIR_LIST)
 # to include the kernels in binary_info_config.json.
 set(lightning_indexer_decode_update_kernel_aliases nanovllm_lidu_decode_update)
 set(lightning_indexer_decode_update_mtp_kernel_aliases nanovllm_lidu_decode_update_mtp)
+# The MTP kernel reuses the single-query LIDU's common cube/vector services.
+# Declare the dependency for OPC so those headers are copied next to the
+# isolated MTP source tree before kernel compilation.  The alias form is what
+# generated compile scripts use, while the directory form is used during op
+# discovery.
+set(lightning_indexer_decode_update_mtp_depends
+    ../ops/lightning_indexer_decode_update)
+set(nanovllm_lidu_decode_update_mtp_depends
+    ../ops/lightning_indexer_decode_update)
 set(kvcache_scatter_copy_kernel_aliases nanovllm_kvcache_scatter_copy)
 set(sparse_and_tail_attention_kernel_aliases nanovllm_sparse_and_tail_attention)
 set(sparse_and_tail_attention_and_scatter_copy_kernel_aliases
