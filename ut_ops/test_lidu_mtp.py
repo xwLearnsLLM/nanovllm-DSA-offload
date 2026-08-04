@@ -962,10 +962,6 @@ def run_performance_case(
     fused_ms = _wall_ms(fused_step, warmup, iters)
     serial_ms = _wall_ms(serial_step, warmup, iters)
     speedup = serial_ms / fused_ms
-    if speedup < min_speedup:
-        raise AssertionError(
-            f"MTP-LIDU speedup={speedup:.4f} is below {min_speedup:.4f}"
-        )
 
     level_results: list[tuple[str, int, float]] = []
     for label, fraction in (("zero", 0.0), ("typical", 0.5), ("high", 1.0)):
@@ -1006,6 +1002,11 @@ def run_performance_case(
         f"min_speedup={min_speedup:.4f} warmup={warmup} iters={iters}",
         flush=True,
     )
+    if speedup < min_speedup:
+        raise AssertionError(
+            "MTP-LIDU performance gate failed after reporting all metrics: "
+            f"speedup={speedup:.4f} is below {min_speedup:.4f}"
+        )
     del case
     torch.npu.empty_cache()
 
