@@ -522,7 +522,65 @@ def validate_result(
                 raise AssertionError(f"{label}: C=0 pool row changed")
             continue
 
-        union = case.union_cpu[request]
+        valid_slots = after[:candidate_len]
+        valid_slots = valid_slots[valid_slots >= 0].to(torch.int64)
+        if (
+            valid_slots.numel() != budget
+            or torch.unique(valid_slots).numel() != budget
+            or int(valid_slots.min()) != 0
+            or int(valid_slots.max()) != budget - 1
+        ):
+            raise AssertionError(
+                f"{label}: request={request} state is not a permutation of [0,C)"
+            )
+
+        # LightningIndexer guarantees the top-k set, but its merge order is
+        # not a public contract (ties may be ordered differently by the fused
+        # MTP kernel).  Reconstruct token IDs from the returned logical slots,
+        # compare each query as a set against the native golden, and retain the
+        # fused operator's deterministic order for the ordered-union checks.
+        cached_tokens = torch.nonzero(after[:candidate_len] >= 0).flatten()
+        slot_to_token = torch.full((budget,), -1, dtype=torch.int64)
+        slot_to_token[after[cached_tokens].to(torch.int64)] = cached_tokens
+        actual_topk_rows: list[torch.Tensor] = []
+        for query_idx in range(QUERY_COUNT):
+            query_row = request * QUERY_COUNT + query_idx
+            actual_slots = topk_slots_cpu[query_row]
+            if (
+                bool((actual_slots < 0).any())
+                or bool((actual_slots >= budget).any())
+                or torch.unique(actual_slots).numel() != TOPK
+            ):
+                raise AssertionError(
+                    f"{label}: request={request} query={query_idx} slots invalid"
+                )
+            actual_tokens = slot_to_token[actual_slots]
+            golden_tokens = case.topk_cpu[query_row]
+            if not torch.equal(
+                torch.sort(actual_tokens).values,
+                torch.sort(golden_tokens).values,
+            ):
+                missing = torch.isin(golden_tokens, actual_tokens, invert=True)
+                extra = torch.isin(actual_tokens, golden_tokens, invert=True)
+                raise AssertionError(
+                    f"{label}: request={request} query={query_idx} topk token "
+                    f"set differs (missing={int(missing.sum())}, "
+                    f"extra={int(extra.sum())})"
+                )
+            actual_topk_rows.append(actual_tokens)
+
+        union = _ordered_union(actual_topk_rows)
+        golden_union = case.union_cpu[request]
+        if not torch.equal(
+            torch.sort(union).values,
+            torch.sort(golden_union).values,
+        ):
+            raise AssertionError(
+                f"{label}: request={request} topk union set differs"
+            )
+        if bool((after[union] < 0).any()):
+            raise AssertionError(f"{label}: request={request} union is not cached")
+
         expected_misses = union[before[union] < 0]
         expected_count = int(expected_misses.numel())
         expected_counts.append(expected_count)
@@ -548,20 +606,6 @@ def validate_result(
                 f"{label}: request={request} miss destination slots invalid"
             )
 
-        valid_slots = after[:candidate_len]
-        valid_slots = valid_slots[valid_slots >= 0].to(torch.int64)
-        if (
-            valid_slots.numel() != budget
-            or torch.unique(valid_slots).numel() != budget
-            or int(valid_slots.min()) != 0
-            or int(valid_slots.max()) != budget - 1
-        ):
-            raise AssertionError(
-                f"{label}: request={request} state is not a permutation of [0,C)"
-            )
-        if bool((after[union] < 0).any()):
-            raise AssertionError(f"{label}: request={request} union is not cached")
-
         old_hits = union[before[union] >= 0]
         if old_hits.numel() and not torch.equal(after[old_hits], before[old_hits]):
             raise AssertionError(
@@ -584,17 +628,6 @@ def validate_result(
                     f"{label}: request={request} evicted a union token"
                 )
 
-        for query_idx in range(QUERY_COUNT):
-            query_row = request * QUERY_COUNT + query_idx
-            expected_slots = after[case.topk_cpu[query_row]].to(torch.int64)
-            if not torch.equal(topk_slots_cpu[query_row], expected_slots):
-                raise AssertionError(
-                    f"{label}: request={request} query={query_idx} topk_slots differ"
-                )
-            if torch.unique(topk_slots_cpu[query_row]).numel() != TOPK:
-                raise AssertionError(
-                    f"{label}: request={request} query={query_idx} slots repeat"
-                )
     return expected_counts
 
 
