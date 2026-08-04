@@ -906,6 +906,11 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
         SetWaitFlag<HardEvent::MTE3_S>(HardEvent::MTE3_S);
     }
     WriteMissCount(info.bIdx, static_cast<int32_t>(updateCount), topkIndices);
+    // topkIndices is also the source buffer used by WriteMissCount.  The next
+    // operation refills it through MTE2, so MTE3 must finish reading the
+    // scalar first.  MTE3_V inside WriteMissCount only protects a following
+    // vector operation and is insufficient for this MTE2 reuse.
+    SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
 
     // Resolve all four top-k rows against the single final cache state.
     AscendC::DataCopyParams topkCopy{
