@@ -47,4 +47,27 @@
     } while (0)
 #endif
 
+// Some reference kernels use the older OPS_* spellings from
+// error/ops_error.h.  That private header is not shipped by every CANN 9.1
+// Ascend 950 package, so keep the small subset needed by this standalone
+// project local.
+#ifndef OPS_LOG_E
+#define OPS_LOG_E(op_name, ...) OP_LOGE(op_name, __VA_ARGS__)
+#endif
+
+#ifndef OPS_ERR_IF
+#define OPS_ERR_IF(condition, log_statement, action) \
+    OP_CHECK_IF(condition, log_statement, action)
+#endif
+
+#ifndef OPS_LOG_E_IF_NULL
+#define OPS_LOG_E_IF_NULL(context, value, action)              \
+    do {                                                       \
+        if ((value) == nullptr) {                              \
+            OP_LOGE(context, "%s is nullptr.", #value);      \
+            action;                                            \
+        }                                                      \
+    } while (0)
+#endif
+
 #endif

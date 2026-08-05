@@ -5,7 +5,7 @@
 #ifndef lightning_indexer_decode_update_a5_TILING_H_
 #define lightning_indexer_decode_update_a5_TILING_H_
 
-#include "error/ops_error.h"
+#include "a5_sfa_shared/ops_log_compat.h"
 #include "exe_graph/runtime/tiling_context.h"
 #include "platform/platform_info.h"
 #include "register/op_def_registry.h"

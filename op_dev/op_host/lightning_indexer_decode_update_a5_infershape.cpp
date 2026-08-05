@@ -3,7 +3,7 @@
  */
 
 #include <register/op_impl_registry.h>
-#include "error/ops_error.h"
+#include "a5_sfa_shared/ops_log_compat.h"
 
 using namespace ge;
 
