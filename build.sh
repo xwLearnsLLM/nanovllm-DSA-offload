@@ -86,6 +86,11 @@ done
 # kernel sources below are the authoritative implementation.
 cp -a "${OP_DEV}/op_host/." "${GENERATED}/op_host/"
 cp -a "${OP_DEV}/op_kernel/." "${GENERATED}/op_kernel/"
+# The checked-in LightningIndexer definition deliberately has the same name
+# as the msopgen stub and overwrites it.  Remove the legacy split definition
+# if an older worktree left it behind; compiling both creates a duplicate
+# section in aic-ascend950-ops-info.ini.
+rm -f "${GENERATED}/op_host/lightning_indexer_decode_update_a5_def.cpp"
 
 pushd "${GENERATED}" >/dev/null
 OPS_CPU_NUMBER="${BUILD_JOBS}" bash build.sh
