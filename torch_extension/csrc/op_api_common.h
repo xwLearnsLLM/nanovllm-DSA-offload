@@ -470,7 +470,347 @@ inline c10::Scalar ConvertTensorToScalar(const at::Tensor &tensor) {
   const at::Tensor *aclInput = &tensor;
   if (aclInput->scalar_type() == at::ScalarType::Double) {
     double value = *(double *)aclInput->data_ptr();
-    c10::Sc…3009 tokens truncated…turn acl_tensor;
+    c10::Scalar scalar(value);
+    expScalar = scalar;
+  } else if (aclInput->scalar_type() == at::ScalarType::Long) {
+    int64_t value = *(int64_t *)aclInput->data_ptr();
+    c10::Scalar scalar(value);
+    expScalar = scalar;
+  } else if (aclInput->scalar_type() == at::ScalarType::Float) {
+    float value = *(float *)aclInput->data_ptr();
+    c10::Scalar scalar(value);
+    expScalar = scalar;
+  } else if (aclInput->scalar_type() == at::ScalarType::Int) {
+    int value = *(int *)aclInput->data_ptr();
+    c10::Scalar scalar(value);
+    expScalar = scalar;
+  } else if (aclInput->scalar_type() == at::ScalarType::Half) {
+    c10::Half value = *(c10::Half *)aclInput->data_ptr();
+    c10::Scalar scalar(value);
+    expScalar = scalar;
+  } else if (aclInput->scalar_type() == at::ScalarType::Bool) {
+    int8_t value = *(int8_t *)aclInput->data_ptr();
+    c10::Scalar scalar(value);
+    expScalar = scalar;
+  } else if (aclInput->scalar_type() == at::ScalarType::ComplexDouble) {
+    c10::complex<double> value = *(c10::complex<double> *)aclInput->data_ptr();
+    c10::Scalar scalar(value);
+    expScalar = scalar;
+  } else if (aclInput->scalar_type() == at::ScalarType::ComplexFloat) {
+    c10::complex<float> value = *(c10::complex<float> *)aclInput->data_ptr();
+    c10::Scalar scalar(value);
+    expScalar = scalar;
+  } else if (aclInput->scalar_type() == at::ScalarType::BFloat16) {
+    c10::BFloat16 value = *(c10::BFloat16 *)aclInput->data_ptr();
+    c10::Scalar scalar(value);
+    expScalar = scalar;
+  }
+  return expScalar;
+}
+
+inline at::Tensor CopyTensorHostToDevice(const at::Tensor &cpu_tensor) {
+  at::Tensor cpuPinMemTensor = cpu_tensor.pin_memory();
+  int deviceIndex = 0;
+  return cpuPinMemTensor.to(c10::Device(torch_npu::utils::get_npu_device_type(), deviceIndex),
+                            cpuPinMemTensor.scalar_type(), true, true);
+}
+
+inline at::Tensor CopyScalarToDevice(const c10::Scalar &cpu_scalar,
+                                     at::ScalarType scalar_data_type) {
+  return CopyTensorHostToDevice(
+      scalar_to_tensor(cpu_scalar).to(scalar_data_type));
+}
+
+static bool IsOpInputBaseFormatCommon(const at::Tensor &at_tensor)
+{
+  if (!torch_npu::utils::is_npu(at_tensor)) {
+    return true;
+  }
+  const auto format = static_cast<NPUStorageImpl *>(at_tensor.storage().unsafeGetStorageImpl())->npu_desc_.npu_format_;
+  return (format == ACL_FORMAT_ND) || (format == ACL_FORMAT_NCHW) || (format == ACL_FORMAT_NHWC) ||
+      (format == ACL_FORMAT_NCDHW);
+}
+
+inline aclTensor *ConvertType(const at::Tensor &at_tensor) {
+  static const auto aclCreateTensor = GET_OP_API_FUNC(aclCreateTensor);
+  if (aclCreateTensor == nullptr) {
+    return nullptr;
+  }
+
+  if (!at_tensor.defined()) {
+    return nullptr;
+  }
+  at::ScalarType scalar_data_type = at_tensor.scalar_type();
+  aclDataType acl_data_type =
+      kATenScalarTypeToAclDataTypeTable[static_cast<int64_t>(scalar_data_type)];
+  TORCH_CHECK(
+      acl_data_type != ACL_DT_UNDEFINED,
+      std::string(c10::toString(scalar_data_type)) + " has not been supported")
+  c10::SmallVector<int64_t, SIZE> storageDims;
+
+  const auto dimNum = at_tensor.sizes().size();
+  aclFormat format = ACL_FORMAT_ND;
+  if (!IsOpInputBaseFormatCommon(at_tensor)) {
+    format = static_cast<NPUStorageImpl *>(at_tensor.storage().unsafeGetStorageImpl())->npu_desc_.npu_format_;
+    if (acl_data_type != ACL_STRING) {
+        TORCH_CHECK(at_tensor.itemsize() > 0, "the itemsize of tensor must be greater than 0.");
+        storageDims = static_cast<NPUStorageImpl *>(at_tensor.storage().unsafeGetStorageImpl())->npu_desc_.storage_sizes_;
+    }
+  } else {
+      switch (dimNum) {
+      case 3:
+        format = ACL_FORMAT_NCL;
+        break;
+      case 4:
+        format = ACL_FORMAT_NCHW;
+        break;
+      case 5:
+        format = ACL_FORMAT_NCDHW;
+        break;
+      default:
+        format = ACL_FORMAT_ND;
+    }
+    if (acl_data_type != ACL_STRING) {
+        TORCH_CHECK(at_tensor.itemsize() > 0, "the itemsize of tensor must be greater than 0.");
+        storageDims.push_back(at_tensor.storage().nbytes() / at_tensor.itemsize());
+    }
+  }
+
+  if (at_tensor.unsafeGetTensorImpl()->is_wrapped_number()) {
+    // no need this ConvertTensorToScalar
+    c10::Scalar expScalar = at_tensor.item();
+    at::Tensor aclInput = CopyScalarToDevice(expScalar, scalar_data_type);
+    return aclCreateTensor(aclInput.sizes().data(), aclInput.sizes().size(),
+                           acl_data_type, aclInput.strides().data(),
+                           aclInput.storage_offset(), format,
+                           storageDims.data(), storageDims.size(),
+                           const_cast<void *>(aclInput.storage().data()));
+  }
+
+  auto acl_tensor = aclCreateTensor(
+      at_tensor.sizes().data(), at_tensor.sizes().size(), acl_data_type,
+      at_tensor.strides().data(), at_tensor.storage_offset(), format,
+      storageDims.data(), storageDims.size(),
+      const_cast<void *>(at_tensor.storage().data()));
+  return acl_tensor;
+}
+
+inline aclScalar *ConvertType(const at::Scalar &at_scalar) {
+  static const auto aclCreateScalar = GET_OP_API_FUNC(aclCreateScalar);
+  if (aclCreateScalar == nullptr) {
+    return nullptr;
+  }
+
+  at::ScalarType scalar_data_type = at_scalar.type();
+  aclDataType acl_data_type =
+      kATenScalarTypeToAclDataTypeTable[static_cast<int64_t>(scalar_data_type)];
+  TORCH_CHECK(
+      acl_data_type != ACL_DT_UNDEFINED,
+      std::string(c10::toString(scalar_data_type)) + " has not been supported")
+  aclScalar *acl_scalar = nullptr;
+  switch (scalar_data_type) {
+    case at::ScalarType::Double: {
+      double value = at_scalar.toDouble();
+      acl_scalar = aclCreateScalar(&value, acl_data_type);
+      break;
+    }
+    case at::ScalarType::Long: {
+      int64_t value = at_scalar.toLong();
+      acl_scalar = aclCreateScalar(&value, acl_data_type);
+      break;
+    }
+    case at::ScalarType::Bool: {
+      bool value = at_scalar.toBool();
+      acl_scalar = aclCreateScalar(&value, acl_data_type);
+      break;
+    }
+    case at::ScalarType::ComplexDouble: {
+      auto value = at_scalar.toComplexDouble();
+      acl_scalar = aclCreateScalar(&value, acl_data_type);
+      break;
+    }
+    default:
+      acl_scalar = nullptr;
+      break;
+  }
+  return acl_scalar;
+}
+
+inline aclIntArray *ConvertType(const at::IntArrayRef &at_array) {
+  static const auto aclCreateIntArray = GET_OP_API_FUNC(aclCreateIntArray);
+  if (aclCreateIntArray == nullptr) {
+    return nullptr;
+  }
+  auto array = aclCreateIntArray(at_array.data(), at_array.size());
+  return array;
+}
+
+template <std::size_t N>
+inline aclBoolArray *ConvertType(const std::array<bool, N> &value) {
+  static const auto aclCreateBoolArray = GET_OP_API_FUNC(aclCreateBoolArray);
+  if (aclCreateBoolArray == nullptr) {
+    return nullptr;
+  }
+
+  auto array = aclCreateBoolArray(value.data(), value.size());
+  return array;
+}
+
+inline aclBoolArray *ConvertType(const at::ArrayRef<bool> &value) {
+  static const auto aclCreateBoolArray = GET_OP_API_FUNC(aclCreateBoolArray);
+  if (aclCreateBoolArray == nullptr) {
+    return nullptr;
+  }
+
+  auto array = aclCreateBoolArray(value.data(), value.size());
+  return array;
+}
+
+inline aclIntArray *ConvertType(const at::ArrayRef<c10::SymInt> &at_array)
+{
+    static const auto aclCreateIntArray = GET_OP_API_FUNC(aclCreateIntArray);
+    if (aclCreateIntArray == nullptr) {
+        return nullptr;
+    }
+    auto int_array = c10::asIntArrayRefUnchecked(at_array);
+    auto array = aclCreateIntArray(int_array.data(), int_array.size());
+    return array;
+}
+
+inline aclTensorList *ConvertType(const at::TensorList &at_tensor_list) {
+  static const auto aclCreateTensorList = GET_OP_API_FUNC(aclCreateTensorList);
+  if (aclCreateTensorList == nullptr) {
+    return nullptr;
+  }
+
+  std::vector<const aclTensor *> tensor_list(at_tensor_list.size());
+  for (size_t i = 0; i < at_tensor_list.size(); i++) {
+    tensor_list[i] = ConvertType(at_tensor_list[i]);
+  }
+  auto acl_tensor_list =
+      aclCreateTensorList(tensor_list.data(), tensor_list.size());
+  return acl_tensor_list;
+}
+
+inline aclScalarList *ConvertType(const at::ArrayRef<at::Scalar> &at_scalar_list)
+{
+    static const auto aclCreateScalarList = GET_OP_API_FUNC(aclCreateScalarList);
+    if (aclCreateScalarList == nullptr) {
+        return nullptr;
+    }
+
+    std::vector<const aclScalar *> scalar_list(at_scalar_list.size());
+    for (size_t i = 0; i < at_scalar_list.size(); i++) {
+        scalar_list[i] = ConvertType(at_scalar_list[i]);
+    }
+    auto acl_scalar_list = aclCreateScalarList(scalar_list.data(), scalar_list.size());
+    return acl_scalar_list;
+}
+
+inline aclTensor *ConvertType(const c10::optional<at::Tensor> &opt_tensor) {
+  if (opt_tensor.has_value() && opt_tensor.value().defined()) {
+    return ConvertType(opt_tensor.value());
+  }
+
+  return nullptr;
+}
+
+inline aclIntArray *ConvertType(const c10::optional<at::IntArrayRef> &opt_array) {
+  if (opt_array.has_value()) {
+    return ConvertType(opt_array.value());
+  }
+  return nullptr;
+}
+
+inline aclScalar *ConvertType(const c10::optional<at::Scalar> &opt_scalar) {
+  if (opt_scalar.has_value()) {
+    return ConvertType(opt_scalar.value());
+  }
+  return nullptr;
+}
+
+
+inline aclIntArray *ConvertType(const c10::OptionalArrayRef<c10::SymInt> &opt_array)
+{
+    if (opt_array.has_value()) {
+        return ConvertType(opt_array.value());
+    }
+
+    return nullptr;
+}
+
+inline aclDataType ConvertType(const at::ScalarType scalarType) {
+  return kATenScalarTypeToAclDataTypeTable[static_cast<int64_t>(scalarType)];
+}
+
+
+// add declare from other hpp
+typedef struct {
+    const at::Tensor& tensor_;
+    aclDataType dtype;
+} TensorWrapper;
+
+typedef struct {
+    const at::TensorList& tensor_list_;
+    aclDataType dtype;
+} TensorListWrapper;
+
+
+c10::SmallVector<int64_t, SIZE> array_to_small_vector(c10::IntArrayRef shape);
+// add declare from other hpp
+
+inline aclTensor *ConvertType(const TensorWrapper &tensor_r)
+{
+    static const auto aclCreateTensor = GET_OP_API_FUNC(aclCreateTensor);
+    if (aclCreateTensor == nullptr) {
+        return nullptr;
+    }
+
+    const at::Tensor &at_tensor = tensor_r.tensor_;
+
+    if (!at_tensor.defined()) {
+        return nullptr;
+    }
+
+    aclDataType acl_data_type = tensor_r.dtype;
+    c10::SmallVector<int64_t, MAX_DIM_NUM> storageDims;
+    c10::SmallVector<int64_t, MAX_DIM_NUM> wrapperStride = array_to_small_vector(at_tensor.strides());
+    c10::SmallVector<int64_t, MAX_DIM_NUM> wrapperShape = array_to_small_vector(at_tensor.sizes());
+
+    const auto dimNum = at_tensor.sizes().size();
+    aclFormat format = ACL_FORMAT_ND;
+    if (!IsOpInputBaseFormatCommon(at_tensor)) {
+        format = static_cast<NPUStorageImpl *>(at_tensor.storage().unsafeGetStorageImpl())->npu_desc_.npu_format_;
+        if (acl_data_type != ACL_STRING) {
+            TORCH_CHECK(at_tensor.itemsize() > 0, "the itemsize of tensor must be greater than 0.");
+            storageDims = static_cast<NPUStorageImpl *>(at_tensor.storage().unsafeGetStorageImpl())->npu_desc_.storage_sizes_;
+        }
+    } else {
+        switch (dimNum) {
+            case NCL_DIM_NUM:
+                format = ACL_FORMAT_NCL;
+                break;
+            case NCHW_DIM_NUM:
+                format = ACL_FORMAT_NCHW;
+                break;
+            case NCDHW_DIM_NUM:
+                format = ACL_FORMAT_NCDHW;
+                break;
+            default:
+                format = ACL_FORMAT_ND;
+        }
+        // if acl_data_type is ACL_STRING, storageDims is empty.
+        if (acl_data_type != ACL_STRING) {
+            TORCH_CHECK(at_tensor.itemsize() > 0, "the itemsize of tensor must be greater than 0.");
+            storageDims.push_back(at_tensor.storage().nbytes() / at_tensor.itemsize());
+        }
+    }
+
+    auto acl_tensor =
+        aclCreateTensor(wrapperShape.data(), at_tensor.sizes().size(), acl_data_type, wrapperStride.data(),
+                        at_tensor.storage_offset(), format, storageDims.data(), storageDims.size(),
+                        const_cast<void *>(at_tensor.storage().data()));
+    return acl_tensor;
 }
 
 inline aclTensorList *ConvertType(const TensorListWrapper &tensor_list_wrapper)
