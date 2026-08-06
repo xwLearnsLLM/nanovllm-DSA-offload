@@ -26,14 +26,14 @@ from nanovllm.models.dsa_indexer_project import (
     dsa_indexer_project_query_only,
 )
 from nanovllm.models.glm_moe_dsa_config import GlmMoeDsaConfig
-from nanovllm.models.lidu import (
+from nanovllm.models.dsa_offload_ops import (
     LIDU_TOPK,
+    fused_copy_sfa,
+    fused_li_manage,
+    fused_li_manage_out,
     initialize_lidu_row,
-    lidu_decode_update,
-    lidu_decode_update_out,
     scatter_copy,
-    sparse_and_tail_attention,
-    sparse_and_tail_attention_and_scatter_copy,
+    sparse_tail_attention,
 )
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.layernorm import RMSNorm
@@ -433,13 +433,11 @@ class GlmMLAAttention(nn.Module):
             )
             self.indexer = GlmDsaIndexer(config)
         # GLM captures this module directly in a raw outer NPUGraph. Keep the
-        # LIDU->SCATTER intermediates alive at fixed addresses across replay.
-        self._use_persistent_lidu_raw_graph_outputs = self.uses_offload
-        self._use_lidu_sparse_and_tail_attention = self.uses_offload
-        self._use_lidu_fused_attention_scatter = (
-            self.offload_mode == OFFLOAD_FUSE
-        )
-        self._lidu_raw_graph_outputs: dict[
+        # fused_li_manage outputs alive at fixed addresses across replay.
+        self._use_persistent_fused_li_manage_outputs = self.uses_offload
+        self._use_sparse_tail_attention = self.uses_offload
+        self._use_fused_copy_sfa = self.offload_mode == OFFLOAD_FUSE
+        self._fused_li_manage_graph_outputs: dict[
             int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]
         ] = {}
 
@@ -968,7 +966,7 @@ class GlmMLAAttention(nn.Module):
                     block_size=self.block_size,
                 )
 
-        lidu_args = (
+        manage_args = (
             q_index[:batch_size],
             self.index_cache,
             weights[:batch_size],
@@ -978,8 +976,11 @@ class GlmMLAAttention(nn.Module):
             context.candidate_lens[:batch_size],
             context.index_block_tables[:batch_size],
         )
-        if context.full_decode_graph and self._use_persistent_lidu_raw_graph_outputs:
-            buffers = self._lidu_raw_graph_outputs.get(batch_size)
+        if (
+            context.full_decode_graph
+            and self._use_persistent_fused_li_manage_outputs
+        ):
+            buffers = self._fused_li_manage_graph_outputs.get(batch_size)
             if buffers is None:
                 options = dict(
                     dtype=torch.int32,
@@ -990,18 +991,18 @@ class GlmMLAAttention(nn.Module):
                     torch.zeros((batch_size, 1, LIDU_TOPK), **options),
                     torch.zeros((batch_size,), **options),
                 )
-                self._lidu_raw_graph_outputs[batch_size] = buffers
+                self._fused_li_manage_graph_outputs[batch_size] = buffers
             source_ids, destination_slots, miss_counts, _ = (
-                lidu_decode_update_out(*lidu_args, *buffers)
+                fused_li_manage_out(*manage_args, *buffers)
             )
         else:
             source_ids, destination_slots, miss_counts, _ = (
-                lidu_decode_update(*lidu_args)
+                fused_li_manage(*manage_args)
             )
         if self._lidu_miss_count_collect_all:
             self._record_lidu_miss_counts(miss_counts, batch_size)
         use_fused_attention_scatter = (
-            self._can_use_lidu_fused_attention_scatter(batch_size)
+            self._can_use_fused_copy_sfa(batch_size)
         )
         if use_fused_attention_scatter:
             kpe_alias, ckv_alias = hbm_kpe, hbm_ckv
@@ -1025,13 +1026,13 @@ class GlmMLAAttention(nn.Module):
             miss_counts,
         )
 
-    def _can_use_lidu_fused_attention_scatter(
+    def _can_use_fused_copy_sfa(
         self,
         batch_size: int,
     ) -> bool:
         context = get_context()
         return (
-            self._use_lidu_fused_attention_scatter
+            self._use_fused_copy_sfa
             and not context.has_first_decode
             and context.lidu_init_rows is None
             and batch_size <= 24
@@ -1103,7 +1104,7 @@ class GlmMLAAttention(nn.Module):
                 miss_counts,
             ) = cache_aliases
         if (
-            self._use_lidu_sparse_and_tail_attention
+            self._use_sparse_tail_attention
             and not context.has_first_decode
             and sparse_slots is not None
         ):
@@ -1130,7 +1131,7 @@ class GlmMLAAttention(nn.Module):
                 -1, self.block_size, 1, self.qk_rope_head_dim
             )
             if (
-                self._can_use_lidu_fused_attention_scatter(batch_size)
+                self._can_use_fused_copy_sfa(batch_size)
                 and source_ids is not None
                 and miss_counts is not None
             ):
@@ -1139,7 +1140,7 @@ class GlmMLAAttention(nn.Module):
                         "Fused Attention+SCATTER requires DRAM block tables."
                     )
                 latent, _, _ = (
-                    sparse_and_tail_attention_and_scatter_copy(
+                    fused_copy_sfa(
                         ql_nope,
                         latent_kv_cache,
                         sparse_slots[:batch_size],
@@ -1158,7 +1159,7 @@ class GlmMLAAttention(nn.Module):
                     )
                 )
             else:
-                latent = sparse_and_tail_attention(
+                latent = sparse_tail_attention(
                     ql_nope,
                     latent_kv_cache,
                     sparse_slots[:batch_size],

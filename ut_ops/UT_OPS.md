@@ -1,6 +1,6 @@
 # Ascend 算子验收
 
-先运行 `bash scripts/build_nanovllm_ops.sh`，再在单张 NPU 上执行下列测试。公共环境：
+先运行 `bash scripts/build_nanovllm_ops.sh`，再在单张 NPU 上执行测试。公共环境变量：
 
 ```bash
 unset NANOVLLM_PROFILE_DECODE_OUTPUT
@@ -15,34 +15,40 @@ export PYTHONPATH=$PWD:$PYTHONPATH
 export ASCEND_HOME_PATH=/usr/local/Ascend/cann-8.5.1
 ```
 
-LIDU + SCATTER 语义、request pool 和 graph replay：
+`fused_li_manage` 的 18/21-bit 边界、request-pool、重复更新及原生 LightningIndexer 对照：
 
 ```bash
-python3 ut_ops/test_lidu_scatter.py --device npu:0 --heads 32 --seed 7 --warmup 2 --iters 10 --graph-replays 3
+python3 ut_ops/test_fused_li_manage.py --device npu:0 --heads 32,64 --seq-lens 262144,262272,1048576,2097151 --batch-size 1 --cache-tokens 6144 --miss-count 300 --warmup 1 --iters 3 --seed 7
 ```
 
-LIDU 索引管理时延：
+`fused_li_manage` + `scatter_copy` 语义、request pool、本地 bs=24 调度和 graph replay：
 
 ```bash
-python3 ut_ops/test_lidu_perf.py --device npu:0 --heads 32 --batch-sizes 24 --seq-lens 20992 --cache-tokens 6144 --miss-ranges 0:0,0:200,0:300,0:2048 --warmup 10 --iters 100 --seed 7
+python3 ut_ops/test_fused_li_manage_scatter.py --device npu:0 --heads 32,64 --seed 7 --warmup 2 --iters 10 --graph-replays 3
 ```
 
-独立 SCATTER：
+`fused_li_manage` 索引管理时延，计时前会恢复初始 `cache_slots`：
 
 ```bash
-python3 ut_ops/test_scatter_copy.py --device npu:0 --batch-size 24 --source-len 20992 --cache-tokens 6144 --copy-cap 2048 --miss-counts 0,256,512,1024,1536,2048 --warmup 10 --iters 100 --seed 7
+python3 ut_ops/test_fused_li_manage_perf.py --device npu:0 --heads 32 --batch-sizes 24 --seq-lens 20992 --cache-tokens 6144 --miss-ranges 0:0,0:200,0:300,0:2048 --warmup 10 --iters 100 --seed 7
 ```
 
-Sparse-and-tail Attention：
+独立 `scatter_copy`，使用真实 swapped-memory DRAM source 和 poison 校验：
 
 ```bash
-python3 ut_ops/test_sparse_and_tail_attention.py --device npu:0 --heads 8 --batch-size 24 --cache-tokens 6144 --tail-tokens 64 --warmup 10 --iters 100 --min-speedup 1.0 --seed 7
+python3 ut_ops/test_scatter_copy.py --device npu:0 --batch-size 24 --source-len 20992 --hbm-slots 6144 --copy-min 0 --copy-max 300 --copy-cap 2048 --warmup 10 --iters 100 --seed 7
 ```
 
-融合 SCATTER + sparse-and-tail Attention，测试使用真实 swapped-memory DRAM source，并分别验证搬移和 Attention：
+独立 `sparse_tail_attention`：
 
 ```bash
-python3 ut_ops/test_fused_attention_scatter.py --device npu:0 --mode check --batch-size 24 --heads 8 --source-len 20992 --cache-tokens 6144 --tail-tokens 64 --miss-min 0 --miss-max 2048 --seed 7
+python3 ut_ops/test_sparse_tail_attention.py --device npu:0 --heads 4 --batch-size 24 --cache-tokens 6144 --tail-tokens 64 --warmup 10 --iters 100 --min-speedup 1.0 --seed 7
+```
+
+`fused_copy_sfa` 与 `scatter_copy + sparse_tail_attention` 对照；测试会独立 poison 两条路径，分别验证 DRAM→HBM 搬移和 Attention：
+
+```bash
+python3 ut_ops/test_fused_copy_sfa.py --device npu:0 --mode all --batch-size 24 --heads 4 --source-len 20992 --cache-tokens 6144 --tail-tokens 64 --miss-min 0 --miss-max 2048 --warmup 10 --iters 100 --seed 7
 ```
 
 GLM Indexer projection 与 interleaved RoPE：

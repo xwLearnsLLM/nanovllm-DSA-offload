@@ -149,7 +149,7 @@ class ModelRunner:
         torch.set_default_device(self.device)
 
         self.model = self._load_model()
-        self.uses_sparse_and_tail_attention = self.uses_offload
+        self.uses_sparse_tail_attention = self.uses_offload
 
         self.sampler = Sampler()
         self._decode_dynamic_buffers: dict[int, _DecodeDynamicBuffers] = {}
@@ -177,17 +177,18 @@ class ModelRunner:
                 device=self.device,
                 expected_mla_tasks=(
                     0
-                    if self.uses_sparse_and_tail_attention
+                    if self.uses_sparse_tail_attention
                     else int(text_config.num_hidden_layers)
                 ),
                 offload_mode=self.offload_mode,
-                uses_tensor_mla_lengths=self.uses_sparse_and_tail_attention,
+                uses_tensor_mla_lengths=self.uses_sparse_tail_attention,
                 log_enabled=self.rank == 0,
             )
             if self.uses_offload:
                 if self.rank == 0:
                     logger.info(
-                        "FULL_DECODE_ONLY: deferring LIDU graph capture until "
+                        "FULL_DECODE_ONLY: deferring fused_li_manage graph "
+                        "capture until "
                         "the first initialized stable decode batch."
                     )
                 if self.world_size > 1:
@@ -211,9 +212,12 @@ class ModelRunner:
             )
             attention = "dense MLA (all KV)"
             if self.offload_mode == OFFLOAD_FUSE:
-                attention = "LIDU + fused SCATTER/sparse-and-tail MLA"
+                attention = "fused_li_manage + fused_copy_sfa"
             elif self.uses_offload:
-                attention = "LIDU + SCATTER + sparse-and-tail MLA"
+                attention = (
+                    "fused_li_manage + scatter_copy + "
+                    "sparse_tail_attention"
+                )
             logger.info(
                 "GLM-5.1 W4A8: %s decode, attention=%s, max_model_len=%d, "
                 "EP%d (%d local experts/rank), ModelSlim version=%s "
@@ -764,7 +768,7 @@ class ModelRunner:
             )
             actual_seq_lengths_kv_tensor = (
                 dynamic_buffers.actual_seq_lengths_kv.stage(sparse_kv_lens)
-                if self.uses_sparse_and_tail_attention
+                if self.uses_sparse_tail_attention
                 else None
             )
             flat_slot_mapping_i64 = None
@@ -789,7 +793,7 @@ class ModelRunner:
             ).to(self.device, non_blocking=True)
             flat_slot_mapping_i64 = None
             actual_seq_lengths_kv_tensor = None
-            if self.uses_sparse_and_tail_attention:
+            if self.uses_sparse_tail_attention:
                 actual_seq_lengths_kv_tensor = torch.tensor(
                     sparse_kv_lens,
                     dtype=torch.int32,

@@ -28,11 +28,13 @@ export ASCEND_HOME_PATH=/usr/local/Ascend/cann-8.5.1
 PYTHONPATH=$PWD:$PYTHONPATH PYTHONUNBUFFERED=1 NANOVLLM_CANN_BUILD_JOBS=64 SOC_VERSION=ascend910_9391 bash scripts/build_nanovllm_ops.sh
 ```
 
+算子验收命令见 [`ut_ops/UT_OPS.md`](ut_ops/UT_OPS.md)。
+
 　
 
 ## 推理
 
-下面是 TP16、LIDU、融合算子、24 个约 20K prompt、`FULL_DECODE_ONLY` 的完整配置：
+下面是 TP16、`fused_li_manage + fused_copy_sfa`、24 个约 20K prompt、`FULL_DECODE_ONLY` 的完整配置：
 
 ```bash
 export ASCEND_HOME_PATH=/usr/local/Ascend/cann-8.5.1
