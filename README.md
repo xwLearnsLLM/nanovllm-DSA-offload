@@ -6,7 +6,7 @@
 
 - LIDU：基于 `ops_li_update_a5@0362e7e` 的生产 P5 内核，增加 request pool、逐请求 C、动态 pool 行跨度、mutable alias 和 caller-owned out。
 - SCATTER：基于 `ops_dsa_offload_a5@01f2065` 已验证的 Ascend 950 swapped-memory DRAM→HBM 路径。
-- SFA：基于 `vllm-ascend-v0.23.0-custom@6af99b372` 的官方 Arch35 SFA，叠加 sparse+tail 语义并保留 `q_head=128` split-G。官方接口说明见 [aclnnSparseFlashAttention](https://github.com/vllm-project/vllm-ascend/blob/main/csrc/attention/sparse_flash_attention/docs/aclnnSparseFlashAttention.md)。
+- SFA：基于 `vllm-ascend-v0.23.0-custom@6af99b372` 的官方 Arch35 SFA叠加 sparse+tail 语义。官方接口说明见 [aclnnSparseFlashAttention](https://github.com/vllm-project/vllm-ascend/blob/main/csrc/attention/sparse_flash_attention/docs/aclnnSparseFlashAttention.md)。
 
 ## 接口
 
@@ -48,7 +48,7 @@ torch.ops.nanovllm_dsa.scatter_copy(
 ) -> (hbm_kpe_alias, hbm_ckv_alias)
 
 torch.ops.nanovllm_dsa.sparse_and_tail_attention(
-    query,                  # bf16/fp16[B, Q_HEAD, 512]
+    query,                  # bf16/fp16[B, Q_HEAD, 512], 1 <= Q_HEAD <= 64
     key,                    # bf16/fp16[HBM_BLOCKS, 128, 1, 512]
     value,                  # GLM MLA 要求与 key alias
     sparse_slots,           # int32[B, 1, 2048]
@@ -67,7 +67,7 @@ torch.ops.nanovllm_dsa.sparse_and_tail_attention(
 ## 约束
 
 - 仅面向 GLM-5.1 W4A8 decode，`q_seq_len=1`，block size 为 128，CKV/KPE 为 512/64。
-- LIDU 支持 `q_head=32|64`；SFA 支持 `q_head=1..64` 或 `128`，门禁重点测试 8 和 128。
+- LIDU 支持 `q_head=32|64`；SFA 仅支持 `q_head=1..64`，门禁使用 8。
 - `C=0` 时 LIDU no-op，SFA 计算全部有效 KV；`C>0` 时 SFA 计算 2048 个 sparse slots 与 `[C, actual_kv_len)` tail。
 - source token ID 为 18 bit，`SOURCE_CAPACITY <= 262144`；LIDU slot 为 14 bit，block-aligned `C <= 16256`。当前预算 `3072/6144/8192/12288` 均受支持。
 - `req_pool_entries` 在活跃 batch 内必须唯一且位于 pool 范围内；非零 C 的 pool 行必须恰有 C 个唯一 slots。
@@ -117,17 +117,11 @@ for count in 0 1 100 300 2048; do python3 tests/test_scatter_copy.py --device np
 
 SCATTER 使用 `empty_with_swapped_memory` 创建真实 DRAM tensor；每次正确性调用前 poison HBM 目标，并验证 CKV、KPE、随机 block tables 和未触碰 guard。
 
-`q_head=8` 与 `q_head=128` 必须分别启动进程：
-
 ```bash
-python3 tests/test_sparse_and_tail_attention.py --device npu:0 --mode check --heads 8 --batch-sizes 24 --source-lens 20096 --cache-tokens 6144 --tail-tokens 64 --split-g-replays 3 --seed 7
+python3 tests/test_sparse_and_tail_attention.py --device npu:0 --mode check --heads 8 --batch-sizes 24 --source-lens 20096 --cache-tokens 6144 --tail-tokens 64 --seed 7
 ```
 
-```bash
-python3 tests/test_sparse_and_tail_attention.py --device npu:0 --mode check --heads 128 --batch-sizes 24 --source-lens 20096 --cache-tokens 6144 --tail-tokens 64 --split-g-replays 3 --seed 7
-```
-
-每条 SFA check 命令都会先验证 2048-token smoke、dense `C=0`、四档 C 和 tail `0/1/64/127/257`，并与独立 CPU FP32 golden 比较。`q_head=128` 会重复执行以暴露 split-G 卡死。
+SFA check 会先验证 2048-token smoke、dense `C=0`、四档 C 和 tail `0/1/64/127/257`，并与独立 CPU FP32 golden 比较。
 
 ```bash
 python3 tests/test_offload_split_graph.py --device npu:0 --case pure-long --replays 4 --seed 7
@@ -141,7 +135,7 @@ python3 tests/test_offload_split_graph.py --device npu:0 --case mixed --replays 
 
 ## 性能矩阵
 
-`q_head=8` 的三算子总时延需与相同输入下的来源版本对照，目标是不超过参考时延的 `1.10x`；`q_head=128` 首阶段以结果正确、重复执行不卡死并产出基线时延为门禁。
+`q_head=8` 的三算子总时延需与相同输入下的来源版本对照，目标是不超过参考时延的 `1.10x`。
 
 LIDU：
 
@@ -155,14 +149,10 @@ SCATTER：
 for bs in 1 4 8 12 16 24 32; do for len in 12288 20096 65536 131072; do python3 tests/test_scatter_copy.py --device npu:0 --batch-size "$bs" --source-len "$len" --hbm-slots 8192 --copy-cap 2048 --copy-min 0 --copy-max 0 --warmup 10 --iters 100 --seed 7; python3 tests/test_scatter_copy.py --device npu:0 --batch-size "$bs" --source-len "$len" --hbm-slots 8192 --copy-cap 2048 --copy-min 0 --copy-max 300 --warmup 10 --iters 100 --seed 7; python3 tests/test_scatter_copy.py --device npu:0 --batch-size "$bs" --source-len "$len" --hbm-slots 8192 --copy-cap 2048 --copy-min 300 --copy-max 300 --warmup 10 --iters 100 --seed 7; done; done
 ```
 
-SFA，两个 heads 配置分进程：
+SFA：
 
 ```bash
 python3 tests/test_sparse_and_tail_attention.py --device npu:0 --mode bench --heads 8 --batch-sizes 1,4,8,12,16,24,32 --source-lens 12288,20096,65536,131072 --cache-tokens 6144 --tail-tokens 64 --warmup 10 --iters 100 --seed 7
-```
-
-```bash
-python3 tests/test_sparse_and_tail_attention.py --device npu:0 --mode bench --heads 128 --batch-sizes 1,4,8,12,16,24,32 --source-lens 12288,20096,65536,131072 --cache-tokens 6144 --tail-tokens 64 --warmup 10 --iters 100 --seed 7
 ```
 
 ## Profile
@@ -177,8 +167,4 @@ msprof --application="python3 tests/test_scatter_copy.py --device npu:0 --batch-
 
 ```bash
 msprof --application="python3 tests/test_sparse_and_tail_attention.py --device npu:0 --mode profile --heads 8 --batch-sizes 24 --source-lens 65536 --cache-tokens 6144 --tail-tokens 64 --profile-replays 4 --seed 7" --output=./profile_sfa_h8
-```
-
-```bash
-msprof --application="python3 tests/test_sparse_and_tail_attention.py --device npu:0 --mode profile --heads 128 --batch-sizes 24 --source-lens 65536 --cache-tokens 6144 --tail-tokens 64 --profile-replays 4 --seed 7" --output=./profile_sfa_h128
 ```

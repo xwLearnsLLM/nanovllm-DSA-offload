@@ -312,8 +312,8 @@ void CheckAttentionInputs(
     const at::Tensor& key_rope) {
   TORCH_CHECK(
       query.dim() == 3 && query.size(0) > 0 && query.size(2) == kCkvDim &&
-          ((query.size(1) >= 1 && query.size(1) <= 64) || query.size(1) == 128),
-      "SFA query must be [B,N,512], 1 <= N <= 64 or N == 128.");
+          query.size(1) >= 1 && query.size(1) <= 64,
+      "SFA query must be [B,N,512] with 1 <= N <= 64.");
   const int64_t batch = query.size(0);
   const int64_t heads = query.size(1);
   TORCH_CHECK(
@@ -418,6 +418,10 @@ at::Tensor SparseAndTailAttentionMeta(
     const at::Tensor&,
     const at::Tensor&,
     double) {
+  TORCH_CHECK(
+      query.dim() == 3 && query.size(0) > 0 && query.size(2) == kCkvDim &&
+          query.size(1) >= 1 && query.size(1) <= 64,
+      "SFA query must be [B,N,512] with 1 <= N <= 64.");
   return at::empty_like(query);
 }
 }  // namespace

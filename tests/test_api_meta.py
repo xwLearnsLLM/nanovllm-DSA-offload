@@ -149,12 +149,53 @@ def run_api(values: dict[str, torch.Tensor]) -> None:
     assert attention.dtype == torch.bfloat16
 
 
+def expect_sfa_head_limit(
+    values: dict[str, torch.Tensor],
+    query: torch.Tensor,
+    query_rope: torch.Tensor,
+) -> None:
+    key = values["hbm_ckv"].view(96, BLOCK, 1, 512)
+    try:
+        torch.ops.nanovllm_dsa.sparse_and_tail_attention.default(
+            query,
+            key,
+            key,
+            values["slots"],
+            values["cache_tokens"],
+            values["hbm_table"],
+            values["actual_q"],
+            values["actual_kv"],
+            query_rope,
+            values["key_rope"],
+            1.0,
+        )
+    except RuntimeError as error:
+        if "1 <= N <= 64" not in str(error):
+            raise
+    else:
+        raise AssertionError("SFA must reject q_head > 64")
+
+
+def check_sfa_head_limit_meta() -> None:
+    values = tensors()
+    query = torch.empty((3, 65, 512), dtype=torch.bfloat16, device="meta")
+    query_rope = torch.empty((3, 65, 64), dtype=torch.bfloat16, device="meta")
+    expect_sfa_head_limit(values, query, query_rope)
+
+
 def fake_values() -> dict[str, torch.Tensor]:
     mode = FakeTensorMode()
     real = tensors("cpu")
+    bad_query = torch.empty((3, 65, 512), dtype=torch.bfloat16)
+    bad_query_rope = torch.empty((3, 65, 64), dtype=torch.bfloat16)
     with mode:
         fake = {name: mode.from_tensor(value) for name, value in real.items()}
         run_api(fake)
+        expect_sfa_head_limit(
+            fake,
+            mode.from_tensor(bad_query),
+            mode.from_tensor(bad_query_rope),
+        )
     return fake
 
 
@@ -175,6 +216,7 @@ def check_schemas() -> None:
 def main() -> None:
     check_schemas()
     run_api(tensors())
+    check_sfa_head_limit_meta()
     fake_values()
     print("A5_NANOVLLM_DSA_META_FAKE_UT_OK", flush=True)
 

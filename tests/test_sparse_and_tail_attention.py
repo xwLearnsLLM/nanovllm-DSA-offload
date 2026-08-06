@@ -55,13 +55,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", choices=("all", "check", "bench", "profile"), default="all")
     parser.add_argument("--batch-sizes", type=csv_ints, default=csv_ints("24"))
     parser.add_argument("--source-lens", type=csv_ints, default=csv_ints("20096"))
-    parser.add_argument("--heads", type=int, choices=(8, 128), default=8)
+    parser.add_argument("--heads", type=int, default=8)
     parser.add_argument("--cache-tokens", type=csv_ints, default=csv_ints("6144"))
     parser.add_argument("--tail-tokens", type=csv_ints, default=csv_ints("64"))
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--profile-replays", type=int, default=4)
-    parser.add_argument("--split-g-replays", type=int, default=3)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--allow-non-a5", action="store_true")
     return parser.parse_args()
@@ -79,10 +78,10 @@ def check_args(args: argparse.Namespace) -> None:
         raise ValueError("cache tokens must be 0 or block-aligned in [2048,16256]")
     if any(tail < 0 for tail in args.tail_tokens):
         raise ValueError("tail token counts must be non-negative")
+    if not 1 <= args.heads <= 64:
+        raise ValueError("heads must be in [1,64]")
     if args.warmup < 0 or args.iters <= 0 or args.profile_replays <= 0:
         raise ValueError("warmup must be non-negative; iters/profile-replays must be positive")
-    if args.split_g_replays < 2:
-        raise ValueError("split-g-replays must be at least 2")
 
 
 def require_a5(device: torch.device, allow_non_a5: bool) -> None:
@@ -201,24 +200,17 @@ def cpu_golden(case: Case) -> torch.Tensor:
     return torch.stack(outputs)
 
 
-def check_case(case: Case, split_g_replays: int) -> None:
+def check_case(case: Case) -> None:
     golden = cpu_golden(case)
-    outputs: list[torch.Tensor] = []
-    replay_count = split_g_replays if case.query.size(1) == 128 else 1
-    for replay in range(replay_count):
-        output = launch(case)
-        torch.npu.synchronize()
-        output_cpu = output.cpu().float()
-        if not torch.isfinite(output_cpu).all():
-            raise AssertionError(f"SFA produced NaN/Inf on replay {replay}")
-        torch.testing.assert_close(output_cpu, golden, rtol=0.02, atol=0.02)
-        outputs.append(output_cpu)
-    if replay_count > 1:
-        for output in outputs[1:]:
-            torch.testing.assert_close(output, outputs[0], rtol=0, atol=0)
-    max_abs = float((outputs[-1] - golden).abs().max())
+    output = launch(case)
+    torch.npu.synchronize()
+    output_cpu = output.cpu().float()
+    if not torch.isfinite(output_cpu).all():
+        raise AssertionError("SFA produced NaN/Inf")
+    torch.testing.assert_close(output_cpu, golden, rtol=0.02, atol=0.02)
+    max_abs = float((output_cpu - golden).abs().max())
     cosine = float(torch.nn.functional.cosine_similarity(
-        outputs[-1].flatten(), golden.flatten(), dim=0
+        output_cpu.flatten(), golden.flatten(), dim=0
     ))
     if cosine < 0.999:
         raise AssertionError(f"SFA cosine similarity is too low: {cosine:.9f}")
@@ -227,7 +219,7 @@ def check_case(case: Case, split_g_replays: int) -> None:
         "A5_SPARSE_TAIL_CHECK "
         f"heads={case.query.size(1)} batch={case.query.size(0)} "
         f"source_len={case.source_len} C={case.cache_budget} tail={case.tail_tokens} "
-        f"attended_tokens={attended} replays={replay_count} "
+        f"attended_tokens={attended} "
         f"max_abs={max_abs:.9f} cosine={cosine:.9f} finite=1 ok=1",
         flush=True,
     )
@@ -289,28 +281,26 @@ def main() -> None:
         "A5_SPARSE_TAIL_CONFIG "
         f"device={device} heads={args.heads} batch_sizes={args.batch_sizes} "
         f"source_lens={args.source_lens} cache_tokens={args.cache_tokens} "
-        f"tail_tokens={args.tail_tokens} opapi={nanovllm_dsa_a5.local_opapi_path()}",
+        f"tail_tokens={args.tail_tokens} "
+        f"opapi={nanovllm_dsa_a5.local_opapi_path()}",
         flush=True,
     )
 
-    # Lightweight mandatory semantic coverage. Heads=128 is deliberately run
-    # in its own process and replayed repeatedly to expose split-G deadlocks.
+    # Lightweight mandatory semantic coverage.
     if args.mode in ("all", "check"):
         smoke = make_case(device, 1, args.heads, 2048, 2048, 0, args.seed + 10)
-        check_case(smoke, args.split_g_replays)
+        check_case(smoke)
         dense = make_case(device, 1, args.heads, 2048, 0, 0, args.seed + 11)
-        check_case(dense, args.split_g_replays)
+        check_case(dense)
         check_index = 0
         for budget in (3072, 6144, 8192, 12288):
-            # Exercise the split-G partial-tile boundary first so a sync
-            # regression fails fast instead of after the full-tile case.
-            for tail in (1, 0, 64, 127, 257):
+            for tail in (0, 1, 64, 127, 257):
                 source_len = budget + tail
                 case = make_case(
                     device, 1, args.heads, source_len, budget, tail,
                     args.seed + 100 + check_index,
                 )
-                check_case(case, args.split_g_replays)
+                check_case(case)
                 check_index += 1
 
     case_index = 0
@@ -332,7 +322,7 @@ def main() -> None:
                         args.seed + 1000 + case_index,
                     )
                     if args.mode in ("all", "check"):
-                        check_case(case, args.split_g_replays)
+                        check_case(case)
                     if args.mode in ("all", "bench"):
                         benchmark(case, args.warmup, args.iters)
                     if args.mode == "profile":

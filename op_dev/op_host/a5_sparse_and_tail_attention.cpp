@@ -41,7 +41,6 @@ constexpr int64_t CKV_DIM = 512;
 constexpr int64_t KPE_DIM = 64;
 constexpr int64_t SPARSE_COUNT = 2048;
 constexpr int64_t MAX_REGULAR_LOCAL_HEADS = 64;
-constexpr int64_t SPLIT_G_LOCAL_HEADS = 128;
 
 bool IsShape(
     const gert::Shape &shape,
@@ -96,8 +95,7 @@ ge::graphStatus CheckA5SparseTailInputs(gert::TilingContext *context)
     if (!IsShape(query, {-1, -1, CKV_DIM}) ||
         query.GetDim(0) <= 0 ||
         query.GetDim(1) <= 0 ||
-        (query.GetDim(1) > MAX_REGULAR_LOCAL_HEADS &&
-         query.GetDim(1) != SPLIT_G_LOCAL_HEADS)) {
+        query.GetDim(1) > MAX_REGULAR_LOCAL_HEADS) {
         return ge::GRAPH_FAILED;
     }
     const int64_t totalQueryTokens = query.GetDim(0);
