@@ -7,24 +7,46 @@
 - LIDU：基于 `ops_li_update_a5@0362e7e` 的生产 P5 内核，增加 request pool、逐请求 C、动态 pool 行跨度、mutable alias 和 caller-owned out。
 - SCATTER：基于 `ops_dsa_offload_a5@01f2065` 已验证的 Ascend 950 swapped-memory DRAM→HBM 路径。
 - SFA：基于 `vllm-ascend-v0.23.0-custom@6af99b372` 的官方 Arch35 SFA叠加 sparse+tail 语义。官方接口说明见 [aclnnSparseFlashAttention](https://github.com/vllm-project/vllm-ascend/blob/main/csrc/attention/sparse_flash_attention/docs/aclnnSparseFlashAttention.md)。
-- W4A4C8 Indexer：使用 A5 官方 `torch_npu.npu_quant_lightning_indexer`，采用 FP8 E4M3 query/key、BF16 weights、FP32 query/key scale、`TND/PA_BSND`、`sparse_count=2048` 和 `sparse_mode=3`；本仓库的 `A5LiduCacheUpdate` 接续完成 request-pool hit/miss、淘汰和更新。
+- W4A4C8 Indexer：使用 A5 官方 `torch_npu.npu_quant_lightning_indexer`，采用 FP8 E4M3 query/key、BF16 weights、FP32 query/key scale、`TND/PA_BSND`、`sparse_count=2048` 和 `sparse_mode=3`；C8 LIDU 接续完成 request-pool hit/miss、淘汰和更新。
 - W4A4C8 Attention：packed KV ABI 与 A5 原生 `npu_kv_quant_sparse_flash_attention` 对齐。ModelSlim 的 GLM-5.1 W4A4C8 量化说明见 [GLM-5 量化 README](https://gitcode.com/Ascend/msmodelslim/blob/26.1.0/example/GLM-5/README.md)。
+
+## W4A8 算子一览表
+
+| 公开入口 | 实际执行 | 作用 | 定位 |
+| --- | --- | --- | --- |
+| `lidu_decode_update` / `lidu_decode_update_out` | `LightningIndexerDecodeUpdateA5` | BF16/FP16 LightningIndexer top-2048 与 request-pool 更新；`_out` 写入 caller-owned buffer | eager / 稳定图主链 |
+| `scatter_copy` | `A5KvcacheScatterCopy` | 按 miss-prefix 将分离的 BF16/FP16 CKV、KPE 从 swapped-memory DRAM 搬到 HBM | 稳定图主链 |
+| `sparse_and_tail_attention` | `A5SparseAndTailAttention` | 对 top-2048 sparse slots 与 tail 执行 BF16/FP16 MLA | 稳定图主链 |
+
+## W4A4C8 算子一览表
+
+| 公开入口 | 实际执行 | 作用 | 定位 |
+| --- | --- | --- | --- |
+| `lidu_decode_update_c8` / `lidu_decode_update_c8_out` | 官方 `npu_quant_lightning_indexer` + request-pool update | C8 top-2048 与 request-pool 更新；`_out` 写入 caller-owned buffer | eager / 稳定图主链 |
+| `packed_scatter_copy` / `packed_scatter_copy_out` | `A5PackedKvcacheScatterCopy` | 整行搬运 656-byte packed KV，并生成 sparse+tail slots 和 resident length；`_out` 写入 caller-owned metadata | eager / 稳定图主链 |
+| `sparse_and_tail_attention_c8` | Python custom op → 原生 `npu_kv_quant_sparse_flash_attention` | 对 packed C8 KV 的 top-2048 sparse slots 与 tail 执行量化 MLA | 稳定图主链 |
 
 ## 接口
 
+共同语义：`B` 是 decode batch，`C=cache_tokens[b]` 是请求固定的 HBM token 预算，`candidate_lens[b]` 是参与稀疏选择的 prefill 满块 token 数。`cache_slots_pool[req_pool_entries[b], token_id]` 保存 source token 到 HBM slot 的映射，`-1` 表示未缓存。LIDU 输出中前 `miss_counts[b]` 项为 miss，SCATTER 只搬运这段；全部 2048 个 `destination_slots` 都供 Attention 使用。稳定图使用 caller-owned `_out` 接口。
+
+### W4A8：BF16/FP16 KV
+
+链路：`lidu_decode_update_out → scatter_copy → sparse_and_tail_attention`。
+
 ```python
 torch.ops.nanovllm_dsa.lidu_decode_update(
-    query,                  # bf16/fp16[B, 32|64, 128]
-    key,                    # bf16/fp16[NUM_BLOCKS, 128, 1, 128]
-    weights,                # bf16/fp16[B, 32|64]
-    req_pool_entries,       # int32[B]
-    cache_slots_pool,       # int32[POOL_SIZE, SOURCE_CAPACITY], in/out
-    cache_tokens,           # int32[B]
+    query,                  # bf16/fp16[B, INDEX_HEADS, 128]，INDEX_HEADS=32|64
+    key,                    # bf16/fp16[INDEX_BLOCKS, 128, 1, 128]
+    weights,                # bf16/fp16[B, INDEX_HEADS]
+    req_pool_entries,       # int32[B]，batch row -> request-pool row
+    cache_slots_pool,       # int32[POOL_SIZE, SOURCE_CAPACITY]，in/out
+    cache_tokens,           # int32[B]，逐请求 C；C=0 时该请求 no-op
     candidate_lens,         # int32[B]
     block_table,            # int32[B, SOURCE_CAPACITY/128]
 ) -> (
-    source_ids,             # int32[B, 1, 2048], miss-prefix + hit-suffix
-    destination_slots,      # int32[B, 1, 2048], 完整 attention slots
+    source_ids,             # int32[B,1,2048]，miss-prefix + hit-suffix
+    destination_slots,      # int32[B,1,2048]，与 source_ids 对齐
     miss_counts,            # int32[B]
     cache_slots_alias,      # cache_slots_pool alias
 )
@@ -32,18 +54,50 @@ torch.ops.nanovllm_dsa.lidu_decode_update(
 torch.ops.nanovllm_dsa.lidu_decode_update_out(
     query, key, weights, req_pool_entries, cache_slots_pool,
     cache_tokens, candidate_lens, block_table,
-    source_ids,             # caller-owned int32[B, 1, 2048], in/out
-    destination_slots,      # caller-owned int32[B, 1, 2048], in/out
-    miss_counts,            # caller-owned int32[B], in/out
+    source_ids,             # caller-owned int32[B,1,2048]，in/out
+    destination_slots,      # caller-owned int32[B,1,2048]，in/out
+    miss_counts,            # caller-owned int32[B]，in/out
 ) -> (source_ids_alias, destination_slots_alias, miss_counts_alias, cache_slots_alias)
 
+torch.ops.nanovllm_dsa.scatter_copy(
+    hbm_kpe,                # bf16/fp16[HBM_BLOCKS,128,64]，in/out
+    hbm_ckv,                # bf16/fp16[HBM_BLOCKS,128,512]，in/out
+    dram_kpe,               # swapped-memory bf16/fp16[DRAM_BLOCKS,128,64]
+    dram_ckv,               # swapped-memory bf16/fp16[DRAM_BLOCKS,128,512]
+    hbm_block_table,        # int32[B,HBM_MAX_BLOCKS]
+    dram_block_table,       # int32[B,DRAM_MAX_BLOCKS]
+    source_token_ids,       # int32[B,COPY_CAP]，取 LIDU miss-prefix
+    destination_slots,      # int32[B,COPY_CAP]
+    copy_counts,            # int32[B]，即 miss_counts
+) -> (hbm_kpe_alias, hbm_ckv_alias)
+
+torch.ops.nanovllm_dsa.sparse_and_tail_attention(
+    query,                  # bf16/fp16[B,Q_HEAD,512]，1<=Q_HEAD<=64
+    key,                    # bf16/fp16[HBM_BLOCKS,128,1,512]
+    value,                  # 必须与 key alias
+    sparse_slots,           # int32[B,1,2048]，即 LIDU destination_slots
+    cache_tokens,           # int32[B]
+    block_table,            # int32[B,HBM_MAX_BLOCKS]
+    actual_seq_lengths_query, # cumulative int32[B]，decode 为 [1,...,B]
+    actual_seq_lengths_kv,  # int32[B]，HBM resident 长度；C>0 时为 C+tail
+    query_rope,             # bf16/fp16[B,Q_HEAD,64]
+    key_rope,               # bf16/fp16[HBM_BLOCKS,128,1,64]
+    scale_value,            # float
+) -> attention_out          # bf16/fp16[B,Q_HEAD,512]
+```
+
+### W4A4C8：packed C8 KV
+
+链路：`lidu_decode_update_c8_out → packed_scatter_copy_out → sparse_and_tail_attention_c8`。每个 packed KV token 固定为 656 bytes：`512 FP8 E4M3 + 64 BF16 RoPE + 4 FP32 scales`。
+
+```python
 torch.ops.nanovllm_dsa.lidu_decode_update_c8(
-    query,                  # float8_e4m3fn[B,32|64,128]
-    key,                    # float8_e4m3fn[NUM_BLOCKS,128,1,128]
-    weights,                # bfloat16[B,32|64]
-    query_dequant_scale,    # float32[B,32|64]
-    key_dequant_scale,      # float32[NUM_BLOCKS,128,1]
-    actual_seq_lengths_query, # cumulative int32[B]，decode 为 1..B
+    query,                  # float8_e4m3fn[B,INDEX_HEADS,128]，INDEX_HEADS=32|64
+    key,                    # float8_e4m3fn[INDEX_BLOCKS,128,1,128]
+    weights,                # bf16[B,INDEX_HEADS]
+    query_dequant_scale,    # fp32[B,INDEX_HEADS]
+    key_dequant_scale,      # fp32[INDEX_BLOCKS,128,1]
+    actual_seq_lengths_query, # cumulative int32[B]，decode 为 [1,...,B]
     req_pool_entries,       # int32[B]
     cache_slots_pool,       # int32[POOL_SIZE,SOURCE_CAPACITY]，in/out
     cache_tokens,           # int32[B]
@@ -60,75 +114,43 @@ torch.ops.nanovllm_dsa.lidu_decode_update_c8_out(
     query, key, weights, query_dequant_scale, key_dequant_scale,
     actual_seq_lengths_query, req_pool_entries, cache_slots_pool,
     cache_tokens, candidate_lens, block_table,
-    source_ids, destination_slots, miss_counts,
+    source_ids,             # caller-owned int32[B,1,2048]，in/out
+    destination_slots,      # caller-owned int32[B,1,2048]，in/out
+    miss_counts,            # caller-owned int32[B]，in/out
 ) -> (source_ids_alias, destination_slots_alias, miss_counts_alias, cache_slots_alias)
 
-torch.ops.nanovllm_dsa.scatter_copy(
-    hbm_kpe,                # bf16/fp16[HBM_BLOCKS, 128, 64], in/out
-    hbm_ckv,                # bf16/fp16[HBM_BLOCKS, 128, 512], in/out
-    dram_kpe,               # swapped-memory bf16/fp16[DRAM_BLOCKS, 128, 64]
-    dram_ckv,               # swapped-memory bf16/fp16[DRAM_BLOCKS, 128, 512]
-    hbm_block_table,        # int32[B, HBM_MAX_BLOCKS]
-    dram_block_table,       # int32[B, DRAM_MAX_BLOCKS]
-    source_token_ids,       # int32[B, COPY_CAP]
-    destination_slots,      # int32[B, COPY_CAP]
-    copy_counts,            # int32[B]
-) -> (hbm_kpe_alias, hbm_ckv_alias)
-
-torch.ops.nanovllm_dsa.sparse_and_tail_attention(
-    query,                  # bf16/fp16[B, Q_HEAD, 512], 1 <= Q_HEAD <= 64
-    key,                    # bf16/fp16[HBM_BLOCKS, 128, 1, 512]
-    value,                  # GLM MLA 要求与 key alias
-    sparse_slots,           # int32[B, 1, 2048]
-    cache_tokens,           # int32[B]
-    block_table,            # int32[B, HBM_MAX_BLOCKS]
-    actual_seq_lengths_query, # cumulative int32[B], decode 为 1..B
-    actual_seq_lengths_kv,  # int32[B]
-    query_rope,             # bf16/fp16[B, Q_HEAD, 64]
-    key_rope,               # bf16/fp16[HBM_BLOCKS, 128, 1, 64]
-    scale_value,            # float
-) -> attention_out          # bf16/fp16[B, Q_HEAD, 512]
-
-torch.ops.nanovllm_dsa.packed_scatter_copy(
-    hbm_packed_kv_bytes,    # int8 view[HBM_BLOCKS,128,1,656], in/out
+torch.ops.nanovllm_dsa.packed_scatter_copy_out(
+    hbm_packed_kv_bytes,    # int8 view[HBM_BLOCKS,128,1,656]，in/out
     dram_packed_kv_bytes,   # swapped-memory int8 view[DRAM_BLOCKS,128,1,656]
-    hbm_block_table,        # int32[B, HBM_MAX_BLOCKS]
-    dram_block_table,       # int32[B, DRAM_MAX_BLOCKS]
-    source_token_ids,       # int32[B,1,2048]
-    destination_slots,      # int32[B,1,2048]
-    copy_counts,            # int32[B]
+    hbm_block_table,        # int32[B,HBM_MAX_BLOCKS]
+    dram_block_table,       # int32[B,DRAM_MAX_BLOCKS]
+    source_token_ids,       # int32[B,1,2048] 或 int32[B,2048]
+    destination_slots,      # 同 source_token_ids
+    copy_counts,            # int32[B]，即 miss_counts
     cache_tokens,           # int32[B]
     candidate_lens,         # int32[B]
-    actual_seq_lengths_kv,  # int32[B]
+    actual_seq_lengths_kv,  # int32[B]，原始逻辑 KV 长度
     max_tail_tokens,        # int，固定图的 tail 容量
-) -> (
-    hbm_packed_kv_alias,
-    attention_slots,        # int32[B,1,2048+max_tail_tokens]
-    resident_seq_lengths,   # int32[B]
-)
-
-torch.ops.nanovllm_dsa.packed_scatter_copy_out(
-    hbm_packed_kv_bytes, dram_packed_kv_bytes,
-    hbm_block_table, dram_block_table,
-    source_token_ids, destination_slots, copy_counts,
-    cache_tokens, candidate_lens, actual_seq_lengths_kv,
-    max_tail_tokens,
     attention_slots,        # caller-owned int32[B,1,2048+max_tail_tokens]
     resident_seq_lengths,   # caller-owned int32[B]
-) -> (hbm_alias, attention_slots_alias, resident_seq_lengths_alias)
+) -> (
+    hbm_packed_kv_alias,
+    attention_slots_alias,  # C>0: top2048 slots + [C,C+tail)；C=0: [0,actual_len)
+    resident_lengths_alias, # C>0: C+tail；C=0: actual_len
+)
 
-nanovllm_dsa_a5.sparse_and_tail_attention_c8(
-    query,                  # bf16/fp16[T,Q_HEAD,576], Q_HEAD<=64
-    packed_kv,              # float8_e4m3fn[HBM_BLOCKS,128,1,656]
+torch.ops.nanovllm_dsa.sparse_and_tail_attention_c8(
+    query,                  # bf16/fp16[T,Q_HEAD,576]，1<=Q_HEAD<=64
+    packed_kv,              # float8_e4m3fn view[HBM_BLOCKS,128,1,656]
     attention_slots,        # int32[T,1,2048+max_tail_tokens]
     hbm_block_table,        # int32[B,HBM_MAX_BLOCKS]
     actual_seq_lengths_query, # cumulative int32[B]
-    resident_seq_lengths,   # int32[B]
+    resident_seq_lengths,   # int32[B]，直接使用 packed SCATTER 输出
     scale_value,            # float
 ) -> attention_out          # bf16/fp16[T,Q_HEAD,512]
 ```
 
-全部接口均提供 Fake/Meta 路径；LIDU 与两种 SCATTER 的 schema 显式声明 mutable alias。C8 LIDU 先调用官方 A5 Quant LightningIndexer 生成真实 C8 top-2048，再调用仓内 AIV update kernel；两段都可被 NPUGraph 捕获。C8 Attention adapter 固定调用 A5 原生 QSFA。
+非 `_out` 的 `packed_scatter_copy` 参数相同，但由算子分配 `attention_slots` 和 `resident_seq_lengths`。C8 LIDU 的组合接口内部完成官方 A5 Quant LightningIndexer 和 request-pool 更新。全部框架接口提供 Fake/Meta；LIDU、SCATTER 的 schema 显式声明 mutable alias。
 
 ## 约束
 
@@ -227,7 +249,7 @@ for C in 3072 6144 8192 12288; do for tail in 0 1 64 127 257; do python3 tests/t
 python3 tests/test_sparse_and_tail_attention_c8.py --device npu:0 --mode check --batch-size 1 --heads 8 --cache-tokens 0 --tail-tokens 2048 --max-tail-tokens 2048 --seed 7
 ```
 
-图门禁捕获 `official C8 LightningIndexer → lidu_cache_update_out → packed_scatter_copy_out → native C8 QSFA`；不依赖 capture 阶段执行，先用一次 replay 验证零 miss 和完整输出写回，再恢复初始 pool 进行多次非零 miss replay：
+图门禁捕获框架链路 `lidu_decode_update_c8_out → packed_scatter_copy_out → sparse_and_tail_attention_c8`；不依赖 capture 阶段执行，先用一次 replay 验证零 miss 和完整输出写回，再恢复初始 pool 进行多次非零 miss replay：
 
 ```bash
 python3 tests/test_offload_split_c8_graph.py --device npu:0 --case pure-long --batch-size 2 --heads 8 --index-heads 32 --source-len 4096 --cache-tokens 3072 --tail-tokens 64 --max-tail-tokens 256 --miss-min 256 --miss-max 512 --replays 4 --seed 7
