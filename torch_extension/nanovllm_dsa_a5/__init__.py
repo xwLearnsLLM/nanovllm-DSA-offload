@@ -88,11 +88,12 @@ def _check_c8_lidu_inputs(
     if (
         weights.shape != (batch, heads)
         or query_dequant_scale.shape != (batch, heads)
-        or weights.dtype != torch.float32
+        or weights.dtype != torch.bfloat16
         or query_dequant_scale.dtype != torch.float32
     ):
         raise ValueError(
-            "C8 LIDU weights/query_dequant_scale must be float32 [B,N]"
+            "C8 LIDU weights must be bfloat16 [B,N] and "
+            "query_dequant_scale must be float32 [B,N]"
         )
     if (
         key_dequant_scale.ndim != 3

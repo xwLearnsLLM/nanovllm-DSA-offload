@@ -7,7 +7,7 @@
 - LIDU：基于 `ops_li_update_a5@0362e7e` 的生产 P5 内核，增加 request pool、逐请求 C、动态 pool 行跨度、mutable alias 和 caller-owned out。
 - SCATTER：基于 `ops_dsa_offload_a5@01f2065` 已验证的 Ascend 950 swapped-memory DRAM→HBM 路径。
 - SFA：基于 `vllm-ascend-v0.23.0-custom@6af99b372` 的官方 Arch35 SFA叠加 sparse+tail 语义。官方接口说明见 [aclnnSparseFlashAttention](https://github.com/vllm-project/vllm-ascend/blob/main/csrc/attention/sparse_flash_attention/docs/aclnnSparseFlashAttention.md)。
-- W4A4C8 Indexer：严格对齐 `vllm-ascend-v0.23.0-custom/vllm_ascend/device/device_op.py` 中 A5 `torch_npu.npu_quant_lightning_indexer` 的生产调用，使用 FP8 E4M3 query/key、FP32 weights/query scale/key scale、`TND/PA_BSND`、`sparse_count=2048` 和 `sparse_mode=3`；本仓库的 `A5LiduCacheUpdate` 接续完成 request-pool hit/miss、淘汰和更新。
+- W4A4C8 Indexer：使用 A5 官方 `torch_npu.npu_quant_lightning_indexer`，采用 FP8 E4M3 query/key、BF16 weights、FP32 query/key scale、`TND/PA_BSND`、`sparse_count=2048` 和 `sparse_mode=3`；本仓库的 `A5LiduCacheUpdate` 接续完成 request-pool hit/miss、淘汰和更新。
 - W4A4C8 Attention：packed KV ABI 与 A5 原生 `npu_kv_quant_sparse_flash_attention` 对齐。ModelSlim 的 GLM-5.1 W4A4C8 量化说明见 [GLM-5 量化 README](https://gitcode.com/Ascend/msmodelslim/blob/26.1.0/example/GLM-5/README.md)。
 
 ## 接口
@@ -40,7 +40,7 @@ torch.ops.nanovllm_dsa.lidu_decode_update_out(
 torch.ops.nanovllm_dsa.lidu_decode_update_c8(
     query,                  # float8_e4m3fn[B,32|64,128]
     key,                    # float8_e4m3fn[NUM_BLOCKS,128,1,128]
-    weights,                # float32[B,32|64]
+    weights,                # bfloat16[B,32|64]
     query_dequant_scale,    # float32[B,32|64]
     key_dequant_scale,      # float32[NUM_BLOCKS,128,1]
     actual_seq_lengths_query, # cumulative int32[B]，decode 为 1..B

@@ -207,7 +207,7 @@ def make_case(
     query, query_scale = quantize_fp8(query_fp)
     key, key_scale = quantize_fp8(key_fp)
     weights = torch.empty(
-        (batch, heads), dtype=torch.float32, device=device
+        (batch, heads), dtype=torch.bfloat16, device=device
     ).uniform_(0.01, 1.0).contiguous()
 
     if candidate_lens_cpu is None:

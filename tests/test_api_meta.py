@@ -81,7 +81,7 @@ def tensors(device: str = "meta") -> dict[str, torch.Tensor]:
         device=device,
     )
     c8_index_weights = torch.empty(
-        (batch, 32), dtype=torch.float32, device=device
+        (batch, 32), dtype=torch.bfloat16, device=device
     )
     c8_query_scale = torch.empty(
         (batch, 32), dtype=torch.float32, device=device
