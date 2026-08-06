@@ -321,8 +321,8 @@ void CheckAttentionInputs(
           key.size(3) == kCkvDim && value.sizes() == key.sizes(),
       "SFA key/value must be [blocks,128,1,512].");
   TORCH_CHECK(
-      value.is_same(key),
-      "SFA is the MLA path and requires value to alias key.");
+      value.data_ptr() == key.data_ptr(),
+      "SFA is the MLA path and requires value to alias key storage.");
   TORCH_CHECK(
       key_rope.dim() == 4 && key_rope.size(0) == key.size(0) &&
           key_rope.size(1) == kBlockSize && key_rope.size(2) == 1 &&

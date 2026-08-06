@@ -262,10 +262,13 @@ def main() -> None:
             lidu_outputs[1].view(batch, TOPK),
             lidu_outputs[2],
         )
+        attention_key = scatter_outputs[1].view(
+            hbm_blocks, BLOCK_SIZE, 1, CKV_DIM,
+        )
         attention = torch.ops.nanovllm_dsa.sparse_and_tail_attention.default(
             attention_query,
-            scatter_outputs[1].view(hbm_blocks, BLOCK_SIZE, 1, CKV_DIM),
-            scatter_outputs[1].view(hbm_blocks, BLOCK_SIZE, 1, CKV_DIM),
+            attention_key,
+            attention_key,
             lidu_outputs[1],
             cache_tokens,
             hbm_table,

@@ -302,7 +302,9 @@ def main() -> None:
         check_case(dense, args.split_g_replays)
         check_index = 0
         for budget in (3072, 6144, 8192, 12288):
-            for tail in (0, 1, 64, 127, 257):
+            # Exercise the split-G partial-tile boundary first so a sync
+            # regression fails fast instead of after the full-tile case.
+            for tail in (1, 0, 64, 127, 257):
                 source_len = budget + tail
                 case = make_case(
                     device, 1, args.heads, source_len, budget, tail,

@@ -395,6 +395,17 @@ TEMPLATES_DEF_NO_DEFAULT
 __aicore__ inline void SFAVectorService<TEMPLATE_ARGS>::CalSparseCalSize(const RunInfo &runInfo, ConstInfo &constInfo)
 {
     if constexpr (IS_SPLIT_G) {
+        // Adjacent AICs share the gathered KV tile when G=128. Keep one AIV
+        // producer alive for each AIC when the final virtual-S2 tile contains
+        // a single row; otherwise the second split-G group has no producer and
+        // its cross-core pipeline can wait forever. The duplicated row is
+        // identical and both groups intentionally write the same workspace row.
+        if (unlikely(runInfo.s2RealSize == 1)) {
+            sparseCalSize = GetSubBlockIdx() == 0 ? 1 : 0;
+            sparseS2Start = 0;
+            sparseS2End = sparseCalSize;
+            return;
+        }
         uint32_t aicIdx = constInfo.aivIdx >> 1U;
         uint32_t v0S2SizeFirstCore = CeilDiv(runInfo.s2RealSize, 2);
         uint32_t v0S2SizeSecondCore = runInfo.s2RealSize - v0S2SizeFirstCore;
