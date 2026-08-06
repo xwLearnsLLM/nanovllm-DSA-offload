@@ -730,6 +730,7 @@ at::Tensor SparseAndTailAttentionNpu(
   constexpr int64_t kAllTokens = std::numeric_limits<int64_t>::max();
   constexpr int64_t kAttentionMode = 2;
   constexpr bool kReturnSoftmaxLse = false;
+  float scale_value_float = static_cast<float>(scale_value);
   auto keepalive = std::make_tuple(
       query, key, value, sparse_slots, block_table, actual_q, actual_kv,
       query_rope, key_rope, cache_tokens, output, softmax_max, softmax_sum);
@@ -746,7 +747,7 @@ at::Tensor SparseAndTailAttentionNpu(
       query_rope,
       key_rope,
       cache_tokens,
-      static_cast<float>(scale_value),
+      scale_value_float,
       kSparseBlockSize,
       query_layout_ptr,
       kv_layout_ptr,
