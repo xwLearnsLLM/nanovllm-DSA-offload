@@ -210,7 +210,19 @@ private:
                 residentLen = actualLen;
             }
 
-            residentSeqLengthsGm_.SetValue(batch, residentLen);
+            // A5 cannot reliably publish adjacent int32 scalars from
+            // different AIV cores with scalar GM stores: the compact
+            // resident_seq_lengths[B] cache line can be false-shared.  The
+            // LIDU miss-count path uses the same MTE3 publication pattern.
+            local.SetValue(0, residentLen);
+            SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
+            WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
+            DataCopyParams scalarCopy{
+                1, static_cast<uint16_t>(sizeof(int32_t)), 0, 0};
+            DataCopyPad(
+                residentSeqLengthsGm_[batch], local, scalarCopy);
+            SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+            WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
         }
     }
 

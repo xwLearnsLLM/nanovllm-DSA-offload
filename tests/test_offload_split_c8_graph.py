@@ -18,6 +18,7 @@ NOPE_DIM = 512
 ROPE_DIM = 64
 PACKED_DIM = 656
 TOPK = 2048
+OUTPUT_SENTINEL = -123456789
 
 
 def parse_args() -> argparse.Namespace:
@@ -227,6 +228,55 @@ def assert_scatter_bytes(
             )
 
 
+def assert_attention_metadata(
+    *,
+    attention_slots: torch.Tensor,
+    resident_lengths: torch.Tensor,
+    destination_slots: torch.Tensor,
+    cache_tokens: torch.Tensor,
+    candidate_lens: torch.Tensor,
+    actual_seq_lengths_kv: torch.Tensor,
+) -> None:
+    slots = attention_slots.cpu()
+    destinations = destination_slots.cpu().view(destination_slots.size(0), TOPK)
+    budgets = cache_tokens.cpu()
+    candidates = candidate_lens.cpu()
+    actual_lengths = actual_seq_lengths_kv.cpu()
+    expected_lengths = torch.empty_like(actual_lengths)
+    for row in range(actual_lengths.numel()):
+        budget = int(budgets[row])
+        candidate = int(candidates[row])
+        actual = int(actual_lengths[row])
+        if budget == 0:
+            active = torch.arange(actual, dtype=torch.int32)
+            resident = actual
+        else:
+            tail = actual - candidate
+            active = torch.cat(
+                (
+                    destinations[row],
+                    torch.arange(budget, budget + tail, dtype=torch.int32),
+                )
+            )
+            resident = budget + tail
+        expected_lengths[row] = resident
+        if not torch.equal(slots[row, 0, : active.numel()], active):
+            raise AssertionError(
+                f"row {row}: topK+tail attention metadata differs"
+            )
+        if bool((slots[row, 0, active.numel() :] != -1).any()):
+            raise AssertionError(
+                f"row {row}: attention metadata padding must be -1"
+            )
+    actual_resident = resident_lengths.cpu()
+    if not torch.equal(actual_resident, expected_lengths):
+        raise AssertionError(
+            "resident lengths differ from the independently computed values: "
+            f"actual={actual_resident.tolist()} "
+            f"expected={expected_lengths.tolist()}"
+        )
+
+
 def main() -> None:
     args = parse_args()
     validate_args(args)
@@ -316,19 +366,26 @@ def main() -> None:
             if pool_seed is None
             else pool_seed.clone()
         )
-        source_ids = torch.empty(
-            (args.batch_size, 1, TOPK), dtype=torch.int32, device=device
-        )
-        destination_slots = torch.empty_like(source_ids)
-        miss_counts = torch.empty(
-            (args.batch_size,), dtype=torch.int32, device=device
-        )
-        attention_slots = torch.empty(
-            (args.batch_size, 1, TOPK + args.max_tail_tokens),
+        source_ids = torch.full(
+            (args.batch_size, 1, TOPK),
+            OUTPUT_SENTINEL,
             dtype=torch.int32,
             device=device,
         )
-        resident_lengths = torch.empty_like(miss_counts)
+        destination_slots = torch.full_like(source_ids, OUTPUT_SENTINEL)
+        miss_counts = torch.full(
+            (args.batch_size,),
+            OUTPUT_SENTINEL,
+            dtype=torch.int32,
+            device=device,
+        )
+        attention_slots = torch.full(
+            (args.batch_size, 1, TOPK + args.max_tail_tokens),
+            OUTPUT_SENTINEL,
+            dtype=torch.int32,
+            device=device,
+        )
+        resident_lengths = torch.full_like(miss_counts, OUTPUT_SENTINEL)
         return (
             hbm,
             pool,
@@ -415,6 +472,16 @@ def main() -> None:
         destination_slots=eager_lidu[1],
         miss_counts=eager_lidu[2],
     )
+    assert_attention_metadata(
+        attention_slots=eager_scatter[1],
+        resident_lengths=eager_scatter[2],
+        destination_slots=eager_lidu[1],
+        cache_tokens=lidu_case.cache_tokens,
+        candidate_lens=lidu_case.candidate_lens,
+        actual_seq_lengths_kv=actual_kv,
+    )
+    if not bool(torch.isfinite(eager_attention).all()):
+        raise AssertionError("eager C8 QSFA output contains NaN or Inf")
 
     graph_state = make_state(
         hbm_seed=eager_state[0], pool_seed=eager_state[1]
@@ -424,10 +491,6 @@ def main() -> None:
     with torch.npu.graph(graph, pool=graph_pool):
         graph_lidu, graph_scatter, graph_attention = chain(graph_state)
     torch.npu.synchronize()
-    if bool((graph_lidu[2].cpu() != 0).any()):
-        raise AssertionError(
-            f"capture must be zero-miss, got {graph_lidu[2].cpu().tolist()}"
-        )
 
     caller_ptrs = tuple(tensor.data_ptr() for tensor in graph_state[2:7])
     captured_ptrs = (
@@ -441,9 +504,39 @@ def main() -> None:
         raise AssertionError("captured outputs are not caller-owned")
     attention_ptr = graph_attention.data_ptr()
 
+    # Graph capture records device work; capture-time output contents are not
+    # a correctness signal. Poison every caller-owned output and prove that
+    # the first replay writes the complete zero-miss result instead.
+    for tensor in graph_state[2:7]:
+        tensor.fill_(OUTPUT_SENTINEL)
+    torch.npu.current_stream().synchronize()
+    graph.replay()
+    torch.npu.synchronize()
+    zero_miss_counts = graph_lidu[2].cpu()
+    if bool((zero_miss_counts != 0).any()):
+        raise AssertionError(
+            "first captured replay did not publish the zero-miss result: "
+            f"actual={zero_miss_counts.tolist()}"
+        )
+    assert_attention_metadata(
+        attention_slots=graph_scatter[1],
+        resident_lengths=graph_scatter[2],
+        destination_slots=graph_lidu[1],
+        cache_tokens=lidu_case.cache_tokens,
+        candidate_lens=lidu_case.candidate_lens,
+        actual_seq_lengths_kv=actual_kv,
+    )
+    if not bool(torch.isfinite(graph_attention).all()):
+        raise AssertionError(
+            "first captured C8 QSFA replay contains NaN or Inf"
+        )
+
     for replay in range(args.replays):
         graph_state[0].copy_(initial_hbm)
         graph_state[1].copy_(lidu_case.initial_pool)
+        for tensor in graph_state[2:7]:
+            tensor.fill_(OUTPUT_SENTINEL)
+        torch.npu.current_stream().synchronize()
         graph.replay()
         torch.npu.synchronize()
         if not torch.equal(graph_lidu[0].cpu(), expected_sources):
@@ -456,6 +549,14 @@ def main() -> None:
             raise AssertionError(f"replay {replay}: topK+tail metadata changed")
         if not torch.equal(graph_scatter[2].cpu(), expected_lengths):
             raise AssertionError(f"replay {replay}: resident lengths changed")
+        assert_attention_metadata(
+            attention_slots=graph_scatter[1],
+            resident_lengths=graph_scatter[2],
+            destination_slots=graph_lidu[1],
+            cache_tokens=lidu_case.cache_tokens,
+            candidate_lens=lidu_case.candidate_lens,
+            actual_seq_lengths_kv=actual_kv,
+        )
         assert_scatter_bytes(
             hbm=graph_state[0],
             dram_cpu=dram_cpu,
@@ -480,7 +581,7 @@ def main() -> None:
         f"cache_tokens={args.cache_tokens} tail_tokens={args.tail_tokens} "
         f"max_tail_tokens={args.max_tail_tokens} "
         f"misses={expected_counts.tolist()} replays={args.replays} "
-        "capture_zero_miss=1 replay_nonzero_miss=1 "
+        "zero_miss_replay=1 replay_nonzero_miss=1 "
         "official_c8_indexer=1 caller_owned_outputs=1 "
         "dram_to_hbm=1 native_c8_qsfa=1 "
         "stable_addresses=1 ok=1",

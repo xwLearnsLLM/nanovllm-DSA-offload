@@ -211,7 +211,7 @@ C8 LIDU 直接用官方 A5 C8 LightningIndexer 作为 top-2048 基线，并覆�
 python3 tests/test_lidu_c8.py --device npu:0 --mode check --heads 32,64 --batch-sizes 24 --source-lens 20096 --cache-tokens 6144 --miss-ranges 0:300 --seed 7
 ```
 
-packed SCATTER 使用真实 swapped memory，逐行 poison HBM 后校验完整 656 bytes、guard、动态 tail metadata 和 caller-owned 地址：
+packed SCATTER 使用真实 swapped memory；分配式与 caller-owned 两条路径都重新 poison HBM，并校验完整 656 bytes、guard、动态 tail metadata、`resident_seq_lengths` 和输出地址：
 
 ```bash
 python3 tests/test_packed_scatter_copy_c8.py --device npu:0 --batch-size 24 --source-len 20096 --cache-tokens 6144 --tail-tokens 257 --max-tail-tokens 512 --copy-min 0 --copy-max 300 --warmup 10 --iters 100 --seed 7
@@ -227,10 +227,14 @@ for C in 3072 6144 8192 12288; do for tail in 0 1 64 127 257; do python3 tests/t
 python3 tests/test_sparse_and_tail_attention_c8.py --device npu:0 --mode check --batch-size 1 --heads 8 --cache-tokens 0 --tail-tokens 2048 --max-tail-tokens 2048 --seed 7
 ```
 
-图门禁捕获 `official C8 LightningIndexer → lidu_cache_update_out → packed_scatter_copy_out → native C8 QSFA`，capture 为零 miss，replay 恢复初始 pool 后产生非零 miss：
+图门禁捕获 `official C8 LightningIndexer → lidu_cache_update_out → packed_scatter_copy_out → native C8 QSFA`；不依赖 capture 阶段执行，先用一次 replay 验证零 miss 和完整输出写回，再恢复初始 pool 进行多次非零 miss replay：
 
 ```bash
-python3 tests/test_offload_split_c8_graph.py --device npu:0 --batch-size 2 --heads 8 --index-heads 32 --source-len 4096 --cache-tokens 3072 --tail-tokens 64 --max-tail-tokens 256 --miss-min 256 --miss-max 512 --replays 4 --seed 7
+python3 tests/test_offload_split_c8_graph.py --device npu:0 --case pure-long --batch-size 2 --heads 8 --index-heads 32 --source-len 4096 --cache-tokens 3072 --tail-tokens 64 --max-tail-tokens 256 --miss-min 256 --miss-max 512 --replays 4 --seed 7
+```
+
+```bash
+python3 tests/test_offload_split_c8_graph.py --device npu:0 --case mixed --batch-size 2 --heads 8 --index-heads 32 --source-len 4096 --cache-tokens 3072 --tail-tokens 64 --max-tail-tokens 256 --miss-min 256 --miss-max 512 --replays 4 --seed 7
 ```
 
 ## 性能矩阵

@@ -308,11 +308,20 @@ def check_copy(case: Case) -> None:
     expected_lengths = case.cache_tokens_cpu + (
         case.actual_kv_cpu - case.candidates_cpu
     )
-    if not torch.equal(resident_lengths.cpu(), expected_lengths):
-        raise AssertionError("resident lengths differ from C+tail")
+    actual_lengths = resident_lengths.cpu()
+    if not torch.equal(actual_lengths, expected_lengths):
+        raise AssertionError(
+            "resident lengths differ from C+tail: "
+            f"actual={actual_lengths.tolist()} "
+            f"expected={expected_lengths.tolist()}"
+        )
 
     out_slots = torch.empty_like(attention_slots)
     out_lengths = torch.empty_like(resident_lengths)
+    case.hbm.fill_(POISON)
+    out_slots.fill_(-123456789)
+    out_lengths.fill_(-123456789)
+    torch.npu.synchronize()
     outputs = launch(
         case, attention_slots=out_slots, resident_lengths=out_lengths
     )
@@ -323,6 +332,31 @@ def check_copy(case: Case) -> None:
         out_lengths.data_ptr(),
     ):
         raise AssertionError("caller-owned packed SCATTER addresses changed")
+    if destination_rows.numel():
+        expected = case.dram_cpu.view(-1, PACKED_DIM)[source_rows]
+        actual = case.hbm.view(-1, PACKED_DIM)[
+            destination_rows.to(case.device)
+        ].cpu()
+        if not torch.equal(actual, expected):
+            raise AssertionError(
+                "caller-owned packed SCATTER DRAM->HBM bytes differ"
+            )
+    if not bool(
+        torch.all(case.hbm.view(-1, PACKED_DIM)[guard] == POISON).item()
+    ):
+        raise AssertionError(
+            "caller-owned packed SCATTER modified an inactive guard row"
+        )
+    if not torch.equal(out_slots.cpu(), actual_slots):
+        raise AssertionError(
+            "caller-owned packed SCATTER attention metadata differs"
+        )
+    if not torch.equal(out_lengths.cpu(), expected_lengths):
+        raise AssertionError(
+            "caller-owned packed SCATTER resident lengths differ: "
+            f"actual={out_lengths.cpu().tolist()} "
+            f"expected={expected_lengths.tolist()}"
+        )
     print(
         "A5_PACKED_C8_SCATTER_CHECK "
         f"copied_tokens={int(case.counts_cpu.sum())} row_bytes={PACKED_DIM} "
