@@ -184,7 +184,11 @@ private:
             const uint32_t chunkLen = MinU32(
                 CACHE_CHUNK, candidateLen - chunkBase);
             DataCopyExtParams copy{
-                1, chunkLen * sizeof(int32_t), 0, 0, 0};
+                1,
+                static_cast<uint32_t>(chunkLen * sizeof(int32_t)),
+                0,
+                0,
+                0};
             DataCopyPad<int32_t, PaddingMode::Normal>(
                 cacheChunk,
                 cacheSlotsPoolGm_[cacheBase + chunkBase],
