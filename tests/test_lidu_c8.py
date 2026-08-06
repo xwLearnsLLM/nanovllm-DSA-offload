@@ -102,6 +102,10 @@ def quantize_fp8(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     quantized, scale = torch_npu.npu_dynamic_quant(
         tensor, dst_type=torch.float8_e4m3fn
     )
+    return (
+        quantized.contiguous(),
+        scale.view(tensor.shape[:-1]).to(torch.float32).contiguous(),
+    )
 
 
 def normalized_hadamard_128(
@@ -115,10 +119,6 @@ def normalized_hadamard_128(
         bottom = torch.cat((matrix, -matrix), dim=1)
         matrix = torch.cat((top, bottom), dim=0)
     return (matrix / math.sqrt(HEAD_DIM)).to(dtype=dtype, device=device)
-    return (
-        quantized.contiguous(),
-        scale.view(tensor.shape[:-1]).to(torch.float32).contiguous(),
-    )
 
 
 def official_c8_lightning_indexer(
