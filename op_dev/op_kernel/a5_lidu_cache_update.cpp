@@ -111,7 +111,18 @@ private:
             sourceIdsGm_[outputBase], outputTokens, copy);
         DataCopyPad<int32_t, PaddingMode::Normal>(
             destinationSlotsGm_[outputBase], outputSlots, copy);
-        missCountsGm_.SetValue(batch, missCount);
+        SetFlag<HardEvent::MTE3_S>(EVENT_ID2);
+        WaitFlag<HardEvent::MTE3_S>(EVENT_ID2);
+
+        // On A5, scalar GM stores from multiple AIV cores can false-share the
+        // compact miss_counts[B] cache line.  Match the official Lightning
+        // Indexer path and publish the scalar through MTE3 instead.
+        outputTokens.SetValue(0, missCount);
+        SetFlag<HardEvent::S_MTE3>(EVENT_ID2);
+        WaitFlag<HardEvent::S_MTE3>(EVENT_ID2);
+        DataCopyParams scalarCopy{
+            1, static_cast<uint16_t>(sizeof(int32_t)), 0, 0};
+        DataCopyPad(missCountsGm_[batch], outputTokens, scalarCopy);
         SetFlag<HardEvent::MTE3_S>(EVENT_ID2);
         WaitFlag<HardEvent::MTE3_S>(EVENT_ID2);
     }

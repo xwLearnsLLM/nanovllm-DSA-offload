@@ -422,9 +422,9 @@ def check_case(case: C8Case) -> None:
         raise AssertionError("repeated C8 update did not publish all top-2048 slots")
 
     out_pool = case.initial_pool.clone()
-    out_sources = torch.empty_like(source_ids)
-    out_slots = torch.empty_like(destination_slots)
-    out_counts = torch.empty_like(miss_counts)
+    out_sources = torch.full_like(source_ids, -777777)
+    out_slots = torch.full_like(destination_slots, -777777)
+    out_counts = torch.full_like(miss_counts, -777777)
     outputs = launch_out(
         case, out_pool, out_sources, out_slots, out_counts
     )
