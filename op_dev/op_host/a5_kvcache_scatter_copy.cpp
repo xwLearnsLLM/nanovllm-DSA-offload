@@ -183,9 +183,17 @@ public:
         this->Output("hbm_k_rope_out").ParamType(REQUIRED).DataType(dataTypes).Format(dataFormats);
         this->Output("hbm_kv_cache_out").ParamType(REQUIRED).DataType(dataTypes).Format(dataFormats);
 
+        OpAICoreConfig config;
+        config.DynamicCompileStaticFlag(true)
+            .DynamicFormatFlag(true)
+            .DynamicRankSupportFlag(true)
+            .DynamicShapeSupportFlag(true)
+            .NeedCheckSupportFlag(false)
+            .PrecisionReduceFlag(true)
+            .ExtendCfgInfo("aclnnSupport.value", "support_aclnn");
         this->AICore()
             .SetTiling(optiling::TilingFunc)
-            .AddConfig("ascend950");
+            .AddConfig("ascend950", config);
     }
 };
 OP_ADD(A5KvcacheScatterCopy);

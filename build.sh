@@ -58,7 +58,9 @@ echo "[nanovllm_a5_ops] jobs: ${BUILD_JOBS}"
 
 OP_NAMES=(
     LightningIndexerDecodeUpdateA5
+    A5LiduCacheUpdate
     A5KvcacheScatterCopy
+    A5PackedKvcacheScatterCopy
     A5SparseAndTailAttention
 )
 

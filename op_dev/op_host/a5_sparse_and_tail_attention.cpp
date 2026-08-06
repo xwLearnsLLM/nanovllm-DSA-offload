@@ -223,7 +223,8 @@ public:
             .DynamicRankSupportFlag(true)
             .DynamicShapeSupportFlag(true)
             .NeedCheckSupportFlag(false)
-            .PrecisionReduceFlag(true);
+            .PrecisionReduceFlag(true)
+            .ExtendCfgInfo("aclnnSupport.value", "support_aclnn");
         this->AICore()
             .SetTiling(optiling::TilingA5SparseAndTailAttention)
             .AddConfig("ascend950", config);

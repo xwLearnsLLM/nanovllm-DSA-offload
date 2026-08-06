@@ -6,7 +6,7 @@
 #include <torch/extension.h>
 #include <torch/library.h>
 
-#include "torch_npu/csrc/framework/OpCommand.h"
+#include "op_api_common.h"
 
 namespace {
 constexpr int64_t kBlockSize = 128;
@@ -14,6 +14,7 @@ constexpr int64_t kKpeDim = 64;
 constexpr int64_t kCkvDim = 512;
 constexpr int64_t kIndexerDim = 128;
 constexpr int64_t kSparseCount = 2048;
+constexpr int64_t kPackedKvDim = 656;
 constexpr int64_t kMaxSourceCapacity = 1 << 18;
 
 void CheckOneDeviceAndContiguous(
@@ -123,21 +124,25 @@ LiduDecodeUpdateOutNpu(
       cache_tokens, candidate_lens, block_table);
   CheckLiduOutputs(query, source_ids, destination_slots, miss_counts);
 
-  at_npu::native::OpCommand cmd;
-  cmd.Name("LightningIndexerDecodeUpdateA5")
-      .Input(query)
-      .Input(key)
-      .Input(weights)
-      .Input(req_pool_entries)
-      .Input(cache_slots_pool)
-      .Input(cache_tokens)
-      .Input(candidate_lens)
-      .Input(block_table)
-      .Output(source_ids)
-      .Output(destination_slots)
-      .Output(miss_counts)
-      .Output(cache_slots_pool)
-      .Run();
+  auto keepalive = std::make_tuple(
+      query, key, weights, req_pool_entries, cache_slots_pool,
+      cache_tokens, candidate_lens, block_table, source_ids,
+      destination_slots, miss_counts);
+  EXEC_NPU_CMD_ORDERED(
+      aclnnLightningIndexerDecodeUpdateA5,
+      keepalive,
+      query,
+      key,
+      weights,
+      req_pool_entries,
+      cache_slots_pool,
+      cache_tokens,
+      candidate_lens,
+      block_table,
+      source_ids,
+      destination_slots,
+      miss_counts,
+      cache_slots_pool);
   return std::make_tuple(
       source_ids, destination_slots, miss_counts, cache_slots_pool);
 }
@@ -188,6 +193,123 @@ LiduDecodeUpdateOutMeta(
     const at::Tensor&,
     at::Tensor cache_slots_pool,
     const at::Tensor&,
+    const at::Tensor&,
+    const at::Tensor&,
+    at::Tensor source_ids,
+    at::Tensor destination_slots,
+    at::Tensor miss_counts) {
+  return std::make_tuple(
+      source_ids, destination_slots, miss_counts, cache_slots_pool);
+}
+
+void CheckLiduCacheUpdateCommon(
+    const at::Tensor& topk_indices,
+    const at::Tensor& req_pool_entries,
+    const at::Tensor& cache_slots_pool,
+    const at::Tensor& cache_tokens,
+    const at::Tensor& candidate_lens) {
+  TORCH_CHECK(
+      topk_indices.dim() == 3 && topk_indices.size(0) > 0 &&
+          topk_indices.size(1) == 1 &&
+          topk_indices.size(2) == kSparseCount,
+      "C8 LIDU topk_indices must be int32 [B,1,2048].");
+  const int64_t batch = topk_indices.size(0);
+  TORCH_CHECK(
+      req_pool_entries.dim() == 1 && req_pool_entries.size(0) == batch &&
+          cache_tokens.dim() == 1 && cache_tokens.size(0) == batch &&
+          candidate_lens.dim() == 1 && candidate_lens.size(0) == batch,
+      "C8 LIDU metadata must be int32 [B].");
+  TORCH_CHECK(
+      cache_slots_pool.dim() == 2 && cache_slots_pool.size(0) > 0 &&
+          cache_slots_pool.size(1) > 0 &&
+          cache_slots_pool.size(1) <= kMaxSourceCapacity,
+      "C8 LIDU cache_slots_pool must be [pool_size,capacity], capacity <= 2^18.");
+  for (const at::Tensor* tensor :
+       {&topk_indices, &req_pool_entries, &cache_slots_pool,
+        &cache_tokens, &candidate_lens}) {
+    TORCH_CHECK(
+        tensor->scalar_type() == at::kInt,
+        "C8 LIDU state-update tensors must be int32.");
+  }
+  CheckOneDeviceAndContiguous(
+      topk_indices,
+      {&topk_indices, &req_pool_entries, &cache_slots_pool,
+       &cache_tokens, &candidate_lens},
+      "C8 LIDU state update");
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+LiduCacheUpdateOutNpu(
+    const at::Tensor& topk_indices,
+    const at::Tensor& req_pool_entries,
+    at::Tensor cache_slots_pool,
+    const at::Tensor& cache_tokens,
+    const at::Tensor& candidate_lens,
+    at::Tensor source_ids,
+    at::Tensor destination_slots,
+    at::Tensor miss_counts) {
+  CheckLiduCacheUpdateCommon(
+      topk_indices, req_pool_entries, cache_slots_pool,
+      cache_tokens, candidate_lens);
+  CheckLiduOutputs(
+      topk_indices, source_ids, destination_slots, miss_counts);
+  auto keepalive = std::make_tuple(
+      topk_indices, req_pool_entries, cache_slots_pool,
+      cache_tokens, candidate_lens, source_ids,
+      destination_slots, miss_counts);
+  EXEC_NPU_CMD_ORDERED(
+      aclnnA5LiduCacheUpdate,
+      keepalive,
+      topk_indices,
+      req_pool_entries,
+      cache_slots_pool,
+      cache_tokens,
+      candidate_lens,
+      source_ids,
+      destination_slots,
+      miss_counts,
+      cache_slots_pool);
+  return std::make_tuple(
+      source_ids, destination_slots, miss_counts, cache_slots_pool);
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+LiduCacheUpdateNpu(
+    const at::Tensor& topk_indices,
+    const at::Tensor& req_pool_entries,
+    at::Tensor cache_slots_pool,
+    const at::Tensor& cache_tokens,
+    const at::Tensor& candidate_lens) {
+  auto options = topk_indices.options().dtype(at::kInt);
+  auto source_ids = at::empty(topk_indices.sizes(), options);
+  auto destination_slots = at::empty(topk_indices.sizes(), options);
+  auto miss_counts = at::empty({topk_indices.size(0)}, options);
+  return LiduCacheUpdateOutNpu(
+      topk_indices, req_pool_entries, cache_slots_pool,
+      cache_tokens, candidate_lens,
+      source_ids, destination_slots, miss_counts);
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+LiduCacheUpdateMeta(
+    const at::Tensor& topk_indices,
+    const at::Tensor&,
+    at::Tensor cache_slots_pool,
+    const at::Tensor&,
+    const at::Tensor&) {
+  auto options = topk_indices.options().dtype(at::kInt);
+  return std::make_tuple(
+      at::empty(topk_indices.sizes(), options),
+      at::empty(topk_indices.sizes(), options),
+      at::empty({topk_indices.size(0)}, options),
+      cache_slots_pool);
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+LiduCacheUpdateOutMeta(
+    const at::Tensor&,
+    const at::Tensor&,
+    at::Tensor cache_slots_pool,
     const at::Tensor&,
     const at::Tensor&,
     at::Tensor source_ids,
@@ -269,20 +391,23 @@ std::tuple<at::Tensor, at::Tensor> ScatterCopyNpu(
   CheckScatterInputs(
       hbm_kpe, hbm_ckv, dram_kpe, dram_ckv, hbm_block_table,
       dram_block_table, source_token_ids, destination_slots, copy_counts);
-  at_npu::native::OpCommand cmd;
-  cmd.Name("A5KvcacheScatterCopy")
-      .Input(hbm_kpe)
-      .Input(hbm_ckv)
-      .Input(dram_kpe)
-      .Input(dram_ckv)
-      .Input(hbm_block_table)
-      .Input(dram_block_table)
-      .Input(source_token_ids)
-      .Input(destination_slots)
-      .Input(copy_counts)
-      .Output(hbm_kpe)
-      .Output(hbm_ckv)
-      .Run();
+  auto keepalive = std::make_tuple(
+      hbm_kpe, hbm_ckv, dram_kpe, dram_ckv, hbm_block_table,
+      dram_block_table, source_token_ids, destination_slots, copy_counts);
+  EXEC_NPU_CMD_ORDERED(
+      aclnnA5KvcacheScatterCopy,
+      keepalive,
+      hbm_kpe,
+      hbm_ckv,
+      dram_kpe,
+      dram_ckv,
+      hbm_block_table,
+      dram_block_table,
+      source_token_ids,
+      destination_slots,
+      copy_counts,
+      hbm_kpe,
+      hbm_ckv);
   return std::make_tuple(hbm_kpe, hbm_ckv);
 }
 
@@ -297,6 +422,228 @@ std::tuple<at::Tensor, at::Tensor> ScatterCopyMeta(
     const at::Tensor&,
     const at::Tensor&) {
   return std::make_tuple(hbm_kpe, hbm_ckv);
+}
+
+int64_t CopyMetadataCapacity(const at::Tensor& tensor) {
+  if (tensor.dim() == 2) {
+    return tensor.size(1);
+  }
+  TORCH_CHECK(
+      tensor.dim() == 3 && tensor.size(1) == 1,
+      "packed SCATTER source/destination metadata must be [B,K] or [B,1,K].");
+  return tensor.size(2);
+}
+
+int64_t AttentionCapacity(int64_t max_tail_tokens) {
+  TORCH_CHECK(
+      max_tail_tokens >= 0 &&
+          max_tail_tokens <= kMaxSourceCapacity - kSparseCount,
+      "packed SCATTER max_tail_tokens must be in [0,260096].");
+  return kSparseCount + max_tail_tokens;
+}
+
+void CheckPackedScatterInputs(
+    const at::Tensor& hbm_kv_bytes,
+    const at::Tensor& dram_kv_bytes,
+    const at::Tensor& hbm_block_table,
+    const at::Tensor& dram_block_table,
+    const at::Tensor& source_token_ids,
+    const at::Tensor& destination_slots,
+    const at::Tensor& copy_counts,
+    const at::Tensor& cache_tokens,
+    const at::Tensor& candidate_lens,
+    const at::Tensor& actual_seq_lengths_kv) {
+  TORCH_CHECK(
+      hbm_kv_bytes.dim() == 4 && hbm_kv_bytes.size(0) > 0 &&
+          hbm_kv_bytes.size(1) == kBlockSize &&
+          hbm_kv_bytes.size(2) == 1 &&
+          hbm_kv_bytes.size(3) == kPackedKvDim &&
+          dram_kv_bytes.dim() == 4 && dram_kv_bytes.size(0) > 0 &&
+          dram_kv_bytes.size(1) == kBlockSize &&
+          dram_kv_bytes.size(2) == 1 &&
+          dram_kv_bytes.size(3) == kPackedKvDim,
+      "packed SCATTER KV byte views must be [blocks,128,1,656].");
+  TORCH_CHECK(
+      hbm_kv_bytes.scalar_type() == at::kChar &&
+          dram_kv_bytes.scalar_type() == at::kChar,
+      "packed SCATTER expects int8 byte views of C8 KV caches.");
+  TORCH_CHECK(copy_counts.dim() == 1, "packed SCATTER copy_counts must be int32[B].");
+  const int64_t batch = copy_counts.size(0);
+  TORCH_CHECK(
+      batch > 0 && cache_tokens.dim() == 1 &&
+          cache_tokens.size(0) == batch && candidate_lens.dim() == 1 &&
+          candidate_lens.size(0) == batch &&
+          actual_seq_lengths_kv.dim() == 1 &&
+          actual_seq_lengths_kv.size(0) == batch &&
+          hbm_block_table.dim() == 2 &&
+          hbm_block_table.size(0) == batch &&
+          hbm_block_table.size(1) > 0 &&
+          dram_block_table.dim() == 2 &&
+          dram_block_table.size(0) == batch &&
+          dram_block_table.size(1) > 0 &&
+          source_token_ids.size(0) == batch &&
+          destination_slots.size(0) == batch &&
+          source_token_ids.sizes() == destination_slots.sizes() &&
+          CopyMetadataCapacity(source_token_ids) == kSparseCount &&
+          dram_block_table.size(1) * kBlockSize <= kMaxSourceCapacity,
+      "packed SCATTER metadata shapes are inconsistent.");
+  for (const at::Tensor* tensor :
+       {&hbm_block_table, &dram_block_table, &source_token_ids,
+        &destination_slots, &copy_counts, &cache_tokens,
+        &candidate_lens, &actual_seq_lengths_kv}) {
+    TORCH_CHECK(
+        tensor->scalar_type() == at::kInt,
+        "packed SCATTER metadata must be int32.");
+  }
+  CheckOneDeviceAndContiguous(
+      hbm_kv_bytes,
+      {&hbm_kv_bytes, &dram_kv_bytes, &hbm_block_table,
+       &dram_block_table, &source_token_ids, &destination_slots,
+       &copy_counts, &cache_tokens, &candidate_lens,
+       &actual_seq_lengths_kv},
+      "packed SCATTER");
+}
+
+void CheckPackedScatterOutputs(
+    const at::Tensor& hbm_kv_bytes,
+    const at::Tensor& attention_slots,
+    const at::Tensor& resident_seq_lengths,
+    int64_t expected_batch,
+    int64_t max_tail_tokens) {
+  const int64_t expected_capacity = AttentionCapacity(max_tail_tokens);
+  TORCH_CHECK(
+      attention_slots.dim() == 3 &&
+          attention_slots.size(0) == expected_batch &&
+          attention_slots.size(1) == 1 &&
+          attention_slots.size(2) == expected_capacity &&
+          resident_seq_lengths.dim() == 1 &&
+          resident_seq_lengths.size(0) == expected_batch,
+      "packed SCATTER outputs must be attention_slots [B,1,2048+max_tail_tokens] "
+      "and resident_seq_lengths [B].");
+  for (const at::Tensor* tensor : {&attention_slots, &resident_seq_lengths}) {
+    TORCH_CHECK(
+        tensor->scalar_type() == at::kInt &&
+            tensor->device() == hbm_kv_bytes.device() &&
+            tensor->is_contiguous(),
+        "packed SCATTER metadata outputs must be contiguous int32 tensors.");
+  }
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+PackedScatterCopyOutNpu(
+    at::Tensor hbm_kv_bytes,
+    const at::Tensor& dram_kv_bytes,
+    const at::Tensor& hbm_block_table,
+    const at::Tensor& dram_block_table,
+    const at::Tensor& source_token_ids,
+    const at::Tensor& destination_slots,
+    const at::Tensor& copy_counts,
+    const at::Tensor& cache_tokens,
+    const at::Tensor& candidate_lens,
+    const at::Tensor& actual_seq_lengths_kv,
+    int64_t max_tail_tokens,
+    at::Tensor attention_slots,
+    at::Tensor resident_seq_lengths) {
+  CheckPackedScatterInputs(
+      hbm_kv_bytes, dram_kv_bytes, hbm_block_table, dram_block_table,
+      source_token_ids, destination_slots, copy_counts, cache_tokens,
+      candidate_lens, actual_seq_lengths_kv);
+  CheckPackedScatterOutputs(
+      hbm_kv_bytes, attention_slots, resident_seq_lengths,
+      copy_counts.size(0), max_tail_tokens);
+  auto keepalive = std::make_tuple(
+      hbm_kv_bytes, dram_kv_bytes, hbm_block_table, dram_block_table,
+      source_token_ids, destination_slots, copy_counts, cache_tokens,
+      candidate_lens, actual_seq_lengths_kv, attention_slots,
+      resident_seq_lengths);
+  EXEC_NPU_CMD_ORDERED(
+      aclnnA5PackedKvcacheScatterCopy,
+      keepalive,
+      hbm_kv_bytes,
+      dram_kv_bytes,
+      hbm_block_table,
+      dram_block_table,
+      source_token_ids,
+      destination_slots,
+      copy_counts,
+      cache_tokens,
+      candidate_lens,
+      actual_seq_lengths_kv,
+      attention_slots,
+      resident_seq_lengths,
+      hbm_kv_bytes,
+      attention_slots,
+      resident_seq_lengths);
+  return std::make_tuple(
+      hbm_kv_bytes, attention_slots, resident_seq_lengths);
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+PackedScatterCopyNpu(
+    at::Tensor hbm_kv_bytes,
+    const at::Tensor& dram_kv_bytes,
+    const at::Tensor& hbm_block_table,
+    const at::Tensor& dram_block_table,
+    const at::Tensor& source_token_ids,
+    const at::Tensor& destination_slots,
+    const at::Tensor& copy_counts,
+    const at::Tensor& cache_tokens,
+    const at::Tensor& candidate_lens,
+    const at::Tensor& actual_seq_lengths_kv,
+    int64_t max_tail_tokens) {
+  auto options = copy_counts.options().dtype(at::kInt);
+  auto attention_slots = at::empty(
+      {copy_counts.size(0), 1, AttentionCapacity(max_tail_tokens)}, options);
+  auto resident_seq_lengths = at::empty({copy_counts.size(0)}, options);
+  return PackedScatterCopyOutNpu(
+      hbm_kv_bytes, dram_kv_bytes, hbm_block_table, dram_block_table,
+      source_token_ids, destination_slots, copy_counts, cache_tokens,
+      candidate_lens, actual_seq_lengths_kv, max_tail_tokens,
+      attention_slots, resident_seq_lengths);
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+PackedScatterCopyMeta(
+    at::Tensor hbm_kv_bytes,
+    const at::Tensor&,
+    const at::Tensor&,
+    const at::Tensor&,
+    const at::Tensor&,
+    const at::Tensor&,
+    const at::Tensor& copy_counts,
+    const at::Tensor&,
+    const at::Tensor&,
+    const at::Tensor&,
+    int64_t max_tail_tokens) {
+  auto options = copy_counts.options().dtype(at::kInt);
+  return std::make_tuple(
+      hbm_kv_bytes,
+      at::empty(
+          {copy_counts.size(0), 1, AttentionCapacity(max_tail_tokens)},
+          options),
+      at::empty({copy_counts.size(0)}, options));
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+PackedScatterCopyOutMeta(
+    at::Tensor hbm_kv_bytes,
+    const at::Tensor&,
+    const at::Tensor&,
+    const at::Tensor&,
+    const at::Tensor&,
+    const at::Tensor&,
+    const at::Tensor& copy_counts,
+    const at::Tensor&,
+    const at::Tensor&,
+    const at::Tensor&,
+    int64_t max_tail_tokens,
+    at::Tensor attention_slots,
+    at::Tensor resident_seq_lengths) {
+  CheckPackedScatterOutputs(
+      hbm_kv_bytes, attention_slots, resident_seq_lengths,
+      copy_counts.size(0), max_tail_tokens);
+  return std::make_tuple(
+      hbm_kv_bytes, attention_slots, resident_seq_lengths);
 }
 
 void CheckAttentionInputs(
@@ -356,18 +703,6 @@ void CheckAttentionInputs(
       "SFA");
 }
 
-void AddAttentionAttrs(at_npu::native::OpCommand& cmd, double scale_value) {
-  cmd.Attr("scale_value", static_cast<float>(scale_value))
-      .Attr("sparse_block_size", static_cast<int64_t>(1))
-      .Attr("layout_query", std::string("TND"))
-      .Attr("layout_kv", std::string("PA_BSND"))
-      .Attr("sparse_mode", static_cast<int64_t>(3))
-      .Attr("pre_tokens", std::numeric_limits<int64_t>::max())
-      .Attr("next_tokens", std::numeric_limits<int64_t>::max())
-      .Attr("attention_mode", static_cast<int64_t>(2))
-      .Attr("return_softmax_lse", false);
-}
-
 at::Tensor SparseAndTailAttentionNpu(
     const at::Tensor& query,
     const at::Tensor& key,
@@ -386,23 +721,43 @@ at::Tensor SparseAndTailAttentionNpu(
   auto output = at::empty_like(query);
   auto softmax_max = at::empty({1}, query.options().dtype(at::kFloat));
   auto softmax_sum = at::empty({1}, query.options().dtype(at::kFloat));
-  at_npu::native::OpCommand cmd;
-  cmd.Name("A5SparseAndTailAttention")
-      .Input(query)
-      .Input(key)
-      .Input(value)
-      .Input(sparse_slots)
-      .Input(block_table)
-      .Input(actual_q)
-      .Input(actual_kv)
-      .Input(query_rope)
-      .Input(key_rope)
-      .Input(cache_tokens)
-      .Output(output)
-      .Output(softmax_max)
-      .Output(softmax_sum);
-  AddAttentionAttrs(cmd, scale_value);
-  cmd.Run();
+  std::string query_layout = "TND";
+  std::string kv_layout = "PA_BSND";
+  char* query_layout_ptr = const_cast<char*>(query_layout.c_str());
+  char* kv_layout_ptr = const_cast<char*>(kv_layout.c_str());
+  constexpr int64_t kSparseBlockSize = 1;
+  constexpr int64_t kSparseMode = 3;
+  constexpr int64_t kAllTokens = std::numeric_limits<int64_t>::max();
+  constexpr int64_t kAttentionMode = 2;
+  constexpr bool kReturnSoftmaxLse = false;
+  auto keepalive = std::make_tuple(
+      query, key, value, sparse_slots, block_table, actual_q, actual_kv,
+      query_rope, key_rope, cache_tokens, output, softmax_max, softmax_sum);
+  EXEC_NPU_CMD_ORDERED(
+      aclnnA5SparseAndTailAttention,
+      keepalive,
+      query,
+      key,
+      value,
+      sparse_slots,
+      block_table,
+      actual_q,
+      actual_kv,
+      query_rope,
+      key_rope,
+      cache_tokens,
+      static_cast<float>(scale_value),
+      kSparseBlockSize,
+      query_layout_ptr,
+      kv_layout_ptr,
+      kSparseMode,
+      kAllTokens,
+      kAllTokens,
+      kAttentionMode,
+      kReturnSoftmaxLse,
+      output,
+      softmax_max,
+      softmax_sum);
   return output;
 }
 
@@ -440,11 +795,54 @@ TORCH_LIBRARY(nanovllm_dsa, m) {
       "Tensor(d!) miss_counts) "
       "-> (Tensor(b!), Tensor(c!), Tensor(d!), Tensor(a!))");
   m.def(
+      "lidu_cache_update(Tensor topk_indices, Tensor req_pool_entries, "
+      "Tensor(a!) cache_slots_pool, Tensor cache_tokens, "
+      "Tensor candidate_lens) "
+      "-> (Tensor, Tensor, Tensor, Tensor(a!))");
+  m.def(
+      "lidu_cache_update_out(Tensor topk_indices, "
+      "Tensor req_pool_entries, Tensor(a!) cache_slots_pool, "
+      "Tensor cache_tokens, Tensor candidate_lens, "
+      "Tensor(b!) source_ids, Tensor(c!) destination_slots, "
+      "Tensor(d!) miss_counts) "
+      "-> (Tensor(b!), Tensor(c!), Tensor(d!), Tensor(a!))");
+  m.def(
+      "lidu_decode_update_c8(Tensor query, Tensor key, Tensor weights, "
+      "Tensor query_dequant_scale, Tensor key_dequant_scale, "
+      "Tensor actual_seq_lengths_query, Tensor req_pool_entries, "
+      "Tensor(a!) cache_slots_pool, Tensor cache_tokens, "
+      "Tensor candidate_lens, Tensor block_table) "
+      "-> (Tensor, Tensor, Tensor, Tensor(a!))");
+  m.def(
+      "lidu_decode_update_c8_out(Tensor query, Tensor key, "
+      "Tensor weights, Tensor query_dequant_scale, "
+      "Tensor key_dequant_scale, Tensor actual_seq_lengths_query, "
+      "Tensor req_pool_entries, Tensor(a!) cache_slots_pool, "
+      "Tensor cache_tokens, Tensor candidate_lens, "
+      "Tensor block_table, Tensor(b!) source_ids, "
+      "Tensor(c!) destination_slots, Tensor(d!) miss_counts) "
+      "-> (Tensor(b!), Tensor(c!), Tensor(d!), Tensor(a!))");
+  m.def(
       "scatter_copy(Tensor(a!) hbm_kpe, Tensor(b!) hbm_ckv, "
       "Tensor dram_kpe, Tensor dram_ckv, Tensor hbm_block_table, "
       "Tensor dram_block_table, Tensor source_token_ids, "
       "Tensor destination_slots, Tensor copy_counts) "
       "-> (Tensor(a!), Tensor(b!))");
+  m.def(
+      "packed_scatter_copy(Tensor(a!) hbm_kv_bytes, Tensor dram_kv_bytes, "
+      "Tensor hbm_block_table, Tensor dram_block_table, "
+      "Tensor source_token_ids, Tensor destination_slots, "
+      "Tensor copy_counts, Tensor cache_tokens, Tensor candidate_lens, "
+      "Tensor actual_seq_lengths_kv, int max_tail_tokens) "
+      "-> (Tensor(a!), Tensor, Tensor)");
+  m.def(
+      "packed_scatter_copy_out(Tensor(a!) hbm_kv_bytes, Tensor dram_kv_bytes, "
+      "Tensor hbm_block_table, Tensor dram_block_table, "
+      "Tensor source_token_ids, Tensor destination_slots, "
+      "Tensor copy_counts, Tensor cache_tokens, Tensor candidate_lens, "
+      "Tensor actual_seq_lengths_kv, int max_tail_tokens, "
+      "Tensor(b!) attention_slots, Tensor(c!) resident_seq_lengths) "
+      "-> (Tensor(a!), Tensor(b!), Tensor(c!))");
   m.def(
       "sparse_and_tail_attention(Tensor query, Tensor key, Tensor value, "
       "Tensor sparse_slots, Tensor cache_tokens, Tensor block_table, "
@@ -455,14 +853,22 @@ TORCH_LIBRARY(nanovllm_dsa, m) {
 TORCH_LIBRARY_IMPL(nanovllm_dsa, PrivateUse1, m) {
   m.impl("lidu_decode_update", &LiduDecodeUpdateNpu);
   m.impl("lidu_decode_update_out", &LiduDecodeUpdateOutNpu);
+  m.impl("lidu_cache_update", &LiduCacheUpdateNpu);
+  m.impl("lidu_cache_update_out", &LiduCacheUpdateOutNpu);
   m.impl("scatter_copy", &ScatterCopyNpu);
+  m.impl("packed_scatter_copy", &PackedScatterCopyNpu);
+  m.impl("packed_scatter_copy_out", &PackedScatterCopyOutNpu);
   m.impl("sparse_and_tail_attention", &SparseAndTailAttentionNpu);
 }
 
 TORCH_LIBRARY_IMPL(nanovllm_dsa, Meta, m) {
   m.impl("lidu_decode_update", &LiduDecodeUpdateMeta);
   m.impl("lidu_decode_update_out", &LiduDecodeUpdateOutMeta);
+  m.impl("lidu_cache_update", &LiduCacheUpdateMeta);
+  m.impl("lidu_cache_update_out", &LiduCacheUpdateOutMeta);
   m.impl("scatter_copy", &ScatterCopyMeta);
+  m.impl("packed_scatter_copy", &PackedScatterCopyMeta);
+  m.impl("packed_scatter_copy_out", &PackedScatterCopyOutMeta);
   m.impl("sparse_and_tail_attention", &SparseAndTailAttentionMeta);
 }
 
