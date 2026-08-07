@@ -1,6 +1,6 @@
 # Ascend 950 nano-vLLM offload_split 算子
 
-本仓库是独立的 Ascend 950 / CANN 9.1 decode KV-cache 卸载算子工程。W4A8 路径包含 BF16 `lightning_indexer_decode_update`、`kvcache_scatter_copy` 和 `sparse_and_tail_attention`；W4A4C8 路径使用官方 A5 C8 LightningIndexer、request-pool update、packed-C8 SCATTER 和原生 C8 QSFA。构建与运行不读取任何参考仓源码，也不包含 nano-vLLM 引擎、融合算子或 MTP。
+本仓库是独立的 Ascend 950 / CANN 9.1 decode KV-cache 卸载算子工程。W4A8 路径包含 BF16 `lightning_indexer_decode_update`、`kvcache_scatter_copy` 和 `sparse_and_tail_attention`；W4A4C8 路径使用官方 A5 C8 LightningIndexer、request-pool update、packed-C8 SCATTER 和原生 C8 QSFA。
 
 ## 来源
 
@@ -10,7 +10,7 @@
 - W4A4C8 Indexer：使用 A5 官方 `torch_npu.npu_quant_lightning_indexer`，采用 FP8 E4M3 query/key、BF16 weights、FP32 query/key scale、`TND/PA_BSND`、`sparse_count=2048` 和 `sparse_mode=3`；C8 LIDU 接续完成 request-pool hit/miss、淘汰和更新。
 - W4A4C8 Attention：packed KV ABI 与 A5 原生 `npu_kv_quant_sparse_flash_attention` 对齐。ModelSlim 的 GLM-5.1 W4A4C8 量化说明见 [GLM-5 量化 README](https://gitcode.com/Ascend/msmodelslim/blob/26.1.0/example/GLM-5/README.md)。
 
-## W4A8 算子一览表
+## BF16 KVcache 算子一览表
 
 | 公开入口 | 实际执行 | 作用 | 定位 |
 | --- | --- | --- | --- |
@@ -18,7 +18,7 @@
 | `scatter_copy` | `A5KvcacheScatterCopy` | 按 miss-prefix 将分离的 BF16/FP16 CKV、KPE 从 swapped-memory DRAM 搬到 HBM | 稳定图主链 |
 | `sparse_and_tail_attention` | `A5SparseAndTailAttention` | 对 top-2048 sparse slots 与 tail 执行 BF16/FP16 MLA | 稳定图主链 |
 
-## W4A4C8 算子一览表
+## C8 KVcache 算子一览表
 
 | 公开入口 | 实际执行 | 作用 | 定位 |
 | --- | --- | --- | --- |
@@ -26,15 +26,11 @@
 | `scatter_copy_c8` / `scatter_copy_c8_out` | `A5PackedKvcacheScatterCopy` | 整行搬运 656-byte packed KV，并生成 sparse+tail slots 和 resident length；`_out` 写入 caller-owned metadata | eager / 稳定图主链 |
 | `sparse_and_tail_attention_c8` | Python custom op → 原生 `npu_kv_quant_sparse_flash_attention` | 对 packed C8 KV 的 top-2048 sparse slots 与 tail 执行量化 MLA | 稳定图主链 |
 
-## 源码布局
-
-六个框架算子分别位于 `csrc/src/lidu_decode_update`、`csrc/src/scatter_copy`、`csrc/src/sparse_and_tail_attention`、`csrc/src/lidu_decode_update_c8`、`csrc/src/scatter_copy_c8` 和 `csrc/src/sparse_and_tail_attention_c8`。Torch 入口对应拆分在 `torch_extension/nanovllm_dsa_a5/ops`；本地 C++ 绑定按算子拆分在 `torch_extension/csrc/npu_*.cpp`，schema 集中在 `ops_registration.cpp`。C8 LIDU 复用官方 Quant LightningIndexer，C8 Attention 复用原生 QSFA，因此这两个目录只保存本仓的组合适配逻辑，不伪造重复的 CANN 内核。
-
 ## 接口
 
 共同语义：`B` 是 decode batch，`C=cache_tokens[b]` 是请求固定的 HBM token 预算，`candidate_lens[b]` 是参与稀疏选择的 prefill 满块 token 数。`cache_slots_pool[req_pool_entries[b], token_id]` 保存 source token 到 HBM slot 的映射，`-1` 表示未缓存。LIDU 输出中前 `miss_counts[b]` 项为 miss，SCATTER 只搬运这段；全部 2048 个 `destination_slots` 都供 Attention 使用。稳定图使用 caller-owned `_out` 接口。
 
-### W4A8：BF16/FP16 KV
+### BF16/FP16 KV
 
 链路：`lidu_decode_update_out → scatter_copy → sparse_and_tail_attention`。
 
@@ -90,7 +86,7 @@ torch.ops.nanovllm_dsa.sparse_and_tail_attention(
 ) -> attention_out          # bf16/fp16[B,Q_HEAD,512]
 ```
 
-### W4A4C8：packed C8 KV
+### packed C8 KV
 
 链路：`lidu_decode_update_c8_out → scatter_copy_c8_out → sparse_and_tail_attention_c8`。每个 packed KV token 固定为 656 bytes：`512 FP8 E4M3 + 64 BF16 RoPE + 4 FP32 scales`。
 
@@ -156,18 +152,9 @@ torch.ops.nanovllm_dsa.sparse_and_tail_attention_c8(
 
 非 `_out` 的 `scatter_copy_c8` 参数相同，但由算子分配 `attention_slots` 和 `resident_seq_lengths`。C8 LIDU 的组合接口内部完成官方 A5 Quant LightningIndexer 和 request-pool 更新。全部框架接口提供 Fake/Meta；LIDU、SCATTER 的 schema 显式声明 mutable alias。
 
-## 约束
 
-- 仅面向 GLM-5.1 W4A8/W4A4C8 decode，`q_seq_len=1`，block size 为 128。
-- LIDU 支持 `q_head=32|64`；SFA 仅支持 `q_head=1..64`，门禁使用 8。
-- `C=0` 时 LIDU no-op，SFA 计算全部有效 KV；`C>0` 时 SFA 计算 2048 个 sparse slots 与 `[C, actual_kv_len)` tail。
-- source token ID 为 18 bit，`SOURCE_CAPACITY <= 262144`；LIDU slot 为 14 bit，block-aligned `C <= 16256`。当前预算 `3072/6144/8192/12288` 均受支持。
-- `req_pool_entries` 在活跃 batch 内必须唯一且位于 pool 范围内；非零 C 的 pool 行必须恰有 C 个唯一 slots。
-- C8 Indexer 使用独立的 `float8_e4m3fn[blocks,128,1,128]` key cache 和 `float32[blocks,128,1]` scale cache，不再复用 BF16 Indexer。C8 Attention cache 每个 token 的 656 bytes 固定为 `512 FP8 E4M3 + 64 BF16 RoPE + 4 FP32 scales`，SCATTER 必须整行搬运。
-- C8 LIDU 的 query/key 接口位于官方 GLM 预处理之后：调用方须先完成 RoPE、归一化 128×128 Hadamard，再执行 FP8 E4M3 动态量化并传入对应 FP32 scale；C8 UT 也按该顺序构造输入。
-- `max_tail_tokens` 是 full-decode-only 的静态 capture 容量；实际 tail 为 `actual_seq_lengths_kv-candidate_lens`。`C>0` 时 Attention 索引为 2048 个 LIDU slots 加 `[C,C+tail)`，`C=0` 时为 `[0,actual_len)`。
 
-## 环境与构建
+## 编译
 
 从仓库根目录执行：
 
@@ -195,7 +182,9 @@ export NANOVLLM_A5_OPS_BUILD_JOBS=64
 bash build.sh
 ```
 
-## 正确性与图回放
+
+
+## BF16 算子测试
 
 ```bash
 python3 tests/test_lidu.py --device npu:0 --mode check --heads 32,64 --batch-sizes 24 --source-lens 20096 --cache-tokens 6144 --miss-ranges 0:300 --seed 7
@@ -225,7 +214,7 @@ python3 tests/test_offload_split_graph.py --device npu:0 --case mixed --replays 
 
 图门禁捕获 `lidu_decode_update_out → scatter_copy → sparse_and_tail_attention`；capture 为零 miss，replay 交替产生非零 miss，并校验输出地址、pool 更新、真实 DRAM→HBM 搬运和 attention golden。
 
-## W4A4C8 门禁
+## C8 算子测试
 
 C8 LIDU 直接用官方 A5 C8 LightningIndexer 作为 top-2048 基线，并覆盖 mixed C、乱序 request-pool、零/随机/2048 miss、重复更新和 caller-owned out：
 
@@ -259,6 +248,8 @@ python3 tests/test_offload_split_c8_graph.py --device npu:0 --case pure-long --b
 python3 tests/test_offload_split_c8_graph.py --device npu:0 --case mixed --batch-size 2 --heads 8 --index-heads 32 --source-len 4096 --cache-tokens 3072 --tail-tokens 64 --max-tail-tokens 256 --miss-min 256 --miss-max 512 --replays 4 --seed 7
 ```
 
+
+
 ## 性能矩阵
 
 `q_head=8` 的三算子总时延需与相同输入下的来源版本对照，目标是不超过参考时延的 `1.10x`。
@@ -287,20 +278,3 @@ SFA：
 python3 tests/test_sparse_and_tail_attention.py --device npu:0 --mode bench --heads 8 --batch-sizes 1,4,8,12,16,24,32 --source-lens 12288,20096,65536,131072 --cache-tokens 6144 --tail-tokens 64 --warmup 10 --iters 100 --seed 7
 ```
 
-## Profile
-
-```bash
-msprof --application="python3 tests/test_lidu.py --device npu:0 --mode profile --heads 32 --batch-sizes 24 --source-lens 20096 --cache-tokens 6144 --miss-ranges 0:300 --profile-replays 4 --seed 7" --output=./profile_lidu
-```
-
-```bash
-msprof --application="python3 tests/test_lidu_c8.py --device npu:0 --mode profile --heads 32 --batch-sizes 24 --source-lens 20096 --cache-tokens 6144 --miss-ranges 0:300 --profile-replays 4 --seed 7" --output=./profile_lidu_c8
-```
-
-```bash
-msprof --application="python3 tests/test_scatter_copy.py --device npu:0 --batch-size 24 --source-len 65536 --hbm-slots 8192 --copy-cap 2048 --copy-min 0 --copy-max 300 --warmup 3 --iters 4 --seed 7" --output=./profile_scatter
-```
-
-```bash
-msprof --application="python3 tests/test_sparse_and_tail_attention.py --device npu:0 --mode profile --heads 8 --batch-sizes 24 --source-lens 65536 --cache-tokens 6144 --tail-tokens 64 --profile-replays 4 --seed 7" --output=./profile_sfa_h8
-```
