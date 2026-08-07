@@ -147,11 +147,19 @@ def apply_reference(
         expected_ckv[dst_blocks, dst_offsets] = dram_ckv[src_blocks, src_offsets]
 
 
-def run_correctness(device: torch.device, seed: int) -> None:
-    batch_size = 6
-    source_len = 4096
-    cache_tokens = 2048
-    copy_cap = 2048
+def run_correctness_case(
+    device: torch.device,
+    *,
+    label: str,
+    batch_size: int,
+    source_len: int,
+    cache_tokens: int,
+    copy_cap: int,
+    rounds: tuple[tuple[int, ...], ...],
+    seed: int,
+) -> None:
+    if any(len(row_counts) != batch_size for row_counts in rounds):
+        raise ValueError("every SCATTER correctness round must match batch_size")
     generator = torch.Generator().manual_seed(seed)
     dram_table_cpu, dram_blocks = random_block_table(
         batch_size, source_len // BLOCK_SIZE, generator
@@ -187,10 +195,6 @@ def run_correctness(device: torch.device, seed: int) -> None:
     dram_table = dram_table_cpu.to(device)
     hbm_table = hbm_table_cpu.to(device)
 
-    rounds = (
-        (0, 1, 47, 256, 1024, 2048),
-        (2048, 1024, 257, 31, 1, 0),
-    )
     for step, row_counts in enumerate(rounds):
         source_ids_cpu, slots_cpu, counts_cpu = make_metadata(
             batch_size,
@@ -228,7 +232,8 @@ def run_correctness(device: torch.device, seed: int) -> None:
         if not torch.equal(hbm_ckv.cpu(), expected_ckv):
             raise AssertionError(f"SCATTER CKV mismatch at update step {step}")
         print(
-            f"SCATTER_COPY_CHECK step={step} counts={list(row_counts)} "
+            f"SCATTER_COPY_CHECK case={label} copy_cap={copy_cap} "
+            f"step={step} counts={list(row_counts)} "
             "random_block_tables=1 ok=1"
         )
 
@@ -252,7 +257,110 @@ def run_correctness(device: torch.device, seed: int) -> None:
         hbm_ckv.cpu(), expected_ckv
     ):
         raise AssertionError("zero-count SCATTER modified the HBM cache")
-    print("SCATTER_COPY_ZERO_COUNT_CHECK ok=1")
+    print(
+        f"SCATTER_COPY_ZERO_COUNT_CHECK case={label} "
+        f"copy_cap={copy_cap} ok=1"
+    )
+
+    # Capture with zero copies, then replay the same fixed-shape graph after
+    # refreshing only copy_counts.  This is the contract used when an earlier
+    # MTP-LIDU node writes a variable-length union miss list in the graph.
+    graph_sources_cpu, graph_slots_cpu, graph_counts_cpu = make_metadata(
+        batch_size,
+        copy_cap,
+        source_len,
+        cache_tokens,
+        rounds[-1],
+        generator,
+    )
+    graph_sources = graph_sources_cpu.to(device)
+    graph_slots = graph_slots_cpu.to(device)
+    graph_counts = torch.zeros(batch_size, dtype=torch.int32, device=device)
+    graph_kpe = torch.zeros_like(hbm_kpe)
+    graph_ckv = torch.zeros_like(hbm_ckv)
+    graph = torch.npu.NPUGraph()
+    pool = torch.npu.graph_pool_handle()
+    with torch.npu.graph(graph, pool=pool):
+        scatter(
+            graph_kpe,
+            graph_ckv,
+            dram_kpe,
+            dram_ckv,
+            hbm_table,
+            dram_table,
+            graph_sources,
+            graph_slots,
+            graph_counts,
+        )
+    torch.npu.synchronize()
+
+    graph_kpe.zero_()
+    graph_ckv.zero_()
+    graph_counts.copy_(graph_counts_cpu.to(device))
+    torch.npu.synchronize()
+    graph.replay()
+    torch.npu.synchronize()
+    expected_graph_kpe = torch.zeros_like(expected_kpe)
+    expected_graph_ckv = torch.zeros_like(expected_ckv)
+    apply_reference(
+        expected_graph_kpe,
+        expected_graph_ckv,
+        dram_kpe_cpu,
+        dram_ckv_cpu,
+        hbm_table_cpu,
+        dram_table_cpu,
+        graph_sources_cpu,
+        graph_slots_cpu,
+        graph_counts_cpu,
+    )
+    if not torch.equal(graph_kpe.cpu(), expected_graph_kpe):
+        raise AssertionError(f"{label}: graph replay KPE mismatch")
+    if not torch.equal(graph_ckv.cpu(), expected_graph_ckv):
+        raise AssertionError(f"{label}: graph replay CKV mismatch")
+    print(
+        f"SCATTER_COPY_GRAPH_CHECK case={label} copy_cap={copy_cap} "
+        f"counts={graph_counts_cpu.tolist()} dynamic_counts=1 ok=1"
+    )
+
+    del (
+        dram_kpe,
+        dram_ckv,
+        hbm_kpe,
+        hbm_ckv,
+        graph_kpe,
+        graph_ckv,
+        graph,
+    )
+    torch.npu.empty_cache()
+
+
+def run_correctness(device: torch.device, seed: int) -> None:
+    run_correctness_case(
+        device,
+        label="legacy_2048",
+        batch_size=6,
+        source_len=4096,
+        cache_tokens=2048,
+        copy_cap=2048,
+        rounds=(
+            (0, 1, 47, 256, 1024, 2048),
+            (2048, 1024, 257, 31, 1, 0),
+        ),
+        seed=seed,
+    )
+    run_correctness_case(
+        device,
+        label="mtp_union_8192",
+        batch_size=6,
+        source_len=16384,
+        cache_tokens=8192,
+        copy_cap=8192,
+        rounds=(
+            (0, 1, 2047, 2048, 4097, 8192),
+            (8192, 6145, 4096, 2049, 1, 0),
+        ),
+        seed=seed + 100,
+    )
 
 
 def run_performance(

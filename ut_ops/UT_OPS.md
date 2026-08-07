@@ -30,7 +30,13 @@ python3 ut_ops/test_lidu_perf.py --device npu:0 --heads 32 --batch-sizes 24 --se
 独立 SCATTER：
 
 ```bash
-python3 ut_ops/test_scatter_copy.py --device npu:0 --batch-size 24 --source-len 20992 --cache-tokens 6144 --copy-cap 2048 --miss-counts 0,256,512,1024,1536,2048 --warmup 10 --iters 100 --seed 7
+python3 ut_ops/test_scatter_copy.py --device npu:0 --batch-size 24 --source-len 20992 --cache-tokens 8192 --copy-cap 8192 --miss-counts 0,256,1024,2048,4096,6144,8192 --warmup 10 --iters 100 --seed 7
+```
+
+MTP3-LIDU，以及其 8192-capacity 输出到 SCATTER 的 eager/graph 链式语义：
+
+```bash
+python3 ut_ops/test_lidu_mtp.py --device npu:0 --batch-size 24 --source-len 20992 --cache-tokens 8192 --graph-replays 3 --warmup 10 --iters 100 --min-speedup 1.0 --seed 7
 ```
 
 Sparse-and-tail Attention：
