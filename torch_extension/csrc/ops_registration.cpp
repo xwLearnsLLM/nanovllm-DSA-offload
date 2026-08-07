@@ -68,6 +68,25 @@ TORCH_LIBRARY(nanovllm_dsa, m) {
       "Tensor sparse_slots, Tensor cache_tokens, Tensor block_table, "
       "Tensor actual_seq_lengths_query, Tensor actual_seq_lengths_kv, "
       "Tensor query_rope, Tensor key_rope, float scale_value) -> Tensor");
+  m.def(
+      "sparse_and_tail_attention_and_scatter_copy("
+      "Tensor query, Tensor(a!) hbm_ckv, Tensor sparse_slots, "
+      "Tensor cache_tokens, Tensor hbm_block_table, "
+      "Tensor actual_seq_lengths_query, Tensor actual_seq_lengths_kv, "
+      "Tensor query_rope, Tensor(b!) hbm_kpe, Tensor dram_kpe, "
+      "Tensor dram_ckv, Tensor dram_block_table, "
+      "Tensor source_token_ids, Tensor copy_counts, float scale_value) "
+      "-> (Tensor, Tensor(b!), Tensor(a!))");
+  m.def(
+      "sparse_and_tail_attention_and_scatter_copy_mte_pipeline("
+      "Tensor query, Tensor(a!) hbm_ckv, Tensor sparse_slots, "
+      "Tensor cache_tokens, Tensor hbm_block_table, "
+      "Tensor actual_seq_lengths_query, Tensor actual_seq_lengths_kv, "
+      "Tensor query_rope, Tensor(b!) hbm_kpe, Tensor dram_kpe, "
+      "Tensor dram_ckv, Tensor dram_block_table, "
+      "Tensor source_token_ids, Tensor copy_counts, float scale_value, "
+      "int prefetch_rows_per_step=5) "
+      "-> (Tensor, Tensor(b!), Tensor(a!))");
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {}

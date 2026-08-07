@@ -29,6 +29,18 @@ inline void CheckOneDeviceAndContiguous(
   }
 }
 
+void CheckAttentionInputs(
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& value,
+    const at::Tensor& sparse_slots,
+    const at::Tensor& cache_tokens,
+    const at::Tensor& block_table,
+    const at::Tensor& actual_q,
+    const at::Tensor& actual_kv,
+    const at::Tensor& query_rope,
+    const at::Tensor& key_rope);
+
 inline void CheckLiduOutputs(
     const at::Tensor& reference,
     const at::Tensor& source_ids,

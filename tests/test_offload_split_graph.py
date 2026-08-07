@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Capture and replay the A5 LIDU -> SCATTER -> sparse+tail Attention chain."""
+"""Capture/replay A5 LIDU with split or BF16 fused Attention/SCATTER."""
 
 from __future__ import annotations
 
@@ -30,6 +30,18 @@ def parse_args() -> argparse.Namespace:
         choices=("mixed", "pure-long"),
         default="mixed",
         help="mixed uses C=0/C=3072; pure-long uses C=3072/C=3072.",
+    )
+    parser.add_argument(
+        "--attention-path",
+        choices=("split", "fused", "mte_pipeline"),
+        default="split",
+        help="Select split SCATTER+SFA or one of the two BF16 fused operators.",
+    )
+    parser.add_argument(
+        "--prefetch-rows-per-step",
+        type=int,
+        default=5,
+        help="MTE-pipeline prefetch depth; ignored by the other paths.",
     )
     parser.add_argument("--replays", type=int, default=4)
     parser.add_argument("--seed", type=int, default=7)
@@ -102,6 +114,8 @@ def main() -> None:
     args = parse_args()
     if args.replays < 2:
         raise ValueError("--replays must be at least 2")
+    if not 0 <= args.prefetch_rows_per_step <= 16:
+        raise ValueError("--prefetch-rows-per-step must be in [0,16]")
     device = torch.device(args.device)
     if device.type != "npu":
         raise ValueError("--device must select an NPU")
@@ -251,34 +265,66 @@ def main() -> None:
             destination_slots,
             miss_counts,
         )
-        scatter_outputs = torch.ops.nanovllm_dsa.scatter_copy.default(
-            hbm_kpe,
-            hbm_ckv,
-            dram_kpe,
-            dram_ckv,
-            hbm_table,
-            dram_table,
-            lidu_outputs[0].view(batch, TOPK),
-            lidu_outputs[1].view(batch, TOPK),
-            lidu_outputs[2],
-        )
-        attention_key = scatter_outputs[1].view(
-            hbm_blocks, BLOCK_SIZE, 1, CKV_DIM,
-        )
-        attention = torch.ops.nanovllm_dsa.sparse_and_tail_attention.default(
+        if args.attention_path == "split":
+            cache_aliases = torch.ops.nanovllm_dsa.scatter_copy.default(
+                hbm_kpe,
+                hbm_ckv,
+                dram_kpe,
+                dram_ckv,
+                hbm_table,
+                dram_table,
+                lidu_outputs[0].view(batch, TOPK),
+                lidu_outputs[1].view(batch, TOPK),
+                lidu_outputs[2],
+            )
+            attention_key = cache_aliases[1].view(
+                hbm_blocks, BLOCK_SIZE, 1, CKV_DIM,
+            )
+            attention = torch.ops.nanovllm_dsa.sparse_and_tail_attention.default(
+                attention_query,
+                attention_key,
+                attention_key,
+                lidu_outputs[1],
+                cache_tokens,
+                hbm_table,
+                actual_q,
+                actual_kv,
+                attention_query_rope,
+                cache_aliases[0].view(hbm_blocks, BLOCK_SIZE, 1, KPE_DIM),
+                scale,
+            )
+            return lidu_outputs, cache_aliases, attention
+
+        fused_args = (
             attention_query,
-            attention_key,
-            attention_key,
+            hbm_ckv.view(hbm_blocks, BLOCK_SIZE, 1, CKV_DIM),
             lidu_outputs[1],
             cache_tokens,
             hbm_table,
             actual_q,
             actual_kv,
             attention_query_rope,
-            scatter_outputs[0].view(hbm_blocks, BLOCK_SIZE, 1, KPE_DIM),
+            hbm_kpe.view(hbm_blocks, BLOCK_SIZE, 1, KPE_DIM),
+            dram_kpe,
+            dram_ckv,
+            dram_table,
+            lidu_outputs[0].view(batch, TOPK),
+            lidu_outputs[2],
             scale,
         )
-        return lidu_outputs, scatter_outputs, attention
+        if args.attention_path == "fused":
+            fused_outputs = (
+                torch.ops.nanovllm_dsa
+                .sparse_and_tail_attention_and_scatter_copy.default(*fused_args)
+            )
+        else:
+            fused_outputs = (
+                torch.ops.nanovllm_dsa
+                .sparse_and_tail_attention_and_scatter_copy_mte_pipeline.default(
+                    *fused_args, args.prefetch_rows_per_step
+                )
+            )
+        return lidu_outputs, (fused_outputs[1], fused_outputs[2]), fused_outputs[0]
 
     # Eager warmup and capture both use the initial high-token zero-miss state.
     chain()
@@ -286,7 +332,7 @@ def main() -> None:
     graph = torch.npu.NPUGraph()
     graph_pool = torch.npu.graph_pool_handle()
     with torch.npu.graph(graph, pool=graph_pool):
-        graph_lidu, graph_scatter, graph_attention = chain()
+        graph_lidu, graph_cache, graph_attention = chain()
     torch.npu.synchronize()
     if graph_lidu[0].data_ptr() != source_ids.data_ptr():
         raise AssertionError("captured LIDU source buffer is not caller-owned")
@@ -294,8 +340,8 @@ def main() -> None:
         raise AssertionError("captured LIDU slot buffer is not caller-owned")
     if graph_lidu[2].data_ptr() != miss_counts.data_ptr():
         raise AssertionError("captured LIDU miss-count buffer is not caller-owned")
-    if graph_scatter[0].data_ptr() != hbm_kpe.data_ptr() or graph_scatter[1].data_ptr() != hbm_ckv.data_ptr():
-        raise AssertionError("captured SCATTER outputs do not alias HBM cache")
+    if graph_cache[0].data_ptr() != hbm_kpe.data_ptr() or graph_cache[1].data_ptr() != hbm_ckv.data_ptr():
+        raise AssertionError("captured cache outputs do not alias HBM cache")
     attention_address = graph_attention.data_ptr()
     if attention_address == 0:
         raise AssertionError("captured Attention output has no persistent address")
@@ -370,13 +416,14 @@ def main() -> None:
         torch.testing.assert_close(actual_attention, golden, rtol=0.02, atol=0.02)
 
     print(
-        "A5_OFFLOAD_SPLIT_GRAPH_CHECK "
-        f"device={device} case={args.case} replays={args.replays} capture_zero_miss=1 "
+        "A5_OFFLOAD_GRAPH_CHECK "
+        f"device={device} case={args.case} attention_path={args.attention_path} "
+        f"replays={args.replays} capture_zero_miss=1 "
         "replay_nonzero_miss=1 caller_owned_outputs=1 "
         "dram_to_hbm=1 attention_golden=1 ok=1",
         flush=True,
     )
-    print("A5_OFFLOAD_SPLIT_GRAPH_UT_OK", flush=True)
+    print("A5_OFFLOAD_GRAPH_UT_OK", flush=True)
 
 
 if __name__ == "__main__":

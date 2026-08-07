@@ -113,5 +113,84 @@
             {"name": "attention_mode", "param_type": "optional", "type": "int", "default_value": 2},
             {"name": "return_softmax_lse", "param_type": "optional", "type": "bool", "default_value": false}
         ]
+    },
+    {
+        "op": "A5SparseAndTailAttentionAndScatterCopy",
+        "language": "cpp",
+        "input_desc": [
+            {"name": "query", "param_type": "required", "format": ["ND"], "type": ["bf16"]},
+            {"name": "key", "param_type": "required", "format": ["ND"], "type": ["bf16"]},
+            {"name": "value", "param_type": "required", "format": ["ND"], "type": ["bf16"]},
+            {"name": "sparse_indices", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "block_table", "param_type": "optional", "format": ["ND"], "type": ["int32"]},
+            {"name": "actual_seq_lengths_query", "param_type": "optional", "format": ["ND"], "type": ["int32"]},
+            {"name": "actual_seq_lengths_kv", "param_type": "optional", "format": ["ND"], "type": ["int32"]},
+            {"name": "query_rope", "param_type": "optional", "format": ["ND"], "type": ["bf16"]},
+            {"name": "key_rope", "param_type": "optional", "format": ["ND"], "type": ["bf16"]},
+            {"name": "cache_tokens", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "dram_key_rope", "param_type": "required", "format": ["ND"], "type": ["bf16"]},
+            {"name": "dram_kv_cache", "param_type": "required", "format": ["ND"], "type": ["bf16"]},
+            {"name": "dram_block_table", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "source_token_ids", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "copy_counts", "param_type": "required", "format": ["ND"], "type": ["int32"]}
+        ],
+        "output_desc": [
+            {"name": "attention_out", "param_type": "required", "format": ["ND"], "type": ["bf16"]},
+            {"name": "softmax_max", "param_type": "required", "format": ["ND"], "type": ["float"]},
+            {"name": "softmax_sum", "param_type": "required", "format": ["ND"], "type": ["float"]},
+            {"name": "hbm_key_rope_out", "param_type": "required", "format": ["ND"], "type": ["bf16"]},
+            {"name": "hbm_kv_cache_out", "param_type": "required", "format": ["ND"], "type": ["bf16"]}
+        ],
+        "attr": [
+            {"name": "scale_value", "param_type": "required", "type": "float"},
+            {"name": "sparse_block_size", "param_type": "optional", "type": "int", "default_value": 1},
+            {"name": "layout_query", "param_type": "optional", "type": "string", "default_value": "TND"},
+            {"name": "layout_kv", "param_type": "optional", "type": "string", "default_value": "PA_BSND"},
+            {"name": "sparse_mode", "param_type": "optional", "type": "int", "default_value": 3},
+            {"name": "pre_tokens", "param_type": "optional", "type": "int", "default_value": 9223372036854775807},
+            {"name": "next_tokens", "param_type": "optional", "type": "int", "default_value": 9223372036854775807},
+            {"name": "attention_mode", "param_type": "optional", "type": "int", "default_value": 2},
+            {"name": "return_softmax_lse", "param_type": "optional", "type": "bool", "default_value": false}
+        ]
+    },
+    {
+        "op": "A5SparseAndTailAttentionAndScatterCopyMtePipeline",
+        "language": "cpp",
+        "input_desc": [
+            {"name": "query", "param_type": "required", "format": ["ND"], "type": ["bf16"]},
+            {"name": "key", "param_type": "required", "format": ["ND"], "type": ["bf16"]},
+            {"name": "value", "param_type": "required", "format": ["ND"], "type": ["bf16"]},
+            {"name": "sparse_indices", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "block_table", "param_type": "optional", "format": ["ND"], "type": ["int32"]},
+            {"name": "actual_seq_lengths_query", "param_type": "optional", "format": ["ND"], "type": ["int32"]},
+            {"name": "actual_seq_lengths_kv", "param_type": "optional", "format": ["ND"], "type": ["int32"]},
+            {"name": "query_rope", "param_type": "optional", "format": ["ND"], "type": ["bf16"]},
+            {"name": "key_rope", "param_type": "optional", "format": ["ND"], "type": ["bf16"]},
+            {"name": "cache_tokens", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "dram_key_rope", "param_type": "required", "format": ["ND"], "type": ["bf16"]},
+            {"name": "dram_kv_cache", "param_type": "required", "format": ["ND"], "type": ["bf16"]},
+            {"name": "dram_block_table", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "source_token_ids", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "copy_counts", "param_type": "required", "format": ["ND"], "type": ["int32"]}
+        ],
+        "output_desc": [
+            {"name": "attention_out", "param_type": "required", "format": ["ND"], "type": ["bf16"]},
+            {"name": "softmax_max", "param_type": "required", "format": ["ND"], "type": ["float"]},
+            {"name": "softmax_sum", "param_type": "required", "format": ["ND"], "type": ["float"]},
+            {"name": "hbm_key_rope_out", "param_type": "required", "format": ["ND"], "type": ["bf16"]},
+            {"name": "hbm_kv_cache_out", "param_type": "required", "format": ["ND"], "type": ["bf16"]}
+        ],
+        "attr": [
+            {"name": "scale_value", "param_type": "required", "type": "float"},
+            {"name": "sparse_block_size", "param_type": "optional", "type": "int", "default_value": 1},
+            {"name": "layout_query", "param_type": "optional", "type": "string", "default_value": "TND"},
+            {"name": "layout_kv", "param_type": "optional", "type": "string", "default_value": "PA_BSND"},
+            {"name": "sparse_mode", "param_type": "optional", "type": "int", "default_value": 3},
+            {"name": "pre_tokens", "param_type": "optional", "type": "int", "default_value": 9223372036854775807},
+            {"name": "next_tokens", "param_type": "optional", "type": "int", "default_value": 9223372036854775807},
+            {"name": "attention_mode", "param_type": "optional", "type": "int", "default_value": 2},
+            {"name": "return_softmax_lse", "param_type": "optional", "type": "bool", "default_value": false},
+            {"name": "prefetch_rows_per_step", "param_type": "optional", "type": "int", "default_value": 5}
+        ]
     }
 ]

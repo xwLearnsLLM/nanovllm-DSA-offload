@@ -44,6 +44,8 @@ from .ops import (  # noqa: E402
     scatter_copy_c8,
     scatter_copy_c8_out,
     sparse_and_tail_attention,
+    sparse_and_tail_attention_and_scatter_copy,
+    sparse_and_tail_attention_and_scatter_copy_mte_pipeline,
     sparse_and_tail_attention_c8,
 )
 
@@ -63,6 +65,8 @@ __all__ = [
     "scatter_copy_c8",
     "scatter_copy_c8_out",
     "sparse_and_tail_attention",
+    "sparse_and_tail_attention_and_scatter_copy",
+    "sparse_and_tail_attention_and_scatter_copy_mte_pipeline",
     "sparse_and_tail_attention_c8",
     "local_opapi_path",
 ]
