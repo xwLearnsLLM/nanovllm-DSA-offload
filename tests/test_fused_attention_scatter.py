@@ -595,14 +595,35 @@ def check_semantics(case: Case) -> None:
     case.cache_tokens.zero_()
     case.actual_kv.fill_(dense_tokens)
     case.copy_counts.zero_()
+    dense_logical = attention_logical_tokens(case)
+    dense_physical = physical_token_rows(
+        case.hbm_block_table, dense_logical
+    ).flatten().to(case.query.device)
+    dense_serial_ckv_before = case.serial_ckv.view(-1, CKV_DIM)[
+        dense_physical
+    ].cpu()
+    dense_serial_kpe_before = case.serial_kpe.view(-1, KPE_DIM)[
+        dense_physical
+    ].cpu()
+    dense_fused_ckv_before = case.fused_ckv.view(-1, CKV_DIM)[
+        dense_physical
+    ].cpu()
+    dense_fused_kpe_before = case.fused_kpe.view(-1, KPE_DIM)[
+        dense_physical
+    ].cpu()
+    # Build the oracle before either implementation runs.  This prevents an
+    # accidental cache mutation from silently changing the expected result.
+    dense_golden = build_cpu_attention_golden(
+        case, torch.empty((0,), dtype=torch.int64)
+    )
     print("FUSED_SCATTER_ATTENTION_PHASE c0_dense_serial", flush=True)
     dense_serial_out = launch_serial(case)
     torch.npu.synchronize()
     print("FUSED_SCATTER_ATTENTION_PHASE c0_dense_fused", flush=True)
     dense_fused_out = launch_fused(case)
     torch.npu.synchronize()
-    dense_golden = build_cpu_attention_golden(
-        case, torch.empty((0,), dtype=torch.int64)
+    print_attention_diagnostics(
+        "c0_dense", dense_fused_out, dense_serial_out
     )
     torch.testing.assert_close(
         dense_fused_out.float(),
@@ -622,9 +643,34 @@ def check_semantics(case: Case) -> None:
         rtol=0.08,
         atol=0.08,
     )
+    torch.testing.assert_close(
+        case.serial_ckv.view(-1, CKV_DIM)[dense_physical].cpu(),
+        dense_serial_ckv_before,
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        case.serial_kpe.view(-1, KPE_DIM)[dense_physical].cpu(),
+        dense_serial_kpe_before,
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        case.fused_ckv.view(-1, CKV_DIM)[dense_physical].cpu(),
+        dense_fused_ckv_before,
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        case.fused_kpe.view(-1, KPE_DIM)[dense_physical].cpu(),
+        dense_fused_kpe_before,
+        rtol=0,
+        atol=0,
+    )
     print(
         "FUSED_SCATTER_ATTENTION_C0_DENSE_CHECK "
-        f"batch={case.query.size(0)} tokens={dense_tokens} ok=1",
+        f"batch={case.query.size(0)} tokens={dense_tokens} "
+        "cache_unchanged=1 ok=1",
         flush=True,
     )
 
