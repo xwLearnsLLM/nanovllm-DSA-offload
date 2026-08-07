@@ -18,7 +18,7 @@
 #include <numeric>
 #include <algorithm>
 #include <graph/utils/type_utils.h>
-#include "common/ops_log_compat.h"
+#include "ops_log_compat.h"
 #include "register/op_def_registry.h"
 #include "../../op_kernel/a5_sparse_and_tail_attention_template_tiling_key.h"
 #include "sparse_flash_attention_tiling.h"

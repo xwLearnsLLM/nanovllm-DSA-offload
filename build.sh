@@ -118,6 +118,11 @@ for op_dir in "${SOURCE_DIRS[@]}"; do
         cp -a "${source_dir}/op_kernel/." "${GENERATED}/op_kernel/"
     fi
 done
+COMPAT_HEADER="${GENERATED}/op_host/a5_sfa_shared/ops_log_compat.h"
+if [[ ! -f "${COMPAT_HEADER}" ]]; then
+    echo "[nanovllm_a5_ops] ERROR: missing flattened host header: ${COMPAT_HEADER}" >&2
+    exit 1
+fi
 # The checked-in LightningIndexer definition deliberately has the same name
 # as the msopgen stub and overwrites it.  Remove the legacy split definition
 # if an older worktree left it behind; compiling both creates a duplicate
