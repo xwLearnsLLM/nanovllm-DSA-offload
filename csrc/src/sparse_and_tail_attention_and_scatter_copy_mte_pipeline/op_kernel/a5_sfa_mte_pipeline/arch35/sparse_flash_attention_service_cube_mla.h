@@ -12,8 +12,8 @@
  * \file sparse_flash_attention_service_cube_mla.h
  * \brief
  */
-#ifndef SPARSE_FLASH_ATTENTION_SERVICE_CUBE_MLA_H
-#define SPARSE_FLASH_ATTENTION_SERVICE_CUBE_MLA_H
+#ifndef A5_MTE_PIPELINE_SPARSE_FLASH_ATTENTION_SERVICE_CUBE_MLA_H
+#define A5_MTE_PIPELINE_SPARSE_FLASH_ATTENTION_SERVICE_CUBE_MLA_H
 
 #include "kernel_operator.h"
 #include "kernel_operator_list_tensor_intf.h"
@@ -49,6 +49,7 @@ using namespace AscendC::Impl::Detail;
 using namespace regbaseutil;
 using namespace fa_base_matmul;
 namespace BaseApi {
+namespace MtePipeline {
 
 template <SFA_LAYOUT LAYOUT>
 __aicore__ inline constexpr GmFormat GetQueryGmFormat()
@@ -441,5 +442,6 @@ DEFINE_CUBE_BLOCK_TRAITS(SFAMatmulServiceDummy);
 #define ARGS_TRAITS \
     CUBE_BLOCK_TRAITS_TYPE_FIELDS(GEN_ARGS_TYPE) \
     CUBE_BLOCK_TRAITS_CONST_FIELDS(GEN_ARGS_CONST)
+} // namespace MtePipeline
 }
-#endif // SPARSE_FLASH_ATTENTION_SERVICE_CUBE_MLA_H
+#endif // A5_MTE_PIPELINE_SPARSE_FLASH_ATTENTION_SERVICE_CUBE_MLA_H

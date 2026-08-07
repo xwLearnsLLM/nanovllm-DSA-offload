@@ -13,8 +13,8 @@
  * \brief
  */
 
-#ifndef SPARSE_FLASH_ATTENTION_KERNEL_MLA_H
-#define SPARSE_FLASH_ATTENTION_KERNEL_MLA_H
+#ifndef A5_MTE_PIPELINE_SPARSE_FLASH_ATTENTION_KERNEL_MLA_H
+#define A5_MTE_PIPELINE_SPARSE_FLASH_ATTENTION_KERNEL_MLA_H
 
 #include "kernel_operator.h"
 #include "kernel_operator_list_tensor_intf.h"
@@ -48,6 +48,9 @@ using namespace AscendC::Impl::Detail;
 using namespace regbaseutil;
 
 namespace BaseApi {
+// This modified implementation is linked beside the baseline and fused SFA.
+// A distinct namespace prevents cross-kernel template symbol reuse.
+namespace MtePipeline {
 template <typename CubeBlockType, typename VecBlockType> class SparseFlashAttentionKernelMla {
 public:
     ARGS_TRAITS;
@@ -824,5 +827,6 @@ __aicore__ inline void SparseFlashAttentionKernelMla<CubeBlockType, VecBlockType
         runInfo.s2AlignedSize = Align(runInfo.s2RealSize);
     }
 }
+} // namespace MtePipeline
 }
-#endif // SPARSE_FLASH_ATTENTION_KERNEL_MLA_H
+#endif // A5_MTE_PIPELINE_SPARSE_FLASH_ATTENTION_KERNEL_MLA_H

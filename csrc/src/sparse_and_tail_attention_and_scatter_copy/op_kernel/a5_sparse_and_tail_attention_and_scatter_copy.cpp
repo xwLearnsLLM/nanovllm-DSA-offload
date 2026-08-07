@@ -24,9 +24,9 @@ using namespace AscendC;
             BaseApi::SFAMatmulServiceDummy<__VA_ARGS__>>::type;                    \
         using VecBlockType = typename std::conditional<                            \
             g_coreType == AscendC::AIC,                                            \
-            BaseApi::SFAVectorServiceDummy<__VA_ARGS__>,                           \
-            BaseApi::SFAVectorService<__VA_ARGS__>>::type;                         \
-        BaseApi::SparseFlashAttentionKernelMla<                                    \
+            BaseApi::Fused::SFAVectorServiceDummy<__VA_ARGS__>,                    \
+            BaseApi::Fused::SFAVectorService<__VA_ARGS__>>::type;                  \
+        BaseApi::Fused::SparseFlashAttentionKernelMla<                             \
             CubeBlockType, VecBlockType> op;                                       \
         GET_TILING_DATA_WITH_STRUCT(                                               \
             A5SparseAndTailAttentionAndScatterCopyTilingData,                      \
@@ -50,9 +50,9 @@ using namespace AscendC;
             BaseApi::SFAMatmulServiceDummy<__VA_ARGS__>>::type;                    \
         using VecBlockType = typename std::conditional<                            \
             g_coreType == AscendC::AIC,                                            \
-            BaseApi::SFAVectorServiceDummy<__VA_ARGS__>,                           \
-            BaseApi::SFAVectorService<__VA_ARGS__>>::type;                         \
-        BaseApi::SparseFlashAttentionKernelMla<                                    \
+            BaseApi::Fused::SFAVectorServiceDummy<__VA_ARGS__>,                    \
+            BaseApi::Fused::SFAVectorService<__VA_ARGS__>>::type;                  \
+        BaseApi::Fused::SparseFlashAttentionKernelMla<                             \
             CubeBlockType, VecBlockType> op;                                       \
         GET_TILING_DATA_WITH_STRUCT(                                               \
             A5SparseAndTailAttentionAndScatterCopyTilingData,                      \

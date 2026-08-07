@@ -12,8 +12,8 @@
  * \file sparse_flash_attention_service_vector_mla.h
  * \brief
  */
-#ifndef SPARSE_FLASH_ATTENTION_SERVICE_VECTOR_MLA_H
-#define SPARSE_FLASH_ATTENTION_SERVICE_VECTOR_MLA_H
+#ifndef A5_FUSED_SPARSE_FLASH_ATTENTION_SERVICE_VECTOR_MLA_H
+#define A5_FUSED_SPARSE_FLASH_ATTENTION_SERVICE_VECTOR_MLA_H
 
 #include "../../a5_sfa/arch35/util_regbase.h"
 #include "../../a5_sfa/arch35/sparse_flash_attention_common_arch35.h"
@@ -56,6 +56,7 @@ using namespace regbaseutil;
 using namespace matmul;
 
 namespace BaseApi {
+namespace Fused {
 static constexpr int64_t A5_ENCODED_MISS_BASE = -2;
 
 TEMPLATES_DEF
@@ -1169,6 +1170,6 @@ public:
     __aicore__ inline void ProcessVec2(mm2ResPos &bmm2ResBuf, RunInfo &runInfo,
         ConstInfo &constInfo) {}
 };
+} // namespace Fused
 }
-#endif // SPARSE_FLASH_ATTENTION_SERVICE_VECTOR_MLA_H
-
+#endif // A5_FUSED_SPARSE_FLASH_ATTENTION_SERVICE_VECTOR_MLA_H

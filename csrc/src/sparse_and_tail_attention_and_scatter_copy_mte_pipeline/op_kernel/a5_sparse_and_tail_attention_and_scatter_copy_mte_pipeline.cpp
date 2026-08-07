@@ -20,13 +20,13 @@ using namespace AscendC;
     do {                                                                          \
         using CubeBlockType = typename std::conditional<                           \
             g_coreType == AscendC::AIC,                                            \
-            BaseApi::SFAMatmulService<__VA_ARGS__>,                                \
-            BaseApi::SFAMatmulServiceDummy<__VA_ARGS__>>::type;                    \
+            BaseApi::MtePipeline::SFAMatmulService<__VA_ARGS__>,                   \
+            BaseApi::MtePipeline::SFAMatmulServiceDummy<__VA_ARGS__>>::type;       \
         using VecBlockType = typename std::conditional<                            \
             g_coreType == AscendC::AIC,                                            \
-            BaseApi::SFAVectorServiceDummy<__VA_ARGS__>,                           \
-            BaseApi::SFAVectorService<__VA_ARGS__>>::type;                         \
-        BaseApi::SparseFlashAttentionKernelMla<                                    \
+            BaseApi::MtePipeline::SFAVectorServiceDummy<__VA_ARGS__>,              \
+            BaseApi::MtePipeline::SFAVectorService<__VA_ARGS__>>::type;            \
+        BaseApi::MtePipeline::SparseFlashAttentionKernelMla<                       \
             CubeBlockType, VecBlockType> op;                                       \
         GET_TILING_DATA_WITH_STRUCT(                                               \
             A5SparseAndTailAttentionAndScatterCopyMtePipelineTilingData,                      \
@@ -50,13 +50,13 @@ using namespace AscendC;
     do {                                                                          \
         using CubeBlockType = typename std::conditional<                           \
             g_coreType == AscendC::AIC,                                            \
-            BaseApi::SFAMatmulService<__VA_ARGS__>,                                \
-            BaseApi::SFAMatmulServiceDummy<__VA_ARGS__>>::type;                    \
+            BaseApi::MtePipeline::SFAMatmulService<__VA_ARGS__>,                   \
+            BaseApi::MtePipeline::SFAMatmulServiceDummy<__VA_ARGS__>>::type;       \
         using VecBlockType = typename std::conditional<                            \
             g_coreType == AscendC::AIC,                                            \
-            BaseApi::SFAVectorServiceDummy<__VA_ARGS__>,                           \
-            BaseApi::SFAVectorService<__VA_ARGS__>>::type;                         \
-        BaseApi::SparseFlashAttentionKernelMla<                                    \
+            BaseApi::MtePipeline::SFAVectorServiceDummy<__VA_ARGS__>,              \
+            BaseApi::MtePipeline::SFAVectorService<__VA_ARGS__>>::type;            \
+        BaseApi::MtePipeline::SparseFlashAttentionKernelMla<                       \
             CubeBlockType, VecBlockType> op;                                       \
         GET_TILING_DATA_WITH_STRUCT(                                               \
             A5SparseAndTailAttentionAndScatterCopyMtePipelineTilingData,                      \
