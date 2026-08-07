@@ -16,7 +16,10 @@ import torch_npu  # type: ignore  # noqa: E402,F401
 from test_lidu import (
     MAX_CACHE_TOKENS,
     MAX_SOURCE_CAPACITY,
+    assert_18bit_boundary_selected,
     assert_pool_row,
+    assert_request_pool_entries,
+    assert_update_row,
     build_pool,
     csv_ints,
     feasible_miss,
@@ -82,8 +85,8 @@ def check_args(args: argparse.Namespace) -> None:
     )
     if any(not valid_budget(value) for value in args.cache_tokens):
         raise ValueError("cache tokens must be 0 or block aligned in [2048,16256]")
-    if args.pool_extra < 0 or args.warmup < 0 or args.iters <= 0:
-        raise ValueError("pool-extra/warmup must be non-negative and iters positive")
+    if args.pool_extra < 0 or args.warmup < 0 or args.iters < 0:
+        raise ValueError("pool-extra/warmup/iters must be non-negative")
 
 
 def require_a5(device: torch.device, allow_non_a5: bool) -> str:
@@ -346,6 +349,9 @@ def check_case(case: C8Case) -> None:
     counts = miss_counts.cpu()
     updated = pool.cpu()
     native = case.native_topk.cpu().reshape(case.query.size(0), TOPK)
+    assert_request_pool_entries(
+        case.req_entries_cpu, case.query.size(0), updated.size(0)
+    )
     active_rows = set(case.req_entries_cpu.tolist())
     for pool_row in range(updated.size(0)):
         if pool_row not in active_rows and not torch.equal(
@@ -355,45 +361,21 @@ def check_case(case: C8Case) -> None:
     for batch_row in range(case.query.size(0)):
         pool_row = int(case.req_entries_cpu[batch_row])
         budget = int(case.cache_tokens[batch_row].cpu())
-        assert_pool_row(updated[pool_row], case.source_capacity, budget)
-        if budget == 0:
-            if (
-                int(counts[batch_row]) != 0
-                or bool((sources[batch_row] != -1).any())
-                or bool((slots[batch_row] != -1).any())
-            ):
-                raise AssertionError("C=0 C8 row must be a strict no-op")
-            continue
-        if not torch.equal(
-            torch.sort(sources[batch_row]).values,
-            torch.sort(native[batch_row]).values,
-        ):
-            raise AssertionError(
-                f"row {batch_row}: C8 LIDU top-2048 differs from official A5 C8 LI"
-            )
-        old_selected_slots = old_pool[pool_row].gather(
-            0, sources[batch_row].long()
+        candidate_len = int(case.candidate_lens[batch_row].cpu())
+        assert_pool_row(old_pool[pool_row], candidate_len, budget)
+        assert_pool_row(updated[pool_row], candidate_len, budget)
+        assert_update_row(
+            label=f"C8 row {batch_row} first update",
+            sources=sources[batch_row],
+            slots=slots[batch_row],
+            reference=native[batch_row],
+            old_row=old_pool[pool_row],
+            new_row=updated[pool_row],
+            candidate_len=candidate_len,
+            budget=budget,
+            expected_miss=case.target_misses[batch_row],
+            actual_miss=int(counts[batch_row]),
         )
-        new_selected_slots = updated[pool_row].gather(
-            0, sources[batch_row].long()
-        )
-        actual_miss = int(counts[batch_row])
-        if (
-            actual_miss != case.target_misses[batch_row]
-            or actual_miss != int((old_selected_slots < 0).sum())
-        ):
-            raise AssertionError(
-                f"row {batch_row}: miss_count={actual_miss}, "
-                f"expected={case.target_misses[batch_row]}"
-            )
-        if actual_miss and bool((old_selected_slots[:actual_miss] >= 0).any()):
-            raise AssertionError("C8 LIDU miss prefix contains a cache hit")
-        if actual_miss < TOPK and bool(
-            (old_selected_slots[actual_miss:] < 0).any()
-        ):
-            raise AssertionError("C8 LIDU hit suffix contains a cache miss")
-        if not torch.equal(slots[batch_row], new_selected_slots):
-            raise AssertionError("C8 LIDU published slots differ from request state")
 
     # Isolate the repository-local update stage from the official C8 LI launch.
     low_pool = case.initial_pool.clone()
@@ -411,15 +393,31 @@ def check_case(case: C8Case) -> None:
     ) or not torch.equal(low_pool.cpu(), pool.cpu()):
         raise AssertionError("C8 high-level LIDU and isolated update stage disagree")
 
-    _, second_slots, second_counts, _ = launch(case, pool)
+    second_sources, second_slots, second_counts, _ = launch(case, pool)
     torch.npu.synchronize()
-    if bool((second_counts.cpu() != 0).any()):
-        raise AssertionError(
-            f"repeated C8 update is not zero-miss: {second_counts.cpu().tolist()}"
+    second_sources = second_sources.reshape(case.query.size(0), TOPK).cpu()
+    second_slots = second_slots.reshape(case.query.size(0), TOPK).cpu()
+    second_counts = second_counts.cpu()
+    second_updated = pool.cpu()
+    if not torch.equal(second_updated, updated):
+        raise AssertionError("repeated zero-miss C8 update changed cache state")
+    for batch_row in range(case.query.size(0)):
+        pool_row = int(case.req_entries_cpu[batch_row])
+        budget = int(case.cache_tokens[batch_row].cpu())
+        candidate_len = int(case.candidate_lens[batch_row].cpu())
+        assert_pool_row(second_updated[pool_row], candidate_len, budget)
+        assert_update_row(
+            label=f"C8 row {batch_row} repeated update",
+            sources=second_sources[batch_row],
+            slots=second_slots[batch_row],
+            reference=native[batch_row],
+            old_row=updated[pool_row],
+            new_row=second_updated[pool_row],
+            candidate_len=candidate_len,
+            budget=budget,
+            expected_miss=0,
+            actual_miss=int(second_counts[batch_row]),
         )
-    active = case.cache_tokens.cpu() > 0
-    if bool(active.any()) and bool((second_slots.cpu()[active] < 0).any()):
-        raise AssertionError("repeated C8 update did not publish all top-2048 slots")
 
     out_pool = case.initial_pool.clone()
     out_sources = torch.full_like(source_ids, -777777)
@@ -442,6 +440,8 @@ def check_case(case: C8Case) -> None:
         for left, right in zip(outputs[:3], (source_ids, destination_slots, miss_counts))
     ):
         raise AssertionError("allocating and caller-owned C8 LIDU paths disagree")
+    if not torch.equal(out_pool.cpu(), updated):
+        raise AssertionError("caller-owned C8 LIDU path produced different cache state")
 
     print(
         "A5_C8_LIDU_CHECK "
@@ -450,6 +450,7 @@ def check_case(case: C8Case) -> None:
         f"candidates={case.candidate_lens.cpu().tolist()} "
         f"budgets={case.cache_tokens.cpu().tolist()} misses={counts.tolist()} "
         "official_c8_li_topk=1 unordered_unique_pool_entries=1 "
+        "topk_unique_range=1 hit_slots_preserved=1 repeat_mapping_preserved=1 "
         "repeat_zero_miss=1 isolated_update_match=1 out_alias=1 ok=1",
         flush=True,
     )
@@ -467,6 +468,7 @@ def event_benchmark(case: C8Case, warmup: int, iters: int) -> tuple[float, float
     retained = []
     for start, end in zip(starts, ends):
         pool.copy_(case.initial_pool)
+        torch.npu.synchronize()
         start.record()
         retained.append(launch(case, pool))
         end.record()
@@ -508,8 +510,9 @@ def main() -> None:
     torch.npu.set_device(device)
     torch.npu.config.allow_internal_format = False
     device_name = require_a5(device, args.allow_non_a5)
+    run_correctness = args.mode in ("all", "check") or args.iters == 0
 
-    if args.mode in ("all", "check"):
+    if run_correctness:
         mixed = make_case(
             device,
             6,
@@ -533,6 +536,20 @@ def main() -> None:
             args.seed + 200,
         )
         check_case(miss_edges)
+        boundary = make_case(
+            device,
+            1,
+            MAX_SOURCE_CAPACITY,
+            32,
+            [6144],
+            (0, 300),
+            args.pool_extra,
+            args.seed + 300,
+        )
+        assert_18bit_boundary_selected(
+            boundary, "A5_C8_LIDU_18BIT_BOUNDARY_CHECK"
+        )
+        check_case(boundary)
 
     case_index = 0
     for heads in args.heads:
@@ -563,9 +580,9 @@ def main() -> None:
                             args.seed + case_index,
                         )
                         case_index += 1
-                        if args.mode in ("all", "check"):
+                        if run_correctness:
                             check_case(case)
-                        if args.mode in ("all", "bench"):
+                        if args.mode in ("all", "bench") and args.iters > 0:
                             native_us, lidu_us = event_benchmark(
                                 case, args.warmup, args.iters
                             )
@@ -581,7 +598,7 @@ def main() -> None:
                                 f"warmup={args.warmup} iters={args.iters}",
                                 flush=True,
                             )
-                        if args.mode == "profile":
+                        if args.mode == "profile" and args.iters > 0:
                             pool = case.initial_pool.clone()
                             for _ in range(args.profile_replays):
                                 pool.copy_(case.initial_pool)

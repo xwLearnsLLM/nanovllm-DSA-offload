@@ -190,7 +190,7 @@ bash build.sh
 python3 tests/test_lidu.py --device npu:0 --mode check --heads 32,64 --batch-sizes 24 --source-lens 20096 --cache-tokens 6144 --miss-ranges 0:300 --seed 7
 ```
 
-该 LIDU 命令还会强制覆盖不同 candidate length、`C=0/2048/3072/6144/8192/12288/16256`、零 miss、2048 miss、乱序 pool entries、重复更新、inactive pool guard 和 caller-owned out。
+该 LIDU 命令还会强制覆盖不同 candidate length、`C=0/2048/3072/6144/8192/12288/16256`、零 miss、2048 miss、乱序 pool entries、hit slot 保持、重复更新映射、inactive pool guard、caller-owned out 和 `262144` 的 18-bit token-index 边界。
 
 ```bash
 for count in 0 1 100 300 2048; do python3 tests/test_scatter_copy.py --device npu:0 --batch-size 24 --source-len 65536 --hbm-slots 4096 --copy-cap 2048 --copy-min "$count" --copy-max "$count" --warmup 3 --iters 10 --seed 7; done
@@ -216,7 +216,7 @@ python3 tests/test_offload_split_graph.py --device npu:0 --case mixed --replays 
 
 ## C8 算子测试
 
-C8 LIDU 直接用官方 A5 C8 LightningIndexer 作为 top-2048 基线，并覆盖 mixed C、乱序 request-pool、零/随机/2048 miss、重复更新和 caller-owned out：
+C8 LIDU 直接用官方 A5 C8 LightningIndexer 作为 top-2048 基线，并覆盖 mixed C、乱序 request-pool、零/随机/2048 miss、hit slot 保持、重复更新映射、caller-owned out 和 `262144` 的 18-bit token-index 边界：
 
 ```bash
 python3 tests/test_lidu_c8.py --device npu:0 --mode check --heads 32,64 --batch-sizes 24 --source-lens 20096 --cache-tokens 6144 --miss-ranges 0:300 --seed 7
@@ -277,4 +277,3 @@ SFA：
 ```bash
 python3 tests/test_sparse_and_tail_attention.py --device npu:0 --mode bench --heads 8 --batch-sizes 1,4,8,12,16,24,32 --source-lens 12288,20096,65536,131072 --cache-tokens 6144 --tail-tokens 64 --warmup 10 --iters 100 --seed 7
 ```
-

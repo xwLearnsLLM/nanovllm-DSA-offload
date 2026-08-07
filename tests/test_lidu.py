@@ -91,8 +91,8 @@ def check_args(args: argparse.Namespace) -> None:
     valid_budgets = lambda c: c == 0 or (TOPK <= c <= MAX_CACHE_TOKENS and c % BLOCK_SIZE == 0)
     if any(not valid_budgets(tokens) for tokens in args.cache_tokens):
         raise ValueError("cache tokens must be 0 or a block-aligned value in [2048,16256]")
-    if args.pool_extra < 0 or args.warmup < 0 or args.iters <= 0:
-        raise ValueError("pool-extra/warmup must be non-negative and iters positive")
+    if args.pool_extra < 0 or args.warmup < 0 or args.iters < 0:
+        raise ValueError("pool-extra/warmup/iters must be non-negative")
 
 
 def require_a5(device: torch.device, allow_non_a5: bool) -> None:
@@ -313,6 +313,8 @@ def launch_out(
 
 def assert_pool_row(row: torch.Tensor, candidate_len: int, budget: int) -> None:
     valid_tokens = (row[:candidate_len] >= 0).nonzero().flatten()
+    if bool((row[candidate_len:] >= 0).any()):
+        raise AssertionError("cache row contains a token outside candidate_len")
     if budget == 0:
         if valid_tokens.numel() != 0:
             raise AssertionError("C=0 request mutated its cache row")
@@ -322,6 +324,104 @@ def assert_pool_row(row: torch.Tensor, candidate_len: int, budget: int) -> None:
     slots = row[valid_tokens]
     if not torch.equal(torch.sort(slots).values, torch.arange(budget, dtype=torch.int32)):
         raise AssertionError("cache slots are not the exact unique range [0,C)")
+
+
+def assert_request_pool_entries(
+    entries: torch.Tensor, batch: int, pool_size: int
+) -> None:
+    if entries.dtype != torch.int32 or entries.shape != (batch,):
+        raise AssertionError("req_pool_entries must be int32[B]")
+    if int(entries.min()) < 0 or int(entries.max()) >= pool_size:
+        raise AssertionError("req_pool_entries contains an invalid request-pool row")
+    if torch.unique(entries).numel() != batch:
+        raise AssertionError("active req_pool_entries are not unique")
+
+
+def assert_update_row(
+    *,
+    label: str,
+    sources: torch.Tensor,
+    slots: torch.Tensor,
+    reference: torch.Tensor,
+    old_row: torch.Tensor,
+    new_row: torch.Tensor,
+    candidate_len: int,
+    budget: int,
+    expected_miss: int,
+    actual_miss: int,
+) -> None:
+    """Check every request-local index-management invariant."""
+
+    if budget == 0:
+        if (
+            actual_miss != 0
+            or bool((sources != -1).any())
+            or bool((slots != -1).any())
+            or not torch.equal(old_row, new_row)
+        ):
+            raise AssertionError(f"{label}: C=0 row is not a strict no-op")
+        return
+
+    if sources.numel() != TOPK or slots.numel() != TOPK:
+        raise AssertionError(f"{label}: expected exactly {TOPK} source IDs and slots")
+    if int(sources.min()) < 0 or int(sources.max()) >= candidate_len:
+        raise AssertionError(f"{label}: topk_index is outside [0,{candidate_len})")
+    if torch.unique(sources).numel() != TOPK:
+        raise AssertionError(f"{label}: topk_index is not unique")
+    if (
+        int(reference.min()) < 0
+        or int(reference.max()) >= candidate_len
+        or torch.unique(reference).numel() != TOPK
+    ):
+        raise AssertionError(f"{label}: LightningIndexer reference is invalid")
+    if not torch.equal(
+        torch.sort(sources).values,
+        torch.sort(reference).values,
+    ):
+        raise AssertionError(f"{label}: top-2048 set differs from LightningIndexer")
+
+    if not 0 <= actual_miss <= TOPK:
+        raise AssertionError(f"{label}: miss_count={actual_miss} is outside [0,{TOPK}]")
+    if actual_miss > candidate_len - budget:
+        raise AssertionError(
+            f"{label}: miss_count={actual_miss} exceeds candidate_len-C"
+        )
+    old_selected_slots = old_row.gather(0, sources.long())
+    new_selected_slots = new_row.gather(0, sources.long())
+    recomputed_miss = int((old_selected_slots < 0).sum())
+    if actual_miss != expected_miss or actual_miss != recomputed_miss:
+        raise AssertionError(
+            f"{label}: miss_count={actual_miss}, expected={expected_miss}, "
+            f"recomputed={recomputed_miss}"
+        )
+    if actual_miss and bool((old_selected_slots[:actual_miss] >= 0).any()):
+        raise AssertionError(f"{label}: miss prefix contains a cache hit")
+    if actual_miss < TOPK:
+        old_hit_slots = old_selected_slots[actual_miss:]
+        if bool((old_hit_slots < 0).any()):
+            raise AssertionError(f"{label}: hit suffix contains a cache miss")
+        if not torch.equal(slots[actual_miss:], old_hit_slots):
+            raise AssertionError(f"{label}: an old hit changed its HBM slot")
+
+    if int(slots.min()) < 0 or int(slots.max()) >= budget:
+        raise AssertionError(f"{label}: topk_slots is outside [0,{budget})")
+    if torch.unique(slots).numel() != TOPK:
+        raise AssertionError(f"{label}: topk_slots is not unique")
+    if not torch.equal(slots, new_selected_slots):
+        raise AssertionError(f"{label}: published slots differ from updated cache state")
+
+
+def assert_18bit_boundary_selected(case: Case, label: str) -> None:
+    if case.source_capacity != MAX_SOURCE_CAPACITY:
+        raise AssertionError(f"{label}: boundary case has the wrong source capacity")
+    selected = case.native_topk.cpu().reshape(case.query.size(0), TOPK)
+    if int(selected.max()) < (1 << 17):
+        raise AssertionError(f"{label}: top-k did not exercise token-index bit 17")
+    print(
+        f"{label} source_capacity={case.source_capacity} "
+        f"selected_max={int(selected.max())} high_index_bit17=1 ok=1",
+        flush=True,
+    )
 
 
 def check_case(case: Case) -> None:
@@ -336,6 +436,9 @@ def check_case(case: Case) -> None:
     counts = miss_counts.cpu()
     updated = pool.cpu()
     native = case.native_topk.cpu().reshape(case.query.size(0), TOPK)
+    assert_request_pool_entries(
+        case.req_entries_cpu, case.query.size(0), updated.size(0)
+    )
     active_rows = set(case.req_entries_cpu.tolist())
     for pool_row in range(updated.size(0)):
         if pool_row not in active_rows and not torch.equal(updated[pool_row], old_pool[pool_row]):
@@ -344,35 +447,48 @@ def check_case(case: Case) -> None:
         pool_row = int(case.req_entries_cpu[batch_row])
         budget = int(case.cache_tokens[batch_row].cpu())
         expected_miss = case.target_misses[batch_row]
-        assert_pool_row(updated[pool_row], case.source_capacity, budget)
-        if budget == 0:
-            if int(counts[batch_row]) != 0 or bool((sources[batch_row] != -1).any()) or bool((slots[batch_row] != -1).any()):
-                raise AssertionError("C=0 output must be miss_count=0 with -1 source/slot rows")
-            continue
-        if not torch.equal(torch.sort(sources[batch_row]).values, torch.sort(native[batch_row]).values):
-            raise AssertionError(f"row {batch_row}: top-2048 set differs from native A5 LI")
-        old_selected_slots = old_pool[pool_row].gather(0, sources[batch_row].long())
-        new_selected_slots = updated[pool_row].gather(0, sources[batch_row].long())
-        actual_miss = int(counts[batch_row])
-        if actual_miss != expected_miss or actual_miss != int((old_selected_slots < 0).sum()):
-            raise AssertionError(
-                f"row {batch_row}: miss_count={actual_miss}, expected={expected_miss}"
-            )
-        if actual_miss and bool((old_selected_slots[:actual_miss] >= 0).any()):
-            raise AssertionError("miss prefix contains a cache hit")
-        if actual_miss < TOPK and bool((old_selected_slots[actual_miss:] < 0).any()):
-            raise AssertionError("hit suffix contains a cache miss")
-        if not torch.equal(slots[batch_row], new_selected_slots):
-            raise AssertionError("published attention slots differ from updated cache state")
+        candidate_len = int(case.candidate_lens[batch_row].cpu())
+        assert_pool_row(old_pool[pool_row], candidate_len, budget)
+        assert_pool_row(updated[pool_row], candidate_len, budget)
+        assert_update_row(
+            label=f"row {batch_row} first update",
+            sources=sources[batch_row],
+            slots=slots[batch_row],
+            reference=native[batch_row],
+            old_row=old_pool[pool_row],
+            new_row=updated[pool_row],
+            candidate_len=candidate_len,
+            budget=budget,
+            expected_miss=expected_miss,
+            actual_miss=int(counts[batch_row]),
+        )
 
     # Repeating the same query must see a fully warm top-2048 cache.
-    _, second_slots, second_counts, _ = launch(case, pool)
+    second_sources, second_slots, second_counts, _ = launch(case, pool)
     torch.npu.synchronize()
-    expected_second = torch.zeros_like(second_counts.cpu())
-    if not torch.equal(second_counts.cpu(), expected_second):
-        raise AssertionError(f"repeated update is not zero-miss: {second_counts.cpu().tolist()}")
-    if bool((case.cache_tokens.cpu() > 0).any()) and bool((second_slots.cpu()[case.cache_tokens.cpu() > 0] < 0).any()):
-        raise AssertionError("repeated update did not publish complete attention slots")
+    second_sources = second_sources.reshape(case.query.size(0), TOPK).cpu()
+    second_slots = second_slots.reshape(case.query.size(0), TOPK).cpu()
+    second_counts = second_counts.cpu()
+    second_updated = pool.cpu()
+    if not torch.equal(second_updated, updated):
+        raise AssertionError("repeated zero-miss update changed cache state")
+    for batch_row in range(case.query.size(0)):
+        pool_row = int(case.req_entries_cpu[batch_row])
+        budget = int(case.cache_tokens[batch_row].cpu())
+        candidate_len = int(case.candidate_lens[batch_row].cpu())
+        assert_pool_row(second_updated[pool_row], candidate_len, budget)
+        assert_update_row(
+            label=f"row {batch_row} repeated update",
+            sources=second_sources[batch_row],
+            slots=second_slots[batch_row],
+            reference=native[batch_row],
+            old_row=updated[pool_row],
+            new_row=second_updated[pool_row],
+            candidate_len=candidate_len,
+            budget=budget,
+            expected_miss=0,
+            actual_miss=int(second_counts[batch_row]),
+        )
 
     # Caller-owned output path is the graph-capture contract.
     out_pool = case.initial_pool.clone()
@@ -386,13 +502,17 @@ def check_case(case: Case) -> None:
         raise AssertionError("lidu_decode_update_out did not preserve caller-owned addresses")
     if not torch.equal(outputs[0].cpu(), source_ids.cpu()) or not torch.equal(outputs[1].cpu(), destination_slots.cpu()) or not torch.equal(outputs[2].cpu(), miss_counts.cpu()):
         raise AssertionError("allocating and caller-owned LIDU paths disagree")
+    if not torch.equal(out_pool.cpu(), updated):
+        raise AssertionError("caller-owned LIDU path produced different cache state")
 
     print(
         "A5_LIDU_CHECK "
         f"heads={case.query.size(1)} batch={case.query.size(0)} "
         f"source_capacity={case.source_capacity} candidates={case.candidate_lens.cpu().tolist()} "
         f"budgets={case.cache_tokens.cpu().tolist()} "
-        f"misses={counts.tolist()} unordered_unique_pool_entries=1 repeat_zero_miss=1 out_alias=1 ok=1",
+        f"misses={counts.tolist()} unordered_unique_pool_entries=1 "
+        "topk_unique_range=1 hit_slots_preserved=1 repeat_mapping_preserved=1 "
+        "repeat_zero_miss=1 out_alias=1 ok=1",
         flush=True,
     )
 
@@ -408,6 +528,7 @@ def event_benchmark(case: Case, warmup: int, iters: int) -> tuple[float, float]:
     retained = []
     for start, end in zip(starts, ends):
         pool.copy_(case.initial_pool)
+        torch.npu.synchronize()
         start.record()
         retained.append(launch(case, pool))
         end.record()
@@ -455,9 +576,11 @@ def main() -> None:
     require_a5(device, args.allow_non_a5)
     check_meta()
 
+    run_correctness = args.mode in ("all", "check") or args.iters == 0
+
     # One mandatory mixed-C case proves C=0 no-op, arbitrary legal C, pool
     # indirection, and the maximum block-aligned 14-bit slot range.
-    if args.mode in ("all", "check"):
+    if run_correctness:
         mixed = make_case(
             device,
             6,
@@ -481,6 +604,18 @@ def main() -> None:
             args.seed + 200,
         )
         check_case(miss_edges)
+        boundary = make_case(
+            device,
+            1,
+            MAX_SOURCE_CAPACITY,
+            32,
+            [6144],
+            (0, 300),
+            args.pool_extra,
+            args.seed + 300,
+        )
+        assert_18bit_boundary_selected(boundary, "A5_LIDU_18BIT_BOUNDARY_CHECK")
+        check_case(boundary)
 
     case_index = 0
     for heads in args.heads:
@@ -510,9 +645,9 @@ def main() -> None:
                             args.seed + case_index,
                         )
                         case_index += 1
-                        if args.mode in ("all", "check"):
+                        if run_correctness:
                             check_case(case)
-                        if args.mode in ("all", "bench"):
+                        if args.mode in ("all", "bench") and args.iters > 0:
                             native_us, lidu_us = event_benchmark(case, args.warmup, args.iters)
                             print(
                                 "A5_LIDU_RESULT "
@@ -524,7 +659,7 @@ def main() -> None:
                                 f"warmup={args.warmup} iters={args.iters}",
                                 flush=True,
                             )
-                        if args.mode == "profile":
+                        if args.mode == "profile" and args.iters > 0:
                             pool = case.initial_pool.clone()
                             for _ in range(args.profile_replays):
                                 pool.copy_(case.initial_pool)
