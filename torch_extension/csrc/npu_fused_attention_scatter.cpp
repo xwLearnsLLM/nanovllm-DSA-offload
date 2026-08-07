@@ -1,5 +1,3 @@
-#include <limits>
-#include <string>
 #include <tuple>
 
 #include "ops_common.h"
@@ -63,17 +61,6 @@ void CheckFusedInputs(
       "Fused SCATTER/SFA");
 }
 
-struct SparseAttentionAttrs {
-  float scale;
-  int64_t sparse_block_size = 1;
-  std::string query_layout = "TND";
-  std::string kv_layout = "PA_BSND";
-  int64_t sparse_mode = 3;
-  int64_t all_tokens = std::numeric_limits<int64_t>::max();
-  int64_t attention_mode = 2;
-  bool return_softmax_lse = false;
-};
-
 using FusedResult = std::tuple<at::Tensor, at::Tensor, at::Tensor>;
 
 }  // namespace
@@ -101,46 +88,30 @@ FusedResult FusedAttentionScatterNpu(
   auto output = at::empty_like(query);
   auto softmax_max = at::empty({1}, query.options().dtype(at::kFloat));
   auto softmax_sum = at::empty({1}, query.options().dtype(at::kFloat));
-  SparseAttentionAttrs attrs{static_cast<float>(scale_value)};
-  char* query_layout = const_cast<char*>(attrs.query_layout.c_str());
-  char* kv_layout = const_cast<char*>(attrs.kv_layout.c_str());
-  auto keepalive = std::make_tuple(
-      query, hbm_ckv, sparse_slots, hbm_block_table, actual_q, actual_kv,
-      query_rope, hbm_kpe, cache_tokens, dram_kpe, dram_ckv,
-      dram_block_table, source_token_ids, copy_counts, output,
-      softmax_max, softmax_sum);
-  EXEC_NPU_CMD_ORDERED(
-      aclnnA5SparseAndTailAttentionAndScatterCopy,
-      keepalive,
-      query,
-      hbm_ckv,
-      hbm_ckv,
-      sparse_slots,
-      hbm_block_table,
-      actual_q,
-      actual_kv,
-      query_rope,
-      hbm_kpe,
-      cache_tokens,
-      dram_kpe,
-      dram_ckv,
-      dram_block_table,
-      source_token_ids,
-      copy_counts,
-      attrs.scale,
-      attrs.sparse_block_size,
-      query_layout,
-      kv_layout,
-      attrs.sparse_mode,
-      attrs.all_tokens,
-      attrs.all_tokens,
-      attrs.attention_mode,
-      attrs.return_softmax_lse,
-      output,
-      softmax_max,
-      softmax_sum,
-      hbm_kpe,
-      hbm_ckv);
+  at_npu::native::OpCommand command;
+  command.Name("A5SparseAndTailAttentionAndScatterCopy")
+      .Input(query)
+      .Input(hbm_ckv)
+      .Input(hbm_ckv)
+      .Input(sparse_slots)
+      .Input(hbm_block_table)
+      .Input(actual_q)
+      .Input(actual_kv)
+      .Input(query_rope)
+      .Input(hbm_kpe)
+      .Input(cache_tokens)
+      .Input(dram_kpe)
+      .Input(dram_ckv)
+      .Input(dram_block_table)
+      .Input(source_token_ids)
+      .Input(copy_counts)
+      .Output(output)
+      .Output(softmax_max)
+      .Output(softmax_sum)
+      .Output(hbm_kpe)
+      .Output(hbm_ckv);
+  AddSparseAttentionAttrs(command, scale_value);
+  command.Run();
   return std::make_tuple(output, hbm_kpe, hbm_ckv);
 }
 
@@ -171,47 +142,31 @@ FusedResult FusedAttentionScatterMtePipelineNpu(
   auto output = at::empty_like(query);
   auto softmax_max = at::empty({1}, query.options().dtype(at::kFloat));
   auto softmax_sum = at::empty({1}, query.options().dtype(at::kFloat));
-  SparseAttentionAttrs attrs{static_cast<float>(scale_value)};
-  char* query_layout = const_cast<char*>(attrs.query_layout.c_str());
-  char* kv_layout = const_cast<char*>(attrs.kv_layout.c_str());
-  auto keepalive = std::make_tuple(
-      query, hbm_ckv, sparse_slots, hbm_block_table, actual_q, actual_kv,
-      query_rope, hbm_kpe, cache_tokens, dram_kpe, dram_ckv,
-      dram_block_table, source_token_ids, copy_counts, output,
-      softmax_max, softmax_sum);
-  EXEC_NPU_CMD_ORDERED(
-      aclnnA5SparseAndTailAttentionAndScatterCopyMtePipeline,
-      keepalive,
-      query,
-      hbm_ckv,
-      hbm_ckv,
-      sparse_slots,
-      hbm_block_table,
-      actual_q,
-      actual_kv,
-      query_rope,
-      hbm_kpe,
-      cache_tokens,
-      dram_kpe,
-      dram_ckv,
-      dram_block_table,
-      source_token_ids,
-      copy_counts,
-      attrs.scale,
-      attrs.sparse_block_size,
-      query_layout,
-      kv_layout,
-      attrs.sparse_mode,
-      attrs.all_tokens,
-      attrs.all_tokens,
-      attrs.attention_mode,
-      attrs.return_softmax_lse,
-      prefetch_rows_per_step,
-      output,
-      softmax_max,
-      softmax_sum,
-      hbm_kpe,
-      hbm_ckv);
+  at_npu::native::OpCommand command;
+  command.Name("A5SparseAndTailAttentionAndScatterCopyMtePipeline")
+      .Input(query)
+      .Input(hbm_ckv)
+      .Input(hbm_ckv)
+      .Input(sparse_slots)
+      .Input(hbm_block_table)
+      .Input(actual_q)
+      .Input(actual_kv)
+      .Input(query_rope)
+      .Input(hbm_kpe)
+      .Input(cache_tokens)
+      .Input(dram_kpe)
+      .Input(dram_ckv)
+      .Input(dram_block_table)
+      .Input(source_token_ids)
+      .Input(copy_counts)
+      .Output(output)
+      .Output(softmax_max)
+      .Output(softmax_sum)
+      .Output(hbm_kpe)
+      .Output(hbm_ckv);
+  AddSparseAttentionAttrs(command, scale_value);
+  command.Attr("prefetch_rows_per_step", prefetch_rows_per_step);
+  command.Run();
   return std::make_tuple(output, hbm_kpe, hbm_ckv);
 }
 

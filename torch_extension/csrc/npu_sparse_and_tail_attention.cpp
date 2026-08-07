@@ -1,7 +1,3 @@
-#include <limits>
-#include <string>
-#include <tuple>
-
 #include "ops_common.h"
 
 namespace nanovllm_dsa_a5_impl {
@@ -81,44 +77,23 @@ at::Tensor SparseAndTailAttentionNpu(
   auto output = at::empty_like(query);
   auto softmax_max = at::empty({1}, query.options().dtype(at::kFloat));
   auto softmax_sum = at::empty({1}, query.options().dtype(at::kFloat));
-  std::string query_layout = "TND";
-  std::string kv_layout = "PA_BSND";
-  char* query_layout_ptr = const_cast<char*>(query_layout.c_str());
-  char* kv_layout_ptr = const_cast<char*>(kv_layout.c_str());
-  constexpr int64_t kSparseBlockSize = 1;
-  constexpr int64_t kSparseMode = 3;
-  constexpr int64_t kAllTokens = std::numeric_limits<int64_t>::max();
-  constexpr int64_t kAttentionMode = 2;
-  constexpr bool kReturnSoftmaxLse = false;
-  float scale_value_float = static_cast<float>(scale_value);
-  auto keepalive = std::make_tuple(
-      query, key, value, sparse_slots, block_table, actual_q, actual_kv,
-      query_rope, key_rope, cache_tokens, output, softmax_max, softmax_sum);
-  EXEC_NPU_CMD_ORDERED(
-      aclnnA5SparseAndTailAttention,
-      keepalive,
-      query,
-      key,
-      value,
-      sparse_slots,
-      block_table,
-      actual_q,
-      actual_kv,
-      query_rope,
-      key_rope,
-      cache_tokens,
-      scale_value_float,
-      kSparseBlockSize,
-      query_layout_ptr,
-      kv_layout_ptr,
-      kSparseMode,
-      kAllTokens,
-      kAllTokens,
-      kAttentionMode,
-      kReturnSoftmaxLse,
-      output,
-      softmax_max,
-      softmax_sum);
+  at_npu::native::OpCommand command;
+  command.Name("A5SparseAndTailAttention")
+      .Input(query)
+      .Input(key)
+      .Input(value)
+      .Input(sparse_slots)
+      .Input(block_table)
+      .Input(actual_q)
+      .Input(actual_kv)
+      .Input(query_rope)
+      .Input(key_rope)
+      .Input(cache_tokens)
+      .Output(output)
+      .Output(softmax_max)
+      .Output(softmax_sum);
+  AddSparseAttentionAttrs(command, scale_value);
+  command.Run();
   return output;
 }
 

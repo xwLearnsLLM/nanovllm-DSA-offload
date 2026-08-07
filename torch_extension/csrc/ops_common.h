@@ -1,6 +1,8 @@
 #pragma once
 
 #include <initializer_list>
+#include <limits>
+#include <string>
 
 #include <torch/extension.h>
 #include <torch/library.h>
@@ -40,6 +42,21 @@ void CheckAttentionInputs(
     const at::Tensor& actual_kv,
     const at::Tensor& query_rope,
     const at::Tensor& key_rope);
+
+inline void AddSparseAttentionAttrs(
+    at_npu::native::OpCommand& command,
+    double scale_value) {
+  command
+      .Attr("scale_value", static_cast<float>(scale_value))
+      .Attr("sparse_block_size", static_cast<int64_t>(1))
+      .Attr("layout_query", std::string("TND"))
+      .Attr("layout_kv", std::string("PA_BSND"))
+      .Attr("sparse_mode", static_cast<int64_t>(3))
+      .Attr("pre_tokens", std::numeric_limits<int64_t>::max())
+      .Attr("next_tokens", std::numeric_limits<int64_t>::max())
+      .Attr("attention_mode", static_cast<int64_t>(2))
+      .Attr("return_softmax_lse", false);
+}
 
 inline void CheckLiduOutputs(
     const at::Tensor& reference,
