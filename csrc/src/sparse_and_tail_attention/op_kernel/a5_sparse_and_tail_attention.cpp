@@ -4,7 +4,11 @@
 
 #include "kernel_operator.h"
 #include "a5_sparse_and_tail_attention_template_tiling_key.h"
-#include "a5_sfa/arch35/sparse_flash_attention_kernel_mla.h"
+// Use the same source-aware SFA implementation as the A5 reference project.
+// Without InitSourceAwareGather() it is the regular sparse+tail path, while
+// preserving the exact kernel implementation already validated against the
+// CPU golden in ops_dsa_offload_a5.
+#include "a5_sfa_fused/arch35/sparse_flash_attention_kernel_mla.h"
 
 using namespace AscendC;
 
@@ -17,9 +21,9 @@ using namespace AscendC;
             BaseApi::SFAMatmulServiceDummy<__VA_ARGS__>>::type;                    \
         using VecBlockType = typename std::conditional<                            \
             g_coreType == AscendC::AIC,                                            \
-            BaseApi::SFAVectorServiceDummy<__VA_ARGS__>,                           \
-            BaseApi::SFAVectorService<__VA_ARGS__>>::type;                         \
-        BaseApi::SparseFlashAttentionKernelMla<                                    \
+            BaseApi::Fused::SFAVectorServiceDummy<__VA_ARGS__>,                    \
+            BaseApi::Fused::SFAVectorService<__VA_ARGS__>>::type;                  \
+        BaseApi::Fused::SparseFlashAttentionKernelMla<                             \
             CubeBlockType, VecBlockType> op;                                       \
         GET_TILING_DATA_WITH_STRUCT(                                               \
             SparseFlashAttentionTilingDataMla, tilingDataIn, tiling);              \
@@ -39,9 +43,9 @@ using namespace AscendC;
             BaseApi::SFAMatmulServiceDummy<__VA_ARGS__>>::type;                    \
         using VecBlockType = typename std::conditional<                            \
             g_coreType == AscendC::AIC,                                            \
-            BaseApi::SFAVectorServiceDummy<__VA_ARGS__>,                           \
-            BaseApi::SFAVectorService<__VA_ARGS__>>::type;                         \
-        BaseApi::SparseFlashAttentionKernelMla<                                    \
+            BaseApi::Fused::SFAVectorServiceDummy<__VA_ARGS__>,                    \
+            BaseApi::Fused::SFAVectorService<__VA_ARGS__>>::type;                  \
+        BaseApi::Fused::SparseFlashAttentionKernelMla<                             \
             CubeBlockType, VecBlockType> op;                                       \
         GET_TILING_DATA_WITH_STRUCT(                                               \
             SparseFlashAttentionTilingDataMla, tilingDataIn, tiling);              \
