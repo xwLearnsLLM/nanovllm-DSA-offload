@@ -422,7 +422,7 @@ def main() -> None:
             destination_slots,
             miss_counts,
         )
-        scatter = torch.ops.nanovllm_dsa.packed_scatter_copy_out.default(
+        scatter = torch.ops.nanovllm_dsa.scatter_copy_c8_out.default(
             hbm.view(torch.int8),
             dram,
             hbm_table,

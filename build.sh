@@ -2,7 +2,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-OP_DEV="${ROOT}/op_dev"
+CSRC="${ROOT}/csrc"
+OP_SPEC="${CSRC}/ops.json"
+OP_SOURCE_ROOT="${CSRC}/src"
 BUILD_ROOT="${ROOT}/build"
 GENERATED="${BUILD_ROOT}/custom_op"
 LOCAL_OPP="${ROOT}/_custom_opp"
@@ -64,6 +66,25 @@ OP_NAMES=(
     A5SparseAndTailAttention
 )
 
+# These are the six operators visible to the framework. C8 LIDU is composed
+# from the official quant LightningIndexer and a repository-local pool-update
+# kernel; C8 Attention is an adapter over the native A5 QSFA implementation.
+FRAMEWORK_OP_DIRS=(
+    lidu_decode_update
+    scatter_copy
+    sparse_and_tail_attention
+    lidu_decode_update_c8
+    scatter_copy_c8
+    sparse_and_tail_attention_c8
+)
+
+for op_dir in "${FRAMEWORK_OP_DIRS[@]}"; do
+    if [[ ! -d "${OP_SOURCE_ROOT}/${op_dir}" ]]; then
+        echo "[nanovllm_a5_ops] ERROR: missing operator directory: ${OP_SOURCE_ROOT}/${op_dir}" >&2
+        exit 2
+    fi
+done
+
 rm -rf "${GENERATED}"
 mkdir -p "${BUILD_ROOT}"
 for index in "${!OP_NAMES[@]}"; do
@@ -71,7 +92,7 @@ for index in "${!OP_NAMES[@]}"; do
     echo "[nanovllm_a5_ops] generate operator: ${op_name}"
     msopgen_args=(
         gen
-        -i "${OP_DEV}/ops.json"
+        -i "${OP_SPEC}"
         -f aclnn
         -c "ai_core-${A5_SOC_VERSION}"
         -lan cpp
@@ -84,10 +105,19 @@ for index in "${!OP_NAMES[@]}"; do
     msopgen "${msopgen_args[@]}"
 done
 
-# The generated project owns only its build scaffold. The checked-in host and
-# kernel sources below are the authoritative implementation.
-cp -a "${OP_DEV}/op_host/." "${GENERATED}/op_host/"
-cp -a "${OP_DEV}/op_kernel/." "${GENERATED}/op_kernel/"
+# The generated project owns only its build scaffold. Repository sources are
+# grouped by framework operator, then flattened into the msopgen workspace so
+# the generated CMake behavior and kernel include layout remain unchanged.
+SOURCE_DIRS=(common "${FRAMEWORK_OP_DIRS[@]}")
+for op_dir in "${SOURCE_DIRS[@]}"; do
+    source_dir="${OP_SOURCE_ROOT}/${op_dir}"
+    if [[ -d "${source_dir}/op_host" ]]; then
+        cp -a "${source_dir}/op_host/." "${GENERATED}/op_host/"
+    fi
+    if [[ -d "${source_dir}/op_kernel" ]]; then
+        cp -a "${source_dir}/op_kernel/." "${GENERATED}/op_kernel/"
+    fi
+done
 # The checked-in LightningIndexer definition deliberately has the same name
 # as the msopgen stub and overwrites it.  Remove the legacy split definition
 # if an older worktree left it behind; compiling both creates a duplicate

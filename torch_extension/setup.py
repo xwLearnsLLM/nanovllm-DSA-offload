@@ -25,9 +25,15 @@ setup(
         NpuExtension(
             name="nanovllm_dsa_a5._C",
             sources=[
-                str(CSRC / "ops.cpp"),
+                str(CSRC / "ops_registration.cpp"),
+                str(CSRC / "npu_lidu_decode_update.cpp"),
+                str(CSRC / "npu_lidu_decode_update_c8.cpp"),
+                str(CSRC / "npu_scatter_copy.cpp"),
+                str(CSRC / "npu_scatter_copy_c8.cpp"),
+                str(CSRC / "npu_sparse_and_tail_attention.cpp"),
                 str(CSRC / "op_api_common.cpp"),
             ],
+            include_dirs=[str(CSRC)],
             extra_compile_args=[
                 f"-I{TORCH_NPU_ROOT / 'include' / 'third_party' / 'acl' / 'inc'}",
                 "-O3",

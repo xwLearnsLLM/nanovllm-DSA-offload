@@ -23,8 +23,12 @@
 | 公开入口 | 实际执行 | 作用 | 定位 |
 | --- | --- | --- | --- |
 | `lidu_decode_update_c8` / `lidu_decode_update_c8_out` | 官方 `npu_quant_lightning_indexer` + request-pool update | C8 top-2048 与 request-pool 更新；`_out` 写入 caller-owned buffer | eager / 稳定图主链 |
-| `packed_scatter_copy` / `packed_scatter_copy_out` | `A5PackedKvcacheScatterCopy` | 整行搬运 656-byte packed KV，并生成 sparse+tail slots 和 resident length；`_out` 写入 caller-owned metadata | eager / 稳定图主链 |
+| `scatter_copy_c8` / `scatter_copy_c8_out` | `A5PackedKvcacheScatterCopy` | 整行搬运 656-byte packed KV，并生成 sparse+tail slots 和 resident length；`_out` 写入 caller-owned metadata | eager / 稳定图主链 |
 | `sparse_and_tail_attention_c8` | Python custom op → 原生 `npu_kv_quant_sparse_flash_attention` | 对 packed C8 KV 的 top-2048 sparse slots 与 tail 执行量化 MLA | 稳定图主链 |
+
+## 源码布局
+
+六个框架算子分别位于 `csrc/src/lidu_decode_update`、`csrc/src/scatter_copy`、`csrc/src/sparse_and_tail_attention`、`csrc/src/lidu_decode_update_c8`、`csrc/src/scatter_copy_c8` 和 `csrc/src/sparse_and_tail_attention_c8`。Torch 入口对应拆分在 `torch_extension/nanovllm_dsa_a5/ops`；本地 C++ 绑定按算子拆分在 `torch_extension/csrc/npu_*.cpp`，schema 集中在 `ops_registration.cpp`。C8 LIDU 复用官方 Quant LightningIndexer，C8 Attention 复用原生 QSFA，因此这两个目录只保存本仓的组合适配逻辑，不伪造重复的 CANN 内核。
 
 ## 接口
 
@@ -88,7 +92,7 @@ torch.ops.nanovllm_dsa.sparse_and_tail_attention(
 
 ### W4A4C8：packed C8 KV
 
-链路：`lidu_decode_update_c8_out → packed_scatter_copy_out → sparse_and_tail_attention_c8`。每个 packed KV token 固定为 656 bytes：`512 FP8 E4M3 + 64 BF16 RoPE + 4 FP32 scales`。
+链路：`lidu_decode_update_c8_out → scatter_copy_c8_out → sparse_and_tail_attention_c8`。每个 packed KV token 固定为 656 bytes：`512 FP8 E4M3 + 64 BF16 RoPE + 4 FP32 scales`。
 
 ```python
 torch.ops.nanovllm_dsa.lidu_decode_update_c8(
@@ -119,7 +123,7 @@ torch.ops.nanovllm_dsa.lidu_decode_update_c8_out(
     miss_counts,            # caller-owned int32[B]，in/out
 ) -> (source_ids_alias, destination_slots_alias, miss_counts_alias, cache_slots_alias)
 
-torch.ops.nanovllm_dsa.packed_scatter_copy_out(
+torch.ops.nanovllm_dsa.scatter_copy_c8_out(
     hbm_packed_kv_bytes,    # int8 view[HBM_BLOCKS,128,1,656]，in/out
     dram_packed_kv_bytes,   # swapped-memory int8 view[DRAM_BLOCKS,128,1,656]
     hbm_block_table,        # int32[B,HBM_MAX_BLOCKS]
@@ -150,7 +154,7 @@ torch.ops.nanovllm_dsa.sparse_and_tail_attention_c8(
 ) -> attention_out          # bf16/fp16[T,Q_HEAD,512]
 ```
 
-非 `_out` 的 `packed_scatter_copy` 参数相同，但由算子分配 `attention_slots` 和 `resident_seq_lengths`。C8 LIDU 的组合接口内部完成官方 A5 Quant LightningIndexer 和 request-pool 更新。全部框架接口提供 Fake/Meta；LIDU、SCATTER 的 schema 显式声明 mutable alias。
+非 `_out` 的 `scatter_copy_c8` 参数相同，但由算子分配 `attention_slots` 和 `resident_seq_lengths`。C8 LIDU 的组合接口内部完成官方 A5 Quant LightningIndexer 和 request-pool 更新。全部框架接口提供 Fake/Meta；LIDU、SCATTER 的 schema 显式声明 mutable alias。
 
 ## 约束
 
@@ -194,10 +198,6 @@ bash build.sh
 ## 正确性与图回放
 
 ```bash
-python3 tests/test_api_meta.py
-```
-
-```bash
 python3 tests/test_lidu.py --device npu:0 --mode check --heads 32,64 --batch-sizes 24 --source-lens 20096 --cache-tokens 6144 --miss-ranges 0:300 --seed 7
 ```
 
@@ -236,7 +236,7 @@ python3 tests/test_lidu_c8.py --device npu:0 --mode check --heads 32,64 --batch-
 packed SCATTER 使用真实 swapped memory；分配式与 caller-owned 两条路径都重新 poison HBM，并校验完整 656 bytes、guard、动态 tail metadata、`resident_seq_lengths` 和输出地址：
 
 ```bash
-python3 tests/test_packed_scatter_copy_c8.py --device npu:0 --batch-size 24 --source-len 20096 --cache-tokens 6144 --tail-tokens 257 --max-tail-tokens 512 --copy-min 0 --copy-max 300 --warmup 10 --iters 100 --seed 7
+python3 tests/test_scatter_copy_c8.py --device npu:0 --batch-size 24 --source-len 20096 --cache-tokens 6144 --tail-tokens 257 --max-tail-tokens 512 --copy-min 0 --copy-max 300 --warmup 10 --iters 100 --seed 7
 ```
 
 C8 QSFA 使用独立 CPU FP32 golden 校验 FP8 latent、BF16 RoPE 和 FP32 scales 的 packed layout。首轮门禁固定 `q_head=8`；本仓库不支持 `q_head>64`：
@@ -249,7 +249,7 @@ for C in 3072 6144 8192 12288; do for tail in 0 1 64 127 257; do python3 tests/t
 python3 tests/test_sparse_and_tail_attention_c8.py --device npu:0 --mode check --batch-size 1 --heads 8 --cache-tokens 0 --tail-tokens 2048 --max-tail-tokens 2048 --seed 7
 ```
 
-图门禁捕获框架链路 `lidu_decode_update_c8_out → packed_scatter_copy_out → sparse_and_tail_attention_c8`；不依赖 capture 阶段执行，先用一次 replay 验证零 miss 和完整输出写回，再恢复初始 pool 进行多次非零 miss replay：
+图门禁捕获框架链路 `lidu_decode_update_c8_out → scatter_copy_c8_out → sparse_and_tail_attention_c8`；不依赖 capture 阶段执行，先用一次 replay 验证零 miss 和完整输出写回，再恢复初始 pool 进行多次非零 miss replay：
 
 ```bash
 python3 tests/test_offload_split_c8_graph.py --device npu:0 --case pure-long --batch-size 2 --heads 8 --index-heads 32 --source-len 4096 --cache-tokens 3072 --tail-tokens 64 --max-tail-tokens 256 --miss-min 256 --miss-max 512 --replays 4 --seed 7
