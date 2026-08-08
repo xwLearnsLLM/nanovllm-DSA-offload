@@ -467,6 +467,18 @@ ge::graphStatus TilingNanovllmSparseAndTailAttention(gert::TilingContext *contex
     return tiling.DoOpTiling(&sfaInfo);
 }
 
+ge::graphStatus TilingNanovllmSparseAndTailAttentionMtp(gert::TilingContext *context)
+{
+    const ge::graphStatus status = TilingNanovllmSparseAndTailAttention(context);
+    if (status == ge::GRAPH_SUCCESS) {
+        // MTP3 has one fixed kernel specialization: query_len=4, TND query,
+        // PA_BSND KV and V-template.  Keep its dispatch key independent from
+        // the configurable single-query attention template key.
+        context->SetTilingKey(1U);
+    }
+    return status;
+}
+
 ge::graphStatus TilingPrepareForNanovllmSparseAndTailAttention(gert::TilingParseContext *context)
 {
     (void)context;
@@ -1885,6 +1897,6 @@ IMPL_OP_OPTILING(NanovllmSparseAndTailAttention)
     .TilingParse<NanovllmSparseAndTailAttentionCompileInfo>(TilingPrepareForNanovllmSparseAndTailAttention);
 
 IMPL_OP_OPTILING(NanovllmSparseAndTailAttentionMtp)
-    .Tiling(TilingNanovllmSparseAndTailAttention)
+    .Tiling(TilingNanovllmSparseAndTailAttentionMtp)
     .TilingParse<NanovllmSparseAndTailAttentionCompileInfo>(TilingPrepareForNanovllmSparseAndTailAttention);
 } // namespace optiling
