@@ -97,6 +97,10 @@ const std::map<ge::DataType, std::string> DATATYPE_TO_STRING_MAP = {
     {ge::DT_UINT2, "DT_UINT2"}                    // dt_variant type
 };
 
+struct NanovllmSparseAndTailAttentionCompileInfo {
+    int64_t core_num;
+};
+
 static const std::map<SFALayout, std::vector<SFAAxis>> SFA_LAYOUT_AXIS_MAP = {
     {SFALayout::BSND, {SFAAxis::B, SFAAxis::S, SFAAxis::N, SFAAxis::D}},
     {SFALayout::TND, {SFAAxis::T, SFAAxis::N, SFAAxis::D}},

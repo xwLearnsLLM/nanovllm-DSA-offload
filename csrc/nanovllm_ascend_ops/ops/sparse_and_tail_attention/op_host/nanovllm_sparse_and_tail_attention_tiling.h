@@ -182,10 +182,6 @@ END_TILING_DATA_DEF
 REGISTER_TILING_DATA_CLASS(NanovllmSparseAndTailAttention, NanovllmSparseAndTailAttentionTilingDataMla)
 REGISTER_TILING_DATA_CLASS(NanovllmSparseAndTailAttentionMtp, NanovllmSparseAndTailAttentionTilingDataMla)
 
-struct NanovllmSparseAndTailAttentionCompileInfo {
-    int64_t core_num;
-};
-
 template <typename T> inline T Align(T num, T rnd)
 {
     return (((rnd) == 0) ? 0 : (((num) + (rnd) - 1) / (rnd) * (rnd)));
@@ -591,7 +587,5 @@ public:
     gert::Shape keyRopeShape_{};
 };
 
-ge::graphStatus TilingNanovllmSparseAndTailAttention(gert::TilingContext *context);
-ge::graphStatus TilingPrepareForNanovllmSparseAndTailAttention(gert::TilingParseContext *context);
 } // namespace optiling
 #endif // NANOVLLM_SPARSE_AND_TAIL_ATTENTION_TILING_H
