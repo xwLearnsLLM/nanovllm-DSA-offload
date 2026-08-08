@@ -234,17 +234,19 @@ def call_attention_out(
     scale: float,
     output: torch.Tensor,
 ) -> torch.Tensor:
+    latent_cache = ckv.view(-1, BLOCK_SIZE, 1, CKV_DIM)
+    rope_cache = kpe.view(-1, BLOCK_SIZE, 1, KPE_DIM)
     return torch.ops.nanovllm_dsa.sparse_and_tail_attention_mtp_out.default(
         query,
-        ckv.view(-1, BLOCK_SIZE, 1, CKV_DIM),
-        ckv.view(-1, BLOCK_SIZE, 1, CKV_DIM),
+        latent_cache,
+        latent_cache,
         sparse_slots,
         cache_tokens,
         hbm_table,
         actual_q,
         actual_kv,
         query_rope,
-        kpe.view(-1, BLOCK_SIZE, 1, KPE_DIM),
+        rope_cache,
         scale,
         output,
     )
