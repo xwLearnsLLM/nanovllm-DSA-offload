@@ -5,7 +5,7 @@
 #ifndef a5_fused_li_manage_mtp_TILING_H_
 #define a5_fused_li_manage_mtp_TILING_H_
 
-#include "error/ops_error.h"
+#include "a5_sfa_shared/ops_log_compat.h"
 #include "exe_graph/runtime/tiling_context.h"
 #include "platform/platform_info.h"
 #include "register/op_def_registry.h"

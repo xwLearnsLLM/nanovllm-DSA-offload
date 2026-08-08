@@ -6,7 +6,7 @@
 
 ## 来源
 
-- LIDU：普通路径基于 `ops_li_update_a5@0362e7e` 的生产 P5 内核，增加 request pool、逐请求 C、动态 pool 行跨度、mutable alias 和 caller-owned out；MTP 路径迁移同仓 `lightning_indexer_decode_update_mtp_a5`，仅重命名并隔离其专用 Arch35 payload，保持原始 packed-query 行为。
+- LIDU：普通路径基于 `ops_li_update_a5@0362e7e` 的生产 P5 内核，增加 request pool、逐请求 C、动态 pool 行跨度、mutable alias 和 caller-owned out；MTP 路径迁移同仓 `lightning_indexer_decode_update_mtp_a5`，仅做命名、专用 Arch35 payload 隔离和本仓 CANN 9.1 host 日志兼容头适配，保持原始 packed-query 行为。
 - SCATTER：基于 `ops_dsa_offload_a5@01f2065` 已验证的 Ascend 950 swapped-memory DRAM→HBM 路径。
 - SFA：基于 `vllm-ascend-v0.23.0-custom@6af99b372` 的官方 Arch35 SFA 叠加 sparse+tail 语义。官方接口说明见 [aclnnSparseFlashAttention](https://github.com/vllm-project/vllm-ascend/blob/main/csrc/attention/sparse_flash_attention/docs/aclnnSparseFlashAttention.md)。
 - 融合算子：基于 `ops_dsa_offload_a5@d58629f` 的 MTE-pipeline 版本；公共 SFA 基础代码复用本仓库副本，避免污染拆分链路基线。
