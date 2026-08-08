@@ -10,7 +10,9 @@ import torch
 
 import nanovllm_dsa_a5
 import torch_npu  # type: ignore  # noqa: E402,F401
-from test_fused_li_manage_c8 import make_case
+
+from _c8_lidu_case import make_case
+from _utils import physical_token_rows, require_a5, swapped_from_cpu
 
 
 BLOCK_SIZE = 128
@@ -59,18 +61,6 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("at least two graph replays are required")
 
 
-def require_a5(device: torch.device, allow_non_a5: bool) -> str:
-    index = device.index if device.index is not None else torch.npu.current_device()
-    getter = getattr(torch.npu, "get_device_name", torch_npu.npu.get_device_name)
-    name = getter(index)
-    if "950" not in name.lower() and not allow_non_a5:
-        raise RuntimeError(
-            f"expected Ascend 950, got {name!r}; "
-            "use --allow-non-a5 only for debugging"
-        )
-    return name
-
-
 def private_block_table(
     batch: int,
     blocks_per_row: int,
@@ -84,18 +74,6 @@ def private_block_table(
             blocks_per_row, generator=generator, dtype=torch.int64
         ).to(torch.int32)
     return table, physical_blocks
-
-
-def physical_rows(
-    table: torch.Tensor,
-    row: int,
-    logical_tokens: torch.Tensor,
-) -> torch.Tensor:
-    logical = logical_tokens.to(torch.int64)
-    return (
-        table[row, logical // BLOCK_SIZE].to(torch.int64) * BLOCK_SIZE
-        + logical.remainder(BLOCK_SIZE)
-    )
 
 
 def make_packed_bytes(
@@ -129,21 +107,6 @@ def make_packed_bytes(
     return packed.view(torch.int8).contiguous()
 
 
-def swapped_from_cpu(cpu: torch.Tensor, device: torch.device) -> torch.Tensor:
-    if not hasattr(torch_npu, "empty_with_swapped_memory"):
-        raise RuntimeError("torch_npu.empty_with_swapped_memory is required")
-    swapped = torch_npu.empty_with_swapped_memory(
-        cpu.shape, dtype=cpu.dtype, device=device
-    )
-    swapped.zero_()
-    staging = cpu.to(device)
-    swapped.add_(staging)
-    torch.npu.synchronize()
-    del staging
-    torch.npu.empty_cache()
-    return swapped
-
-
 def initialize_hbm(
     *,
     dram_bytes: torch.Tensor,
@@ -172,14 +135,20 @@ def initialize_hbm(
         if budget == 0:
             source_tokens = torch.arange(actual_len, dtype=torch.int64)
             hbm_rows[
-                physical_rows(hbm_table, row, source_tokens)
-            ] = dram_rows[physical_rows(dram_table, row, source_tokens)]
+                physical_token_rows(hbm_table, row, source_tokens)
+            ] = dram_rows[
+                physical_token_rows(dram_table, row, source_tokens)
+            ]
             continue
         state = pool_cpu[int(req_cpu[row]), :candidate_len]
         source_tokens = (state >= 0).nonzero().flatten().to(torch.int64)
         destination_slots = state[source_tokens].to(torch.int64)
-        hbm_rows[physical_rows(hbm_table, row, destination_slots)] = (
-            dram_rows[physical_rows(dram_table, row, source_tokens)]
+        hbm_rows[
+            physical_token_rows(hbm_table, row, destination_slots)
+        ] = (
+            dram_rows[
+                physical_token_rows(dram_table, row, source_tokens)
+            ]
         )
         tail_tokens = actual_len - candidate_len
         if tail_tokens:
@@ -191,8 +160,10 @@ def initialize_hbm(
                 budget + tail_tokens,
                 dtype=torch.int64,
             )
-            hbm_rows[physical_rows(hbm_table, row, tail_slots)] = dram_rows[
-                physical_rows(dram_table, row, tail_sources)
+            hbm_rows[
+                physical_token_rows(hbm_table, row, tail_slots)
+            ] = dram_rows[
+                physical_token_rows(dram_table, row, tail_sources)
             ]
     return hbm
 
@@ -214,10 +185,10 @@ def assert_scatter_bytes(
     dram_rows = dram_cpu.view(-1, PACKED_DIM)
     for row, count_value in enumerate(counts.tolist()):
         count = int(count_value)
-        source_physical = physical_rows(
+        source_physical = physical_token_rows(
             dram_table, row, sources[row, :count]
         )
-        destination_physical = physical_rows(
+        destination_physical = physical_token_rows(
             hbm_table, row, destinations[row, :count]
         )
         actual = hbm_rows[destination_physical.to(hbm.device)].cpu()
@@ -573,7 +544,7 @@ def main() -> None:
             raise AssertionError("QSFA replay changed output address")
 
     print(
-        "A5_OFFLOAD_SPLIT_C8_GRAPH_CHECK "
+        "A5_C8_GRAPH_CHECK "
         f"device={device} device_name={device_name!r} "
         f"case={args.case} "
         f"batch={args.batch_size} index_heads={args.index_heads} "
@@ -587,7 +558,7 @@ def main() -> None:
         "stable_addresses=1 ok=1",
         flush=True,
     )
-    print("A5_OFFLOAD_SPLIT_C8_GRAPH_UT_OK", flush=True)
+    print("A5_C8_GRAPH_UT_OK", flush=True)
 
 
 if __name__ == "__main__":

@@ -12,6 +12,8 @@ import torch
 import nanovllm_dsa_a5
 import torch_npu  # type: ignore  # noqa: E402,F401
 
+from _utils import physical_token_rows, require_a5, swapped_from_cpu
+
 
 BLOCK_SIZE = 128
 PACKED_DIM = 656
@@ -75,33 +77,6 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("copy range must be within [0,2048]")
     if args.warmup < 0 or args.iters <= 0:
         raise ValueError("warmup must be non-negative and iters positive")
-
-
-def require_a5(device: torch.device, allow_non_a5: bool) -> str:
-    index = device.index if device.index is not None else torch.npu.current_device()
-    getter = getattr(torch.npu, "get_device_name", torch_npu.npu.get_device_name)
-    name = getter(index)
-    if "950" not in name.lower() and not allow_non_a5:
-        raise RuntimeError(
-            f"expected Ascend 950, got {name!r}; "
-            "use --allow-non-a5 only for debugging"
-        )
-    return name
-
-
-def swapped_from_cpu(cpu: torch.Tensor, device: torch.device) -> torch.Tensor:
-    if not hasattr(torch_npu, "empty_with_swapped_memory"):
-        raise RuntimeError("torch_npu.empty_with_swapped_memory is required")
-    tensor = torch_npu.empty_with_swapped_memory(
-        cpu.shape, dtype=cpu.dtype, device=device
-    )
-    tensor.zero_()
-    staging = cpu.to(device)
-    tensor.add_(staging)
-    torch.npu.synchronize()
-    del staging
-    torch.npu.empty_cache()
-    return tensor
 
 
 def random_private_table(
@@ -224,16 +199,12 @@ def physical_rows(case: Case) -> tuple[torch.Tensor, torch.Tensor]:
     for row, count in enumerate(case.counts_cpu.tolist()):
         source = case.sources_cpu[row, 0, :count].to(torch.int64)
         destination = case.slots_cpu[row, 0, :count].to(torch.int64)
-        source_rows.append(
-            case.dram_table_cpu[row].to(torch.int64)[source // BLOCK_SIZE]
-            * BLOCK_SIZE
-            + source % BLOCK_SIZE
-        )
-        destination_rows.append(
-            case.hbm_table_cpu[row].to(torch.int64)[destination // BLOCK_SIZE]
-            * BLOCK_SIZE
-            + destination % BLOCK_SIZE
-        )
+        source_rows.append(physical_token_rows(
+            case.dram_table_cpu, row, source, BLOCK_SIZE
+        ))
+        destination_rows.append(physical_token_rows(
+            case.hbm_table_cpu, row, destination, BLOCK_SIZE
+        ))
     return torch.cat(source_rows), torch.cat(destination_rows)
 
 
@@ -358,7 +329,7 @@ def check_copy(case: Case) -> None:
             f"expected={expected_lengths.tolist()}"
         )
     print(
-        "A5_SCATTER_COPY_C8_CHECK "
+        "A5_KVCACHE_SCATTER_COPY_C8_CHECK "
         f"copied_tokens={int(case.counts_cpu.sum())} row_bytes={PACKED_DIM} "
         "allocator=empty_with_swapped_memory byte_exact=1 "
         "guard_unchanged=1 topk_tail_indices=1 out_alias=1 ok=1",
@@ -407,7 +378,7 @@ def check_zero_copy_and_dense_row(case: Case) -> None:
     if int(dense_lengths[0].cpu()) != dense_len:
         raise AssertionError("C=0 resident length is wrong")
     print(
-        "A5_SCATTER_COPY_C8_ZERO_COPY_CHECK "
+        "A5_KVCACHE_SCATTER_COPY_C8_ZERO_COPY_CHECK "
         "hbm_unchanged=1 metadata_published=1 mixed_dense_row=1 ok=1",
         flush=True,
     )
@@ -444,7 +415,7 @@ def benchmark(case: Case, warmup: int, iters: int) -> None:
     payload_bytes = int(case.counts_cpu.sum()) * PACKED_DIM
     payload_gbps = payload_bytes / (avg_us * 1000) if avg_us else 0.0
     print(
-        "A5_SCATTER_COPY_C8_RESULT "
+        "A5_KVCACHE_SCATTER_COPY_C8_RESULT "
         f"batch={case.counts.size(0)} "
         f"copied_tokens={int(case.counts_cpu.sum())} "
         f"avg_us={avg_us:.3f} payload_gbps={payload_gbps:.3f} "
@@ -458,7 +429,7 @@ def main() -> None:
     validate_args(args)
     case = make_case(args)
     print(
-        "A5_SCATTER_COPY_C8_CONFIG "
+        "A5_KVCACHE_SCATTER_COPY_C8_CONFIG "
         f"device={case.device} device_name={case.device_name!r} "
         f"batch={args.batch_size} source_len={args.source_len} "
         f"cache_tokens={args.cache_tokens} tail_tokens={args.tail_tokens} "
@@ -470,7 +441,7 @@ def main() -> None:
     check_copy(case)
     check_zero_copy_and_dense_row(case)
     benchmark(case, args.warmup, args.iters)
-    print("A5_SCATTER_COPY_C8_UT_OK", flush=True)
+    print("A5_KVCACHE_SCATTER_COPY_C8_UT_OK", flush=True)
 
 
 if __name__ == "__main__":

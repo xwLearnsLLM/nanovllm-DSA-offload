@@ -11,6 +11,8 @@ import torch
 import nanovllm_dsa_a5
 import torch_npu  # type: ignore  # noqa: E402,F401
 
+from _utils import csv_ints, require_a5
+
 
 BLOCK_SIZE = 128
 NOPE_DIM = 512
@@ -25,11 +27,10 @@ TOPK = 2048
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="npu:0")
-    parser.add_argument("--mode", choices=("all", "check", "bench"), default="all")
-    parser.add_argument("--batch-size", type=int, default=24)
+    parser.add_argument("--batch-sizes", type=csv_ints, default=csv_ints("24"))
     parser.add_argument("--heads", type=int, default=8)
-    parser.add_argument("--cache-tokens", type=int, default=6144)
-    parser.add_argument("--tail-tokens", type=int, default=257)
+    parser.add_argument("--cache-tokens", type=csv_ints, default=csv_ints("6144"))
+    parser.add_argument("--tail-tokens", type=csv_ints, default=csv_ints("64"))
     parser.add_argument("--max-tail-tokens", type=int, default=512)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=100)
@@ -39,32 +40,46 @@ def parse_args() -> argparse.Namespace:
 
 
 def validate_args(args: argparse.Namespace) -> None:
-    if args.batch_size <= 0:
-        raise ValueError("batch size must be positive")
+    if any(batch <= 0 for batch in args.batch_sizes):
+        raise ValueError("batch sizes must be positive")
     if not 1 <= args.heads <= 64:
         raise ValueError("this project intentionally supports Q_HEAD <= 64")
-    if args.cache_tokens != 0 and (
-        args.cache_tokens < TOPK or args.cache_tokens % BLOCK_SIZE
+    if any(
+        cache_tokens != 0
+        and (cache_tokens < TOPK or cache_tokens % BLOCK_SIZE)
+        for cache_tokens in args.cache_tokens
     ):
         raise ValueError("cache tokens must be 0 or block-aligned >= 2048")
-    if not 0 <= args.tail_tokens <= args.max_tail_tokens:
+    if args.max_tail_tokens < 0 or any(
+        not 0 <= tail_tokens <= args.max_tail_tokens
+        for tail_tokens in args.tail_tokens
+    ):
         raise ValueError("tail tokens must be in [0,max_tail_tokens]")
-    if args.cache_tokens == 0 and args.tail_tokens == 0:
+    if any(cache_tokens == 0 and tail_tokens == 0
+           for cache_tokens in args.cache_tokens
+           for tail_tokens in args.tail_tokens):
         raise ValueError("dense C=0 test requires at least one resident token")
-    if args.warmup < 0 or args.iters <= 0:
-        raise ValueError("warmup must be non-negative and iters positive")
+    if args.warmup < 0 or args.iters < 0:
+        raise ValueError("warmup and iters must be non-negative")
 
 
-def require_a5(device: torch.device, allow_non_a5: bool) -> str:
-    index = device.index if device.index is not None else torch.npu.current_device()
-    getter = getattr(torch.npu, "get_device_name", torch_npu.npu.get_device_name)
-    name = getter(index)
-    if "950" not in name.lower() and not allow_non_a5:
-        raise RuntimeError(
-            f"expected Ascend 950, got {name!r}; "
-            "use --allow-non-a5 only for debugging"
-        )
-    return name
+def case_args(
+    args: argparse.Namespace,
+    batch_size: int,
+    cache_tokens: int,
+    tail_tokens: int,
+    max_tail_tokens: int,
+    seed: int,
+) -> argparse.Namespace:
+    values = vars(args).copy()
+    values.update(
+        batch_size=batch_size,
+        cache_tokens=cache_tokens,
+        tail_tokens=tail_tokens,
+        max_tail_tokens=max_tail_tokens,
+        seed=seed,
+    )
+    return argparse.Namespace(**values)
 
 
 def pack_cache(
@@ -89,9 +104,6 @@ def make_inputs(args: argparse.Namespace) -> dict[str, object]:
     torch.manual_seed(args.seed)
     generator = torch.Generator().manual_seed(args.seed)
     device = torch.device(args.device)
-    torch.npu.set_device(device)
-    torch.npu.config.allow_internal_format = False
-    device_name = require_a5(device, args.allow_non_a5)
     resident_len = args.cache_tokens + args.tail_tokens
     blocks_per_row = (resident_len + BLOCK_SIZE - 1) // BLOCK_SIZE
     physical_blocks = args.batch_size * blocks_per_row
@@ -142,7 +154,6 @@ def make_inputs(args: argparse.Namespace) -> dict[str, object]:
 
     return {
         "device": device,
-        "device_name": device_name,
         "query_cpu": query_cpu,
         "nope_cpu": nope_cpu,
         "rope_cpu": rope_cpu,
@@ -223,7 +234,7 @@ def check(inputs: dict[str, object], args: argparse.Namespace) -> None:
         else TOPK + args.tail_tokens
     )
     print(
-        "A5_PACKED_C8_QSFA_CHECK "
+        "A5_SPARSE_TAIL_ATTENTION_C8_CHECK "
         f"batch={args.batch_size} heads={args.heads} "
         f"cache_tokens={args.cache_tokens} tail_tokens={args.tail_tokens} "
         f"attended_tokens={attended} max_abs={max_abs:.9f} "
@@ -248,7 +259,7 @@ def benchmark(inputs: dict[str, object], args: argparse.Namespace) -> None:
         start.elapsed_time(end) for start, end in zip(starts, ends)
     ) * 1000
     print(
-        "A5_PACKED_C8_QSFA_RESULT "
+        "A5_SPARSE_TAIL_ATTENTION_C8_RESULT "
         f"batch={args.batch_size} heads={args.heads} "
         f"cache_tokens={args.cache_tokens} tail_tokens={args.tail_tokens} "
         f"avg_us={avg_us:.3f} warmup={args.warmup} iters={args.iters}",
@@ -256,23 +267,84 @@ def benchmark(inputs: dict[str, object], args: argparse.Namespace) -> None:
     )
 
 
+def check_meta(heads: int, max_tail_tokens: int) -> None:
+    query = torch.empty((3, heads, QUERY_DIM), dtype=torch.bfloat16, device="meta")
+    packed = torch.empty(
+        (96, BLOCK_SIZE, 1, PACKED_DIM),
+        dtype=torch.float8_e4m3fn,
+        device="meta",
+    )
+    slots = torch.empty(
+        (3, 1, TOPK + max_tail_tokens), dtype=torch.int32, device="meta"
+    )
+    table = torch.empty((3, 96), dtype=torch.int32, device="meta")
+    lengths = torch.empty((3,), dtype=torch.int32, device="meta")
+    output = nanovllm_dsa_a5.sparse_tail_attention_c8(
+        query, packed, slots, table, lengths, lengths, 1.0
+    )
+    if tuple(output.shape) != (3, heads, NOPE_DIM) or output.dtype != query.dtype:
+        raise AssertionError("C8 SFA Meta implementation returned wrong shape/dtype")
+    print(
+        f"A5_SPARSE_TAIL_ATTENTION_C8_META_CHECK heads={heads} ok=1",
+        flush=True,
+    )
+
+
 def main() -> None:
     args = parse_args()
     validate_args(args)
-    inputs = make_inputs(args)
+    device = torch.device(args.device)
+    if device.type != "npu":
+        raise ValueError("--device must select an NPU")
+    torch.npu.set_device(device)
+    torch.npu.config.allow_internal_format = False
+    device_name = require_a5(device, args.allow_non_a5)
+    check_meta(args.heads, args.max_tail_tokens)
     print(
-        "A5_PACKED_C8_QSFA_CONFIG "
-        f"device={inputs['device']} device_name={inputs['device_name']!r} "
-        f"batch={args.batch_size} heads={args.heads} "
-        f"cache_tokens={args.cache_tokens} tail_tokens={args.tail_tokens} "
-        f"max_tail_tokens={args.max_tail_tokens}",
+        "A5_SPARSE_TAIL_ATTENTION_C8_CONFIG "
+        f"device={device} device_name={device_name!r} heads={args.heads} "
+        f"batch_sizes={args.batch_sizes} cache_tokens={args.cache_tokens} "
+        f"tail_tokens={args.tail_tokens} max_tail_tokens={args.max_tail_tokens}",
         flush=True,
     )
-    if args.mode in ("all", "check"):
-        check(inputs, args)
-    if args.mode in ("all", "bench"):
-        benchmark(inputs, args)
-    print("A5_PACKED_C8_QSFA_UT_OK", flush=True)
+
+    # C8-specific representatives cover the packed dense row, sparse-only,
+    # the common cache budget and the largest production budget/tail pair.
+    mandatory = (
+        (1, 0, 2048, 2048),
+        (1, 2048, 0, 512),
+        (1, 6144, 64, 512),
+        (1, 12288, 257, 512),
+    )
+    for index, (batch, cache_tokens, tail_tokens, max_tail) in enumerate(mandatory):
+        current = case_args(
+            args,
+            batch,
+            cache_tokens,
+            tail_tokens,
+            max_tail,
+            args.seed + 10 + index,
+        )
+        check(make_inputs(current), current)
+
+    case_index = 0
+    for batch in args.batch_sizes:
+        for cache_tokens in args.cache_tokens:
+            for tail_tokens in args.tail_tokens:
+                current = case_args(
+                    args,
+                    batch,
+                    cache_tokens,
+                    tail_tokens,
+                    args.max_tail_tokens,
+                    args.seed + 1000 + case_index,
+                )
+                inputs = make_inputs(current)
+                check(inputs, current)
+                if args.iters > 0:
+                    benchmark(inputs, current)
+                case_index += 1
+    print("A5_SPARSE_TAIL_ATTENTION_C8_UT_OK", flush=True)
 
 
 if __name__ == "__main__":

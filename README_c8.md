@@ -115,36 +115,34 @@ bash build.sh
 
 ## 算子测试
 
-C8 LIDU 直接用官方 A5 C8 LightningIndexer 作为 top-2048 基线，并覆盖 mixed C、乱序 request-pool、零/随机/2048 miss、hit slot 保持、重复更新映射、caller-owned out 和 `262144` 的 18-bit token-index 边界：
+C8 测试固定执行正确性检查；LIDU 和 SFA 使用 `--iters=0` 时仅检查正确性，`--iters>0` 时随后继续计时。
 
 ```bash
-python3 tests/test_fused_li_manage_c8.py --device npu:0 --mode check --heads 32,64 --batch-sizes 24 --source-lens 20096 --cache-tokens 6144 --miss-ranges 0:300 --seed 7
+python3 tests/test_fused_li_manage_c8.py --device npu:0 --heads 32,64 --batch-sizes 24 --source-lens 20096 --cache-tokens 6144 --miss-ranges 0:300 --iters 0 --seed 7
 ```
 
-packed SCATTER 使用真实 swapped memory；分配式与 caller-owned 两条路径都重新 poison HBM，并校验完整 656 bytes、guard、动态 tail metadata、`resident_seq_lengths` 和输出地址：
+该命令以官方 A5 C8 LightningIndexer 为 top-2048 基线，并强制覆盖 mixed C、乱序 request-pool、零/随机/2048 miss、hit slot 保持、重复更新映射、隔离 update 对照、caller-owned out 和 `262144` 的 18-bit token-index 边界。
 
 ```bash
-python3 tests/test_kvcache_scatter_copy_c8.py --device npu:0 --batch-size 24 --source-len 20096 --cache-tokens 6144 --tail-tokens 257 --max-tail-tokens 512 --copy-min 0 --copy-max 300 --warmup 10 --iters 100 --seed 7
+for count in 0 1 100 300 2048; do python3 tests/test_kvcache_scatter_copy_c8.py --device npu:0 --batch-size 24 --source-len 20096 --cache-tokens 6144 --tail-tokens 257 --max-tail-tokens 512 --copy-min "$count" --copy-max "$count" --warmup 3 --iters 10 --seed 7; done
 ```
 
-C8 QSFA 使用独立 CPU FP32 golden 校验 FP8 latent、BF16 RoPE 和 FP32 scales 的 packed layout。首轮门禁固定 `q_head=8`；本仓库不支持 `q_head>64`：
-
-```bash
-for C in 3072 6144 8192 12288; do for tail in 0 1 64 127 257; do python3 tests/test_sparse_tail_attention_c8.py --device npu:0 --mode check --batch-size 24 --heads 8 --cache-tokens "$C" --tail-tokens "$tail" --max-tail-tokens 512 --seed 7; done; done
-```
+SCATTER 使用真实 swapped memory；分配式与 caller-owned 两条路径都独立 poison HBM，并校验完整 656 bytes、未触碰 guard、topK+tail metadata、`resident_seq_lengths` 和输出地址。
 
 ```bash
-python3 tests/test_sparse_tail_attention_c8.py --device npu:0 --mode check --batch-size 1 --heads 8 --cache-tokens 0 --tail-tokens 2048 --max-tail-tokens 2048 --seed 7
+python3 tests/test_sparse_tail_attention_c8.py --device npu:0 --heads 8 --batch-sizes 24 --cache-tokens 6144 --tail-tokens 64 --max-tail-tokens 512 --iters 0 --seed 7
 ```
+
+C8 SFA 固定覆盖 packed dense `C=0`、2048-token sparse-only、常用 `C=6144/tail=64` 和最大档 `C=12288/tail=257`，再检查命令指定的配置；所有结果均与独立 CPU FP32 golden 比较。首轮门禁固定 `q_head=8`，本仓库不支持 `q_head>64`。
 
 图门禁捕获框架链路 `fused_li_manage_c8_out → kvcache_scatter_copy_c8_out → sparse_tail_attention_c8`；不依赖 capture 阶段执行，先用一次 replay 验证零 miss 和完整输出写回，再恢复初始 pool 进行多次非零 miss replay：
 
 ```bash
-python3 tests/test_offload_split_c8_graph.py --device npu:0 --case pure-long --batch-size 2 --heads 8 --index-heads 32 --source-len 4096 --cache-tokens 3072 --tail-tokens 64 --max-tail-tokens 256 --miss-min 256 --miss-max 512 --replays 4 --seed 7
+python3 tests/test_c8_graph.py --device npu:0 --case pure-long --batch-size 2 --heads 8 --index-heads 32 --source-len 4096 --cache-tokens 3072 --tail-tokens 64 --max-tail-tokens 256 --miss-min 256 --miss-max 512 --replays 4 --seed 7
 ```
 
 ```bash
-python3 tests/test_offload_split_c8_graph.py --device npu:0 --case mixed --batch-size 2 --heads 8 --index-heads 32 --source-len 4096 --cache-tokens 3072 --tail-tokens 64 --max-tail-tokens 256 --miss-min 256 --miss-max 512 --replays 4 --seed 7
+python3 tests/test_c8_graph.py --device npu:0 --case mixed --batch-size 2 --heads 8 --index-heads 32 --source-len 4096 --cache-tokens 3072 --tail-tokens 64 --max-tail-tokens 256 --miss-min 256 --miss-max 512 --replays 4 --seed 7
 ```
 
 ## 性能矩阵
@@ -152,5 +150,17 @@ python3 tests/test_offload_split_c8_graph.py --device npu:0 --case mixed --batch
 LIDU：
 
 ```bash
-python3 tests/test_fused_li_manage_c8.py --device npu:0 --mode bench --heads 32 --batch-sizes 1,4,8,12,16,24,32 --source-lens 12288,20096,65536,131072 --cache-tokens 6144 --miss-ranges 0:0,0:300,300:300 --warmup 10 --iters 100 --seed 7
+python3 tests/test_fused_li_manage_c8.py --device npu:0 --heads 32 --batch-sizes 1,4,8,12,16,24,32 --source-lens 12288,20096,65536,131072 --cache-tokens 6144 --miss-ranges 0:0,0:300,300:300 --warmup 10 --iters 100 --seed 7
+```
+
+SCATTER：
+
+```bash
+for bs in 1 4 8 12 16 24 32; do for len in 12288 20096 65536 131072; do python3 tests/test_kvcache_scatter_copy_c8.py --device npu:0 --batch-size "$bs" --source-len "$len" --cache-tokens 6144 --tail-tokens 64 --max-tail-tokens 512 --copy-min 0 --copy-max 300 --warmup 10 --iters 100 --seed 7; done; done
+```
+
+SFA：
+
+```bash
+python3 tests/test_sparse_tail_attention_c8.py --device npu:0 --heads 8 --batch-sizes 1,4,8,12,16,24,32 --cache-tokens 6144 --tail-tokens 64 --max-tail-tokens 512 --warmup 10 --iters 100 --seed 7
 ```

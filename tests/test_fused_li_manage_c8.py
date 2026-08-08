@@ -4,59 +4,34 @@
 from __future__ import annotations
 
 import argparse
-import math
-import random
 import statistics
-from dataclasses import dataclass
 
 import torch
 
 import nanovllm_dsa_a5
 import torch_npu  # type: ignore  # noqa: E402,F401
-from test_fused_li_manage import (
+
+from _c8_lidu_case import C8Case, make_case, official_c8_lightning_indexer
+from _lidu_utils import (
     MAX_CACHE_TOKENS,
     MAX_SOURCE_CAPACITY,
+    TOPK,
     assert_18bit_boundary_selected,
     assert_pool_row,
     assert_request_pool_entries,
     assert_update_row,
-    build_pool,
-    csv_ints,
     feasible_miss,
     miss_ranges,
 )
+from _utils import csv_ints, require_a5
 
 
 BLOCK_SIZE = 128
-HEAD_DIM = 128
-TOPK = 2048
-
-
-@dataclass
-class C8Case:
-    query: torch.Tensor
-    key: torch.Tensor
-    weights: torch.Tensor
-    query_scale: torch.Tensor
-    key_scale: torch.Tensor
-    actual_q: torch.Tensor
-    req_entries: torch.Tensor
-    req_entries_cpu: torch.Tensor
-    cache_tokens: torch.Tensor
-    candidate_lens: torch.Tensor
-    block_table: torch.Tensor
-    native_topk: torch.Tensor
-    initial_pool: torch.Tensor
-    target_misses: list[int]
-    source_capacity: int
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="npu:0")
-    parser.add_argument(
-        "--mode", choices=("all", "check", "bench", "profile"), default="all"
-    )
     parser.add_argument("--batch-sizes", type=csv_ints, default=csv_ints("24"))
     parser.add_argument("--source-lens", type=csv_ints, default=csv_ints("20096"))
     parser.add_argument("--heads", type=csv_ints, default=csv_ints("32,64"))
@@ -65,7 +40,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pool-extra", type=int, default=7)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iters", type=int, default=20)
-    parser.add_argument("--profile-replays", type=int, default=4)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--allow-non-a5", action="store_true")
     return parser.parse_args()
@@ -87,213 +61,6 @@ def check_args(args: argparse.Namespace) -> None:
         raise ValueError("cache tokens must be 0 or block aligned in [2048,16256]")
     if args.pool_extra < 0 or args.warmup < 0 or args.iters < 0:
         raise ValueError("pool-extra/warmup/iters must be non-negative")
-
-
-def require_a5(device: torch.device, allow_non_a5: bool) -> str:
-    index = device.index if device.index is not None else torch.npu.current_device()
-    getter = getattr(torch.npu, "get_device_name", torch_npu.npu.get_device_name)
-    name = getter(index)
-    if "950" not in name.lower() and not allow_non_a5:
-        raise RuntimeError(
-            f"expected Ascend 950, got {name!r}; "
-            "use --allow-non-a5 only for debugging"
-        )
-    return name
-
-
-def quantize_fp8(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    quantized, scale = torch_npu.npu_dynamic_quant(
-        tensor, dst_type=torch.float8_e4m3fn
-    )
-    return (
-        quantized.contiguous(),
-        scale.view(tensor.shape[:-1]).to(torch.float32).contiguous(),
-    )
-
-
-def normalized_hadamard_128(
-    *, dtype: torch.dtype, device: torch.device
-) -> torch.Tensor:
-    """Match the normalized 128x128 Hadamard used by official GLM C8 LI."""
-
-    matrix = torch.ones((1, 1), dtype=torch.float32)
-    while matrix.size(0) < HEAD_DIM:
-        top = torch.cat((matrix, matrix), dim=1)
-        bottom = torch.cat((matrix, -matrix), dim=1)
-        matrix = torch.cat((top, bottom), dim=0)
-    return (matrix / math.sqrt(HEAD_DIM)).to(dtype=dtype, device=device)
-
-
-def official_c8_lightning_indexer(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    weights: torch.Tensor,
-    query_scale: torch.Tensor,
-    key_scale: torch.Tensor,
-    actual_q: torch.Tensor,
-    candidate_lens: torch.Tensor,
-    block_table: torch.Tensor,
-) -> torch.Tensor:
-    """Call the same official A5 C8 LI ABI used by vLLM-Ascend."""
-
-    op = getattr(torch_npu, "npu_quant_lightning_indexer", None)
-    if op is None:
-        namespace = getattr(torch.ops, "_C_ascend", None)
-        op = (
-            getattr(namespace, "npu_lightning_indexer_quant", None)
-            if namespace is not None
-            else None
-        )
-    if op is None:
-        raise RuntimeError("official A5 C8 LightningIndexer is not registered")
-    output = op(
-        query=query,
-        key=key,
-        weights=weights,
-        query_dequant_scale=query_scale,
-        key_dequant_scale=key_scale,
-        actual_seq_lengths_query=actual_q,
-        actual_seq_lengths_key=candidate_lens,
-        block_table=block_table,
-        query_quant_mode=0,
-        key_quant_mode=0,
-        layout_query="TND",
-        layout_key="PA_BSND",
-        sparse_count=TOPK,
-        sparse_mode=3,
-    )
-    topk = output[0] if isinstance(output, tuple) else output
-    if not isinstance(topk, torch.Tensor) or topk.dtype != torch.int32:
-        raise RuntimeError("official A5 C8 LI returned no int32 top-k tensor")
-    if topk.numel() != query.size(0) * TOPK:
-        raise RuntimeError(
-            f"official A5 C8 LI returned unexpected shape {tuple(topk.shape)}"
-        )
-    return topk.reshape(query.size(0), TOPK).contiguous()
-
-
-def make_case(
-    device: torch.device,
-    batch: int,
-    source_len: int,
-    heads: int,
-    budgets: list[int],
-    miss_range: tuple[int, int],
-    pool_extra: int,
-    seed: int,
-    candidate_lens_cpu: list[int] | None = None,
-) -> C8Case:
-    if len(budgets) != batch:
-        raise ValueError("budget list must match batch")
-    torch.manual_seed(seed)
-    torch.npu.manual_seed_all(seed)
-    blocks = source_len // BLOCK_SIZE
-    block_table_cpu = torch.stack(
-        [
-            torch.randperm(blocks, dtype=torch.int64).to(torch.int32)
-            for _ in range(batch)
-        ]
-    )
-    query_fp = torch.empty(
-        (batch, heads, HEAD_DIM), dtype=torch.bfloat16, device=device
-    ).uniform_(-1, 1)
-    key_fp = torch.empty(
-        (blocks, BLOCK_SIZE, 1, HEAD_DIM),
-        dtype=torch.bfloat16,
-        device=device,
-    ).uniform_(-1, 1)
-    hadamard = normalized_hadamard_128(
-        dtype=query_fp.dtype, device=device
-    )
-    query_fp = torch.matmul(query_fp, hadamard)
-    key_fp = torch.matmul(key_fp, hadamard)
-    query, query_scale = quantize_fp8(query_fp)
-    key, key_scale = quantize_fp8(key_fp)
-    weights = torch.empty(
-        (batch, heads), dtype=torch.bfloat16, device=device
-    ).uniform_(0.01, 1.0).contiguous()
-
-    if candidate_lens_cpu is None:
-        candidate_lens_cpu = [source_len] * batch
-    if len(candidate_lens_cpu) != batch:
-        raise ValueError("candidate length list must match batch")
-    if any(length < TOPK or length > source_len for length in candidate_lens_cpu):
-        raise ValueError("candidate lengths must be in [2048,source_capacity]")
-    candidate_lens = torch.tensor(
-        candidate_lens_cpu, dtype=torch.int32, device=device
-    )
-    actual_q = torch.arange(1, batch + 1, dtype=torch.int32, device=device)
-    block_table = block_table_cpu.to(device)
-    native_topk = official_c8_lightning_indexer(
-        query,
-        key,
-        weights,
-        query_scale,
-        key_scale,
-        actual_q,
-        candidate_lens,
-        block_table,
-    )
-    torch.npu.synchronize()
-
-    rng = random.Random(seed + 1)
-    target_misses: list[int] = []
-    for candidate_len, budget in zip(candidate_lens_cpu, budgets):
-        if budget == 0:
-            target_misses.append(0)
-            continue
-        feasible = [
-            miss
-            for miss in range(miss_range[0], miss_range[1] + 1)
-            if feasible_miss(candidate_len, budget, miss)
-        ]
-        if not feasible:
-            raise ValueError(
-                f"no feasible miss in {miss_range} for "
-                f"candidate_len={candidate_len}, C={budget}"
-            )
-        target_misses.append(rng.choice(feasible))
-    if batch > 1:
-        if budgets[0] > 0 and feasible_miss(
-            candidate_lens_cpu[0], budgets[0], miss_range[0]
-        ):
-            target_misses[0] = miss_range[0]
-        if budgets[1] > 0 and feasible_miss(
-            candidate_lens_cpu[1], budgets[1], miss_range[1]
-        ):
-            target_misses[1] = miss_range[1]
-
-    pool_size = batch + pool_extra
-    req_entries_cpu = torch.randperm(pool_size, dtype=torch.int64)[:batch].to(
-        torch.int32
-    )
-    initial_pool = build_pool(
-        native_topk,
-        source_len,
-        candidate_lens_cpu,
-        budgets,
-        target_misses,
-        req_entries_cpu,
-        pool_size,
-        seed + 2,
-    ).to(device)
-    return C8Case(
-        query=query,
-        key=key,
-        weights=weights,
-        query_scale=query_scale,
-        key_scale=key_scale,
-        actual_q=actual_q,
-        req_entries=req_entries_cpu.to(device),
-        req_entries_cpu=req_entries_cpu,
-        cache_tokens=torch.tensor(budgets, dtype=torch.int32, device=device),
-        candidate_lens=candidate_lens,
-        block_table=block_table,
-        native_topk=native_topk,
-        initial_pool=initial_pool,
-        target_misses=target_misses,
-        source_capacity=source_len,
-    )
 
 
 def launch(case: C8Case, pool: torch.Tensor):
@@ -444,7 +211,7 @@ def check_case(case: C8Case) -> None:
         raise AssertionError("caller-owned C8 LIDU path produced different cache state")
 
     print(
-        "A5_C8_LIDU_CHECK "
+        "A5_FUSED_LI_MANAGE_C8_CHECK "
         f"heads={case.query.size(1)} batch={case.query.size(0)} "
         f"source_capacity={case.source_capacity} "
         f"candidates={case.candidate_lens.cpu().tolist()} "
@@ -501,6 +268,41 @@ def event_benchmark(case: C8Case, warmup: int, iters: int) -> tuple[float, float
     return native_us, lidu_us
 
 
+def check_meta() -> None:
+    query = torch.empty((3, 32, 128), dtype=torch.float8_e4m3fn, device="meta")
+    key = torch.empty(
+        (96, BLOCK_SIZE, 1, 128), dtype=torch.float8_e4m3fn, device="meta"
+    )
+    weights = torch.empty((3, 32), dtype=torch.bfloat16, device="meta")
+    query_scale = torch.empty((3, 32), dtype=torch.float32, device="meta")
+    key_scale = torch.empty(
+        (96, BLOCK_SIZE, 1), dtype=torch.float32, device="meta"
+    )
+    ints = torch.empty((3,), dtype=torch.int32, device="meta")
+    req = torch.empty((3,), dtype=torch.int32, device="meta")
+    pool = torch.empty((7, 12288), dtype=torch.int32, device="meta")
+    table = torch.empty((3, 96), dtype=torch.int32, device="meta")
+    outputs = torch.ops.nanovllm_dsa.fused_li_manage_c8.default(
+        query,
+        key,
+        weights,
+        query_scale,
+        key_scale,
+        ints,
+        req,
+        pool,
+        ints,
+        ints,
+        table,
+    )
+    expected = [(3, 1, TOPK), (3, 1, TOPK), (3,), (7, 12288)]
+    if [tuple(tensor.shape) for tensor in outputs] != expected:
+        raise AssertionError("C8 LIDU Meta implementation returned wrong shapes")
+    if outputs[3] is not pool and outputs[3]._cdata != pool._cdata:
+        raise AssertionError("C8 LIDU Meta cache output does not alias its input")
+    print("A5_FUSED_LI_MANAGE_C8_META_CHECK ok=1", flush=True)
+
+
 def main() -> None:
     args = parse_args()
     check_args(args)
@@ -510,46 +312,44 @@ def main() -> None:
     torch.npu.set_device(device)
     torch.npu.config.allow_internal_format = False
     device_name = require_a5(device, args.allow_non_a5)
-    run_correctness = args.mode in ("all", "check") or args.iters == 0
-
-    if run_correctness:
-        mixed = make_case(
-            device,
-            6,
-            32768,
-            32,
-            [0, 3072, 6144, 8192, 12288, MAX_CACHE_TOKENS],
-            (0, 300),
-            args.pool_extra,
-            args.seed + 100,
-            [2048, 8192, 12288, 20096, 24576, 32768],
-        )
-        check_case(mixed)
-        miss_edges = make_case(
-            device,
-            2,
-            4096,
-            32,
-            [2048, 2048],
-            (0, TOPK),
-            args.pool_extra,
-            args.seed + 200,
-        )
-        check_case(miss_edges)
-        boundary = make_case(
-            device,
-            1,
-            MAX_SOURCE_CAPACITY,
-            32,
-            [6144],
-            (0, 300),
-            args.pool_extra,
-            args.seed + 300,
-        )
-        assert_18bit_boundary_selected(
-            boundary, "A5_C8_LIDU_18BIT_BOUNDARY_CHECK"
-        )
-        check_case(boundary)
+    check_meta()
+    mixed = make_case(
+        device,
+        6,
+        32768,
+        32,
+        [0, 3072, 6144, 8192, 12288, MAX_CACHE_TOKENS],
+        (0, 300),
+        args.pool_extra,
+        args.seed + 100,
+        [2048, 8192, 12288, 20096, 24576, 32768],
+    )
+    check_case(mixed)
+    miss_edges = make_case(
+        device,
+        2,
+        4096,
+        32,
+        [2048, 2048],
+        (0, TOPK),
+        args.pool_extra,
+        args.seed + 200,
+    )
+    check_case(miss_edges)
+    boundary = make_case(
+        device,
+        1,
+        MAX_SOURCE_CAPACITY,
+        32,
+        [6144],
+        (0, 300),
+        args.pool_extra,
+        args.seed + 300,
+    )
+    assert_18bit_boundary_selected(
+        boundary, "A5_FUSED_LI_MANAGE_C8_18BIT_BOUNDARY_CHECK"
+    )
+    check_case(boundary)
 
     case_index = 0
     for heads in args.heads:
@@ -562,7 +362,7 @@ def main() -> None:
                             for miss in range(miss_range[0], miss_range[1] + 1)
                         ):
                             print(
-                                "A5_C8_LIDU_SKIP "
+                                "A5_FUSED_LI_MANAGE_C8_SKIP "
                                 f"heads={heads} batch={batch} "
                                 f"source_len={source_len} C={budget} "
                                 f"miss_range={miss_range} reason=infeasible",
@@ -580,14 +380,13 @@ def main() -> None:
                             args.seed + case_index,
                         )
                         case_index += 1
-                        if run_correctness:
-                            check_case(case)
-                        if args.mode in ("all", "bench") and args.iters > 0:
+                        check_case(case)
+                        if args.iters > 0:
                             native_us, lidu_us = event_benchmark(
                                 case, args.warmup, args.iters
                             )
                             print(
-                                "A5_C8_LIDU_RESULT "
+                                "A5_FUSED_LI_MANAGE_C8_RESULT "
                                 f"device_name={device_name!r} heads={heads} "
                                 f"batch={batch} source_len={source_len} C={budget} "
                                 f"miss_range={miss_range[0]}:{miss_range[1]} "
@@ -598,13 +397,7 @@ def main() -> None:
                                 f"warmup={args.warmup} iters={args.iters}",
                                 flush=True,
                             )
-                        if args.mode == "profile" and args.iters > 0:
-                            pool = case.initial_pool.clone()
-                            for _ in range(args.profile_replays):
-                                pool.copy_(case.initial_pool)
-                                launch(case, pool)
-                            torch.npu.synchronize()
-    print("A5_C8_LIDU_UT_OK", flush=True)
+    print("A5_FUSED_LI_MANAGE_C8_UT_OK", flush=True)
 
 
 if __name__ == "__main__":
