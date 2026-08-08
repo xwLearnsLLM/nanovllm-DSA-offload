@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import argparse
 import math
-import os
 
 import torch
 import torch_npu  # type: ignore
 
 import nanovllm.ops  # noqa: F401  # Load repository-local custom operators.
-import test_lidu_mtp as lidu_ut
+from ut_ops._op_utils import require_local_opapi
+import test_fused_li_manage_mtp as lidu_ut
 
 
 QUERY_COUNT = lidu_ut.QUERY_COUNT
@@ -236,7 +236,7 @@ def call_attention_out(
 ) -> torch.Tensor:
     latent_cache = ckv.view(-1, BLOCK_SIZE, 1, CKV_DIM)
     rope_cache = kpe.view(-1, BLOCK_SIZE, 1, KPE_DIM)
-    return torch.ops.nanovllm_dsa.sparse_and_tail_attention_mtp_out.default(
+    return torch.ops.nanovllm_dsa.sparse_tail_attention_mtp_out.default(
         query,
         latent_cache,
         latent_cache,
@@ -567,12 +567,7 @@ def main() -> None:
         raise ValueError("--device must select one NPU, for example npu:0")
     torch.npu.set_device(device)
     torch.npu.config.allow_internal_format = False
-    opapi_path = os.environ.get("NANOVLLM_CUST_OPAPI_LIB", "")
-    if not opapi_path or not os.path.isfile(opapi_path):
-        raise RuntimeError(
-            "Repository-local libcust_opapi.so was not selected; rebuild "
-            "with `bash scripts/build_nanovllm_ops.sh`."
-        )
+    opapi_path = require_local_opapi()
     print(f"MTP_OFFLOAD_CHAIN_OPAPI path={opapi_path} local=1", flush=True)
     print(
         "MTP_OFFLOAD_CHAIN_CONFIG "

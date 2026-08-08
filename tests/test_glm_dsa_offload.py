@@ -207,9 +207,11 @@ def test_glm_offload_accepts_supported_cache_geometry(
     )
 
 
+@pytest.mark.parametrize("batch_size", [24, 25, 48, 64])
 def test_glm_offload_fuse_allows_full_decode_only(
     tmp_path,
     monkeypatch,
+    batch_size,
 ):
     monkeypatch.delenv("ASCEND_LAUNCH_BLOCKING", raising=False)
     _write_glm_config(
@@ -225,11 +227,12 @@ def test_glm_offload_fuse_allows_full_decode_only(
         max_model_len=32768,
         kvcache_block_size=128,
         enforce_eager=False,
-        max_num_decode_seqs_per_step=24,
-        decode_graph_capture_sizes=(24,),
+        max_num_decode_seqs_per_step=batch_size,
+        decode_graph_capture_sizes=(batch_size,),
     )
 
-    assert config.decode_graph_capture_sizes == (24,)
+    assert config.max_num_decode_seqs_per_step == batch_size
+    assert config.decode_graph_capture_sizes == (batch_size,)
 
 
 def test_glm_dense_mla_mode_needs_no_dram_cache(tmp_path):

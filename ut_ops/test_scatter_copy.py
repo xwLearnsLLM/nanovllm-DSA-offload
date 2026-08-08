@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import argparse
 import math
-import os
 from time import perf_counter
 
 import torch
 import torch_npu  # type: ignore
 
 import nanovllm.ops  # noqa: F401  # Load repository-local custom operators.
+from ut_ops._op_utils import require_local_opapi
 
 
 BLOCK_SIZE = 128
@@ -481,12 +481,7 @@ def main() -> None:
         raise ValueError("--device must select one NPU, for example npu:0.")
     torch.npu.set_device(device)
     torch.npu.config.allow_internal_format = False
-    opapi_path = os.environ.get("NANOVLLM_CUST_OPAPI_LIB", "")
-    if not opapi_path or not os.path.isfile(opapi_path):
-        raise RuntimeError(
-            "Repository-local libcust_opapi.so was not selected; rebuild "
-            "with `bash scripts/build_nanovllm_ops.sh`."
-        )
+    opapi_path = require_local_opapi()
     print(f"SCATTER_COPY_OPAPI path={opapi_path} local=1")
     run_correctness(device, args.seed)
     if not args.skip_performance:

@@ -1,4 +1,4 @@
-﻿# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the Nano-vLLM project
 
 from __future__ import annotations
@@ -167,7 +167,7 @@ class ModelRunner:
         torch.set_default_device(self.device)
 
         self.model = self._load_model()
-        self.uses_sparse_and_tail_attention = self.uses_offload
+        self.uses_sparse_tail_attention = self.uses_offload
 
         self.sampler = Sampler()
         self._decode_dynamic_buffers: dict[int, _DecodeDynamicBuffers] = {}
@@ -224,11 +224,11 @@ class ModelRunner:
                     device=self.device,
                     expected_mla_tasks=(
                         0
-                        if self.uses_sparse_and_tail_attention
+                        if self.uses_sparse_tail_attention
                         else int(text_config.num_hidden_layers)
                     ),
                     offload_mode=self.offload_mode,
-                    uses_tensor_mla_lengths=self.uses_sparse_and_tail_attention,
+                    uses_tensor_mla_lengths=self.uses_sparse_tail_attention,
                     log_enabled=self.rank == 0,
                 )
                 if self.uses_offload:
@@ -898,7 +898,7 @@ class ModelRunner:
             )
             actual_seq_lengths_kv_tensor = (
                 dynamic_buffers.actual_seq_lengths_kv.stage(sparse_kv_lens)
-                if self.uses_sparse_and_tail_attention
+                if self.uses_sparse_tail_attention
                 else None
             )
             flat_slot_mapping_i64 = None
@@ -923,7 +923,7 @@ class ModelRunner:
             ).to(self.device, non_blocking=True)
             flat_slot_mapping_i64 = None
             actual_seq_lengths_kv_tensor = None
-            if self.uses_sparse_and_tail_attention:
+            if self.uses_sparse_tail_attention:
                 actual_seq_lengths_kv_tensor = torch.tensor(
                     sparse_kv_lens,
                     dtype=torch.int32,

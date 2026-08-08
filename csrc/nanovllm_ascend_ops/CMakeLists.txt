@@ -104,11 +104,11 @@ target_include_directories(_C BEFORE PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/ops/mla_preprocess
   ${CMAKE_CURRENT_SOURCE_DIR}/ops/mla_preprocess/op_host
   ${CMAKE_CURRENT_SOURCE_DIR}/cann_ops
-  ${CMAKE_CURRENT_SOURCE_DIR}/ops/lightning_indexer_decode_update
-  ${CMAKE_CURRENT_SOURCE_DIR}/ops/lightning_indexer_decode_update_mtp
+  ${CMAKE_CURRENT_SOURCE_DIR}/ops/fused_li_manage
+  ${CMAKE_CURRENT_SOURCE_DIR}/ops/fused_li_manage_mtp
   ${CMAKE_CURRENT_SOURCE_DIR}/ops/kvcache_scatter_copy
-  ${CMAKE_CURRENT_SOURCE_DIR}/ops/sparse_and_tail_attention
-  ${CMAKE_CURRENT_SOURCE_DIR}/ops/sparse_and_tail_attention_and_scatter_copy
+  ${CMAKE_CURRENT_SOURCE_DIR}/ops/sparse_tail_attention
+  ${CMAKE_CURRENT_SOURCE_DIR}/ops/fused_copy_sfa
   ${CMAKE_CURRENT_SOURCE_DIR}/ops/matmul_allreduce_add_rmsnorm
   ${CMAKE_CURRENT_SOURCE_DIR}/ops/moe_gating_top_k)
 

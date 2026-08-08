@@ -560,7 +560,6 @@ def main() -> None:
         cos_bmm,
         sin_bmm,
         GLM_INDEX_ROPE_DIM,
-        "interleave",
     ):
         raise AssertionError(
             "GLM query-only test did not select the fused in-place RoPE "
