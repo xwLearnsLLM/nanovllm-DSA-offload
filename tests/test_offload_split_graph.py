@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Capture/replay A5 LIDU with split or BF16 fused Attention/SCATTER."""
+"""Capture/replay A5 LIDU with split or fused Attention/SCATTER."""
 
 from __future__ import annotations
 
@@ -33,15 +33,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--attention-path",
-        choices=("split", "fused", "mte_pipeline"),
+        choices=("split", "fused"),
         default="split",
-        help="Select split SCATTER+SFA or one of the two BF16 fused operators.",
+        help="Select split SCATTER+SFA or the promoted BF16 fused operator.",
     )
     parser.add_argument(
         "--prefetch-rows-per-step",
         type=int,
         default=5,
-        help="MTE-pipeline prefetch depth; ignored by the other paths.",
+        help="Fused MTE-pipeline prefetch depth; ignored by split.",
     )
     parser.add_argument("--replays", type=int, default=4)
     parser.add_argument("--seed", type=int, default=7)
@@ -312,18 +312,12 @@ def main() -> None:
             lidu_outputs[2],
             scale,
         )
-        if args.attention_path == "fused":
-            fused_outputs = (
-                torch.ops.nanovllm_dsa
-                .sparse_and_tail_attention_and_scatter_copy.default(*fused_args)
+        fused_outputs = (
+            torch.ops.nanovllm_dsa
+            .sparse_and_tail_attention_and_scatter_copy.default(
+                *fused_args, args.prefetch_rows_per_step
             )
-        else:
-            fused_outputs = (
-                torch.ops.nanovllm_dsa
-                .sparse_and_tail_attention_and_scatter_copy_mte_pipeline.default(
-                    *fused_args, args.prefetch_rows_per_step
-                )
-            )
+        )
         return lidu_outputs, (fused_outputs[1], fused_outputs[2]), fused_outputs[0]
 
     # Eager warmup and capture both use the initial high-token zero-miss state.

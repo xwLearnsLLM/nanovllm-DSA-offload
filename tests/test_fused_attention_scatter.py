@@ -881,7 +881,7 @@ def event_benchmark(fn, warmup: int, iters: int) -> float:
 
 def benchmark(case: Case, warmup: int, iters: int) -> None:
     batch = case.query.size(0)
-    strategy = "a5_source_aware_gather_staggered"
+    strategy = "a5_mte_pipeline_default_prefetch5"
     serial_ms = event_benchmark(lambda: launch_serial(case), warmup, iters)
     fused_ms = event_benchmark(lambda: launch_fused(case), warmup, iters)
     # Keep serial/fused first so component timing cannot perturb their values.
@@ -928,7 +928,7 @@ def profile_calls(case: Case, replays: int) -> None:
 def main() -> None:
     args = parse_args()
     case = make_case(args)
-    strategy = "a5_source_aware_gather_staggered"
+    strategy = "a5_mte_pipeline_default_prefetch5"
     print(
         "FUSED_SCATTER_ATTENTION_CONFIG "
         "model=GLM-5.1 tp=16 dtype=bf16 "

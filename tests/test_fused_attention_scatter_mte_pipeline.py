@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check and benchmark the A5 hit-first MTE pipeline against the baseline."""
+"""Check and tune the promoted A5 fused Attention/SCATTER MTE pipeline."""
 
 from __future__ import annotations
 
@@ -142,7 +142,7 @@ def launch_pipeline(
     base = case.base
     output, _, _ = (
         nanovllm_dsa_a5
-        .sparse_and_tail_attention_and_scatter_copy_mte_pipeline(
+        .sparse_and_tail_attention_and_scatter_copy(
             base.query,
             case.pipeline_ckv,
             base.sparse_slots,

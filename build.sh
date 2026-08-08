@@ -64,11 +64,11 @@ OP_NAMES=(
     A5KvcacheScatterCopy
     A5PackedKvcacheScatterCopy
     A5SparseAndTailAttention
-    A5SparseAndTailAttentionAndScatterCopy
     A5SparseAndTailAttentionAndScatterCopyMtePipeline
 )
 
-# These are the eight operators visible to the framework. C8 LIDU is composed
+# These directories provide the BF16 and C8 operators visible to the framework.
+# C8 LIDU is composed
 # from the official quant LightningIndexer and a repository-local pool-update
 # kernel; C8 Attention is an adapter over the native A5 QSFA implementation.
 FRAMEWORK_OP_DIRS=(
@@ -78,7 +78,6 @@ FRAMEWORK_OP_DIRS=(
     lidu_decode_update_c8
     scatter_copy_c8
     sparse_and_tail_attention_c8
-    sparse_and_tail_attention_and_scatter_copy
     sparse_and_tail_attention_and_scatter_copy_mte_pipeline
 )
 
