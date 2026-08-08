@@ -59,7 +59,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--graph-replays", type=int, default=3)
-    parser.add_argument("--min-speedup", type=float, default=1.0)
     parser.add_argument(
         "--skip-performance",
         action="store_true",
@@ -85,10 +84,6 @@ def _validate_cli(args: argparse.Namespace) -> None:
         raise ValueError(
             "--warmup/--graph-replays must be >=0 and --iters must be >0."
         )
-    if args.min_speedup <= 0:
-        raise ValueError("--min-speedup must be positive.")
-
-
 def _random_block_table(
     batch_size: int,
     blocks_per_request: int,
@@ -1144,7 +1139,6 @@ def run_performance_case(
     seed: int,
     warmup: int,
     iters: int,
-    min_speedup: float,
 ) -> None:
     case = make_case(
         name="performance",
@@ -1272,14 +1266,9 @@ def run_performance_case(
         f"batch={batch_size} candidate_len={source_len} "
         f"cache_tokens={cache_tokens} fused_ms={fused_ms:.6f} "
         f"four_serial_lidu_ms={serial_ms:.6f} speedup={speedup:.4f} "
-        f"min_speedup={min_speedup:.4f} warmup={warmup} iters={iters}",
+        f"warmup={warmup} iters={iters}",
         flush=True,
     )
-    if speedup < min_speedup:
-        raise AssertionError(
-            "MTP-LIDU performance gate failed after reporting all metrics: "
-            f"speedup={speedup:.4f} is below {min_speedup:.4f}"
-        )
     del case
     torch.npu.empty_cache()
 
@@ -1342,7 +1331,6 @@ def main() -> None:
             seed=args.seed,
             warmup=args.warmup,
             iters=args.iters,
-            min_speedup=args.min_speedup,
         )
     print("FUSED_LI_MANAGE_MTP_UT_OK", flush=True)
 

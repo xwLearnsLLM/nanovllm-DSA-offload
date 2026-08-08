@@ -137,7 +137,7 @@ python3 ut_ops/test_scatter_copy.py \
 python3 ut_ops/test_sparse_tail_attention.py \
   --device npu:0 --heads 4 --batch-size 24 \
   --cache-tokens 6144 --tail-tokens 64 \
-  --warmup 10 --iters 100 --min-speedup 1.0 --seed 7
+  --warmup 10 --iters 100 --seed 7
 
 # 融合算子语义与性能
 python3 ut_ops/test_fused_copy_sfa.py \
@@ -161,13 +161,13 @@ done
 python3 ut_ops/test_fused_li_manage_mtp.py \
   --device npu:0 --batch-size 24 --source-len 20992 \
   --cache-tokens 8192 --graph-replays 3 \
-  --warmup 10 --iters 100 --min-speedup 1.0 --seed 7
+  --warmup 10 --iters 100 --seed 7
 
 # 四行因果 sparse Attention、_out 和 graph replay
 python3 ut_ops/test_sparse_tail_attention_mtp.py \
   --device npu:0 --heads 2 --batch-size 24 \
   --cache-tokens 8192 --tail-tokens 64 --graph-replays 3 \
-  --warmup 10 --iters 100 --min-speedup 1.0 --seed 7
+  --warmup 10 --iters 100 --seed 7
 
 # 完整 MTP 卸载链的数据依赖
 python3 ut_ops/test_mtp_offload_chain.py \

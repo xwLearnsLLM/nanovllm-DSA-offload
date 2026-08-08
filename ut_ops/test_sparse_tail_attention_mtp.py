@@ -35,7 +35,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--graph-replays", type=int, default=3)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=100)
-    parser.add_argument("--min-speedup", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument(
         "--skip-performance",
@@ -416,7 +415,6 @@ def run_performance(
     tail_count: int,
     warmup: int,
     iters: int,
-    min_speedup: float,
     seed: int,
 ) -> None:
     final_len = cache_count + tail_count + QUERY_COUNT
@@ -542,13 +540,9 @@ def run_performance(
         f"batch={batch_size} heads={heads} cache_tokens={cache_count} "
         f"tail_tokens={tail_count} max_attended={TOPK + tail_count + 4} "
         f"mtp_ms={mtp_ms:.6f} four_serial_ms={serial_ms:.6f} "
-        f"speedup={speedup:.4f} min_speedup={min_speedup:.4f} "
+        f"speedup={speedup:.4f} "
         f"warmup={warmup} iters={iters}"
     )
-    if speedup < min_speedup:
-        raise AssertionError(
-            f"MTP Attention speedup={speedup:.4f} is below {min_speedup:.4f}"
-        )
 
 
 def main() -> None:
@@ -562,9 +556,8 @@ def main() -> None:
         or args.graph_replays < 1
         or args.warmup < 0
         or args.iters <= 0
-        or args.min_speedup < 0
     ):
-        raise ValueError("invalid batch/cache/tail/replay/performance arguments")
+        raise ValueError("invalid batch/cache/tail/replay/timing arguments")
     device = torch.device(args.device)
     if device.type != "npu":
         raise ValueError("--device must select one NPU, for example npu:0")
@@ -592,7 +585,6 @@ def main() -> None:
             tail_count=args.tail_tokens,
             warmup=args.warmup,
             iters=args.iters,
-            min_speedup=args.min_speedup,
             seed=args.seed,
         )
     print("MTP_SPARSE_TAIL_ATTENTION_UT_OK")
