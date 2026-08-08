@@ -50,11 +50,6 @@ class Case:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="npu:0")
-    parser.add_argument(
-        "--mode",
-        choices=("all", "check", "bench", "profile"),
-        default="all",
-    )
     parser.add_argument("--batch-size", type=int, default=24)
     parser.add_argument(
         "--heads",
@@ -69,7 +64,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--miss-max", type=int, default=300)
     parser.add_argument("--warmup", type=int, default=100)
     parser.add_argument("--iters", type=int, default=100)
-    parser.add_argument("--profile-replays", type=int, default=4)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--allow-non-a5", action="store_true")
     return parser.parse_args()
@@ -759,24 +753,10 @@ def benchmark(case: Case, warmup: int, iters: int) -> None:
     )
 
 
-def profile_calls(case: Case, replays: int) -> None:
-    launch_serial(case)
-    launch_fused(case)
-    torch.npu.synchronize()
-    print(f"A5_FUSED_PROFILE_SPLIT_BEGIN replays={replays}", flush=True)
-    for _ in range(replays):
-        launch_serial(case)
-    torch.npu.synchronize()
-    print("A5_FUSED_PROFILE_SPLIT_END", flush=True)
-    print(f"A5_FUSED_PROFILE_FUSED_BEGIN replays={replays}", flush=True)
-    for _ in range(replays):
-        launch_fused(case)
-    torch.npu.synchronize()
-    print("A5_FUSED_PROFILE_FUSED_END", flush=True)
-
-
 def main() -> None:
     args = parse_args()
+    if args.warmup < 0 or args.iters < 0:
+        raise ValueError("warmup and iters must be non-negative")
     device = torch.device(args.device)
     if device.type != "npu":
         raise ValueError("--device must select an NPU")
@@ -788,7 +768,7 @@ def main() -> None:
     print(
         "A5_FUSED_COPY_SPARSE_TAIL_ATTENTION_CONFIG "
         "model=GLM-5.1 tp=16 dtype=bf16 "
-        f"mode={args.mode} local_heads={args.heads} "
+        f"local_heads={args.heads} "
         f"batch={args.batch_size} source_len={args.source_len} "
         f"cache_tokens={args.cache_tokens} tail_tokens={args.tail_tokens} "
         f"miss_range=[{args.miss_min},{args.miss_max}] "
@@ -799,12 +779,9 @@ def main() -> None:
         f"opapi={nanovllm_dsa_a5.local_opapi_path()}",
         flush=True,
     )
-    if args.mode in ("all", "check"):
-        check_semantics(case)
-    if args.mode in ("all", "bench"):
+    check_semantics(case)
+    if args.iters > 0:
         benchmark(case, args.warmup, args.iters)
-    if args.mode == "profile":
-        profile_calls(case, args.profile_replays)
     print("A5_FUSED_COPY_SPARSE_TAIL_ATTENTION_UT_OK", flush=True)
 
 

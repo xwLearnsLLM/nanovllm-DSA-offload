@@ -127,8 +127,10 @@ bash build.sh
 
 ## 算子测试
 
+BF16 测试固定执行正确性检查；`--iters=0` 仅检查正确性，`--iters>0` 随后继续计时。
+
 ```bash
-python3 tests/test_fused_li_manage.py --device npu:0 --mode check --heads 32,64 --batch-sizes 24 --source-lens 20096 --cache-tokens 6144 --miss-ranges 0:300 --seed 7
+python3 tests/test_fused_li_manage.py --device npu:0 --heads 32,64 --batch-sizes 24 --source-lens 20096 --cache-tokens 6144 --miss-ranges 0:300 --iters 0 --seed 7
 ```
 
 该 LIDU 命令还会强制覆盖不同 candidate length、`C=0/2048/3072/6144/8192/12288/16256`、零 miss、2048 miss、乱序 pool entries、hit slot 保持、重复更新映射、inactive pool guard、caller-owned out 和 `262144` 的 18-bit token-index 边界。
@@ -140,13 +142,13 @@ for count in 0 1 100 300 2048; do python3 tests/test_kvcache_scatter_copy.py --d
 SCATTER 使用 `empty_with_swapped_memory` 创建真实 DRAM tensor；每次正确性调用前 poison HBM 目标，并验证 CKV、KPE、随机 block tables 和未触碰 guard。
 
 ```bash
-python3 tests/test_sparse_tail_attention.py --device npu:0 --mode check --heads 8 --batch-sizes 24 --source-lens 20096 --cache-tokens 6144 --tail-tokens 64 --seed 7
+python3 tests/test_sparse_tail_attention.py --device npu:0 --heads 8 --batch-sizes 24 --source-lens 20096 --cache-tokens 6144 --tail-tokens 64 --iters 0 --seed 7
 ```
 
 SFA check 固定覆盖 dense `C=0`、2048-token sparse-only、常用 `C=6144/tail=64` 和最大档 `C=12288/tail=257`，再检查命令指定的配置；所有结果均与独立 CPU FP32 golden 比较。
 
 ```bash
-python3 tests/test_fused_copy_sparse_tail_attention.py --device npu:0 --mode all --batch-size 24 --heads 8 --source-len 65536 --cache-tokens 8192 --tail-tokens 64 --miss-min 0 --miss-max 300 --warmup 10 --iters 100 --seed 7
+python3 tests/test_fused_copy_sparse_tail_attention.py --device npu:0 --batch-size 24 --heads 8 --source-len 65536 --cache-tokens 8192 --tail-tokens 64 --miss-min 0 --miss-max 300 --warmup 10 --iters 100 --seed 7
 ```
 
 该门禁将拆分链路与转正后的融合算子分别从真实 swapped-memory DRAM 搬运；每条链路调用前独立 poison HBM 目标，并校验精确 CKV/KPE 写回、guard、CPU FP32 Attention golden 和时延。融合算子默认使用 `prefetch_rows_per_step=5`。
@@ -168,7 +170,7 @@ python3 tests/test_bf16_graph.py --device npu:0 --case mixed --attention-path fu
 LIDU：
 
 ```bash
-python3 tests/test_fused_li_manage.py --device npu:0 --mode bench --heads 32 --batch-sizes 1,4,8,12,16,24,32 --source-lens 12288,20096,65536,131072 --cache-tokens 6144 --miss-ranges 0:0,0:300,300:300 --warmup 10 --iters 100 --seed 7
+python3 tests/test_fused_li_manage.py --device npu:0 --heads 32 --batch-sizes 1,4,8,12,16,24,32 --source-lens 12288,20096,65536,131072 --cache-tokens 6144 --miss-ranges 0:0,0:300,300:300 --warmup 10 --iters 100 --seed 7
 ```
 
 SCATTER：
@@ -180,11 +182,11 @@ for bs in 1 4 8 12 16 24 32; do for len in 12288 20096 65536 131072; do python3 
 SFA：
 
 ```bash
-python3 tests/test_sparse_tail_attention.py --device npu:0 --mode bench --heads 8 --batch-sizes 1,4,8,12,16,24,32 --source-lens 12288,20096,65536,131072 --cache-tokens 6144 --tail-tokens 64 --warmup 10 --iters 100 --seed 7
+python3 tests/test_sparse_tail_attention.py --device npu:0 --heads 8 --batch-sizes 1,4,8,12,16,24,32 --source-lens 12288,20096,65536,131072 --cache-tokens 6144 --tail-tokens 64 --warmup 10 --iters 100 --seed 7
 ```
 
 融合链路（默认预取深度 5）：
 
 ```bash
-python3 tests/test_fused_copy_sparse_tail_attention.py --device npu:0 --mode bench --batch-size 24 --heads 8 --source-len 65536 --cache-tokens 8192 --tail-tokens 64 --miss-min 0 --miss-max 300 --warmup 10 --iters 100 --seed 7
+python3 tests/test_fused_copy_sparse_tail_attention.py --device npu:0 --batch-size 24 --heads 8 --source-len 65536 --cache-tokens 8192 --tail-tokens 64 --miss-min 0 --miss-max 300 --warmup 10 --iters 100 --seed 7
 ```

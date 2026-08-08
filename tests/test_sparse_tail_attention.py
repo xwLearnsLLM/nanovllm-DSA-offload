@@ -47,7 +47,6 @@ class Case:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="npu:0")
-    parser.add_argument("--mode", choices=("all", "check", "bench", "profile"), default="all")
     parser.add_argument("--batch-sizes", type=csv_ints, default=csv_ints("24"))
     parser.add_argument("--source-lens", type=csv_ints, default=csv_ints("20096"))
     parser.add_argument("--heads", type=int, default=8)
@@ -55,7 +54,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tail-tokens", type=csv_ints, default=csv_ints("64"))
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iters", type=int, default=20)
-    parser.add_argument("--profile-replays", type=int, default=4)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--allow-non-a5", action="store_true")
     return parser.parse_args()
@@ -75,8 +73,8 @@ def check_args(args: argparse.Namespace) -> None:
         raise ValueError("tail token counts must be non-negative")
     if not 1 <= args.heads <= 64:
         raise ValueError("heads must be in [1,64]")
-    if args.warmup < 0 or args.iters <= 0 or args.profile_replays <= 0:
-        raise ValueError("warmup must be non-negative; iters/profile-replays must be positive")
+    if args.warmup < 0 or args.iters < 0:
+        raise ValueError("warmup and iters must be non-negative")
 
 
 def make_case(
@@ -278,18 +276,17 @@ def main() -> None:
 
     # Four representative cases cover dense, sparse-only, ordinary tail and
     # the largest supported cache/tail boundary without a 4x5 Cartesian sweep.
-    if args.mode in ("all", "check"):
-        mandatory = (
-            (2048, 0, 0),
-            (2048, 2048, 0),
-            (6208, 6144, 64),
-            (12545, 12288, 257),
-        )
-        for index, (source_len, budget, tail) in enumerate(mandatory):
-            check_case(make_case(
-                device, 1, args.heads, source_len, budget, tail,
-                args.seed + 10 + index,
-            ))
+    mandatory = (
+        (2048, 0, 0),
+        (2048, 2048, 0),
+        (6208, 6144, 64),
+        (12545, 12288, 257),
+    )
+    for index, (source_len, budget, tail) in enumerate(mandatory):
+        check_case(make_case(
+            device, 1, args.heads, source_len, budget, tail,
+            args.seed + 10 + index,
+        ))
 
     case_index = 0
     for batch in args.batch_sizes:
@@ -309,20 +306,9 @@ def main() -> None:
                         device, batch, args.heads, source_len, budget, tail,
                         args.seed + 1000 + case_index,
                     )
-                    if args.mode in ("all", "check"):
-                        check_case(case)
-                    if args.mode in ("all", "bench"):
+                    check_case(case)
+                    if args.iters > 0:
                         benchmark(case, args.warmup, args.iters)
-                    if args.mode == "profile":
-                        for _ in range(args.profile_replays):
-                            launch(case)
-                        torch.npu.synchronize()
-                        print(
-                            "A5_SPARSE_TAIL_PROFILE_DONE "
-                            f"heads={args.heads} batch={batch} source_len={source_len} "
-                            f"C={budget} tail={tail} replays={args.profile_replays}",
-                            flush=True,
-                        )
                     case_index += 1
     print("A5_SPARSE_TAIL_ATTENTION_UT_OK", flush=True)
 

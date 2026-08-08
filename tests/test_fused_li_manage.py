@@ -59,7 +59,6 @@ def miss_ranges(value: str) -> list[tuple[int, int]]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="npu:0")
-    parser.add_argument("--mode", choices=("all", "check", "bench", "profile"), default="all")
     parser.add_argument("--batch-sizes", type=csv_ints, default=csv_ints("24"))
     parser.add_argument("--source-lens", type=csv_ints, default=csv_ints("20096"))
     parser.add_argument("--heads", type=csv_ints, default=csv_ints("32,64"))
@@ -68,7 +67,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pool-extra", type=int, default=7)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iters", type=int, default=20)
-    parser.add_argument("--profile-replays", type=int, default=4)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--allow-non-a5", action="store_true")
     return parser.parse_args()
@@ -563,46 +561,45 @@ def main() -> None:
     require_a5(device, args.allow_non_a5)
     check_meta()
 
-    run_correctness = args.mode in ("all", "check") or args.iters == 0
-
     # One mandatory mixed-C case proves C=0 no-op, arbitrary legal C, pool
     # indirection, and the maximum block-aligned 14-bit slot range.
-    if run_correctness:
-        mixed = make_case(
-            device,
-            6,
-            32768,
-            32,
-            [0, 3072, 6144, 8192, 12288, MAX_CACHE_TOKENS],
-            (0, 300),
-            args.pool_extra,
-            args.seed + 100,
-            [2048, 8192, 12288, 20096, 24576, 32768],
-        )
-        check_case(mixed)
-        miss_edges = make_case(
-            device,
-            2,
-            4096,
-            32,
-            [2048, 2048],
-            (0, TOPK),
-            args.pool_extra,
-            args.seed + 200,
-        )
-        check_case(miss_edges)
-        boundary = make_case(
-            device,
-            1,
-            MAX_SOURCE_CAPACITY,
-            32,
-            [6144],
-            (0, 300),
-            args.pool_extra,
-            args.seed + 300,
-        )
-        assert_18bit_boundary_selected(boundary, "A5_FUSED_LI_MANAGE_18BIT_BOUNDARY_CHECK")
-        check_case(boundary)
+    mixed = make_case(
+        device,
+        6,
+        32768,
+        32,
+        [0, 3072, 6144, 8192, 12288, MAX_CACHE_TOKENS],
+        (0, 300),
+        args.pool_extra,
+        args.seed + 100,
+        [2048, 8192, 12288, 20096, 24576, 32768],
+    )
+    check_case(mixed)
+    miss_edges = make_case(
+        device,
+        2,
+        4096,
+        32,
+        [2048, 2048],
+        (0, TOPK),
+        args.pool_extra,
+        args.seed + 200,
+    )
+    check_case(miss_edges)
+    boundary = make_case(
+        device,
+        1,
+        MAX_SOURCE_CAPACITY,
+        32,
+        [6144],
+        (0, 300),
+        args.pool_extra,
+        args.seed + 300,
+    )
+    assert_18bit_boundary_selected(
+        boundary, "A5_FUSED_LI_MANAGE_18BIT_BOUNDARY_CHECK"
+    )
+    check_case(boundary)
 
     case_index = 0
     for heads in args.heads:
@@ -632,9 +629,8 @@ def main() -> None:
                             args.seed + case_index,
                         )
                         case_index += 1
-                        if run_correctness:
-                            check_case(case)
-                        if args.mode in ("all", "bench") and args.iters > 0:
+                        check_case(case)
+                        if args.iters > 0:
                             native_us, lidu_us = event_benchmark(case, args.warmup, args.iters)
                             print(
                                 "A5_FUSED_LI_MANAGE_RESULT "
@@ -646,12 +642,6 @@ def main() -> None:
                                 f"warmup={args.warmup} iters={args.iters}",
                                 flush=True,
                             )
-                        if args.mode == "profile" and args.iters > 0:
-                            pool = case.initial_pool.clone()
-                            for _ in range(args.profile_replays):
-                                pool.copy_(case.initial_pool)
-                                launch(case, pool)
-                            torch.npu.synchronize()
     print("A5_FUSED_LI_MANAGE_UT_OK", flush=True)
 
 
