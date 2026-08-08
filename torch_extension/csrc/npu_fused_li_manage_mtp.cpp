@@ -113,7 +113,7 @@ FusedLiManageMtpMeta(
     const at::Tensor& query,
     const at::Tensor&,
     const at::Tensor&,
-    const at::Tensor& cache_slots,
+    at::Tensor cache_slots,
     const at::Tensor&,
     const at::Tensor&,
     const at::Tensor&) {
