@@ -70,3 +70,11 @@ and comparison with four serial single-query launches):
 ```bash
 python3 ut_ops/test_sparse_and_tail_attention_mtp.py --device npu:0 --heads 2 --batch-size 24 --cache-tokens 8192 --tail-tokens 64 --graph-replays 3 --warmup 10 --iters 100 --min-speedup 1.0 --seed 7
 ```
+
+Complete MTP3 offload chain.  The actual MTP-LIDU outputs feed SCATTER, and
+SCATTER's mutable cache aliases feed MTP sparse-and-tail Attention in the same
+eager/ACLGraph launch:
+
+```bash
+python3 ut_ops/test_mtp_offload_chain.py --device npu:0 --batch-size 4 --heads 2 --source-len 20992 --cache-tokens 8192 --tail-tokens 64 --graph-replays 3 --seed 7
+```
