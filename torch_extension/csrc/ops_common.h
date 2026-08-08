@@ -43,20 +43,22 @@ void CheckAttentionInputs(
     const at::Tensor& query_rope,
     const at::Tensor& key_rope);
 
-inline void AddSparseAttentionAttrs(
-    at_npu::native::OpCommand& command,
-    double scale_value) {
-  command
-      .Attr("scale_value", static_cast<float>(scale_value))
-      .Attr("sparse_block_size", static_cast<int64_t>(1))
-      .Attr("layout_query", std::string("TND"))
-      .Attr("layout_kv", std::string("PA_BSND"))
-      .Attr("sparse_mode", static_cast<int64_t>(3))
-      .Attr("pre_tokens", std::numeric_limits<int64_t>::max())
-      .Attr("next_tokens", std::numeric_limits<int64_t>::max())
-      .Attr("attention_mode", static_cast<int64_t>(2))
-      .Attr("return_softmax_lse", false);
-}
+struct SparseAttentionAclnnAttrs {
+  explicit SparseAttentionAclnnAttrs(double scale) : scale_value(scale) {}
+
+  // msopgen maps an op JSON `float` attribute to `double` in the public
+  // aclnn GetWorkspaceSize ABI.  Narrowing this field to C++ float changes
+  // the inferred function-pointer signature and corrupts scale_value at the
+  // dynamic call boundary.
+  double scale_value;
+  int64_t sparse_block_size = 1;
+  std::string query_layout = "TND";
+  std::string kv_layout = "PA_BSND";
+  int64_t sparse_mode = 3;
+  int64_t all_tokens = std::numeric_limits<int64_t>::max();
+  int64_t attention_mode = 2;
+  bool return_softmax_lse = false;
+};
 
 inline void CheckLiduOutputs(
     const at::Tensor& reference,

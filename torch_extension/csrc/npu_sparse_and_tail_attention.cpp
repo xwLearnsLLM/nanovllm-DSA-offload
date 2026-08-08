@@ -1,3 +1,5 @@
+#include <tuple>
+
 #include "ops_common.h"
 
 namespace nanovllm_dsa_a5_impl {
@@ -77,23 +79,37 @@ at::Tensor SparseAndTailAttentionNpu(
   auto output = at::empty_like(query);
   auto softmax_max = at::empty({1}, query.options().dtype(at::kFloat));
   auto softmax_sum = at::empty({1}, query.options().dtype(at::kFloat));
-  at_npu::native::OpCommand command;
-  command.Name("A5SparseAndTailAttention")
-      .Input(query)
-      .Input(key)
-      .Input(value)
-      .Input(sparse_slots)
-      .Input(block_table)
-      .Input(actual_q)
-      .Input(actual_kv)
-      .Input(query_rope)
-      .Input(key_rope)
-      .Input(cache_tokens)
-      .Output(output)
-      .Output(softmax_max)
-      .Output(softmax_sum);
-  AddSparseAttentionAttrs(command, scale_value);
-  command.Run();
+  SparseAttentionAclnnAttrs attrs(scale_value);
+  char* query_layout = attrs.query_layout.data();
+  char* kv_layout = attrs.kv_layout.data();
+  auto keepalive = std::make_tuple(
+      query, key, value, sparse_slots, block_table, actual_q, actual_kv,
+      query_rope, key_rope, cache_tokens, output, softmax_max, softmax_sum);
+  EXEC_NPU_CMD_ORDERED(
+      aclnnA5SparseAndTailAttention,
+      keepalive,
+      query,
+      key,
+      value,
+      sparse_slots,
+      block_table,
+      actual_q,
+      actual_kv,
+      query_rope,
+      key_rope,
+      cache_tokens,
+      attrs.scale_value,
+      attrs.sparse_block_size,
+      query_layout,
+      kv_layout,
+      attrs.sparse_mode,
+      attrs.all_tokens,
+      attrs.all_tokens,
+      attrs.attention_mode,
+      attrs.return_softmax_lse,
+      output,
+      softmax_max,
+      softmax_sum);
   return output;
 }
 
