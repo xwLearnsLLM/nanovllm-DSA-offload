@@ -8,7 +8,7 @@
 // Without InitSourceAwareGather() it is the regular sparse+tail path, while
 // preserving the exact kernel implementation already validated against the
 // CPU golden in ops_dsa_offload_a5.
-#include "a5_sfa_fused/arch35/sparse_flash_attention_kernel_mla.h"
+#include "a5_sfa/arch35/sparse_flash_attention_kernel_mla.h"
 
 using namespace AscendC;
 
