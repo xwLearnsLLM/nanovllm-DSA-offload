@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Capture/replay A5 LIDU with split or fused Attention/SCATTER."""
+"""Capture/replay the complete BF16 offload chain, split or fused."""
 
 from __future__ import annotations
 
@@ -10,6 +10,12 @@ import torch
 
 import nanovllm_dsa_a5
 import torch_npu  # type: ignore  # noqa: E402,F401
+
+from _utils import (
+    physical_token_rows as physical_rows,
+    require_a5,
+    swapped_from_cpu,
+)
 
 
 BLOCK_SIZE = 128
@@ -47,29 +53,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--allow-non-a5", action="store_true")
     return parser.parse_args()
-
-
-def swapped_from_cpu(cpu: torch.Tensor, device: torch.device) -> torch.Tensor:
-    if not hasattr(torch_npu, "empty_with_swapped_memory"):
-        raise RuntimeError("torch_npu.empty_with_swapped_memory is required")
-    tensor = torch_npu.empty_with_swapped_memory(cpu.shape, dtype=cpu.dtype, device=device)
-    tensor.fill_(0)
-    staging = cpu.to(device)
-    tensor.add_(staging)
-    torch.npu.synchronize()
-    del staging
-    torch.npu.empty_cache()
-    return tensor
-
-
-def physical_rows(
-    table: torch.Tensor, row: int, logical_tokens: torch.Tensor
-) -> torch.Tensor:
-    logical = logical_tokens.to(torch.int64)
-    return (
-        table[row, logical // BLOCK_SIZE].to(torch.int64) * BLOCK_SIZE
-        + logical.remainder(BLOCK_SIZE)
-    )
 
 
 def cpu_attention_golden(
@@ -121,11 +104,7 @@ def main() -> None:
         raise ValueError("--device must select an NPU")
     torch.npu.set_device(device)
     torch.npu.config.allow_internal_format = False
-    index = device.index if device.index is not None else torch.npu.current_device()
-    getter = getattr(torch.npu, "get_device_name", torch_npu.npu.get_device_name)
-    name = getter(index)
-    if "950" not in name.lower() and not args.allow_non_a5:
-        raise RuntimeError(f"expected Ascend 950, got {name!r}")
+    require_a5(device, args.allow_non_a5)
 
     torch.manual_seed(args.seed)
     torch.npu.manual_seed_all(args.seed)
@@ -410,14 +389,14 @@ def main() -> None:
         torch.testing.assert_close(actual_attention, golden, rtol=0.02, atol=0.02)
 
     print(
-        "A5_OFFLOAD_GRAPH_CHECK "
+        "A5_BF16_GRAPH_CHECK "
         f"device={device} case={args.case} attention_path={args.attention_path} "
         f"replays={args.replays} capture_zero_miss=1 "
         "replay_nonzero_miss=1 caller_owned_outputs=1 "
         "dram_to_hbm=1 attention_golden=1 ok=1",
         flush=True,
     )
-    print("A5_OFFLOAD_GRAPH_UT_OK", flush=True)
+    print("A5_BF16_GRAPH_UT_OK", flush=True)
 
 
 if __name__ == "__main__":

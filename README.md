@@ -143,7 +143,7 @@ SCATTER 使用 `empty_with_swapped_memory` 创建真实 DRAM tensor；每次正�
 python3 tests/test_sparse_tail_attention.py --device npu:0 --mode check --heads 8 --batch-sizes 24 --source-lens 20096 --cache-tokens 6144 --tail-tokens 64 --seed 7
 ```
 
-SFA check 会先验证 2048-token smoke、dense `C=0`、四档 C 和 tail `0/1/64/127/257`，并与独立 CPU FP32 golden 比较。
+SFA check 固定覆盖 dense `C=0`、2048-token sparse-only、常用 `C=6144/tail=64` 和最大档 `C=12288/tail=257`，再检查命令指定的配置；所有结果均与独立 CPU FP32 golden 比较。
 
 ```bash
 python3 tests/test_fused_copy_sparse_tail_attention.py --device npu:0 --mode all --batch-size 24 --heads 8 --source-len 65536 --cache-tokens 8192 --tail-tokens 64 --miss-min 0 --miss-max 300 --warmup 10 --iters 100 --seed 7
@@ -152,17 +152,11 @@ python3 tests/test_fused_copy_sparse_tail_attention.py --device npu:0 --mode all
 该门禁将拆分链路与转正后的融合算子分别从真实 swapped-memory DRAM 搬运；每条链路调用前独立 poison HBM 目标，并校验精确 CKV/KPE 写回、guard、CPU FP32 Attention golden 和时延。融合算子默认使用 `prefetch_rows_per_step=5`。
 
 ```bash
-python3 tests/test_fused_copy_sparse_tail_attention_prefetch.py --device npu:0 --mode all --batch-size 24 --heads 8 --source-len 65536 --cache-tokens 8192 --tail-tokens 64 --miss-min 0 --miss-max 300 --prefetch-rows 0,1,3,5,8 --warmup 10 --iters 100 --seed 7
-```
-
-该调优测试覆盖精确缓存写回、Attention golden 与不同预取深度，并以默认 `prefetch_rows_per_step=5` 为对照。
-
-```bash
-python3 tests/test_offload_split_graph.py --device npu:0 --case pure-long --attention-path split --replays 4 --seed 7
+python3 tests/test_bf16_graph.py --device npu:0 --case pure-long --attention-path split --replays 4 --seed 7
 ```
 
 ```bash
-python3 tests/test_offload_split_graph.py --device npu:0 --case mixed --attention-path fused --prefetch-rows-per-step 5 --replays 4 --seed 7
+python3 tests/test_bf16_graph.py --device npu:0 --case mixed --attention-path fused --prefetch-rows-per-step 5 --replays 4 --seed 7
 ```
 
 同一图门禁覆盖拆分与融合两条 BF16 链路；capture 为零 miss，replay 交替产生非零 miss，并校验输出地址、pool 更新、真实 DRAM→HBM 搬运和 Attention golden。
@@ -193,10 +187,4 @@ python3 tests/test_sparse_tail_attention.py --device npu:0 --mode bench --heads 
 
 ```bash
 python3 tests/test_fused_copy_sparse_tail_attention.py --device npu:0 --mode bench --batch-size 24 --heads 8 --source-len 65536 --cache-tokens 8192 --tail-tokens 64 --miss-min 0 --miss-max 300 --warmup 10 --iters 100 --seed 7
-```
-
-融合链路预取深度扫描：
-
-```bash
-python3 tests/test_fused_copy_sparse_tail_attention_prefetch.py --device npu:0 --mode bench --batch-size 24 --heads 8 --source-len 65536 --cache-tokens 8192 --tail-tokens 64 --miss-min 0 --miss-max 300 --prefetch-rows 0,1,3,5,8 --warmup 10 --iters 100 --seed 7
 ```

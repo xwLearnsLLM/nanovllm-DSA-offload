@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A5 GLM-5.1: serial SCATTER+SFA versus fused source-aware gather."""
+"""Compare split and fused BF16 copy+sparse-tail Attention paths."""
 
 from __future__ import annotations
 
@@ -13,14 +13,15 @@ import torch
 import nanovllm_dsa_a5
 import torch_npu  # noqa: E402,F401
 
+from _utils import require_a5, swapped_from_cpu
+
 
 BLOCK_SIZE = 128
 CKV_DIM = 512
 KPE_DIM = 64
 SPARSE_COUNT = 2048
 DEFAULT_TEST_HEADS = 8
-SUPPORTED_TEST_HEADS = (1, 2, 4, 8, 16, 32, 64, 128)
-KNOWN_UNSUPPORTED_HEADS = (128,)
+SUPPORTED_TEST_HEADS = (1, 2, 4, 8, 16, 32, 64)
 
 
 @dataclass
@@ -70,6 +71,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--profile-replays", type=int, default=4)
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--allow-non-a5", action="store_true")
     return parser.parse_args()
 
 
@@ -83,24 +85,6 @@ def random_cpu_bf16(
     return torch.randn(
         shape, generator=generator, dtype=torch.float32
     ).to(torch.bfloat16)
-
-
-def swapped_from_cpu(
-    cpu: torch.Tensor, device: torch.device
-) -> torch.Tensor:
-    if not hasattr(torch_npu, "empty_with_swapped_memory"):
-        raise RuntimeError(
-            "torch_npu.empty_with_swapped_memory is required: "
-            "ordinary NPU tensors would benchmark HBM instead of DRAM."
-        )
-    tensor = torch_npu.empty_with_swapped_memory(
-        cpu.shape,
-        dtype=cpu.dtype,
-        device=device,
-    )
-    tensor.fill_(0)
-    tensor.add_(cpu.to(device))
-    return tensor
 
 
 def assert_random_scatter_addresses(
@@ -152,12 +136,6 @@ def assert_random_scatter_addresses(
 def make_case(args: argparse.Namespace) -> Case:
     if args.batch_size <= 0:
         raise ValueError("batch-size must be positive.")
-    if args.heads in KNOWN_UNSUPPORTED_HEADS:
-        raise ValueError(
-            "local_heads=128 is a known unsupported A5 case: the current "
-            "split-G sparse+tail kernel hangs at the first sparse Attention "
-            "launch. Use --heads 8 for the supported TP16 latency path."
-        )
     if args.source_len <= 0 or args.source_len % BLOCK_SIZE != 0:
         raise ValueError("source-len must be positive and block aligned.")
     if args.cache_tokens < SPARSE_COUNT or args.cache_tokens % BLOCK_SIZE != 0:
@@ -552,35 +530,23 @@ def build_cpu_attention_golden(
     return torch.stack(golden_rows)
 
 
-def print_attention_diagnostics(
-    label: str, fused: torch.Tensor, serial: torch.Tensor
-) -> None:
-    fused_cpu = fused.detach().float().cpu()
-    serial_cpu = serial.detach().float().cpu()
-    diff = (fused_cpu - serial_cpu).abs()
-    fused_rows = fused_cpu.reshape(fused_cpu.size(0), -1)
-    serial_rows = serial_cpu.reshape(serial_cpu.size(0), -1)
-    row_max = diff.reshape(diff.size(0), -1).amax(dim=1)
-    close = torch.isclose(fused_cpu, serial_cpu, rtol=0.02, atol=0.01)
-    cosine = torch.nn.functional.cosine_similarity(
-        fused_cpu.flatten(), serial_cpu.flatten(), dim=0
-    )
-    print(
-        f"FUSED_SCATTER_ATTENTION_DIAGNOSTIC phase={label} "
-        f"max_abs={float(diff.max()):.9f} "
-        f"mean_abs={float(diff.mean()):.9f} "
-        f"close_fraction={float(close.float().mean()):.6f} "
-        f"cosine={float(cosine):.9f} "
-        f"serial_l2={float(torch.linalg.vector_norm(serial_cpu)):.6f} "
-        f"fused_l2={float(torch.linalg.vector_norm(fused_cpu)):.6f} "
-        f"fused_zero_fraction={float((fused_cpu == 0).float().mean()):.6f} "
-        f"row_max_first4={[round(float(x), 6) for x in row_max[:4]]} "
-        f"serial_row_l2_first4="
-        f"{[round(float(x), 6) for x in torch.linalg.vector_norm(serial_rows, dim=1)[:4]]} "
-        f"fused_row_l2_first4="
-        f"{[round(float(x), 6) for x in torch.linalg.vector_norm(fused_rows, dim=1)[:4]]}",
-        flush=True,
-    )
+def assert_attention_close(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    *,
+    rtol: float,
+    atol: float,
+) -> tuple[float, float]:
+    actual_cpu = actual.detach().cpu().float()
+    expected_cpu = expected.detach().cpu().float()
+    if not torch.isfinite(actual_cpu).all():
+        raise AssertionError("Attention output contains NaN/Inf")
+    torch.testing.assert_close(actual_cpu, expected_cpu, rtol=rtol, atol=atol)
+    max_abs = float((actual_cpu - expected_cpu).abs().max())
+    cosine = float(torch.nn.functional.cosine_similarity(
+        actual_cpu.flatten(), expected_cpu.flatten(), dim=0
+    ))
+    return max_abs, cosine
 
 
 def check_semantics(case: Case) -> None:
@@ -588,6 +554,7 @@ def check_semantics(case: Case) -> None:
     original_actual_kv = case.actual_kv.clone()
     original_counts = case.copy_counts.clone()
 
+    # C=0 must run dense Attention without touching either HBM cache.
     dense_tokens = max(
         1,
         int(original_actual_kv[0] - original_cache_tokens[0]),
@@ -599,77 +566,40 @@ def check_semantics(case: Case) -> None:
     dense_physical = physical_token_rows(
         case.hbm_block_table, dense_logical
     ).flatten().to(case.query.device)
-    dense_serial_ckv_before = case.serial_ckv.view(-1, CKV_DIM)[
-        dense_physical
-    ].cpu()
-    dense_serial_kpe_before = case.serial_kpe.view(-1, KPE_DIM)[
-        dense_physical
-    ].cpu()
-    dense_fused_ckv_before = case.fused_ckv.view(-1, CKV_DIM)[
-        dense_physical
-    ].cpu()
-    dense_fused_kpe_before = case.fused_kpe.view(-1, KPE_DIM)[
-        dense_physical
-    ].cpu()
-    # Build the oracle before either implementation runs.  This prevents an
-    # accidental cache mutation from silently changing the expected result.
+    dense_snapshots = [
+        (cache, width, cache.view(-1, width)[dense_physical].cpu().clone())
+        for cache, width in (
+            (case.serial_ckv, CKV_DIM),
+            (case.serial_kpe, KPE_DIM),
+            (case.fused_ckv, CKV_DIM),
+            (case.fused_kpe, KPE_DIM),
+        )
+    ]
     dense_golden = build_cpu_attention_golden(
         case, torch.empty((0,), dtype=torch.int64)
     )
-    print("FUSED_SCATTER_ATTENTION_PHASE c0_dense_serial", flush=True)
     dense_serial_out = launch_serial(case)
     torch.npu.synchronize()
-    print("FUSED_SCATTER_ATTENTION_PHASE c0_dense_fused", flush=True)
     dense_fused_out = launch_fused(case)
     torch.npu.synchronize()
-    print_attention_diagnostics(
-        "c0_dense", dense_fused_out, dense_serial_out
+    dense_pair_max, _ = assert_attention_close(
+        dense_fused_out, dense_serial_out, rtol=0.02, atol=0.01
     )
-    torch.testing.assert_close(
-        dense_fused_out.float(),
-        dense_serial_out.float(),
-        rtol=0.02,
-        atol=0.01,
+    assert_attention_close(
+        dense_serial_out, dense_golden, rtol=0.08, atol=0.08
     )
-    torch.testing.assert_close(
-        dense_serial_out.cpu().float(),
-        dense_golden,
-        rtol=0.08,
-        atol=0.08,
+    dense_golden_max, dense_cosine = assert_attention_close(
+        dense_fused_out, dense_golden, rtol=0.08, atol=0.08
     )
-    torch.testing.assert_close(
-        dense_fused_out.cpu().float(),
-        dense_golden,
-        rtol=0.08,
-        atol=0.08,
-    )
-    torch.testing.assert_close(
-        case.serial_ckv.view(-1, CKV_DIM)[dense_physical].cpu(),
-        dense_serial_ckv_before,
-        rtol=0,
-        atol=0,
-    )
-    torch.testing.assert_close(
-        case.serial_kpe.view(-1, KPE_DIM)[dense_physical].cpu(),
-        dense_serial_kpe_before,
-        rtol=0,
-        atol=0,
-    )
-    torch.testing.assert_close(
-        case.fused_ckv.view(-1, CKV_DIM)[dense_physical].cpu(),
-        dense_fused_ckv_before,
-        rtol=0,
-        atol=0,
-    )
-    torch.testing.assert_close(
-        case.fused_kpe.view(-1, KPE_DIM)[dense_physical].cpu(),
-        dense_fused_kpe_before,
-        rtol=0,
-        atol=0,
-    )
+    for cache, width, before in dense_snapshots:
+        torch.testing.assert_close(
+            cache.view(-1, width)[dense_physical].cpu(), before, rtol=0, atol=0
+        )
     print(
-        "FUSED_SCATTER_ATTENTION_C0_DENSE_CHECK "
+        "A5_FUSED_COPY_SPARSE_TAIL_ATTENTION_DENSE_CHECK "
         f"batch={case.query.size(0)} tokens={dense_tokens} "
+        f"split_fused_max_abs={dense_pair_max:.9f} "
+        f"cpu_max_abs={dense_golden_max:.9f} cosine={dense_cosine:.9f} "
         "cache_unchanged=1 ok=1",
         flush=True,
     )
@@ -677,36 +607,23 @@ def check_semantics(case: Case) -> None:
     case.cache_tokens.copy_(original_cache_tokens)
     case.actual_kv.copy_(original_actual_kv)
 
-    print("FUSED_SCATTER_ATTENTION_PHASE zero_miss_serial", flush=True)
+    # The metadata remains zero from the dense phase: verify the no-copy path.
     serial_zero_out = launch_serial(case)
     torch.npu.synchronize()
-    print("FUSED_SCATTER_ATTENTION_PHASE zero_miss_fused", flush=True)
     fused_zero_out = launch_fused(case)
     torch.npu.synchronize()
-    serial_zero_f32 = serial_zero_out.float()
-    fused_zero_f32 = fused_zero_out.float()
-    if (
-        not torch.isfinite(serial_zero_f32).all()
-        or not torch.isfinite(fused_zero_f32).all()
-    ):
-        raise AssertionError("Zero-miss Attention output contains NaN/Inf.")
-    print_attention_diagnostics(
-        "zero_miss", fused_zero_f32, serial_zero_f32
-    )
-    torch.testing.assert_close(
-        fused_zero_f32, serial_zero_f32, rtol=0.02, atol=0.01
-    )
-    zero_max_abs = float(
-        (fused_zero_f32 - serial_zero_f32).abs().max()
+    zero_max_abs, zero_cosine = assert_attention_close(
+        fused_zero_out, serial_zero_out, rtol=0.02, atol=0.01
     )
     print(
-        "FUSED_SCATTER_ATTENTION_ZERO_MISS_CHECK "
-        f"batch={case.query.size(0)} max_abs={zero_max_abs:.9f} ok=1",
+        "A5_FUSED_COPY_SPARSE_TAIL_ATTENTION_ZERO_MISS_CHECK "
+        f"batch={case.query.size(0)} max_abs={zero_max_abs:.9f} "
+        f"cosine={zero_cosine:.9f} ok=1",
         flush=True,
     )
     case.copy_counts.copy_(original_counts)
 
-    rows, destination_cpu = active_physical_token_indices(
+    _, destination_cpu = active_physical_token_indices(
         case.hbm_block_table,
         case.sparse_slots[:, 0, :],
         case.copy_counts,
@@ -738,126 +655,59 @@ def check_semantics(case: Case) -> None:
             "Poisoned HBM destinations unexpectedly equal DRAM source data."
         )
 
-    # Snapshot hit/tail data before launch, replace miss rows from the CPU
-    # DRAM oracle, and evaluate Attention independently of both custom ops.
+    # Build the independent oracle and guard snapshots before either path runs.
     cpu_golden = build_cpu_attention_golden(case, source_cpu)
     guard_cpu = guard_physical_token_indices(case)
     guard = guard_cpu.to(case.query.device)
-    serial_ckv_guard = (
-        case.serial_ckv.view(-1, CKV_DIM)[guard].cpu().clone()
-    )
-    serial_kpe_guard = (
-        case.serial_kpe.view(-1, KPE_DIM)[guard].cpu().clone()
-    )
-    fused_ckv_guard = (
-        case.fused_ckv.view(-1, CKV_DIM)[guard].cpu().clone()
-    )
-    fused_kpe_guard = (
-        case.fused_kpe.view(-1, KPE_DIM)[guard].cpu().clone()
-    )
+    guard_snapshots = [
+        (cache, width, cache.view(-1, width)[guard].cpu().clone())
+        for cache, width in (
+            (case.serial_ckv, CKV_DIM),
+            (case.serial_kpe, KPE_DIM),
+            (case.fused_ckv, CKV_DIM),
+            (case.fused_kpe, KPE_DIM),
+        )
+    ]
 
-    print("FUSED_SCATTER_ATTENTION_PHASE random_miss_serial", flush=True)
     serial_out = launch_serial(case)
     torch.npu.synchronize()
-    print("FUSED_SCATTER_ATTENTION_PHASE random_miss_fused", flush=True)
     fused_out = launch_fused(case)
     torch.npu.synchronize()
 
     destination = destination_cpu.to(case.query.device)
-    serial_ckv = case.serial_ckv.view(-1, CKV_DIM)[destination].cpu()
-    fused_ckv = case.fused_ckv.view(-1, CKV_DIM)[destination].cpu()
-    serial_kpe = case.serial_kpe.view(-1, KPE_DIM)[destination].cpu()
-    fused_kpe = case.fused_kpe.view(-1, KPE_DIM)[destination].cpu()
-    torch.testing.assert_close(
-        serial_ckv, expected_ckv_cpu, rtol=0, atol=0
-    )
-    torch.testing.assert_close(
-        fused_ckv, expected_ckv_cpu, rtol=0, atol=0
-    )
-    torch.testing.assert_close(
-        serial_kpe, expected_kpe_cpu, rtol=0, atol=0
-    )
-    torch.testing.assert_close(
-        fused_kpe, expected_kpe_cpu, rtol=0, atol=0
-    )
-    torch.testing.assert_close(
-        case.serial_ckv.view(-1, CKV_DIM)[guard].cpu(),
-        serial_ckv_guard,
-        rtol=0,
-        atol=0,
-    )
-    torch.testing.assert_close(
-        case.serial_kpe.view(-1, KPE_DIM)[guard].cpu(),
-        serial_kpe_guard,
-        rtol=0,
-        atol=0,
-    )
-    torch.testing.assert_close(
-        case.fused_ckv.view(-1, CKV_DIM)[guard].cpu(),
-        fused_ckv_guard,
-        rtol=0,
-        atol=0,
-    )
-    torch.testing.assert_close(
-        case.fused_kpe.view(-1, KPE_DIM)[guard].cpu(),
-        fused_kpe_guard,
-        rtol=0,
-        atol=0,
-    )
-    print(
-        "FUSED_SCATTER_ATTENTION_DRAM_COPY_CHECK "
-        "allocator=empty_with_swapped_memory "
-        "hbm_source_disjoint=1 "
-        f"copied_tokens={copied_tokens} "
-        f"poisoned_destinations={copied_tokens} "
-        f"guard_tokens={guard_cpu.numel()} "
-        "source_to_hbm_exact=1 guards_unchanged=1 ok=1",
-        flush=True,
-    )
+    for cache, width, expected in (
+        (case.serial_ckv, CKV_DIM, expected_ckv_cpu),
+        (case.fused_ckv, CKV_DIM, expected_ckv_cpu),
+        (case.serial_kpe, KPE_DIM, expected_kpe_cpu),
+        (case.fused_kpe, KPE_DIM, expected_kpe_cpu),
+    ):
+        torch.testing.assert_close(
+            cache.view(-1, width)[destination].cpu(), expected, rtol=0, atol=0
+        )
+    for cache, width, before in guard_snapshots:
+        torch.testing.assert_close(
+            cache.view(-1, width)[guard].cpu(), before, rtol=0, atol=0
+        )
 
-    serial_f32 = serial_out.float()
-    fused_f32 = fused_out.float()
-    if not torch.isfinite(serial_f32).all() or not torch.isfinite(fused_f32).all():
-        raise AssertionError("Attention output contains NaN/Inf.")
-    print_attention_diagnostics("random_miss", fused_f32, serial_f32)
-    torch.testing.assert_close(fused_f32, serial_f32, rtol=0.02, atol=0.01)
-    serial_cpu = serial_out.cpu().float()
-    fused_cpu = fused_out.cpu().float()
-    torch.testing.assert_close(
-        serial_cpu, cpu_golden, rtol=0.08, atol=0.08
+    pair_max_abs, pair_cosine = assert_attention_close(
+        fused_out, serial_out, rtol=0.02, atol=0.01
     )
-    torch.testing.assert_close(
-        fused_cpu, cpu_golden, rtol=0.08, atol=0.08
+    serial_golden_max_abs, _ = assert_attention_close(
+        serial_out, cpu_golden, rtol=0.08, atol=0.08
     )
-    serial_golden_max_abs = float(
-        (serial_cpu - cpu_golden).abs().max()
-    )
-    fused_golden_max_abs = float(
-        (fused_cpu - cpu_golden).abs().max()
-    )
-    fused_golden_cosine = float(
-        torch.nn.functional.cosine_similarity(
-            fused_cpu.flatten(), cpu_golden.flatten(), dim=0
-        )
+    fused_golden_max_abs, fused_golden_cosine = assert_attention_close(
+        fused_out, cpu_golden, rtol=0.08, atol=0.08
     )
     print(
-        "FUSED_SCATTER_ATTENTION_CPU_GOLDEN_CHECK "
-        f"serial_max_abs={serial_golden_max_abs:.9f} "
-        f"fused_max_abs={fused_golden_max_abs:.9f} "
-        f"fused_cosine={fused_golden_cosine:.9f} ok=1",
-        flush=True,
-    )
-    max_abs = float((fused_f32 - serial_f32).abs().max())
-    cosine = float(
-        torch.nn.functional.cosine_similarity(
-            fused_f32.flatten(), serial_f32.flatten(), dim=0
-        )
-    )
-    print(
-        "FUSED_SCATTER_ATTENTION_CHECK "
+        "A5_FUSED_COPY_SPARSE_TAIL_ATTENTION_CHECK "
         f"batch={case.query.size(0)} misses={case.copy_counts.cpu().tolist()} "
-        f"copied_tokens={len(rows)} max_abs={max_abs:.9f} "
-        f"cosine={cosine:.9f} ok=1",
+        f"copied_tokens={copied_tokens} poisoned_destinations={copied_tokens} "
+        f"guard_tokens={guard_cpu.numel()} dram_to_hbm_exact=1 "
+        f"split_fused_max_abs={pair_max_abs:.9f} "
+        f"split_fused_cosine={pair_cosine:.9f} "
+        f"split_cpu_max_abs={serial_golden_max_abs:.9f} "
+        f"fused_cpu_max_abs={fused_golden_max_abs:.9f} "
+        f"fused_cpu_cosine={fused_golden_cosine:.9f} ok=1",
         flush=True,
     )
 
@@ -893,7 +743,7 @@ def benchmark(case: Case, warmup: int, iters: int) -> None:
     )
     speedup = serial_ms / fused_ms
     print(
-        "FUSED_SCATTER_ATTENTION_RESULT "
+        "A5_FUSED_COPY_SPARSE_TAIL_ATTENTION_RESULT "
         f"batch={batch} heads={case.query.size(1)} strategy={strategy} "
         f"source_len={case.dram_block_table.size(1) * BLOCK_SIZE} "
         f"attended_tokens={SPARSE_COUNT + int(case.actual_kv[0]) - int(case.cache_tokens[0])} "
@@ -913,24 +763,30 @@ def profile_calls(case: Case, replays: int) -> None:
     launch_serial(case)
     launch_fused(case)
     torch.npu.synchronize()
-    print(f"PROFILE_SERIAL_BEGIN replays={replays}", flush=True)
+    print(f"A5_FUSED_PROFILE_SPLIT_BEGIN replays={replays}", flush=True)
     for _ in range(replays):
         launch_serial(case)
     torch.npu.synchronize()
-    print("PROFILE_SERIAL_END", flush=True)
-    print(f"PROFILE_FUSED_BEGIN replays={replays}", flush=True)
+    print("A5_FUSED_PROFILE_SPLIT_END", flush=True)
+    print(f"A5_FUSED_PROFILE_FUSED_BEGIN replays={replays}", flush=True)
     for _ in range(replays):
         launch_fused(case)
     torch.npu.synchronize()
-    print("PROFILE_FUSED_END", flush=True)
+    print("A5_FUSED_PROFILE_FUSED_END", flush=True)
 
 
 def main() -> None:
     args = parse_args()
+    device = torch.device(args.device)
+    if device.type != "npu":
+        raise ValueError("--device must select an NPU")
+    torch.npu.set_device(device)
+    torch.npu.config.allow_internal_format = False
+    require_a5(device, args.allow_non_a5)
     case = make_case(args)
     strategy = "a5_mte_pipeline_default_prefetch5"
     print(
-        "FUSED_SCATTER_ATTENTION_CONFIG "
+        "A5_FUSED_COPY_SPARSE_TAIL_ATTENTION_CONFIG "
         "model=GLM-5.1 tp=16 dtype=bf16 "
         f"mode={args.mode} local_heads={args.heads} "
         f"batch={args.batch_size} source_len={args.source_len} "
@@ -949,7 +805,7 @@ def main() -> None:
         benchmark(case, args.warmup, args.iters)
     if args.mode == "profile":
         profile_calls(case, args.profile_replays)
-    print("FUSED_SCATTER_ATTENTION_UT_OK", flush=True)
+    print("A5_FUSED_COPY_SPARSE_TAIL_ATTENTION_UT_OK", flush=True)
 
 
 if __name__ == "__main__":

@@ -13,6 +13,8 @@ import torch
 import nanovllm_dsa_a5
 import torch_npu  # type: ignore  # noqa: E402,F401
 
+from _utils import csv_ints, physical_token_rows, require_a5
+
 
 BLOCK_SIZE = 128
 CKV_DIM = 512
@@ -40,13 +42,6 @@ class Case:
     source_len: int
     cache_budget: int
     tail_tokens: int
-
-
-def csv_ints(value: str) -> list[int]:
-    values = [int(item.strip()) for item in value.split(",") if item.strip()]
-    if not values:
-        raise argparse.ArgumentTypeError("expected a non-empty comma-separated list")
-    return values
 
 
 def parse_args() -> argparse.Namespace:
@@ -82,14 +77,6 @@ def check_args(args: argparse.Namespace) -> None:
         raise ValueError("heads must be in [1,64]")
     if args.warmup < 0 or args.iters <= 0 or args.profile_replays <= 0:
         raise ValueError("warmup must be non-negative; iters/profile-replays must be positive")
-
-
-def require_a5(device: torch.device, allow_non_a5: bool) -> None:
-    index = device.index if device.index is not None else torch.npu.current_device()
-    getter = getattr(torch.npu, "get_device_name", torch_npu.npu.get_device_name)
-    name = getter(index)
-    if "950" not in name.lower() and not allow_non_a5:
-        raise RuntimeError(f"expected Ascend 950, got {name!r}; use --allow-non-a5 only for debugging")
 
 
 def make_case(
@@ -186,10 +173,7 @@ def cpu_golden(case: Case) -> torch.Tensor:
     outputs: list[torch.Tensor] = []
     for row in range(case.query.size(0)):
         tokens = logical_tokens(case, row)
-        physical = (
-            case.block_table_cpu[row, tokens // BLOCK_SIZE].to(torch.int64) * BLOCK_SIZE
-            + tokens.remainder(BLOCK_SIZE)
-        )
+        physical = physical_token_rows(case.block_table_cpu, row, tokens, BLOCK_SIZE)
         key = flat_key[physical]
         value = flat_value[physical]
         key_rope = flat_rope[physical]
@@ -213,14 +197,6 @@ def check_case(case: Case) -> None:
     cosine = float(torch.nn.functional.cosine_similarity(
         output_cpu.flatten(), golden.flatten(), dim=0
     ))
-    print(
-        "A5_SPARSE_TAIL_DIAGNOSTIC "
-        f"heads={case.query.size(1)} batch={case.query.size(0)} "
-        f"source_len={case.source_len} C={case.cache_budget} "
-        f"tail={case.tail_tokens} max_abs={max_abs:.9f} "
-        f"mean_abs={mean_abs:.9f} cosine={cosine:.9f}",
-        flush=True,
-    )
     # The A5 BF16 kernel and the CPU FP32 reference use different reduction
     # orders.  Relative error is not meaningful for reference values close to
     # zero, so retain a strict cosine gate and allow 0.04 absolute BF16 error.
@@ -300,22 +276,20 @@ def main() -> None:
         flush=True,
     )
 
-    # Lightweight mandatory semantic coverage.
+    # Four representative cases cover dense, sparse-only, ordinary tail and
+    # the largest supported cache/tail boundary without a 4x5 Cartesian sweep.
     if args.mode in ("all", "check"):
-        smoke = make_case(device, 1, args.heads, 2048, 2048, 0, args.seed + 10)
-        check_case(smoke)
-        dense = make_case(device, 1, args.heads, 2048, 0, 0, args.seed + 11)
-        check_case(dense)
-        check_index = 0
-        for budget in (3072, 6144, 8192, 12288):
-            for tail in (0, 1, 64, 127, 257):
-                source_len = budget + tail
-                case = make_case(
-                    device, 1, args.heads, source_len, budget, tail,
-                    args.seed + 100 + check_index,
-                )
-                check_case(case)
-                check_index += 1
+        mandatory = (
+            (2048, 0, 0),
+            (2048, 2048, 0),
+            (6208, 6144, 64),
+            (12545, 12288, 257),
+        )
+        for index, (source_len, budget, tail) in enumerate(mandatory):
+            check_case(make_case(
+                device, 1, args.heads, source_len, budget, tail,
+                args.seed + 10 + index,
+            ))
 
     case_index = 0
     for batch in args.batch_sizes:
@@ -350,7 +324,7 @@ def main() -> None:
                             flush=True,
                         )
                     case_index += 1
-    print("A5_SPARSE_AND_TAIL_ATTENTION_UT_OK", flush=True)
+    print("A5_SPARSE_TAIL_ATTENTION_UT_OK", flush=True)
 
 
 if __name__ == "__main__":

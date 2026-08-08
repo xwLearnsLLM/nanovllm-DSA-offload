@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Correctness and performance tests for nano-vLLM's Ascend 950 LIDU."""
+"""Correctness and performance tests for BF16 fused LI management."""
 
 from __future__ import annotations
 
@@ -12,6 +12,8 @@ import torch
 
 import nanovllm_dsa_a5
 import torch_npu  # type: ignore  # noqa: E402,F401
+
+from _utils import csv_ints, require_a5
 
 
 BLOCK_SIZE = 128
@@ -35,13 +37,6 @@ class Case:
     initial_pool: torch.Tensor
     target_misses: list[int]
     source_capacity: int
-
-
-def csv_ints(value: str) -> list[int]:
-    values = [int(item.strip()) for item in value.split(",") if item.strip()]
-    if not values:
-        raise argparse.ArgumentTypeError("expected a non-empty comma-separated list")
-    return values
 
 
 def miss_ranges(value: str) -> list[tuple[int, int]]:
@@ -93,14 +88,6 @@ def check_args(args: argparse.Namespace) -> None:
         raise ValueError("cache tokens must be 0 or a block-aligned value in [2048,16256]")
     if args.pool_extra < 0 or args.warmup < 0 or args.iters < 0:
         raise ValueError("pool-extra/warmup/iters must be non-negative")
-
-
-def require_a5(device: torch.device, allow_non_a5: bool) -> None:
-    index = device.index if device.index is not None else torch.npu.current_device()
-    getter = getattr(torch.npu, "get_device_name", torch_npu.npu.get_device_name)
-    name = getter(index)
-    if "950" not in name.lower() and not allow_non_a5:
-        raise RuntimeError(f"expected Ascend 950, got {name!r}; use --allow-non-a5 only for debugging")
 
 
 def native_lightning_indexer(
@@ -506,7 +493,7 @@ def check_case(case: Case) -> None:
         raise AssertionError("caller-owned LIDU path produced different cache state")
 
     print(
-        "A5_LIDU_CHECK "
+        "A5_FUSED_LI_MANAGE_CHECK "
         f"heads={case.query.size(1)} batch={case.query.size(0)} "
         f"source_capacity={case.source_capacity} candidates={case.candidate_lens.cpu().tolist()} "
         f"budgets={case.cache_tokens.cpu().tolist()} "
@@ -562,7 +549,7 @@ def check_meta() -> None:
     )
     if [tuple(t.shape) for t in outputs] != [(3, 1, TOPK), (3, 1, TOPK), (3,), (7, 12288)]:
         raise AssertionError("LIDU Meta implementation returned wrong shapes")
-    print("A5_LIDU_META_CHECK ok=1", flush=True)
+    print("A5_FUSED_LI_MANAGE_META_CHECK ok=1", flush=True)
 
 
 def main() -> None:
@@ -614,7 +601,7 @@ def main() -> None:
             args.pool_extra,
             args.seed + 300,
         )
-        assert_18bit_boundary_selected(boundary, "A5_LIDU_18BIT_BOUNDARY_CHECK")
+        assert_18bit_boundary_selected(boundary, "A5_FUSED_LI_MANAGE_18BIT_BOUNDARY_CHECK")
         check_case(boundary)
 
     case_index = 0
@@ -628,7 +615,7 @@ def main() -> None:
                             for miss in range(miss_range[0], miss_range[1] + 1)
                         ):
                             print(
-                                "A5_LIDU_SKIP "
+                                "A5_FUSED_LI_MANAGE_SKIP "
                                 f"heads={heads} batch={batch} source_len={source_len} "
                                 f"C={budget} miss_range={miss_range} reason=infeasible",
                                 flush=True,
@@ -650,7 +637,7 @@ def main() -> None:
                         if args.mode in ("all", "bench") and args.iters > 0:
                             native_us, lidu_us = event_benchmark(case, args.warmup, args.iters)
                             print(
-                                "A5_LIDU_RESULT "
+                                "A5_FUSED_LI_MANAGE_RESULT "
                                 f"heads={heads} batch={batch} source_len={source_len} C={budget} "
                                 f"miss_range={miss_range[0]}:{miss_range[1]} "
                                 f"actual_miss_mean={statistics.mean(case.target_misses):.3f} "
@@ -665,7 +652,7 @@ def main() -> None:
                                 pool.copy_(case.initial_pool)
                                 launch(case, pool)
                             torch.npu.synchronize()
-    print("A5_LIDU_UT_OK", flush=True)
+    print("A5_FUSED_LI_MANAGE_UT_OK", flush=True)
 
 
 if __name__ == "__main__":

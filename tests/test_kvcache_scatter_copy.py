@@ -11,6 +11,8 @@ import torch
 import nanovllm_dsa_a5
 import torch_npu  # type: ignore  # noqa: E402
 
+from _utils import require_a5, swapped_from_cpu
+
 
 BLOCK_SIZE = 128
 KPE_DIM = 64
@@ -131,29 +133,6 @@ def random_shared_source_table(
     return table.contiguous(), blocks_per_row
 
 
-def swapped_from_cpu(
-    cpu: torch.Tensor,
-    device: torch.device,
-) -> torch.Tensor:
-    if not hasattr(torch_npu, "empty_with_swapped_memory"):
-        raise RuntimeError(
-            "torch_npu.empty_with_swapped_memory is unavailable. "
-            "This test refuses to replace DRAM with an HBM tensor."
-        )
-    tensor = torch_npu.empty_with_swapped_memory(
-        cpu.shape,
-        dtype=cpu.dtype,
-        device=device,
-    )
-    tensor.fill_(0)
-    staging = cpu.to(device)
-    tensor.add_(staging)
-    torch.npu.synchronize()
-    del staging
-    torch.npu.empty_cache()
-    return tensor
-
-
 def make_cache_tensor(
     shape: tuple[int, ...],
     dtype: torch.dtype,
@@ -168,20 +147,7 @@ def make_cache_tensor(
 
 def make_case(args: argparse.Namespace) -> Case:
     device = torch.device(args.device)
-    device_index = (
-        device.index
-        if device.index is not None
-        else torch.npu.current_device()
-    )
-    get_device_name = getattr(torch.npu, "get_device_name", None)
-    if get_device_name is None:
-        get_device_name = torch_npu.npu.get_device_name
-    device_name = get_device_name(device_index)
-    if "950" not in device_name.lower() and not args.allow_non_a5:
-        raise RuntimeError(
-            f"Expected an Ascend 950 device, got {device_name!r}. "
-            "Use --allow-non-a5 only for portability debugging."
-        )
+    device_name = require_a5(device, args.allow_non_a5)
 
     generator = torch.Generator().manual_seed(args.seed)
     source_blocks_per_row = (
