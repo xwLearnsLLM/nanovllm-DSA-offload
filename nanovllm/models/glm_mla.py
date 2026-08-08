@@ -27,10 +27,12 @@ from nanovllm.models.dsa_indexer_project import (
 )
 from nanovllm.models.glm_moe_dsa_config import GlmMoeDsaConfig
 from nanovllm.models.lidu import (
+    LIDU_MTP_UNION_CAPACITY,
     LIDU_TOPK,
     initialize_lidu_row,
     lidu_decode_update,
     lidu_decode_update_mtp,
+    lidu_decode_update_mtp_out,
     lidu_decode_update_out,
     scatter_copy,
     sparse_and_tail_attention,
@@ -450,6 +452,16 @@ class GlmMLAAttention(nn.Module):
         self._lidu_raw_graph_outputs: dict[
             int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]
         ] = {}
+        self._lidu_mtp_graph_outputs: dict[
+            int,
+            tuple[
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+            ],
+        ] = {}
+        self._mtp_sparse_tail_graph_outputs: dict[int, torch.Tensor] = {}
 
         self.ckv_cache = torch.tensor([])
         self.kpe_cache = torch.tensor([])
@@ -1250,13 +1262,7 @@ class GlmMLAAttention(nn.Module):
                     block_size=self.block_size,
                 )
 
-        (
-            topk_slots,
-            source_ids,
-            destination_slots,
-            miss_counts,
-            _,
-        ) = lidu_decode_update_mtp(
+        lidu_args = (
             q_index[: batch_size * 4],
             self.index_cache,
             weights[: batch_size * 4],
@@ -1266,6 +1272,38 @@ class GlmMLAAttention(nn.Module):
             context.candidate_lens[:batch_size],
             context.index_block_tables[:batch_size],
         )
+        if context.full_decode_graph:
+            buffers = self._lidu_mtp_graph_outputs.get(batch_size)
+            if buffers is None:
+                options = dict(dtype=torch.int32, device=q_index.device)
+                buffers = (
+                    torch.zeros(
+                        (batch_size * 4, 1, LIDU_TOPK), **options
+                    ),
+                    torch.zeros(
+                        (batch_size, LIDU_MTP_UNION_CAPACITY), **options
+                    ),
+                    torch.zeros(
+                        (batch_size, LIDU_MTP_UNION_CAPACITY), **options
+                    ),
+                    torch.zeros((batch_size,), **options),
+                )
+                self._lidu_mtp_graph_outputs[batch_size] = buffers
+            (
+                topk_slots,
+                source_ids,
+                destination_slots,
+                miss_counts,
+                _,
+            ) = lidu_decode_update_mtp_out(*lidu_args, *buffers)
+        else:
+            (
+                topk_slots,
+                source_ids,
+                destination_slots,
+                miss_counts,
+                _,
+            ) = lidu_decode_update_mtp(*lidu_args)
         if self._lidu_miss_count_collect_all:
             self._record_lidu_miss_counts(miss_counts, batch_size)
         kpe_alias, ckv_alias = scatter_copy(
@@ -1319,6 +1357,21 @@ class GlmMLAAttention(nn.Module):
             _,
             _,
         ) = self._lidu_update_mtp(q_index, weights, batch_size)
+        attention_out = None
+        if context.full_decode_graph:
+            attention_out = self._mtp_sparse_tail_graph_outputs.get(
+                batch_size
+            )
+            if (
+                attention_out is None
+                or tuple(attention_out.shape) != tuple(ql_nope.shape)
+                or attention_out.dtype != ql_nope.dtype
+                or attention_out.device != ql_nope.device
+            ):
+                attention_out = torch.empty_like(ql_nope)
+                self._mtp_sparse_tail_graph_outputs[batch_size] = (
+                    attention_out
+                )
         latent = sparse_and_tail_attention_mtp(
             ql_nope,
             ckv_cache.view(-1, self.block_size, 1, self.kv_lora_rank),
@@ -1330,6 +1383,7 @@ class GlmMLAAttention(nn.Module):
             q_pe,
             kpe_cache.view(-1, self.block_size, 1, self.qk_rope_head_dim),
             self.scale,
+            out=attention_out,
         )
         return torch_npu.npu_transpose_batchmatmul(
             latent.transpose(0, 1).contiguous(),

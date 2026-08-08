@@ -783,6 +783,15 @@ class MTPDecodeGraphEntry:
     flat_slot_mapping_i32: torch.Tensor
     cu_seqlens_q: torch.Tensor
     block_tables: torch.Tensor
+    mtp_block_tables: torch.Tensor
+    actual_seq_lengths_kv: torch.Tensor
+    index_block_tables: torch.Tensor
+    dram_block_tables: torch.Tensor
+    req_pool_entries: torch.Tensor
+    candidate_lens: torch.Tensor
+    candidate_query_lens: torch.Tensor
+    lidu_cache_tokens: torch.Tensor
+    decode_metadata_key: tuple[tuple[int, int], ...] | None = None
     target_graph: Any | None = None
     draft_graph: Any | None = None
     target_tokens: torch.Tensor | None = None
@@ -795,6 +804,7 @@ class MTPDecodeGraphEntry:
     draft_tasks: list[MLAGraphTask] = field(default_factory=list)
     replay_count: int = 0
     metadata_refresh_count: int = 0
+    metadata_reuse_count: int = 0
 
     @property
     def query_len(self) -> int:
@@ -845,7 +855,64 @@ class MTPDecodeGraphEntry:
                 dtype=torch.int32,
                 device=device,
             ),
+            mtp_block_tables=torch.zeros(
+                batch_size,
+                max_block_columns,
+                dtype=torch.int32,
+                device=device,
+            ),
+            actual_seq_lengths_kv=torch.zeros(
+                batch_size, dtype=torch.int32, device=device
+            ),
+            index_block_tables=torch.zeros(
+                batch_size,
+                max_block_columns,
+                dtype=torch.int32,
+                device=device,
+            ),
+            dram_block_tables=torch.zeros(
+                batch_size,
+                max_block_columns,
+                dtype=torch.int32,
+                device=device,
+            ),
+            req_pool_entries=torch.zeros(
+                batch_size, dtype=torch.int32, device=device
+            ),
+            candidate_lens=torch.zeros(
+                batch_size, dtype=torch.int32, device=device
+            ),
+            candidate_query_lens=torch.arange(
+                query_len,
+                (batch_size + 1) * query_len,
+                query_len,
+                dtype=torch.int32,
+                device=device,
+            ),
+            lidu_cache_tokens=torch.zeros(
+                batch_size, dtype=torch.int32, device=device
+            ),
         )
+
+    def _copy_table(
+        self,
+        destination: torch.Tensor,
+        source: torch.Tensor,
+        name: str,
+    ) -> None:
+        if int(source.shape[0]) != self.batch_size:
+            raise ValueError(
+                f"MTP {name} batch changed: expected={self.batch_size}, "
+                f"actual={source.shape[0]}."
+            )
+        columns = int(source.shape[1])
+        if columns > self.max_block_columns:
+            raise ValueError(
+                f"MTP {name} is wider than its graph buffer: "
+                f"runtime={columns}, graph={self.max_block_columns}."
+            )
+        destination.zero_()
+        destination[:, :columns].copy_(source)
 
     def copy_runtime_inputs(
         self,
@@ -853,6 +920,9 @@ class MTPDecodeGraphEntry:
         positions: torch.Tensor,
         draft_token_ids: torch.Tensor,
         context: Context,
+        mtp_block_tables: torch.Tensor | None = None,
+        *,
+        offload_mode: str = OFFLOAD_NONE,
     ) -> None:
         expected_tokens = self.batch_size * self.query_len
         if tuple(input_ids.shape) != (expected_tokens,):
@@ -884,19 +954,6 @@ class MTPDecodeGraphEntry:
                 f"expected={(expected_tokens,)}, "
                 f"actual={tuple(context.flat_slot_mapping.shape)}."
             )
-        if int(context.block_tables.shape[0]) != self.batch_size:
-            raise ValueError(
-                "MTP block-table batch changed: "
-                f"expected={self.batch_size}, "
-                f"actual={context.block_tables.shape[0]}."
-            )
-        columns = int(context.block_tables.shape[1])
-        if columns > self.max_block_columns:
-            raise ValueError(
-                "MTP block table is wider than its graph buffer: "
-                f"runtime={columns}, graph={self.max_block_columns}."
-            )
-
         self.input_ids.copy_(input_ids)
         self.positions.copy_(positions)
         self.draft_token_ids.copy_(draft_token_ids)
@@ -905,9 +962,67 @@ class MTPDecodeGraphEntry:
         if runtime_slots_i32 is None:
             runtime_slots_i32 = context.flat_slot_mapping.to(torch.int32)
         self.flat_slot_mapping_i32.copy_(runtime_slots_i32)
-        self.block_tables.zero_()
-        self.block_tables[:, :columns].copy_(context.block_tables)
-        self.metadata_refresh_count += 1
+        stateful_offload = normalize_offload_mode(offload_mode) != OFFLOAD_NONE
+        if stateful_offload:
+            required = {
+                "actual_seq_lengths_kv_tensor": (
+                    context.actual_seq_lengths_kv_tensor
+                ),
+                "index_block_tables": context.index_block_tables,
+                "dram_block_tables": context.dram_block_tables,
+                "req_pool_entries": context.req_pool_entries,
+                "candidate_lens": context.candidate_lens,
+                "candidate_query_lens": context.candidate_query_lens,
+                "lidu_cache_tokens": context.lidu_cache_tokens,
+            }
+            missing = [
+                name for name, value in required.items() if value is None
+            ]
+            if missing:
+                raise RuntimeError(
+                    "MTP FULL_DECODE_ONLY is missing offload metadata: "
+                    + ", ".join(missing)
+                )
+            self.actual_seq_lengths_kv.copy_(
+                context.actual_seq_lengths_kv_tensor
+            )
+
+        if mtp_block_tables is None:
+            mtp_block_tables = context.block_tables
+        metadata_key = context.decode_metadata_key
+        refresh_metadata = (
+            metadata_key is None or metadata_key != self.decode_metadata_key
+        )
+        if refresh_metadata:
+            self._copy_table(
+                self.block_tables, context.block_tables, "block_tables"
+            )
+            self._copy_table(
+                self.mtp_block_tables,
+                mtp_block_tables,
+                "mtp_block_tables",
+            )
+            if stateful_offload:
+                self._copy_table(
+                    self.index_block_tables,
+                    context.index_block_tables,
+                    "index_block_tables",
+                )
+                self._copy_table(
+                    self.dram_block_tables,
+                    context.dram_block_tables,
+                    "dram_block_tables",
+                )
+                self.req_pool_entries.copy_(context.req_pool_entries)
+                self.candidate_lens.copy_(context.candidate_lens)
+                self.candidate_query_lens.copy_(
+                    context.candidate_query_lens
+                )
+                self.lidu_cache_tokens.copy_(context.lidu_cache_tokens)
+            self.decode_metadata_key = metadata_key
+            self.metadata_refresh_count += 1
+        else:
+            self.metadata_reuse_count += 1
 
 
 class MTPDecodeOnlyGraphManager:
@@ -932,6 +1047,7 @@ class MTPDecodeOnlyGraphManager:
         device: str,
         speculative_tokens: int,
         expected_target_tasks: int,
+        offload_mode: str = OFFLOAD_NONE,
         log_enabled: bool = True,
     ) -> None:
         if int(speculative_tokens) != 3:
@@ -951,8 +1067,8 @@ class MTPDecodeOnlyGraphManager:
         self.speculative_tokens = int(speculative_tokens)
         self.expected_target_tasks = int(expected_target_tasks)
         self.log_enabled = bool(log_enabled)
-        self.offload_mode = OFFLOAD_NONE
-        self.stateful_offload = False
+        self.offload_mode = normalize_offload_mode(offload_mode)
+        self.stateful_offload = self.offload_mode != OFFLOAD_NONE
         self._entries: dict[int, MTPDecodeGraphEntry] = {}
         self._eager_seen: set[int] = set()
         self._graph_pool = None
@@ -962,16 +1078,29 @@ class MTPDecodeOnlyGraphManager:
         self.target_replay_count = 0
         self.draft_replay_count = 0
         self.eager_first_decode_count = 0
+        self.eager_lidu_uninitialized_count = 0
         self.eager_uncaptured_batch_count = 0
         self.eager_capture_count = 0
 
-    def should_use_graph(self, batch_size: int) -> bool:
+    def should_use_graph(
+        self,
+        batch_size: int,
+        runtime_context: Context | None = None,
+    ) -> bool:
         """Keep the first exact-size verification eager, then graph it."""
 
         batch_size = int(batch_size)
         if batch_size not in self.capture_sizes:
             self.eager_uncaptured_batch_count += 1
             return False
+        if self.stateful_offload and runtime_context is not None:
+            if runtime_context.has_first_decode:
+                self._eager_seen.add(batch_size)
+                self.eager_first_decode_count += 1
+                return False
+            if not runtime_context.lidu_all_rows_ready:
+                self.eager_lidu_uninitialized_count += 1
+                return False
         if batch_size not in self._eager_seen:
             self._eager_seen.add(batch_size)
             self.eager_first_decode_count += 1
@@ -1038,7 +1167,35 @@ class MTPDecodeOnlyGraphManager:
             flat_slot_mapping=entry.flat_slot_mapping,
             flat_slot_mapping_i32=entry.flat_slot_mapping_i32,
             actual_seq_lengths_kv=target_seq_lengths,
+            actual_seq_lengths_kv_tensor=(
+                entry.actual_seq_lengths_kv
+                if self.stateful_offload
+                else None
+            ),
             block_tables=entry.block_tables,
+            index_block_tables=(
+                entry.index_block_tables if self.stateful_offload else None
+            ),
+            dram_block_tables=(
+                entry.dram_block_tables if self.stateful_offload else None
+            ),
+            req_pool_entries=(
+                entry.req_pool_entries if self.stateful_offload else None
+            ),
+            candidate_lens=(
+                entry.candidate_lens if self.stateful_offload else None
+            ),
+            candidate_query_lens=(
+                entry.candidate_query_lens
+                if self.stateful_offload
+                else None
+            ),
+            lidu_cache_tokens=(
+                entry.lidu_cache_tokens if self.stateful_offload else None
+            ),
+            needs_dsa_update=self.stateful_offload,
+            lidu_all_rows_ready=self.stateful_offload,
+            has_first_decode=False,
             full_decode_graph=True,
         )
 
@@ -1116,6 +1273,7 @@ class MTPDecodeOnlyGraphManager:
         draft_token_ids: torch.Tensor,
         runtime_context: Context,
         base_seq_lengths: list[int],
+        mtp_block_tables: torch.Tensor | None = None,
     ) -> None:
         self._ensure_capture_resources()
         distributed = dist.is_initialized() and dist.get_world_size() > 1
@@ -1129,6 +1287,8 @@ class MTPDecodeOnlyGraphManager:
                     positions,
                     draft_token_ids,
                     runtime_context,
+                    mtp_block_tables,
+                    offload_mode=self.offload_mode,
                 )
                 target_seq_lengths = self._target_seq_lengths(
                     base_seq_lengths, self.speculative_tokens
@@ -1141,6 +1301,8 @@ class MTPDecodeOnlyGraphManager:
                         positions,
                         draft_token_ids,
                         runtime_context,
+                        mtp_block_tables,
+                        offload_mode=self.offload_mode,
                     )
                     self._set_target_context(entry, target_seq_lengths)
 
@@ -1189,7 +1351,7 @@ class MTPDecodeOnlyGraphManager:
                         entry.next_token_ids,
                         entry.selected_positions,
                         entry.selected_hidden_states,
-                        entry.block_tables,
+                        entry.mtp_block_tables,
                         draft_seq_lengths,
                     )
                 else:
@@ -1197,7 +1359,7 @@ class MTPDecodeOnlyGraphManager:
                         entry.next_token_ids,
                         entry.selected_positions,
                         entry.selected_hidden_states,
-                        entry.block_tables,
+                        entry.mtp_block_tables,
                         draft_seq_lengths,
                     )
                 torch.npu.synchronize()
@@ -1214,7 +1376,7 @@ class MTPDecodeOnlyGraphManager:
                             entry.next_token_ids,
                             entry.selected_positions,
                             entry.selected_hidden_states,
-                            entry.block_tables,
+                            entry.mtp_block_tables,
                             draft_seq_lengths,
                         )
                 torch.npu.synchronize()
@@ -1259,12 +1421,15 @@ class MTPDecodeOnlyGraphManager:
         draft_token_ids: torch.Tensor,
         runtime_context: Context,
         base_seq_lengths: list[int],
+        mtp_block_tables: torch.Tensor | None = None,
     ) -> None:
         entry.copy_runtime_inputs(
             input_ids,
             positions,
             draft_token_ids,
             runtime_context,
+            mtp_block_tables,
+            offload_mode=self.offload_mode,
         )
         target_seq_lengths = self._target_seq_lengths(
             base_seq_lengths, self.speculative_tokens
@@ -1293,6 +1458,7 @@ class MTPDecodeOnlyGraphManager:
         draft_token_ids: torch.Tensor,
         runtime_context: Context,
         base_seq_lengths: list[int],
+        mtp_block_tables: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size = len(base_seq_lengths)
         if batch_size not in self.capture_sizes:
@@ -1311,6 +1477,7 @@ class MTPDecodeOnlyGraphManager:
                 draft_token_ids,
                 runtime_context,
                 base_seq_lengths,
+                mtp_block_tables,
             )
         else:
             self._replay(
@@ -1320,6 +1487,7 @@ class MTPDecodeOnlyGraphManager:
                 draft_token_ids,
                 runtime_context,
                 base_seq_lengths,
+                mtp_block_tables,
             )
         return entry.target_tokens, entry.accepted_counts, entry.next_drafts
 
@@ -1332,7 +1500,7 @@ class MTPDecodeOnlyGraphManager:
             "enabled": True,
             "mode": FULL_DECODE_ONLY,
             "capture_sizes": list(self.capture_sizes),
-            "offload_mode": OFFLOAD_NONE,
+            "offload_mode": self.offload_mode,
             "exact_size_only": True,
             "captures": self.capture_count,
             "replays": self.replay_count,
@@ -1343,12 +1511,14 @@ class MTPDecodeOnlyGraphManager:
             "eager_prefill": 0,
             "eager_first_decode": self.eager_first_decode_count,
             "eager_no_dsa": 0,
-            "eager_lidu_uninitialized": 0,
-            "eager_lidu_capture": 0,
+            "eager_lidu_uninitialized": self.eager_lidu_uninitialized_count,
+            "eager_lidu_capture": self.eager_capture_count,
             "eager_uncaptured_batch": self.eager_uncaptured_batch_count,
             "eager_mtp_capture": self.eager_capture_count,
             "metadata_refreshes": sum(
                 entry.metadata_refresh_count for entry in self._entries.values()
             ),
-            "metadata_reuses": 0,
+            "metadata_reuses": sum(
+                entry.metadata_reuse_count for entry in self._entries.values()
+            ),
         }

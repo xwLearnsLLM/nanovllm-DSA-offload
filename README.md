@@ -98,9 +98,9 @@ python3 ut_ops/test_mtp_offload_chain.py \
 三个成功标志分别为 `MTP_LIDU_UT_OK`、`MTP_SPARSE_TAIL_ATTENTION_UT_OK` 和 `MTP_OFFLOAD_CHAIN_UT_OK`。
 
 
-## MTP3 + LIDU eager 整网验收
+## MTP3 + LIDU 整网验收
 
-该组合固定使用 `NANOVLLM_OFFLOAD_MODE=offload_split` 和 `NANOVLLM_ENFORCE_EAGER=1`。MTP union 最多为 8192，因此 2049 token 以上的请求会自动把 C 提高到 `min(prefill_full_tokens, 8192)`；原本更大的可调预算保持不变。`NANOVLLM_DRAM_NUM_BLOCKS` 同时决定完整 target source 和 MTP 单层 dense KV 池容量。
+该组合固定使用 `NANOVLLM_OFFLOAD_MODE=offload_split`。`NANOVLLM_ENFORCE_EAGER=1` 运行 eager，设置为 `0` 时仅稳定 exact-size decode batch 进入 FULL_DECODE_ONLY；首次 decode、LIDU 初始化和首次图捕获允许较慢。MTP union 最多为 8192，因此 2049 token 以上的请求会自动把 C 提高到 `min(prefill_full_tokens, 8192)`；原本更大的可调预算保持不变。`NANOVLLM_DRAM_NUM_BLOCKS` 同时决定完整 target source 和 MTP 单层 dense KV 池容量。
 
 ```bash
 unset NANOVLLM_ENABLE_DSA_OFFLOAD
@@ -123,14 +123,14 @@ export NANOVLLM_MODEL=/mnt/models/GLM-5.1-w4a8/
 export NANOVLLM_TP_SIZE=16
 export NANOVLLM_ENABLE_EXPERT_PARALLEL=1
 export NANOVLLM_OFFLOAD_MODE=offload_split
-export NANOVLLM_ENFORCE_EAGER=1
+export NANOVLLM_ENFORCE_EAGER=0
 export NANOVLLM_KVCACHE_BLOCK_SIZE=128
-export NANOVLLM_HBM_NUM_BLOCKS=700
-export NANOVLLM_DRAM_NUM_BLOCKS=2000
+export NANOVLLM_HBM_NUM_BLOCKS=900
+export NANOVLLM_DRAM_NUM_BLOCKS=2500
 export NANOVLLM_PREFILL_CHUNK_SIZE=1024
 export NANOVLLM_NUM_SPECULATIVE_TOKENS=3
 export NANOVLLM_IGNORE_EOS=1
-export NANOVLLM_MAX_STEPS=8
+export NANOVLLM_MAX_STEPS=16
 
 python3 example/test_dureader.py --prompt_count 8
 ```

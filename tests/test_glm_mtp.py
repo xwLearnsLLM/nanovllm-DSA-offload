@@ -459,30 +459,25 @@ def test_glm_mtp_runtime_accepts_nonoffload_k3(tmp_path, enforce_eager):
     assert config.hf_config.nanovllm_num_speculative_tokens == 3
 
 
-def test_glm_mtp_runtime_accepts_eager_lidu_split(tmp_path):
+@pytest.mark.parametrize("enforce_eager", [True, False])
+def test_glm_mtp_runtime_accepts_lidu_split(tmp_path, enforce_eager):
     _write_mtp_config(tmp_path)
     config = _mtp_config(
         tmp_path,
         offload_mode="offload_split",
-        enforce_eager=True,
+        enforce_eager=enforce_eager,
         kvcache_block_size=128,
         num_dram_kvcache_blocks=64,
     )
     assert config.offload_mode == "offload_split"
+    assert config.decode_graph_capture_sizes == (
+        () if enforce_eager else (config.max_num_decode_seqs_per_step,)
+    )
 
 
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
-        (
-            {
-                "offload_mode": "offload_split",
-                "enforce_eager": False,
-                "kvcache_block_size": 128,
-                "num_dram_kvcache_blocks": 64,
-            },
-            "requires enforce_eager=True",
-        ),
         (
             {
                 "offload_mode": "offload_fuse",

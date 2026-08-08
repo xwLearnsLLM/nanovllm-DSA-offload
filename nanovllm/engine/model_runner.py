@@ -21,6 +21,7 @@ from nanovllm.engine.dsa_offload import (
     OFFLOAD_NONE,
     finalize_prefill_hbm_layout,
     max_lidu_cache_tokens,
+    mtp_lidu_cache_tokens,
 )
 from nanovllm.engine.full_decode_graph import (
     FullDecodeOnlyGraphManager,
@@ -198,13 +199,19 @@ class ModelRunner:
                     block_size=config.kvcache_block_size,
                     device=self.device,
                     speculative_tokens=self.num_speculative_tokens,
-                    expected_target_tasks=int(text_config.num_hidden_layers),
+                    expected_target_tasks=(
+                        0
+                        if self.uses_offload
+                        else int(text_config.num_hidden_layers)
+                    ),
+                    offload_mode=self.offload_mode,
                     log_enabled=self.rank == 0,
                 )
                 if self.rank == 0:
                     logger.info(
-                        "FULL_DECODE_ONLY MTP: first exact-size verify stays "
-                        "eager; target and draft graphs are captured lazily."
+                        "FULL_DECODE_ONLY MTP: first decode and uninitialized "
+                        "LIDU rows stay eager; exact-size target and draft "
+                        "graphs are captured lazily."
                     )
                 if self.world_size > 1:
                     dist.barrier()
@@ -462,7 +469,7 @@ class ModelRunner:
         cache_dtype = torch.bfloat16
         num_target_layers = int(text_config.num_hidden_layers)
         num_layers = num_target_layers + int(
-            self.num_speculative_tokens > 0
+            self.num_speculative_tokens > 0 and not self.uses_offload
         )
         kv_lora_rank = int(text_config.kv_lora_rank)
         rope_dim = int(text_config.qk_rope_head_dim)
@@ -513,7 +520,13 @@ class ModelRunner:
                 config.num_hbm_kvcache_blocks,
                 config.num_dram_kvcache_blocks,
                 config.num_dram_kvcache_blocks,
-                max_lidu_cache_tokens(config.max_model_len),
+                (
+                    mtp_lidu_cache_tokens(
+                        config.max_model_len, self.block_size
+                    )
+                    if self.num_speculative_tokens
+                    else max_lidu_cache_tokens(config.max_model_len)
+                ),
             )
 
         index_shape = (num_target_layers, config.num_dram_kvcache_blocks, self.block_size, 1, index_dim)
@@ -1448,7 +1461,7 @@ class ModelRunner:
         graph_manager = self.decode_graph_manager
         if (
             isinstance(graph_manager, MTPDecodeOnlyGraphManager)
-            and graph_manager.should_use_graph(len(seqs))
+            and graph_manager.should_use_graph(len(seqs), get_context())
         ):
             target_tokens, accepted_counts, next_drafts = graph_manager.run(
                 input_ids,
@@ -1456,6 +1469,7 @@ class ModelRunner:
                 draft_token_ids,
                 get_context(),
                 base_seq_lengths,
+                mtp_block_tables,
             )
         else:
             (

@@ -12,7 +12,12 @@ from nanovllm.engine.full_decode_graph import (
     MTPDecodeOnlyGraphManager,
     normalize_capture_sizes,
 )
-from nanovllm.utils.context import Context, reset_context, set_context
+from nanovllm.utils.context import (
+    Context,
+    get_context,
+    reset_context,
+    set_context,
+)
 
 
 def _decode_context(
@@ -87,6 +92,73 @@ def test_mtp_entry_copies_exact_target_inputs():
     assert entry.block_tables[:, 3].count_nonzero().item() == 0
 
 
+def test_mtp_entry_copies_offload_and_separate_draft_metadata():
+    entry = MTPDecodeGraphEntry.allocate(
+        batch_size=2,
+        speculative_tokens=3,
+        max_block_columns=4,
+        device=torch.device("cpu"),
+    )
+    target_tables = torch.tensor(
+        [[1, 2, 3], [4, 5, 6]], dtype=torch.int32
+    )
+    mtp_tables = target_tables + 100
+    original_target_tables = target_tables.clone()
+    original_mtp_tables = mtp_tables.clone()
+    context = Context(
+        flat_slot_mapping=torch.arange(8, dtype=torch.int64) + 20,
+        flat_slot_mapping_i32=torch.arange(8, dtype=torch.int32) + 20,
+        actual_seq_lengths_kv=[5188, 5192],
+        actual_seq_lengths_kv_tensor=torch.tensor(
+            [5188, 5192], dtype=torch.int32
+        ),
+        block_tables=target_tables,
+        index_block_tables=target_tables + 10,
+        dram_block_tables=target_tables + 20,
+        req_pool_entries=torch.tensor([7, 3], dtype=torch.int32),
+        candidate_lens=torch.tensor([20992, 32768], dtype=torch.int32),
+        candidate_query_lens=torch.tensor([4, 8], dtype=torch.int32),
+        lidu_cache_tokens=torch.tensor([8192, 12288], dtype=torch.int32),
+        decode_metadata_key=((10, 3), (11, 7)),
+    )
+
+    entry.copy_runtime_inputs(
+        torch.arange(8, dtype=torch.int64) + 100,
+        torch.arange(8, dtype=torch.int64) + 1000,
+        torch.tensor([[7, 8, 9], [10, 11, 12]], dtype=torch.int64),
+        context,
+        mtp_tables,
+        offload_mode="offload_split",
+    )
+
+    assert entry.block_tables[:, :3].equal(original_target_tables)
+    assert entry.mtp_block_tables[:, :3].equal(original_mtp_tables)
+    assert entry.index_block_tables[:, :3].equal(target_tables + 10)
+    assert entry.dram_block_tables[:, :3].equal(target_tables + 20)
+    assert entry.actual_seq_lengths_kv.tolist() == [5188, 5192]
+    assert entry.req_pool_entries.tolist() == [7, 3]
+    assert entry.candidate_lens.tolist() == [20992, 32768]
+    assert entry.candidate_query_lens.tolist() == [4, 8]
+    assert entry.lidu_cache_tokens.tolist() == [8192, 12288]
+
+    # Dynamic lengths always refresh, while unchanged tables/state are reused.
+    context.actual_seq_lengths_kv_tensor.add_(1)
+    context.block_tables.add_(1000)
+    entry.copy_runtime_inputs(
+        torch.arange(8, dtype=torch.int64) + 200,
+        torch.arange(8, dtype=torch.int64) + 2000,
+        torch.tensor([[17, 18, 19], [20, 21, 22]], dtype=torch.int64),
+        context,
+        mtp_tables + 1000,
+        offload_mode="offload_split",
+    )
+    assert entry.actual_seq_lengths_kv.tolist() == [5189, 5193]
+    assert entry.block_tables[:, :3].equal(original_target_tables)
+    assert entry.mtp_block_tables[:, :3].equal(original_mtp_tables)
+    assert entry.metadata_refresh_count == 1
+    assert entry.metadata_reuse_count == 1
+
+
 def test_mtp_graph_uses_only_exact_batch_after_one_eager_step():
     manager = MTPDecodeOnlyGraphManager(
         target_forward=lambda *_args: (),
@@ -109,6 +181,78 @@ def test_mtp_graph_uses_only_exact_batch_after_one_eager_step():
     assert stats["eager_first_decode"] == 1
     assert stats["eager_uncaptured_batch"] == 1
     assert stats["exact_size_only"] is True
+
+
+def test_mtp_offload_graph_waits_for_initialized_rows():
+    manager = MTPDecodeOnlyGraphManager(
+        target_forward=lambda *_args: (),
+        draft_forward=lambda *_args: torch.empty(0),
+        target_warmup=None,
+        draft_warmup=None,
+        capture_sizes=(8,),
+        max_model_len=32768,
+        block_size=128,
+        device="cpu",
+        speculative_tokens=3,
+        expected_target_tasks=0,
+        offload_mode="offload_split",
+        log_enabled=False,
+    )
+
+    assert not manager.should_use_graph(
+        8, Context(has_first_decode=True, lidu_all_rows_ready=False)
+    )
+    assert not manager.should_use_graph(
+        8, Context(has_first_decode=False, lidu_all_rows_ready=False)
+    )
+    assert manager.should_use_graph(
+        8, Context(has_first_decode=False, lidu_all_rows_ready=True)
+    )
+    stats = manager.stats()
+    assert stats["offload_mode"] == "offload_split"
+    assert stats["eager_first_decode"] == 1
+    assert stats["eager_lidu_uninitialized"] == 1
+
+
+def test_mtp_offload_target_context_uses_fixed_graph_metadata():
+    manager = MTPDecodeOnlyGraphManager(
+        target_forward=lambda *_args: (),
+        draft_forward=lambda *_args: torch.empty(0),
+        target_warmup=None,
+        draft_warmup=None,
+        capture_sizes=(2,),
+        max_model_len=32768,
+        block_size=128,
+        device="cpu",
+        speculative_tokens=3,
+        expected_target_tasks=0,
+        offload_mode="offload_split",
+        log_enabled=False,
+    )
+    entry = manager._allocate_entry(2)
+    entry.actual_seq_lengths_kv.copy_(torch.tensor([5188, 5192]))
+    entry.req_pool_entries.copy_(torch.tensor([7, 3]))
+    entry.candidate_lens.copy_(torch.tensor([20992, 32768]))
+    entry.lidu_cache_tokens.copy_(torch.tensor([8192, 12288]))
+
+    manager._set_target_context(entry, [21003, 32779])
+    try:
+        context = get_context()
+        assert context.is_spec_decode is True
+        assert context.full_decode_graph is True
+        assert context.needs_dsa_update is True
+        assert context.lidu_all_rows_ready is True
+        assert context.actual_seq_lengths_kv == [21003, 32779]
+        assert context.actual_seq_lengths_kv_tensor is entry.actual_seq_lengths_kv
+        assert context.block_tables is entry.block_tables
+        assert context.index_block_tables is entry.index_block_tables
+        assert context.dram_block_tables is entry.dram_block_tables
+        assert context.req_pool_entries is entry.req_pool_entries
+        assert context.candidate_lens is entry.candidate_lens
+        assert context.candidate_query_lens is entry.candidate_query_lens
+        assert context.lidu_cache_tokens is entry.lidu_cache_tokens
+    finally:
+        reset_context()
 
 
 def test_static_entry_copies_all_lidu_metadata():
