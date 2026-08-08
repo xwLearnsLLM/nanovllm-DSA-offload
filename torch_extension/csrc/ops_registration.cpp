@@ -15,6 +15,11 @@ TORCH_LIBRARY(nanovllm_dsa, m) {
       "Tensor(d!) miss_counts) "
       "-> (Tensor(b!), Tensor(c!), Tensor(d!), Tensor(a!))");
   m.def(
+      "fused_li_manage_mtp(Tensor query, Tensor key, Tensor weights, "
+      "Tensor(a!) cache_slots, Tensor actual_seq_lengths_query, "
+      "Tensor actual_seq_lengths_key, Tensor block_table) "
+      "-> (Tensor, Tensor, Tensor, Tensor, Tensor)");
+  m.def(
       "_fused_li_manage_c8_cache_update(Tensor topk_indices, Tensor req_pool_entries, "
       "Tensor(a!) cache_slots_pool, Tensor cache_tokens, "
       "Tensor candidate_lens) "

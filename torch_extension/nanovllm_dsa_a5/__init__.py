@@ -34,17 +34,16 @@ import torch_npu  # noqa: E402,F401
 
 from . import _C  # noqa: E402,F401
 from .ops import (  # noqa: E402
-
-
     fused_li_manage,
     fused_li_manage_c8,
     fused_li_manage_c8_out,
+    fused_li_manage_mtp,
     fused_li_manage_out,
+    fused_copy_sparse_tail_attention,
     kvcache_scatter_copy,
     kvcache_scatter_copy_c8,
     kvcache_scatter_copy_c8_out,
     sparse_tail_attention,
-    fused_copy_sparse_tail_attention,
     sparse_tail_attention_c8,
 )
 
@@ -56,8 +55,7 @@ def local_opapi_path() -> str:
 __all__ = [
     "fused_li_manage",
     "fused_li_manage_out",
-
-
+    "fused_li_manage_mtp",
     "fused_li_manage_c8",
     "fused_li_manage_c8_out",
     "kvcache_scatter_copy",

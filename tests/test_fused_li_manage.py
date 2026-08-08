@@ -31,6 +31,42 @@ from _lidu_utils import (
 BLOCK_SIZE = 128
 HEAD_DIM = 128
 
+# Incremental latency (fused LI management minus native LightningIndexer),
+# measured by ops_li_update_a5 on Ascend 950DT with C=12288,
+# miss_count=100..200, warmup=10 and iters=1000.  Exact-matrix runs below
+# print the delta to this historical baseline; it is intentionally not a
+# hard gate because firmware, frequency and native-LI versions affect events.
+REFERENCE_INDEX_MANAGEMENT_US = {
+    (32, 65536, 1): 14.085,
+    (32, 65536, 8): 20.456,
+    (32, 65536, 16): 7.251,
+    (32, 65536, 24): 26.989,
+    (32, 65536, 32): 34.647,
+    (32, 65536, 48): 47.612,
+    (32, 65536, 64): 62.598,
+    (32, 131072, 1): 15.937,
+    (32, 131072, 8): 11.348,
+    (32, 131072, 16): -5.229,
+    (32, 131072, 24): 26.841,
+    (32, 131072, 32): 36.176,
+    (32, 131072, 48): 83.341,
+    (32, 131072, 64): 85.670,
+    (64, 65536, 1): 6.362,
+    (64, 65536, 8): 16.484,
+    (64, 65536, 16): 15.985,
+    (64, 65536, 24): 17.960,
+    (64, 65536, 32): 25.426,
+    (64, 65536, 48): 65.220,
+    (64, 65536, 64): 63.823,
+    (64, 131072, 1): 19.587,
+    (64, 131072, 8): 26.534,
+    (64, 131072, 16): 20.949,
+    (64, 131072, 24): 32.315,
+    (64, 131072, 32): 33.766,
+    (64, 131072, 48): 85.174,
+    (64, 131072, 64): 90.316,
+}
+
 
 @dataclass
 class Case:
@@ -126,16 +162,30 @@ def make_case(
     pool_extra: int,
     seed: int,
     candidate_lens_cpu: list[int] | None = None,
+    pin_miss_endpoints: bool = False,
+    random_block_table: bool = False,
 ) -> Case:
     if len(budgets) != batch:
         raise ValueError("budget list must match batch")
     torch.manual_seed(seed)
     torch.npu.manual_seed_all(seed)
     blocks = source_len // BLOCK_SIZE
-    block_table_cpu = torch.stack(
-        [torch.randperm(blocks, dtype=torch.int64).to(torch.int32) for _ in range(batch)]
-    )
-    key = torch.empty((blocks, BLOCK_SIZE, 1, HEAD_DIM), dtype=torch.bfloat16, device=device).uniform_(-1, 1)
+    if random_block_table:
+        block_table_cpu = torch.stack([
+            torch.randperm(blocks, dtype=torch.int64).to(torch.int32) + row * blocks
+            for row in range(batch)
+        ])
+    else:
+        block_table_cpu = torch.arange(
+            batch * blocks, dtype=torch.int32
+        ).reshape(batch, blocks)
+    # Keep physical KV pages disjoint across requests, matching the historical
+    # ops_li_update_a5 benchmark instead of letting rows reuse one HBM region.
+    key = torch.empty(
+        (batch * blocks, BLOCK_SIZE, 1, HEAD_DIM),
+        dtype=torch.bfloat16,
+        device=device,
+    ).uniform_(-1, 1)
     query = torch.empty((batch, heads, HEAD_DIM), dtype=torch.bfloat16, device=device).uniform_(-1, 1)
     weights = torch.empty((batch, heads), dtype=torch.bfloat16, device=device).uniform_(-1, 1)
     if candidate_lens_cpu is None:
@@ -167,7 +217,7 @@ def make_case(
     # Multi-row cases pin both range endpoints for coverage.  A one-row
     # performance case keeps its seeded random sample, so 0:300 does not
     # silently degenerate into the zero-miss benchmark.
-    if batch > 1:
+    if pin_miss_endpoints and batch > 1:
         if budgets[0] > 0 and feasible_miss(
             candidate_lens_cpu[0], budgets[0], miss_range[0]
         ):
@@ -333,35 +383,76 @@ def check_case(case: Case) -> None:
     )
 
 
-def event_benchmark(case: Case, warmup: int, iters: int) -> tuple[float, float]:
+def event_benchmark(
+    case: Case, warmup: int, iters: int, seed: int
+) -> tuple[float, float, float]:
     pool = case.initial_pool.clone()
     for _ in range(warmup):
+        native_lightning_indexer(
+            case.query, case.key, case.weights,
+            case.candidate_lens, case.block_table,
+        )
         pool.copy_(case.initial_pool)
         launch(case, pool)
     torch.npu.synchronize()
-    starts = [torch.npu.Event(enable_timing=True) for _ in range(iters)]
-    ends = [torch.npu.Event(enable_timing=True) for _ in range(iters)]
-    retained = []
-    for start, end in zip(starts, ends):
-        pool.copy_(case.initial_pool)
-        torch.npu.synchronize()
-        start.record()
-        retained.append(launch(case, pool))
-        end.record()
-    ends[-1].synchronize()
-    lidu_us = statistics.mean(start.elapsed_time(end) for start, end in zip(starts, ends)) * 1000
 
-    native_starts = [torch.npu.Event(enable_timing=True) for _ in range(iters)]
-    native_ends = [torch.npu.Event(enable_timing=True) for _ in range(iters)]
-    for start, end in zip(native_starts, native_ends):
+    def timed_call(fn) -> float:
+        start = torch.npu.Event(enable_timing=True)
+        end = torch.npu.Event(enable_timing=True)
         start.record()
-        native_lightning_indexer(case.query, case.key, case.weights, case.candidate_lens, case.block_table)
+        output = fn()
         end.record()
-    native_ends[-1].synchronize()
-    native_us = statistics.mean(start.elapsed_time(end) for start, end in zip(native_starts, native_ends)) * 1000
-    if not retained:
-        raise AssertionError("timed outputs were not retained")
-    return native_us, lidu_us
+        end.synchronize()
+        if output is None:
+            raise AssertionError("timed call returned no output")
+        return start.elapsed_time(end) * 1000.0
+
+    native_samples = []
+    lidu_samples = []
+    paired_extra = []
+    order_rng = random.Random(seed + 3)
+    native = lambda: native_lightning_indexer(
+        case.query, case.key, case.weights,
+        case.candidate_lens, case.block_table,
+    )
+    fused = lambda: launch(case, pool)
+    for _ in range(iters):
+        names = ["native", "fused"]
+        order_rng.shuffle(names)
+        pair = {}
+        for name in names:
+            if name == "fused":
+                # Cache restoration is deliberately outside the timed region.
+                pool.copy_(case.initial_pool)
+                torch.npu.synchronize()
+            pair[name] = timed_call(native if name == "native" else fused)
+        native_samples.append(pair["native"])
+        lidu_samples.append(pair["fused"])
+        paired_extra.append(pair["fused"] - pair["native"])
+    return (
+        statistics.mean(native_samples),
+        statistics.mean(lidu_samples),
+        statistics.mean(paired_extra),
+    )
+
+
+def reference_comparison(
+    heads: int,
+    source_len: int,
+    batch: int,
+    budget: int,
+    miss_range: tuple[int, int],
+    measured_extra_us: float,
+) -> str:
+    if budget != 12288 or miss_range != (100, 200):
+        return ""
+    reference = REFERENCE_INDEX_MANAGEMENT_US.get((heads, source_len, batch))
+    if reference is None:
+        return ""
+    return (
+        f" reference_index_management_us={reference:+.3f}"
+        f" delta_vs_reference_us={measured_extra_us - reference:+.3f}"
+    )
 
 
 def check_meta() -> None:
@@ -404,6 +495,8 @@ def main() -> None:
         args.pool_extra,
         args.seed + 100,
         [2048, 8192, 12288, 20096, 24576, 32768],
+        True,
+        True,
     )
     check_case(mixed)
     miss_edges = make_case(
@@ -415,6 +508,8 @@ def main() -> None:
         (0, TOPK),
         args.pool_extra,
         args.seed + 200,
+        pin_miss_endpoints=True,
+        random_block_table=True,
     )
     check_case(miss_edges)
     boundary = make_case(
@@ -426,13 +521,13 @@ def main() -> None:
         (0, 300),
         args.pool_extra,
         args.seed + 300,
+        random_block_table=True,
     )
     assert_18bit_boundary_selected(
         boundary, "A5_FUSED_LI_MANAGE_18BIT_BOUNDARY_CHECK"
     )
     check_case(boundary)
 
-    case_index = 0
     for heads in args.heads:
         for batch in args.batch_sizes:
             for source_len in args.source_lens:
@@ -457,20 +552,25 @@ def main() -> None:
                             [budget] * batch,
                             miss_range,
                             args.pool_extra,
-                            args.seed + case_index,
+                            args.seed,
                         )
-                        case_index += 1
                         check_case(case)
                         if args.iters > 0:
-                            native_us, lidu_us = event_benchmark(case, args.warmup, args.iters)
+                            native_us, lidu_us, extra_us = event_benchmark(
+                                case, args.warmup, args.iters, args.seed
+                            )
+                            comparison = reference_comparison(
+                                heads, source_len, batch, budget,
+                                miss_range, extra_us,
+                            )
                             print(
                                 "A5_FUSED_LI_MANAGE_RESULT "
                                 f"heads={heads} batch={batch} source_len={source_len} C={budget} "
                                 f"miss_range={miss_range[0]}:{miss_range[1]} "
                                 f"actual_miss_mean={statistics.mean(case.target_misses):.3f} "
                                 f"native_li_us={native_us:.3f} lidu_us={lidu_us:.3f} "
-                                f"index_management_us={lidu_us - native_us:+.3f} "
-                                f"warmup={args.warmup} iters={args.iters}",
+                                f"index_management_us={extra_us:+.3f} paired=1"
+                                f"{comparison} warmup={args.warmup} iters={args.iters}",
                                 flush=True,
                             )
     print("A5_FUSED_LI_MANAGE_UT_OK", flush=True)

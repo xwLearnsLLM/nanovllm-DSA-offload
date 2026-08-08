@@ -6,7 +6,7 @@
 
 ## 来源
 
-- LIDU：基于 `ops_li_update_a5@0362e7e` 的生产 P5 内核，增加 request pool、逐请求 C、动态 pool 行跨度、mutable alias 和 caller-owned out。
+- LIDU：普通路径基于 `ops_li_update_a5@0362e7e` 的生产 P5 内核，增加 request pool、逐请求 C、动态 pool 行跨度、mutable alias 和 caller-owned out；MTP 路径迁移同仓 `lightning_indexer_decode_update_mtp_a5`，仅重命名并隔离其专用 Arch35 payload，保持原始 packed-query 行为。
 - SCATTER：基于 `ops_dsa_offload_a5@01f2065` 已验证的 Ascend 950 swapped-memory DRAM→HBM 路径。
 - SFA：基于 `vllm-ascend-v0.23.0-custom@6af99b372` 的官方 Arch35 SFA 叠加 sparse+tail 语义。官方接口说明见 [aclnnSparseFlashAttention](https://github.com/vllm-project/vllm-ascend/blob/main/csrc/attention/sparse_flash_attention/docs/aclnnSparseFlashAttention.md)。
 - 融合算子：基于 `ops_dsa_offload_a5@d58629f` 的 MTE-pipeline 版本；公共 SFA 基础代码复用本仓库副本，避免污染拆分链路基线。
@@ -16,6 +16,7 @@
 | 公开入口 | 实际执行 | 作用 | 定位 |
 | --- | --- | --- | --- |
 | `fused_li_manage` / `fused_li_manage_out` | `A5FusedLiManage` | BF16/FP16 LightningIndexer top-2048 与 request-pool 更新；`_out` 写入 caller-owned buffer | eager / 稳定图主链 |
+| `fused_li_manage_mtp` | `A5FusedLiManageMtp` | BF16/FP16 packed MTP query 的逐 query top-2048、请求级并集与一次性 8192-token 缓存更新 | MTP decode |
 | `kvcache_scatter_copy` | `A5KvcacheScatterCopy` | 按 miss-prefix 将分离的 BF16/FP16 CKV、KPE 从 swapped-memory DRAM 搬到 HBM | 稳定图主链 |
 | `sparse_tail_attention` | `A5SparseTailAttention` | 对 top-2048 sparse slots 与 tail 执行 BF16/FP16 MLA | 稳定图主链 |
 | `fused_copy_sparse_tail_attention` | `A5FusedCopySparseTailAttention` | BF16 MTE pipeline，将 DRAM→HBM 搬运与 sparse+tail Attention 融合，可配置每步预取行数 | 稳定图主链 |
@@ -52,6 +53,22 @@ torch.ops.nanovllm_dsa.fused_li_manage_out(
     destination_slots,      # caller-owned int32[B,1,2048]，in/out
     miss_counts,            # caller-owned int32[B]，in/out
 ) -> (source_ids_alias, destination_slots_alias, miss_counts_alias, cache_slots_alias)
+
+torch.ops.nanovllm_dsa.fused_li_manage_mtp(
+    query,                  # bf16/fp16[T,INDEX_HEADS,128]，INDEX_HEADS=32|64
+    key,                    # bf16/fp16[INDEX_BLOCKS,BLOCK,1,128]
+    weights,                # bf16/fp16[T,INDEX_HEADS]
+    cache_slots,            # int32[B,262144]，in/out；每个请求固定缓存 8192 tokens
+    actual_seq_lengths_query, # cumulative int32[B]；每个请求包含 1..4 个 packed query
+    actual_seq_lengths_key, # int32[B]
+    block_table,            # int32[B,MAX_BLOCKS]
+) -> (
+    topk_index,             # int32[T,1,2048]
+    topk_slots,             # int32[T,1,2048]
+    miss_index,             # int32[B,8192]；请求内所有 query 的 top-k 并集 miss
+    miss_slots,             # int32[B,8192]
+    miss_count,             # int32[B]
+)
 
 torch.ops.nanovllm_dsa.kvcache_scatter_copy(
     hbm_kpe,                # bf16/fp16[HBM_BLOCKS,128,64]，in/out
@@ -136,6 +153,12 @@ python3 tests/test_fused_li_manage.py --device npu:0 --heads 32,64 --batch-sizes
 该 LIDU 命令还会强制覆盖不同 candidate length、`C=0/2048/3072/6144/8192/12288/16256`、零 miss、2048 miss、乱序 pool entries、hit slot 保持、重复更新映射、inactive pool guard、caller-owned out 和 `262144` 的 18-bit token-index 边界。
 
 ```bash
+python3 tests/test_fused_li_manage_mtp.py --device npu:0 --bs 24 --min-seqlen 32768 --max-seqlen 65536 --q-heads 64 --queries-per-request 0 --min-miss-count 0 --max-miss-count 300 --seed 7
+```
+
+MTP 门禁逐 query 对照原生 LightningIndexer，并检查因果可见前缀、请求级 top-k 并集去重、并集 miss、一次性缓存更新、hit slot 保持、victim 淘汰和 8192-token 缓存基数。
+
+```bash
 for count in 0 1 100 300 2048; do python3 tests/test_kvcache_scatter_copy.py --device npu:0 --batch-size 24 --source-len 65536 --hbm-slots 4096 --copy-cap 2048 --copy-min "$count" --copy-max "$count" --warmup 3 --iters 10 --seed 7; done
 ```
 
@@ -171,6 +194,12 @@ LIDU：
 
 ```bash
 python3 tests/test_fused_li_manage.py --device npu:0 --heads 32 --batch-sizes 1,4,8,12,16,24,32 --source-lens 12288,20096,65536,131072 --cache-tokens 6144 --miss-ranges 0:0,0:300,300:300 --warmup 10 --iters 100 --seed 7
+```
+
+与 `ops_li_update_a5/README.md` 历史表格完全同口径的确认命令如下；单测采用每轮随机顺序的成对 NPU Event 计时，并打印 `delta_vs_reference_us`：
+
+```bash
+python3 tests/test_fused_li_manage.py --device npu:0 --heads 32,64 --batch-sizes 1,8,16,24,32,48,64 --source-lens 65536,131072 --cache-tokens 12288 --miss-ranges 100:200 --pool-extra 0 --warmup 10 --iters 1000 --seed 1234
 ```
 
 SCATTER：

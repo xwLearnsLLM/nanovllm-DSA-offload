@@ -21,6 +21,27 @@
         "attr": []
     },
     {
+        "op": "A5FusedLiManageMtp",
+        "language": "cpp",
+        "input_desc": [
+            {"name": "query", "param_type": "required", "format": ["ND", "ND"], "type": ["bf16", "fp16"]},
+            {"name": "key", "param_type": "required", "format": ["ND", "ND"], "type": ["bf16", "fp16"]},
+            {"name": "weights", "param_type": "required", "format": ["ND", "ND"], "type": ["bf16", "fp16"]},
+            {"name": "cache_slots", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "actual_seq_lengths_query", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "actual_seq_lengths_key", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "block_table", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]}
+        ],
+        "output_desc": [
+            {"name": "topk_index", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "topk_slots", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "miss_index", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "miss_slots", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "miss_count", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]}
+        ],
+        "attr": []
+    },
+    {
         "op": "A5FusedLiManageC8CacheUpdate",
         "language": "cpp",
         "input_desc": [

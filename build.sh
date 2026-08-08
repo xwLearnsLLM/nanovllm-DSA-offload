@@ -60,6 +60,7 @@ echo "[nanovllm_a5_ops] jobs: ${BUILD_JOBS}"
 
 OP_NAMES=(
     A5FusedLiManage
+    A5FusedLiManageMtp
     A5FusedLiManageC8CacheUpdate
     A5KvcacheScatterCopy
     A5KvcacheScatterCopyC8
@@ -73,6 +74,7 @@ OP_NAMES=(
 # kernel; C8 Attention is an adapter over the native A5 QSFA implementation.
 FRAMEWORK_OP_DIRS=(
     fused_li_manage
+    fused_li_manage_mtp
     kvcache_scatter_copy
     sparse_tail_attention
     fused_li_manage_c8
