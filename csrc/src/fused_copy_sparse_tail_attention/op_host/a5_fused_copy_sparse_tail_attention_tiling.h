@@ -1,0 +1,32 @@
+#ifndef A5_SPARSE_AND_TAIL_ATTENTION_AND_SCATTER_COPY_MTE_PIPELINE_TILING_H
+#define A5_SPARSE_AND_TAIL_ATTENTION_AND_SCATTER_COPY_MTE_PIPELINE_TILING_H
+
+#include "a5_sfa_shared/sparse_flash_attention_tiling.h"
+
+namespace optiling {
+
+BEGIN_TILING_DATA_DEF(A5FusedCopySparseTailAttentionTilingData)
+TILING_DATA_FIELD_DEF_STRUCT(SparseFlashAttentionBaseParamsMla, baseParams);
+TILING_DATA_FIELD_DEF_STRUCT(SparseFlashAttentionSplitKVParamsMla, splitKVParams);
+TILING_DATA_FIELD_DEF_STRUCT(SparseFlashAttentionSingleCoreParamsMla, singleCoreParams);
+TILING_DATA_FIELD_DEF_STRUCT(SparseFlashAttentionSingleCoreTensorSizeMla, singleCoreTensorSize);
+TILING_DATA_FIELD_DEF_STRUCT(SparseFlashAttentionInnerSplitParams, innerSplitParams);
+TILING_DATA_FIELD_DEF(uint32_t, copyCap);
+TILING_DATA_FIELD_DEF(uint32_t, dramMaxBlockNum);
+TILING_DATA_FIELD_DEF(uint32_t, prefetchRowsPerStep);
+TILING_DATA_FIELD_DEF(uint32_t, futureWorkspaceMaxMiss);
+TILING_DATA_FIELD_DEF(uint32_t, futureWorkspaceTileCount);
+TILING_DATA_FIELD_DEF(uint32_t, futureWorkspaceOffsetBytes);
+// GE appends runtime metadata (including atomic_index) after operator tiling.
+// Keep this tail out of the operator's logical DataSize so the append has room.
+TILING_DATA_FIELD_DEF_ARR(uint8_t, 16, geRuntimeAppendReserve);
+END_TILING_DATA_DEF
+
+REGISTER_TILING_DATA_CLASS(
+    A5FusedCopySparseTailAttention,
+    A5FusedCopySparseTailAttentionTilingData)
+
+} // namespace optiling
+
+#endif
+

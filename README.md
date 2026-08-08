@@ -15,19 +15,21 @@
 
 | 公开入口 | 实际执行 | 作用 | 定位 |
 | --- | --- | --- | --- |
-| `lidu_decode_update` / `lidu_decode_update_out` | `LightningIndexerDecodeUpdateA5` | BF16/FP16 LightningIndexer top-2048 与 request-pool 更新；`_out` 写入 caller-owned buffer | eager / 稳定图主链 |
-| `scatter_copy` | `A5KvcacheScatterCopy` | 按 miss-prefix 将分离的 BF16/FP16 CKV、KPE 从 swapped-memory DRAM 搬到 HBM | 稳定图主链 |
-| `sparse_and_tail_attention` | `A5SparseAndTailAttention` | 对 top-2048 sparse slots 与 tail 执行 BF16/FP16 MLA | 稳定图主链 |
-| `sparse_and_tail_attention_and_scatter_copy` | `A5SparseAndTailAttentionAndScatterCopyMtePipeline` | BF16 MTE pipeline，将 DRAM→HBM 搬运与 sparse+tail Attention 融合，可配置每步预取行数 | 稳定图主链 |
+| `fused_li_manage` / `fused_li_manage_out` | `A5FusedLiManage` | BF16/FP16 LightningIndexer top-2048 与 request-pool 更新；`_out` 写入 caller-owned buffer | eager / 稳定图主链 |
+| `kvcache_scatter_copy` | `A5KvcacheScatterCopy` | 按 miss-prefix 将分离的 BF16/FP16 CKV、KPE 从 swapped-memory DRAM 搬到 HBM | 稳定图主链 |
+| `sparse_tail_attention` | `A5SparseTailAttention` | 对 top-2048 sparse slots 与 tail 执行 BF16/FP16 MLA | 稳定图主链 |
+| `fused_copy_sparse_tail_attention` | `A5FusedCopySparseTailAttention` | BF16 MTE pipeline，将 DRAM→HBM 搬运与 sparse+tail Attention 融合，可配置每步预取行数 | 稳定图主链 |
 
 ## 接口
 
+Torch 算子 namespace 为 `nanovllm_dsa`；Python 包名为 `nanovllm_dsa_a5`，C++ wrapper 的内部 namespace 为 `nanovllm_dsa_a5_impl`。
+
 共同语义：`B` 是 decode batch，`C=cache_tokens[b]` 是请求固定的 HBM token 预算，`candidate_lens[b]` 是参与稀疏选择的 prefill 满块 token 数。`cache_slots_pool[req_pool_entries[b], token_id]` 保存 source token 到 HBM slot 的映射，`-1` 表示未缓存。LIDU 输出中前 `miss_counts[b]` 项为 miss，SCATTER 只搬运这段；全部 2048 个 `destination_slots` 都供 Attention 使用。稳定图使用 caller-owned `_out` 接口。
 
-可选链路：`lidu_decode_update_out → scatter_copy → sparse_and_tail_attention` 或 `lidu_decode_update_out → sparse_and_tail_attention_and_scatter_copy`。融合入口只接受 BF16。
+可选链路：`fused_li_manage_out → kvcache_scatter_copy → sparse_tail_attention` 或 `fused_li_manage_out → fused_copy_sparse_tail_attention`。融合入口只接受 BF16。
 
 ```python
-torch.ops.nanovllm_dsa.lidu_decode_update(
+torch.ops.nanovllm_dsa.fused_li_manage(
     query,                  # bf16/fp16[B, INDEX_HEADS, 128]，INDEX_HEADS=32|64
     key,                    # bf16/fp16[INDEX_BLOCKS, 128, 1, 128]
     weights,                # bf16/fp16[B, INDEX_HEADS]
@@ -43,7 +45,7 @@ torch.ops.nanovllm_dsa.lidu_decode_update(
     cache_slots_alias,      # cache_slots_pool alias
 )
 
-torch.ops.nanovllm_dsa.lidu_decode_update_out(
+torch.ops.nanovllm_dsa.fused_li_manage_out(
     query, key, weights, req_pool_entries, cache_slots_pool,
     cache_tokens, candidate_lens, block_table,
     source_ids,             # caller-owned int32[B,1,2048]，in/out
@@ -51,7 +53,7 @@ torch.ops.nanovllm_dsa.lidu_decode_update_out(
     miss_counts,            # caller-owned int32[B]，in/out
 ) -> (source_ids_alias, destination_slots_alias, miss_counts_alias, cache_slots_alias)
 
-torch.ops.nanovllm_dsa.scatter_copy(
+torch.ops.nanovllm_dsa.kvcache_scatter_copy(
     hbm_kpe,                # bf16/fp16[HBM_BLOCKS,128,64]，in/out
     hbm_ckv,                # bf16/fp16[HBM_BLOCKS,128,512]，in/out
     dram_kpe,               # swapped-memory bf16/fp16[DRAM_BLOCKS,128,64]
@@ -63,7 +65,7 @@ torch.ops.nanovllm_dsa.scatter_copy(
     copy_counts,            # int32[B]，即 miss_counts
 ) -> (hbm_kpe_alias, hbm_ckv_alias)
 
-torch.ops.nanovllm_dsa.sparse_and_tail_attention(
+torch.ops.nanovllm_dsa.sparse_tail_attention(
     query,                  # bf16/fp16[B,Q_HEAD,512]，1<=Q_HEAD<=64
     key,                    # bf16/fp16[HBM_BLOCKS,128,1,512]
     value,                  # 必须与 key alias
@@ -77,7 +79,7 @@ torch.ops.nanovllm_dsa.sparse_and_tail_attention(
     scale_value,            # float
 ) -> attention_out          # bf16/fp16[B,Q_HEAD,512]
 
-torch.ops.nanovllm_dsa.sparse_and_tail_attention_and_scatter_copy(
+torch.ops.nanovllm_dsa.fused_copy_sparse_tail_attention(
     query,                  # bf16[B,Q_HEAD,512]，1<=Q_HEAD<=64
     hbm_ckv,                # bf16[HBM_BLOCKS,128,1,512]，in/out
     sparse_slots,           # int32[B,1,2048]，LIDU destination_slots
@@ -126,31 +128,31 @@ bash build.sh
 ## 算子测试
 
 ```bash
-python3 tests/test_lidu.py --device npu:0 --mode check --heads 32,64 --batch-sizes 24 --source-lens 20096 --cache-tokens 6144 --miss-ranges 0:300 --seed 7
+python3 tests/test_fused_li_manage.py --device npu:0 --mode check --heads 32,64 --batch-sizes 24 --source-lens 20096 --cache-tokens 6144 --miss-ranges 0:300 --seed 7
 ```
 
 该 LIDU 命令还会强制覆盖不同 candidate length、`C=0/2048/3072/6144/8192/12288/16256`、零 miss、2048 miss、乱序 pool entries、hit slot 保持、重复更新映射、inactive pool guard、caller-owned out 和 `262144` 的 18-bit token-index 边界。
 
 ```bash
-for count in 0 1 100 300 2048; do python3 tests/test_scatter_copy.py --device npu:0 --batch-size 24 --source-len 65536 --hbm-slots 4096 --copy-cap 2048 --copy-min "$count" --copy-max "$count" --warmup 3 --iters 10 --seed 7; done
+for count in 0 1 100 300 2048; do python3 tests/test_kvcache_scatter_copy.py --device npu:0 --batch-size 24 --source-len 65536 --hbm-slots 4096 --copy-cap 2048 --copy-min "$count" --copy-max "$count" --warmup 3 --iters 10 --seed 7; done
 ```
 
 SCATTER 使用 `empty_with_swapped_memory` 创建真实 DRAM tensor；每次正确性调用前 poison HBM 目标，并验证 CKV、KPE、随机 block tables 和未触碰 guard。
 
 ```bash
-python3 tests/test_sparse_and_tail_attention.py --device npu:0 --mode check --heads 8 --batch-sizes 24 --source-lens 20096 --cache-tokens 6144 --tail-tokens 64 --seed 7
+python3 tests/test_sparse_tail_attention.py --device npu:0 --mode check --heads 8 --batch-sizes 24 --source-lens 20096 --cache-tokens 6144 --tail-tokens 64 --seed 7
 ```
 
 SFA check 会先验证 2048-token smoke、dense `C=0`、四档 C 和 tail `0/1/64/127/257`，并与独立 CPU FP32 golden 比较。
 
 ```bash
-python3 tests/test_fused_attention_scatter.py --device npu:0 --mode all --batch-size 24 --heads 8 --source-len 65536 --cache-tokens 8192 --tail-tokens 64 --miss-min 0 --miss-max 300 --warmup 10 --iters 100 --seed 7
+python3 tests/test_fused_copy_sparse_tail_attention.py --device npu:0 --mode all --batch-size 24 --heads 8 --source-len 65536 --cache-tokens 8192 --tail-tokens 64 --miss-min 0 --miss-max 300 --warmup 10 --iters 100 --seed 7
 ```
 
 该门禁将拆分链路与转正后的融合算子分别从真实 swapped-memory DRAM 搬运；每条链路调用前独立 poison HBM 目标，并校验精确 CKV/KPE 写回、guard、CPU FP32 Attention golden 和时延。融合算子默认使用 `prefetch_rows_per_step=5`。
 
 ```bash
-python3 tests/test_fused_attention_scatter_mte_pipeline.py --device npu:0 --mode all --batch-size 24 --heads 8 --source-len 65536 --cache-tokens 8192 --tail-tokens 64 --miss-min 0 --miss-max 300 --prefetch-rows 0,1,3,5,8 --warmup 10 --iters 100 --seed 7
+python3 tests/test_fused_copy_sparse_tail_attention_prefetch.py --device npu:0 --mode all --batch-size 24 --heads 8 --source-len 65536 --cache-tokens 8192 --tail-tokens 64 --miss-min 0 --miss-max 300 --prefetch-rows 0,1,3,5,8 --warmup 10 --iters 100 --seed 7
 ```
 
 该调优测试覆盖精确缓存写回、Attention golden 与不同预取深度，并以默认 `prefetch_rows_per_step=5` 为对照。
@@ -172,29 +174,29 @@ python3 tests/test_offload_split_graph.py --device npu:0 --case mixed --attentio
 LIDU：
 
 ```bash
-python3 tests/test_lidu.py --device npu:0 --mode bench --heads 32 --batch-sizes 1,4,8,12,16,24,32 --source-lens 12288,20096,65536,131072 --cache-tokens 6144 --miss-ranges 0:0,0:300,300:300 --warmup 10 --iters 100 --seed 7
+python3 tests/test_fused_li_manage.py --device npu:0 --mode bench --heads 32 --batch-sizes 1,4,8,12,16,24,32 --source-lens 12288,20096,65536,131072 --cache-tokens 6144 --miss-ranges 0:0,0:300,300:300 --warmup 10 --iters 100 --seed 7
 ```
 
 SCATTER：
 
 ```bash
-for bs in 1 4 8 12 16 24 32; do for len in 12288 20096 65536 131072; do python3 tests/test_scatter_copy.py --device npu:0 --batch-size "$bs" --source-len "$len" --hbm-slots 8192 --copy-cap 2048 --copy-min 0 --copy-max 0 --warmup 10 --iters 100 --seed 7; python3 tests/test_scatter_copy.py --device npu:0 --batch-size "$bs" --source-len "$len" --hbm-slots 8192 --copy-cap 2048 --copy-min 0 --copy-max 300 --warmup 10 --iters 100 --seed 7; python3 tests/test_scatter_copy.py --device npu:0 --batch-size "$bs" --source-len "$len" --hbm-slots 8192 --copy-cap 2048 --copy-min 300 --copy-max 300 --warmup 10 --iters 100 --seed 7; done; done
+for bs in 1 4 8 12 16 24 32; do for len in 12288 20096 65536 131072; do python3 tests/test_kvcache_scatter_copy.py --device npu:0 --batch-size "$bs" --source-len "$len" --hbm-slots 8192 --copy-cap 2048 --copy-min 0 --copy-max 0 --warmup 10 --iters 100 --seed 7; python3 tests/test_kvcache_scatter_copy.py --device npu:0 --batch-size "$bs" --source-len "$len" --hbm-slots 8192 --copy-cap 2048 --copy-min 0 --copy-max 300 --warmup 10 --iters 100 --seed 7; python3 tests/test_kvcache_scatter_copy.py --device npu:0 --batch-size "$bs" --source-len "$len" --hbm-slots 8192 --copy-cap 2048 --copy-min 300 --copy-max 300 --warmup 10 --iters 100 --seed 7; done; done
 ```
 
 SFA：
 
 ```bash
-python3 tests/test_sparse_and_tail_attention.py --device npu:0 --mode bench --heads 8 --batch-sizes 1,4,8,12,16,24,32 --source-lens 12288,20096,65536,131072 --cache-tokens 6144 --tail-tokens 64 --warmup 10 --iters 100 --seed 7
+python3 tests/test_sparse_tail_attention.py --device npu:0 --mode bench --heads 8 --batch-sizes 1,4,8,12,16,24,32 --source-lens 12288,20096,65536,131072 --cache-tokens 6144 --tail-tokens 64 --warmup 10 --iters 100 --seed 7
 ```
 
 融合链路（默认预取深度 5）：
 
 ```bash
-python3 tests/test_fused_attention_scatter.py --device npu:0 --mode bench --batch-size 24 --heads 8 --source-len 65536 --cache-tokens 8192 --tail-tokens 64 --miss-min 0 --miss-max 300 --warmup 10 --iters 100 --seed 7
+python3 tests/test_fused_copy_sparse_tail_attention.py --device npu:0 --mode bench --batch-size 24 --heads 8 --source-len 65536 --cache-tokens 8192 --tail-tokens 64 --miss-min 0 --miss-max 300 --warmup 10 --iters 100 --seed 7
 ```
 
 融合链路预取深度扫描：
 
 ```bash
-python3 tests/test_fused_attention_scatter_mte_pipeline.py --device npu:0 --mode bench --batch-size 24 --heads 8 --source-len 65536 --cache-tokens 8192 --tail-tokens 64 --miss-min 0 --miss-max 300 --prefetch-rows 0,1,3,5,8 --warmup 10 --iters 100 --seed 7
+python3 tests/test_fused_copy_sparse_tail_attention_prefetch.py --device npu:0 --mode bench --batch-size 24 --heads 8 --source-len 65536 --cache-tokens 8192 --tail-tokens 64 --miss-min 0 --miss-max 300 --prefetch-rows 0,1,3,5,8 --warmup 10 --iters 100 --seed 7
 ```

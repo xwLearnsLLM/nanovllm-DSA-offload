@@ -10,7 +10,7 @@ import torch
 
 import nanovllm_dsa_a5
 import torch_npu  # type: ignore  # noqa: E402,F401
-from test_lidu_c8 import make_case
+from test_fused_li_manage_c8 import make_case
 
 
 BLOCK_SIZE = 128
@@ -406,7 +406,7 @@ def main() -> None:
             attention_slots,
             resident_lengths,
         ) = state
-        lidu = torch.ops.nanovllm_dsa.lidu_decode_update_c8_out.default(
+        lidu = torch.ops.nanovllm_dsa.fused_li_manage_c8_out.default(
             lidu_case.query,
             lidu_case.key,
             lidu_case.weights,
@@ -422,7 +422,7 @@ def main() -> None:
             destination_slots,
             miss_counts,
         )
-        scatter = torch.ops.nanovllm_dsa.scatter_copy_c8_out.default(
+        scatter = torch.ops.nanovllm_dsa.kvcache_scatter_copy_c8_out.default(
             hbm.view(torch.int8),
             dram,
             hbm_table,
@@ -437,7 +437,7 @@ def main() -> None:
             attention_slots,
             resident_lengths,
         )
-        attention = nanovllm_dsa_a5.sparse_and_tail_attention_c8(
+        attention = nanovllm_dsa_a5.sparse_tail_attention_c8(
             attention_query,
             hbm,
             scatter[1],

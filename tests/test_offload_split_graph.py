@@ -252,7 +252,7 @@ def main() -> None:
     scale = 1.0 / math.sqrt(CKV_DIM + KPE_DIM)
 
     def chain():
-        lidu_outputs = torch.ops.nanovllm_dsa.lidu_decode_update_out.default(
+        lidu_outputs = torch.ops.nanovllm_dsa.fused_li_manage_out.default(
             index_query,
             index_key,
             weights,
@@ -266,7 +266,7 @@ def main() -> None:
             miss_counts,
         )
         if args.attention_path == "split":
-            cache_aliases = torch.ops.nanovllm_dsa.scatter_copy.default(
+            cache_aliases = torch.ops.nanovllm_dsa.kvcache_scatter_copy.default(
                 hbm_kpe,
                 hbm_ckv,
                 dram_kpe,
@@ -280,7 +280,7 @@ def main() -> None:
             attention_key = cache_aliases[1].view(
                 hbm_blocks, BLOCK_SIZE, 1, CKV_DIM,
             )
-            attention = torch.ops.nanovllm_dsa.sparse_and_tail_attention.default(
+            attention = torch.ops.nanovllm_dsa.sparse_tail_attention.default(
                 attention_query,
                 attention_key,
                 attention_key,
@@ -314,7 +314,7 @@ def main() -> None:
         )
         fused_outputs = (
             torch.ops.nanovllm_dsa
-            .sparse_and_tail_attention_and_scatter_copy.default(
+            .fused_copy_sparse_tail_attention.default(
                 *fused_args, args.prefetch_rows_per_step
             )
         )

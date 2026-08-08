@@ -59,12 +59,12 @@ fi
 echo "[nanovllm_a5_ops] jobs: ${BUILD_JOBS}"
 
 OP_NAMES=(
-    LightningIndexerDecodeUpdateA5
-    A5LiduCacheUpdate
+    A5FusedLiManage
+    A5FusedLiManageC8CacheUpdate
     A5KvcacheScatterCopy
-    A5PackedKvcacheScatterCopy
-    A5SparseAndTailAttention
-    A5SparseAndTailAttentionAndScatterCopyMtePipeline
+    A5KvcacheScatterCopyC8
+    A5SparseTailAttention
+    A5FusedCopySparseTailAttention
 )
 
 # These directories provide the BF16 and C8 operators visible to the framework.
@@ -72,13 +72,13 @@ OP_NAMES=(
 # from the official quant LightningIndexer and a repository-local pool-update
 # kernel; C8 Attention is an adapter over the native A5 QSFA implementation.
 FRAMEWORK_OP_DIRS=(
-    lidu_decode_update
-    scatter_copy
-    sparse_and_tail_attention
-    lidu_decode_update_c8
-    scatter_copy_c8
-    sparse_and_tail_attention_c8
-    sparse_and_tail_attention_and_scatter_copy_mte_pipeline
+    fused_li_manage
+    kvcache_scatter_copy
+    sparse_tail_attention
+    fused_li_manage_c8
+    kvcache_scatter_copy_c8
+    sparse_tail_attention_c8
+    fused_copy_sparse_tail_attention
 )
 
 for op_dir in "${FRAMEWORK_OP_DIRS[@]}"; do
@@ -130,7 +130,7 @@ fi
 # as the msopgen stub and overwrites it.  Remove the legacy split definition
 # if an older worktree left it behind; compiling both creates a duplicate
 # section in aic-ascend950-ops-info.ini.
-rm -f "${GENERATED}/op_host/lightning_indexer_decode_update_a5_def.cpp"
+rm -f "${GENERATED}/op_host/a5_fused_li_manage_def.cpp"
 
 pushd "${GENERATED}" >/dev/null
 OPS_CPU_NUMBER="${BUILD_JOBS}" bash build.sh

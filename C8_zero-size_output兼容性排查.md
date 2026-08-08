@@ -55,7 +55,7 @@ PyTorch 本身允许 zero-size tensor；存在兼容性差异的是特定 ACLNN 
 
 - `aclnnQuantLightningIndexer`：重点检查未使用的 `sparse_values` 输出。
 - `aclnnKvQuantSparseFlashAttention`：重点检查未使用的 `softmax_max/softmax_sum` 输出。
-- `aclnnA5SparseAndTailAttention`：确认是否使用了旧二进制；当前仓库的 BF16 wrapper 已使用 `{1}` 占位，不会主动创建 zero-size softmax 输出。
+- `aclnnA5SparseTailAttention`：确认是否使用了旧二进制；当前仓库的 BF16 wrapper 已使用 `{1}` 占位，不会主动创建 zero-size softmax 输出。
 - LIDU cache-update 或 SCATTER：这两个自定义算子本身没有 zero-size 输出，需要检查实际加载的 `.so` 是否来自当前代码。
 
 请保留完整异常栈，尤其是 `call aclnnXXX failed`、输入输出 descriptor 和实际加载动态库路径。

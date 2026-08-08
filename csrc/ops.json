@@ -1,6 +1,6 @@
 [
     {
-        "op": "LightningIndexerDecodeUpdateA5",
+        "op": "A5FusedLiManage",
         "language": "cpp",
         "input_desc": [
             {"name": "query", "param_type": "required", "format": ["ND", "ND"], "type": ["bf16", "fp16"]},
@@ -21,7 +21,7 @@
         "attr": []
     },
     {
-        "op": "A5LiduCacheUpdate",
+        "op": "A5FusedLiManageC8CacheUpdate",
         "language": "cpp",
         "input_desc": [
             {"name": "topk_indices", "param_type": "required", "format": ["ND"], "type": ["int32"]},
@@ -59,7 +59,7 @@
         "attr": []
     },
     {
-        "op": "A5PackedKvcacheScatterCopy",
+        "op": "A5KvcacheScatterCopyC8",
         "language": "cpp",
         "input_desc": [
             {"name": "hbm_kv", "param_type": "required", "format": ["ND"], "type": ["int8"]},
@@ -83,7 +83,7 @@
         "attr": []
     },
     {
-        "op": "A5SparseAndTailAttention",
+        "op": "A5SparseTailAttention",
         "language": "cpp",
         "input_desc": [
             {"name": "query", "param_type": "required", "format": ["ND", "ND"], "type": ["bf16", "fp16"]},
@@ -115,7 +115,7 @@
         ]
     },
     {
-        "op": "A5SparseAndTailAttentionAndScatterCopyMtePipeline",
+        "op": "A5FusedCopySparseTailAttention",
         "language": "cpp",
         "input_desc": [
             {"name": "query", "param_type": "required", "format": ["ND"], "type": ["bf16"]},
