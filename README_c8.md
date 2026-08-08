@@ -118,19 +118,19 @@ bash build.sh
 C8 测试固定执行正确性检查；LIDU 和 SFA 使用 `--iters=0` 时仅检查正确性，`--iters>0` 时随后继续计时。
 
 ```bash
-python3 tests/test_fused_li_manage_c8.py --device npu:0 --heads 32,64 --batch-sizes 24 --source-lens 20096 --cache-tokens 6144 --miss-ranges 0:300 --iters 0 --seed 7
+python3 tests/test_fused_li_manage_c8.py --device npu:0 --heads 32,64 --batch-sizes 32 --source-lens 20096 --cache-tokens 6144 --miss-ranges 0:300 --iters 0 --seed 7
 ```
 
 该命令以官方 A5 C8 LightningIndexer 为 top-2048 基线，并强制覆盖 mixed C、乱序 request-pool、零/随机/2048 miss、hit slot 保持、重复更新映射、隔离 update 对照、caller-owned out 和 `262144` 的 18-bit token-index 边界。
 
 ```bash
-for count in 0 1 100 300 2048; do python3 tests/test_kvcache_scatter_copy_c8.py --device npu:0 --batch-size 24 --source-len 20096 --cache-tokens 6144 --tail-tokens 257 --max-tail-tokens 512 --copy-min "$count" --copy-max "$count" --warmup 3 --iters 10 --seed 7; done
+for count in 0 1 100 300 2048; do python3 tests/test_kvcache_scatter_copy_c8.py --device npu:0 --batch-size 32 --source-len 20096 --cache-tokens 6144 --tail-tokens 257 --max-tail-tokens 512 --copy-min "$count" --copy-max "$count" --warmup 3 --iters 10 --seed 7; done
 ```
 
 SCATTER 使用真实 swapped memory；分配式与 caller-owned 两条路径都独立 poison HBM，并校验完整 656 bytes、未触碰 guard、topK+tail metadata、`resident_seq_lengths` 和输出地址。
 
 ```bash
-python3 tests/test_sparse_tail_attention_c8.py --device npu:0 --heads 8 --batch-sizes 24 --cache-tokens 6144 --tail-tokens 64 --max-tail-tokens 512 --iters 0 --seed 7
+python3 tests/test_sparse_tail_attention_c8.py --device npu:0 --heads 8 --batch-sizes 32 --cache-tokens 6144 --tail-tokens 64 --max-tail-tokens 512 --iters 0 --seed 7
 ```
 
 C8 SFA 固定覆盖 packed dense `C=0`、2048-token sparse-only、常用 `C=6144/tail=64` 和最大档 `C=12288/tail=257`，再检查命令指定的配置；所有结果均与独立 CPU FP32 golden 比较。首轮门禁固定 `q_head=8`，本仓库不支持 `q_head>64`。
