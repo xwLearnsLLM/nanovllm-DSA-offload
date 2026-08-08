@@ -32,7 +32,7 @@ PYTHONPATH=$PWD:$PYTHONPATH PYTHONUNBUFFERED=1 NANOVLLM_CANN_BUILD_JOBS=64 SOC_V
 
 ## MTP-LIDU 算子验收
 
-仓库内置 `NanovllmLiduDecodeUpdateMtp`，固定处理 GLM MTP3 的每请求 4 个 query。四路 top-2048 先求有序并集，再做一次 request-pool 命中、淘汰和状态更新。活跃请求要求 `C >= min(candidate_len, 8192)`。当前阶段只提供算子及 UT，尚未接入 SCATTER、MTP sparse attention 或整网推理。
+仓库内置 `NanovllmLiduDecodeUpdateMtp`，固定处理 GLM MTP3 的每请求 4 个 query。四路 top-2048 先求有序并集，再做一次 request-pool 命中、淘汰和状态更新。活跃请求要求 `C >= min(candidate_len, 8192)`。配套 SCATTER 已支持最多 8192 个 union miss；`NanovllmSparseAndTailAttentionMtp` 分别消费四路 top-2048，并按四个验证位置计算各自的因果 tail。三者均有独立 UT，LIDU 到 SCATTER 另有链式 UT；整网接入仍在后续阶段。
 
 修改或首次拉取该算子后先执行上面的完整编译，再运行：
 
@@ -65,7 +65,23 @@ python3 ut_ops/test_lidu_mtp.py \
   --seed 7
 ```
 
-成功标志为最后输出 `MTP_LIDU_UT_OK`。UT 覆盖 BF16/FP16、混合缓存档位、乱序 request-pool、重复更新、普通接口与 `_out`、动态 metadata 图回放，以及 B=24 下与四次串行单-query LIDU 的时延对比。
+随后验证 MTP3 sparse-and-tail Attention 的 CPU golden、`_out`、动态图回放和时延：
+
+```bash
+python3 ut_ops/test_sparse_and_tail_attention_mtp.py \
+  --device npu:0 \
+  --heads 2 \
+  --batch-size 24 \
+  --cache-tokens 8192 \
+  --tail-tokens 64 \
+  --graph-replays 3 \
+  --warmup 10 \
+  --iters 100 \
+  --min-speedup 1.0 \
+  --seed 7
+```
+
+两个成功标志分别为 `MTP_LIDU_UT_OK` 和 `MTP_SPARSE_TAIL_ATTENTION_UT_OK`。UT 覆盖 BF16/FP16、混合缓存档位、乱序 request-pool、重复更新、普通接口与 `_out`、四行因果 tail、动态 metadata 图回放，以及 B=24 下与四次串行单-query 算子的时延对比。
 
 
 

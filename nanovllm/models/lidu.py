@@ -198,6 +198,44 @@ def sparse_and_tail_attention(
     )
 
 
+def sparse_and_tail_attention_mtp(
+    query: torch.Tensor,
+    latent_kv_cache: torch.Tensor,
+    sparse_slots: torch.Tensor,
+    cache_tokens: torch.Tensor,
+    block_table: torch.Tensor,
+    actual_seq_lengths_query: torch.Tensor,
+    actual_seq_lengths_kv: torch.Tensor,
+    query_rope: torch.Tensor,
+    key_rope: torch.Tensor,
+    scale_value: float,
+    *,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """MTP3 Attention over each query's top-2048 plus its causal dense tail."""
+
+    args = (
+        query,
+        latent_kv_cache,
+        latent_kv_cache,
+        sparse_slots,
+        cache_tokens,
+        block_table,
+        actual_seq_lengths_query,
+        actual_seq_lengths_kv,
+        query_rope,
+        key_rope,
+        float(scale_value),
+    )
+    if out is None:
+        return torch.ops.nanovllm_dsa.sparse_and_tail_attention_mtp.default(
+            *args
+        )
+    return torch.ops.nanovllm_dsa.sparse_and_tail_attention_mtp_out.default(
+        *args, out
+    )
+
+
 def sparse_and_tail_attention_and_scatter_copy(
     query: torch.Tensor,
     hbm_ckv: torch.Tensor,

@@ -97,10 +97,6 @@ const std::map<ge::DataType, std::string> DATATYPE_TO_STRING_MAP = {
     {ge::DT_UINT2, "DT_UINT2"}                    // dt_variant type
 };
 
-struct NanovllmSparseAndTailAttentionCompileInfo {
-    int64_t core_num;
-};
-
 static const std::map<SFALayout, std::vector<SFAAxis>> SFA_LAYOUT_AXIS_MAP = {
     {SFALayout::BSND, {SFAAxis::B, SFAAxis::S, SFAAxis::N, SFAAxis::D}},
     {SFALayout::TND, {SFAAxis::T, SFAAxis::N, SFAAxis::D}},
@@ -1274,8 +1270,9 @@ ge::graphStatus SFATilingCheck::CheckDecodeOnly() const
         OPS_LOG_E(opName_, "sparse_indices last dim must be %u, but got %u",
                   OFFLOAD_SPARSE_INDICES_CAPACITY, sparseBlockCount_),
         return ge::GRAPH_FAILED);
-    OPS_ERR_IF(qTSize_ != bSize_,
-        OPS_LOG_E(opName_, "decode TND query token count must equal batch size"),
+    OPS_ERR_IF(qTSize_ != bSize_ &&
+               qTSize_ != bSize_ * OFFLOAD_MTP3_QUERY_COUNT,
+        OPS_LOG_E(opName_, "decode TND query token count must be B or 4B"),
         return ge::GRAPH_FAILED);
 
     const gert::Shape &cacheTokensShape = opParamInfo_.cacheTokens.shape->GetStorageShape();
@@ -1880,6 +1877,10 @@ ge::graphStatus SFAInfoParser::Parse(SFATilingInfo &sfaInfo)
 }
 
 IMPL_OP_OPTILING(NanovllmSparseAndTailAttention)
+    .Tiling(TilingNanovllmSparseAndTailAttention)
+    .TilingParse<NanovllmSparseAndTailAttentionCompileInfo>(TilingPrepareForNanovllmSparseAndTailAttention);
+
+IMPL_OP_OPTILING(NanovllmSparseAndTailAttentionMtp)
     .Tiling(TilingNanovllmSparseAndTailAttention)
     .TilingParse<NanovllmSparseAndTailAttentionCompileInfo>(TilingPrepareForNanovllmSparseAndTailAttention);
 } // namespace optiling

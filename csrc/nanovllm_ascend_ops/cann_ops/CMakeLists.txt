@@ -251,6 +251,14 @@ set(nanovllm_lidu_decode_update_mtp_depends
     ../ops/lightning_indexer_decode_update)
 set(kvcache_scatter_copy_kernel_aliases nanovllm_kvcache_scatter_copy)
 set(sparse_and_tail_attention_kernel_aliases nanovllm_sparse_and_tail_attention)
+set(sparse_and_tail_attention_mtp_kernel_aliases
+    nanovllm_sparse_and_tail_attention_mtp)
+# MTP3 reuses the mature single-query MLA cube/vector implementation.  Keep
+# only the four-query scheduling and causal visibility logic in its own kernel.
+set(sparse_and_tail_attention_mtp_depends
+    ../ops/sparse_and_tail_attention)
+set(nanovllm_sparse_and_tail_attention_mtp_depends
+    ../ops/sparse_and_tail_attention)
 set(sparse_and_tail_attention_and_scatter_copy_kernel_aliases
     nanovllm_sparse_and_tail_attention_and_scatter_copy)
 

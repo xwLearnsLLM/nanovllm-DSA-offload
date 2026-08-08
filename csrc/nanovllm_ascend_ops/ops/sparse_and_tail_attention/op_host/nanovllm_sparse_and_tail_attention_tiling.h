@@ -56,6 +56,7 @@ constexpr uint32_t BYTE_BLOCK = 32;
 const uint32_t SFA_MAX_AIC_CORE_NUM = 26;
 constexpr uint32_t OFFLOAD_SPARSE_INDICES_CAPACITY = 2048;
 constexpr uint32_t OFFLOAD_SPARSE_COMPUTE_COUNT = 2048;
+constexpr uint32_t OFFLOAD_MTP3_QUERY_COUNT = 4;
 
 enum class SFALayout : uint32_t {
     BSND = 0,
@@ -179,6 +180,11 @@ TILING_DATA_FIELD_DEF_STRUCT(NanovllmSparseAndTailAttentionSingleCoreTensorSizeM
 TILING_DATA_FIELD_DEF_STRUCT(NanovllmSparseAndTailAttentionInnerSplitParams, innerSplitParams);
 END_TILING_DATA_DEF
 REGISTER_TILING_DATA_CLASS(NanovllmSparseAndTailAttention, NanovllmSparseAndTailAttentionTilingDataMla)
+REGISTER_TILING_DATA_CLASS(NanovllmSparseAndTailAttentionMtp, NanovllmSparseAndTailAttentionTilingDataMla)
+
+struct NanovllmSparseAndTailAttentionCompileInfo {
+    int64_t core_num;
+};
 
 template <typename T> inline T Align(T num, T rnd)
 {
@@ -584,5 +590,8 @@ public:
     gert::Shape queryRopeShape_{};
     gert::Shape keyRopeShape_{};
 };
+
+ge::graphStatus TilingNanovllmSparseAndTailAttention(gert::TilingContext *context);
+ge::graphStatus TilingPrepareForNanovllmSparseAndTailAttention(gert::TilingParseContext *context);
 } // namespace optiling
 #endif // NANOVLLM_SPARSE_AND_TAIL_ATTENTION_TILING_H

@@ -21,7 +21,7 @@ using namespace AscendC;
 
 #define SFA_OP_IMPL(templateClass, tilingdataClass, ...)                                          \
     do {                                                                                          \
-        templateClass<SFAType<__VA_ARGS__>> op;                                                   \
+        templateClass<SFAType<__VA_ARGS__, SFA_STAGE_NORMAL, false>> op;                           \
         GET_TILING_DATA_WITH_STRUCT(tilingdataClass, tiling_data_in, tiling);                     \
         const tilingdataClass *__restrict tiling_data = &tiling_data_in;                          \
         op.Init(query, key, value, sparseIndices, cacheTokens, nullptr, actualSeqLengthsQuery, actualSeqLengthsKV, \

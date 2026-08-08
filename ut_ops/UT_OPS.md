@@ -63,3 +63,10 @@ ModelSlim W4A8 routed expert：
 export NANOVLLM_MODEL=/mnt/models/GLM-5.1-w4a8/
 python3 ut_ops/test_glm_w4a8_moe.py --model "$NANOVLLM_MODEL" --device npu:0 --layer 3 --expert 0 --tokens 2 --warmup 2 --iters 10
 ```
+
+MTP3 sparse-and-tail Attention (four causal query rows, alloc/out, graph replay,
+and comparison with four serial single-query launches):
+
+```bash
+python3 ut_ops/test_sparse_and_tail_attention_mtp.py --device npu:0 --heads 2 --batch-size 24 --cache-tokens 8192 --tail-tokens 64 --graph-replays 3 --warmup 10 --iters 100 --min-speedup 1.0 --seed 7
+```
