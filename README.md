@@ -194,7 +194,7 @@ python3 tests/test_bf16_graph.py --device npu:0 --case mixed --attention-path fu
 python3 tests/test_fused_li_manage.py --device npu:0 --heads 32,64 --batch-sizes 1,8,16,24,32,48,64 --source-lens 65536,131072 --cache-tokens 12288 --miss-ranges 100:200 --pool-extra 0 --warmup 10 --iters 1000 --seed 1234
 ```
 
-测试环境为 Ascend 950DT，`C=12288`、`miss_count=100...200`、`warmup=10`、`iters=1000`；增量为 `fused_li_manage - 原生 LI`。结果总结如下表。
+运行以上命令（on Ascend950DT），得到如下表的 LI_manage 融合算子的性能测试结果。
 
 | Q Head | SeqLen | BS | 原生 LI（μs） | fused_li_manage（μs） | 增量（μs） |
 |---:|---:|---:|---:|---:|---:|
@@ -239,8 +239,19 @@ SFA：
 python3 tests/test_sparse_tail_attention.py --device npu:0 --heads 8 --batch-sizes 1,4,8,12,16,24,32 --source-lens 12288,20096,65536,131072 --cache-tokens 6144 --tail-tokens 64 --warmup 10 --iters 100 --seed 7
 ```
 
-融合链路（默认预取深度 5）：
+融合 COPYSFA 算子（默认预取深度 5）：
 
 ```bash
 python3 tests/test_fused_copy_sparse_tail_attention.py --device npu:0 --batch-size 32 --heads 8 --source-len 65536 --cache-tokens 8192 --tail-tokens 64 --miss-min 100 --miss-max 200 --warmup 10 --iters 100 --seed 7
 ```
+
+下表是 COPYSFA 融合算子的性能测试结果。（测试条件：Ascend950DT，在 mindstudio 中统计 kernel 侧耗时）
+
+| attn-q-head | batch-size | miss_count | COPY算子时延 | SFA算子时延 | COPYSFA融合算子时延 |
+| ----------- | ---------- | ---------- | ------------ | ----------- | ------------------- |
+| 8           | 32         | 0~0        | 5 μs         | 104 μs      | 103 μs              |
+| 8           | 32         | 100~100    | 79 μs        | 104 μs      | 132 μs              |
+| 8           | 32         | 200~200    | 164 μs       | 104 μs      | 173 μs              |
+| 8           | 32         | 300~300    | 229 μs       | 104 μs      | 244 μs              |
+| 8           | 32         | 0~300      | 118 μs       | 104 μs      | 152 μs              |
+
