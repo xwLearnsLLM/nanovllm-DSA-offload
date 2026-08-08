@@ -121,6 +121,25 @@ def lidu_cache_tokens(prompt_len: int) -> int:
     return tier_larger
 
 
+def mtp_lidu_cache_tokens(prompt_len: int, block_size: int = 128) -> int:
+    """Return an MTP3-safe LIDU cache budget.
+
+    MTP verification protects the union of four independent top-2048 sets.
+    Therefore an offloaded request needs room for up to 8192 source tokens.
+    When the complete-block source is shorter than that, cache the complete
+    source; otherwise retain the ordinary (possibly larger) tuned budget but
+    raise it to 8192.
+    """
+
+    prompt_len = int(prompt_len)
+    block_size = int(block_size)
+    base_budget = lidu_cache_tokens(prompt_len)
+    if base_budget == 0:
+        return 0
+    candidate_len = (prompt_len // block_size) * block_size
+    return min(candidate_len, max(base_budget, 4 * DSA_SELECTION_TOPK_TOKENS))
+
+
 def validate_lidu_cache_token_budgets(
     block_size: int,
 ) -> tuple[int, int, int, int]:

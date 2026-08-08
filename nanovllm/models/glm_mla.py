@@ -30,9 +30,11 @@ from nanovllm.models.lidu import (
     LIDU_TOPK,
     initialize_lidu_row,
     lidu_decode_update,
+    lidu_decode_update_mtp,
     lidu_decode_update_out,
     scatter_copy,
     sparse_and_tail_attention,
+    sparse_and_tail_attention_mtp,
     sparse_and_tail_attention_and_scatter_copy,
 )
 from nanovllm.layers.activation import SiluAndMul
@@ -373,8 +375,14 @@ class GlmMLAAttention(nn.Module):
         self.offload_mode = getattr(
             config, "nanovllm_offload_mode", OFFLOAD_NONE
         )
-        self.uses_offload = self.offload_mode != OFFLOAD_NONE
         self.num_hidden_layers = int(config.num_hidden_layers)
+        self.is_mtp_layer = self.layer_idx >= self.num_hidden_layers
+        # The 78 target layers are offloaded. The recursively reused MTP layer
+        # deliberately keeps a separate dense HBM KV cache and has no DSA
+        # indexer weights in the checkpoint.
+        self.uses_offload = (
+            self.offload_mode != OFFLOAD_NONE and not self.is_mtp_layer
+        )
         miss_count_layers = parse_lidu_miss_count_layers(
             os.environ.get("NANOVLLM_LIDU_MISS_COUNT_ON_LAYERS"),
             self.num_hidden_layers,
@@ -1180,6 +1188,155 @@ class GlmMLAAttention(nn.Module):
             miss_counts,
         )
 
+    def _lidu_update_mtp(
+        self,
+        q_index: torch.Tensor,
+        weights: torch.Tensor,
+        batch_size: int,
+    ) -> _LiduUpdateResult:
+        """Update one request cache from the union of its four MTP queries."""
+
+        context = get_context()
+        required = {
+            "req_pool_entries": context.req_pool_entries,
+            "lidu_cache_tokens": context.lidu_cache_tokens,
+            "candidate_lens": context.candidate_lens,
+            "index_block_tables": context.index_block_tables,
+            "block_tables": context.block_tables,
+            "dram_block_tables": context.dram_block_tables,
+        }
+        missing = [name for name, value in required.items() if value is None]
+        if missing:
+            raise RuntimeError(
+                "MTP-LIDU decode context is missing: " + ", ".join(missing)
+            )
+        if int(q_index.shape[0]) != batch_size * 4:
+            raise RuntimeError(
+                "MTP-LIDU requires four query rows per request: "
+                f"queries={q_index.shape[0]}, batch={batch_size}."
+            )
+
+        hbm_kpe = self.kpe_cache.squeeze(2)
+        hbm_ckv = self.ckv_cache.squeeze(2)
+        dram_kpe = self.dram_kpe_cache.squeeze(2)
+        dram_ckv = self.dram_ckv_cache.squeeze(2)
+
+        init_rows = context.lidu_init_rows
+        if init_rows is not None and init_rows.numel() > 0:
+            if context.full_decode_graph:
+                raise RuntimeError("MTP-LIDU initialization must remain eager.")
+            for row in init_rows.detach().cpu().tolist():
+                row = int(row)
+                pool_entry = int(context.req_pool_entries[row].item())
+                cache_tokens = int(context.lidu_cache_tokens[row].item())
+                candidate_len = int(context.candidate_lens[row].item())
+                # Initialization is a deliberately slow first-decode path.
+                # Seed top-C from q0, then the fused four-query update below
+                # installs the complete protected union before Attention.
+                hbm_kpe, hbm_ckv = initialize_lidu_row(
+                    query=q_index[row * 4],
+                    weights=weights[row * 4],
+                    index_cache=self.index_cache,
+                    index_block_table=context.index_block_tables[row],
+                    candidate_len=candidate_len,
+                    cache_tokens=cache_tokens,
+                    cache_slots_row=self.lidu_cache_slots[pool_entry],
+                    hbm_kpe=hbm_kpe,
+                    hbm_ckv=hbm_ckv,
+                    dram_kpe=dram_kpe,
+                    dram_ckv=dram_ckv,
+                    hbm_block_table=context.block_tables[row],
+                    dram_block_table=context.dram_block_tables[row],
+                    block_size=self.block_size,
+                )
+
+        (
+            topk_slots,
+            source_ids,
+            destination_slots,
+            miss_counts,
+            _,
+        ) = lidu_decode_update_mtp(
+            q_index[: batch_size * 4],
+            self.index_cache,
+            weights[: batch_size * 4],
+            context.req_pool_entries[:batch_size],
+            self.lidu_cache_slots,
+            context.lidu_cache_tokens[:batch_size],
+            context.candidate_lens[:batch_size],
+            context.index_block_tables[:batch_size],
+        )
+        if self._lidu_miss_count_collect_all:
+            self._record_lidu_miss_counts(miss_counts, batch_size)
+        kpe_alias, ckv_alias = scatter_copy(
+            hbm_kpe,
+            hbm_ckv,
+            dram_kpe,
+            dram_ckv,
+            context.block_tables[:batch_size],
+            context.dram_block_tables[:batch_size],
+            source_ids,
+            destination_slots,
+            miss_counts[:batch_size],
+        )
+        return (
+            kpe_alias,
+            ckv_alias,
+            topk_slots,
+            source_ids,
+            miss_counts,
+        )
+
+    def _spec_decode_forward_lidu(
+        self,
+        ql_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        q_index: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run eager MTP3 target verification through the offload chain."""
+
+        context = get_context()
+        if int(ql_nope.shape[0]) % 4:
+            raise RuntimeError("MTP3 target query rows must be divisible by four.")
+        batch_size = int(ql_nope.shape[0]) // 4
+        required = {
+            "candidate_query_lens": context.candidate_query_lens,
+            "actual_seq_lengths_kv_tensor": context.actual_seq_lengths_kv_tensor,
+            "lidu_cache_tokens": context.lidu_cache_tokens,
+            "block_tables": context.block_tables,
+        }
+        missing = [name for name, value in required.items() if value is None]
+        if missing:
+            raise RuntimeError(
+                "MTP sparse-and-tail Attention context is missing: "
+                + ", ".join(missing)
+            )
+        (
+            kpe_cache,
+            ckv_cache,
+            topk_slots,
+            _,
+            _,
+        ) = self._lidu_update_mtp(q_index, weights, batch_size)
+        latent = sparse_and_tail_attention_mtp(
+            ql_nope,
+            ckv_cache.view(-1, self.block_size, 1, self.kv_lora_rank),
+            topk_slots,
+            context.lidu_cache_tokens[:batch_size],
+            context.block_tables[:batch_size],
+            context.candidate_query_lens[:batch_size],
+            context.actual_seq_lengths_kv_tensor[:batch_size],
+            q_pe,
+            kpe_cache.view(-1, self.block_size, 1, self.qk_rope_head_dim),
+            self.scale,
+        )
+        return torch_npu.npu_transpose_batchmatmul(
+            latent.transpose(0, 1).contiguous(),
+            self.w_uv,
+            perm_y=(1, 0, 2),
+        ).reshape(batch_size * 4, -1)
+
     def _can_use_lidu_fused_attention_scatter(
         self,
         batch_size: int,
@@ -1443,7 +1600,16 @@ class GlmMLAAttention(nn.Module):
         ql_nope = self._q_nope_up_proj(q_nope)
 
         if context.is_spec_decode:
-            attn_output = self._spec_decode_forward_npu_mla(ql_nope, q_pe)
+            if self.uses_offload and context.needs_dsa_update:
+                if q_index is None or weights is None:
+                    raise RuntimeError(
+                        "MTP-LIDU verification requires indexer outputs."
+                    )
+                attn_output = self._spec_decode_forward_lidu(
+                    ql_nope, q_pe, q_index, weights
+                )
+            else:
+                attn_output = self._spec_decode_forward_npu_mla(ql_nope, q_pe)
         elif context.is_prefill:
             attn_output = self._prefill_forward_npu_mla(ql_nope, q_pe)
         else:

@@ -7,6 +7,10 @@ import torch
 
 from nanovllm.config import Config
 from nanovllm.engine.scheduler import Scheduler
+from nanovllm.engine.dsa_offload import (
+    finalize_prefill_hbm_layout,
+    mtp_lidu_cache_tokens,
+)
 from nanovllm.engine.sequence import (
     DecodeBatchDelta,
     FinishReason,
@@ -184,6 +188,64 @@ def test_scheduler_reserves_verify_and_worst_case_mtp_recurrence_slots():
     assert len(seq.hbm_block_table) == 3
 
 
+@pytest.mark.parametrize(
+    ("prompt_len", "expected"),
+    [
+        (2048, 0),
+        (2049, 2048),
+        (4097, 4096),
+        (8192, 8192),
+        (8193, 8192),
+        (21_000, 8192),
+        (65_537, 12_288),
+    ],
+)
+def test_mtp_lidu_budget_can_hold_four_query_union(prompt_len, expected):
+    assert mtp_lidu_cache_tokens(prompt_len, 128) == expected
+
+
+def test_mtp_lidu_uses_independent_dense_mtp_block_pool():
+    config = SimpleNamespace(
+        max_num_prefill_seqs_per_step=1,
+        prefill_chunk_size=0,
+        max_num_decode_seqs_per_step=4,
+        eos=(-1,),
+        num_hbm_kvcache_blocks=64,
+        num_dram_kvcache_blocks=64,
+        offload_mode="offload_split",
+        kvcache_block_size=128,
+        max_model_len=4096,
+        num_speculative_tokens=3,
+    )
+    scheduler = Scheduler(config)
+    seq = _sequence(length=2050, block_size=128, request_id="mtp-lidu")
+    scheduler.add(seq)
+
+    seqs, is_prefill = scheduler.schedule()
+    assert is_prefill and seqs == [seq]
+    assert seq.lidu_cache_tokens == 2048
+    assert len(seq.hbm_block_table) == 17
+    assert len(seq.mtp_block_table) == 17
+    mtp_blocks = tuple(seq.mtp_block_table)
+
+    finalize_prefill_hbm_layout(seq, "offload_split")
+    scheduler.release_prefill_hbm_blocks([seq])
+    assert tuple(seq.mtp_block_table) == mtp_blocks
+    scheduler.postprocess(
+        [seq],
+        SpeculativeStepOutput([[99]], [[1, 2, 3]], [0]),
+        is_prefill=True,
+    )
+    decode, is_prefill = scheduler.schedule()
+    assert not is_prefill and decode == [seq]
+    assert tuple(seq.mtp_block_table) == mtp_blocks
+
+    scheduler.deallocate(seq)
+    assert not seq.hbm_block_table
+    assert not seq.mtp_block_table
+    assert not scheduler.mtp_block_manager.used_block_ids
+
+
 def test_scheduler_commits_multiple_tokens_and_truncates_at_max_tokens():
     scheduler = Scheduler(_scheduler_config())
     seq = _sequence(max_tokens=3)
@@ -356,6 +418,8 @@ def _write_mtp_config(path, *, is_rot_used=True):
         "n_routed_experts": 256,
         "num_experts_per_tok": 8,
         "num_attention_heads": 64,
+        "kv_lora_rank": 512,
+        "qk_rope_head_dim": 64,
     }
     (path / "config.json").write_text(json.dumps(config), encoding="utf-8")
     description = {
@@ -395,19 +459,43 @@ def test_glm_mtp_runtime_accepts_nonoffload_k3(tmp_path, enforce_eager):
     assert config.hf_config.nanovllm_num_speculative_tokens == 3
 
 
+def test_glm_mtp_runtime_accepts_eager_lidu_split(tmp_path):
+    _write_mtp_config(tmp_path)
+    config = _mtp_config(
+        tmp_path,
+        offload_mode="offload_split",
+        enforce_eager=True,
+        kvcache_block_size=128,
+        num_dram_kvcache_blocks=64,
+    )
+    assert config.offload_mode == "offload_split"
+
+
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
         (
             {
                 "offload_mode": "offload_split",
+                "enforce_eager": False,
+                "kvcache_block_size": 128,
                 "num_dram_kvcache_blocks": 64,
             },
-            "offload_mode='none'",
+            "requires enforce_eager=True",
+        ),
+        (
+            {
+                "offload_mode": "offload_fuse",
+                "kvcache_block_size": 128,
+                "num_dram_kvcache_blocks": 64,
+            },
+            "does not support offload_mode='offload_fuse'",
         ),
     ],
 )
-def test_glm_mtp_runtime_rejects_offload(tmp_path, overrides, message):
+def test_glm_mtp_runtime_rejects_unsupported_offload(
+    tmp_path, overrides, message
+):
     _write_mtp_config(tmp_path)
     with pytest.raises(ValueError, match=message):
         _mtp_config(tmp_path, **overrides)

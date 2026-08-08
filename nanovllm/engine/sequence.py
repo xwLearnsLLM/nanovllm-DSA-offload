@@ -46,6 +46,10 @@ class Sequence:
         self.block_table = []
         self.index_block_table = []
         self.hbm_block_table = self.block_table
+        # MTP+offload keeps the single draft layer's complete KV in a small,
+        # independent dense HBM cache. Target layers continue to use the LIDU
+        # sparse HBM layout in ``hbm_block_table``.
+        self.mtp_block_table = []
         self.dram_block_table = []
         self.offload_pool_entry = -1
         self.offload_finalized = False
@@ -191,6 +195,7 @@ class Sequence:
             "block_table": self.block_table,
             "index_block_table": self.index_block_table,
             "hbm_block_table": self.hbm_block_table,
+            "mtp_block_table": self.mtp_block_table,
             "dram_block_table": self.dram_block_table,
             "offload_pool_entry": self.offload_pool_entry,
             "offload_finalized": self.offload_finalized,
@@ -231,6 +236,7 @@ class Sequence:
         self.block_table = state["block_table"]
         self.index_block_table = state.get("index_block_table", self.block_table)
         self.hbm_block_table = state.get("hbm_block_table", self.block_table)
+        self.mtp_block_table = state.get("mtp_block_table", [])
         self.dram_block_table = state.get("dram_block_table", [])
         self.offload_pool_entry = state.get("offload_pool_entry", -1)
         self.offload_finalized = state.get("offload_finalized", False)
@@ -282,6 +288,7 @@ class DecodeSequenceMetadata:
     num_prefill_tokens_processed: int
     block_size: int
     hbm_block_table: list[int]
+    mtp_block_table: list[int]
     index_block_table: list[int]
     dram_block_table: list[int]
     offload_pool_entry: int
@@ -309,6 +316,7 @@ class DecodeSequenceMetadata:
             num_prefill_tokens_processed=seq.num_prefill_tokens_processed,
             block_size=seq.block_size,
             hbm_block_table=list(seq.hbm_block_table),
+            mtp_block_table=list(seq.mtp_block_table),
             index_block_table=list(seq.index_block_table),
             dram_block_table=list(seq.dram_block_table),
             offload_pool_entry=seq.offload_pool_entry,

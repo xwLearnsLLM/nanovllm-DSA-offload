@@ -130,6 +130,7 @@ class _DecodeDynamicBuffers:
 @dataclass
 class _DecodeStaticMetadata:
     key: tuple[tuple[int, int], ...]
+    query_len: int
     block_tables: torch.Tensor
     index_block_tables: torch.Tensor
     dram_block_tables: torch.Tensor
@@ -149,6 +150,9 @@ class ModelRunner:
         self.offload_mode = config.offload_mode
         self.num_speculative_tokens = config.num_speculative_tokens
         self.uses_offload = self.offload_mode != OFFLOAD_NONE
+        self.uses_separate_mtp_cache = bool(
+            self.uses_offload and self.num_speculative_tokens
+        )
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
@@ -456,7 +460,8 @@ class ModelRunner:
         hf_config = config.hf_config
         text_config = getattr(hf_config, "text_config", hf_config)
         cache_dtype = torch.bfloat16
-        num_layers = int(text_config.num_hidden_layers) + int(
+        num_target_layers = int(text_config.num_hidden_layers)
+        num_layers = num_target_layers + int(
             self.num_speculative_tokens > 0
         )
         kv_lora_rank = int(text_config.kv_lora_rank)
@@ -511,9 +516,9 @@ class ModelRunner:
                 max_lidu_cache_tokens(config.max_model_len),
             )
 
-        index_shape = (num_layers, config.num_dram_kvcache_blocks, self.block_size, 1, index_dim)
-        dram_ckv_shape = (num_layers, config.num_dram_kvcache_blocks, self.block_size, 1, kv_lora_rank)
-        dram_kpe_shape = (num_layers, config.num_dram_kvcache_blocks, self.block_size, 1, rope_dim)
+        index_shape = (num_target_layers, config.num_dram_kvcache_blocks, self.block_size, 1, index_dim)
+        dram_ckv_shape = (num_target_layers, config.num_dram_kvcache_blocks, self.block_size, 1, kv_lora_rank)
+        dram_kpe_shape = (num_target_layers, config.num_dram_kvcache_blocks, self.block_size, 1, rope_dim)
         max_source_tokens = max(
             self.block_size,
             (
@@ -548,7 +553,9 @@ class ModelRunner:
             dram_kpe_shape[1:],
         )
         for module in self.model.modules():
-            if hasattr(module, "assign_dsa_cache"):
+            if not hasattr(module, "assign_mla_cache"):
+                continue
+            if getattr(module, "uses_offload", False):
                 ckv_cache = torch.empty(layer_shapes[0], dtype=cache_dtype, device=self.device)
                 kpe_cache = torch.empty(layer_shapes[1], dtype=cache_dtype, device=self.device)
                 index_cache = torch.empty(layer_shapes[2], dtype=cache_dtype, device=self.device)
@@ -570,6 +577,33 @@ class ModelRunner:
                     dram_ckv_cache,
                     dram_kpe_cache,
                     lidu_cache_slots,
+                )
+                continue
+
+            # The recursively reused MTP layer keeps its complete history in a
+            # separate dense HBM cache. Use the DRAM-source block capacity so
+            # long/multi-request offload runs are not capped by the target
+            # layers' deliberately small sparse HBM pool.
+            mtp_blocks = config.num_dram_kvcache_blocks
+            dense_ckv = torch.empty(
+                (mtp_blocks, self.block_size, 1, kv_lora_rank),
+                dtype=cache_dtype,
+                device=self.device,
+            )
+            dense_kpe = torch.empty(
+                (mtp_blocks, self.block_size, 1, rope_dim),
+                dtype=cache_dtype,
+                device=self.device,
+            )
+            dense_ckv.zero_()
+            dense_kpe.zero_()
+            module.assign_mla_cache(dense_ckv, dense_kpe)
+            if self.rank == 0:
+                logger.info(
+                    "MTP dense MLA cache: blocks=%d, CKV=%s, KPE=%s",
+                    mtp_blocks,
+                    tuple(dense_ckv.shape),
+                    tuple(dense_kpe.shape),
                 )
 
     def prepare_block_tables(self, seqs: list[Sequence], table_name: str = "hbm_block_table"):
@@ -595,10 +629,15 @@ class ModelRunner:
         candidate_lens: list[int],
         req_pool_entries: list[int],
         lidu_cache_tokens: list[int],
+        query_len: int = 1,
     ) -> _DecodeStaticMetadata:
         key = decode_metadata_key(seqs)
         cached = self._decode_static_metadata
-        if cached is not None and cached.key == key:
+        if (
+            cached is not None
+            and cached.key == key
+            and cached.query_len == int(query_len)
+        ):
             self._decode_metadata_cache_hits += 1
             return cached
 
@@ -612,6 +651,7 @@ class ModelRunner:
             ).to(self.device, non_blocking=True)
         cached = _DecodeStaticMetadata(
             key=key,
+            query_len=int(query_len),
             block_tables=self.prepare_block_tables(seqs, "hbm_block_table"),
             index_block_tables=self.prepare_block_tables(
                 seqs,
@@ -632,8 +672,9 @@ class ModelRunner:
                 pin_memory=True,
             ).to(self.device, non_blocking=True),
             candidate_query_lens=torch.arange(
-                1,
-                len(seqs) + 1,
+                int(query_len),
+                (len(seqs) + 1) * int(query_len),
+                int(query_len),
                 dtype=torch.int32,
                 pin_memory=True,
             ).to(self.device, non_blocking=True),
@@ -734,6 +775,41 @@ class ModelRunner:
         )
 
         return input_ids, positions, is_last_chunk
+
+    def _set_mtp_prefill_context(self, seqs: list[Sequence]) -> None:
+        """Point the MTP layer at its independent dense cache during prefill."""
+
+        if not self.uses_separate_mtp_cache:
+            return
+        target_context = get_context()
+        if target_context.cu_seqlens_q is None:
+            raise RuntimeError("MTP prefill is missing target query lengths.")
+        slots: list[int] = []
+        for seq in seqs:
+            if not seq.mtp_block_table:
+                raise RuntimeError("MTP prefill has no dense MTP block table.")
+            if self.config.prefill_chunk_size:
+                start = seq.num_prefill_tokens_processed
+                end = start + seq.num_scheduled_tokens
+            else:
+                start, end = 0, len(seq)
+            slots.extend(
+                seq.mtp_block_table[position // self.block_size]
+                * self.block_size
+                + position % self.block_size
+                for position in range(start, end)
+            )
+        flat_slots = torch.tensor(
+            slots, dtype=torch.int64, device=self.device
+        )
+        set_context(
+            True,
+            cu_seqlens_q=target_context.cu_seqlens_q,
+            flat_slot_mapping=flat_slots,
+            flat_slot_mapping_i32=flat_slots.to(torch.int32),
+            actual_seq_lengths_kv=target_context.actual_seq_lengths_kv,
+            block_tables=self.prepare_block_tables(seqs, "mtp_block_table"),
+        )
 
     def prepare_decode(
         self,
@@ -1049,6 +1125,7 @@ class ModelRunner:
         mtp_input_ids = self._prepare_mtp_prefill_input_ids(
             seqs, sampled_token_ids
         )
+        self._set_mtp_prefill_context(seqs)
         mtp_hidden_states = mtp(
             mtp_input_ids, positions, target_hidden_states
         )
@@ -1109,13 +1186,27 @@ class ModelRunner:
     def _prepare_mtp_verify(
         self,
         seqs: list[Sequence | DecodeSequenceMetadata],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         k = self.num_speculative_tokens
+        query_len = k + 1
         input_ids: list[int] = []
         positions: list[int] = []
         slots: list[int] = []
         cu_seqlens_q = [0]
-        for seq in seqs:
+        candidate_lens: list[int] = []
+        sparse_kv_lens: list[int] = []
+        req_pool_entries: list[int] = []
+        cache_tokens_by_row: list[int] = []
+        lidu_init_rows: list[int] = []
+        needs_dsa_update = False
+        has_first_decode = False
+        for row, seq in enumerate(seqs):
             if len(seq.draft_token_ids) != k:
                 raise RuntimeError(
                     "MTP verification requires exactly "
@@ -1125,13 +1216,48 @@ class ModelRunner:
             row_positions = list(range(len(seq) - 1, len(seq) + k))
             input_ids.extend(row_ids)
             positions.extend(row_positions)
-            slots.extend(
-                seq.hbm_block_table[position // self.block_size]
-                * self.block_size
-                + position % self.block_size
-                for position in row_positions
+            if self.uses_offload:
+                source_tokens = seq.num_prefill_full_blocks * self.block_size
+                for position in row_positions:
+                    tail_offset = position - source_tokens
+                    logical_block = (
+                        seq.num_sparse_blocks + tail_offset // self.block_size
+                    )
+                    block_id = seq.hbm_block_table[logical_block]
+                    slots.append(
+                        block_id * self.block_size
+                        + tail_offset % self.block_size
+                    )
+            else:
+                slots.extend(
+                    seq.hbm_block_table[position // self.block_size]
+                    * self.block_size
+                    + position % self.block_size
+                    for position in row_positions
+                )
+            cu_seqlens_q.append(cu_seqlens_q[-1] + query_len)
+
+            candidate_len = seq.num_prefill_full_blocks * self.block_size
+            cache_tokens = int(seq.lidu_cache_tokens) if self.uses_offload else 0
+            if cache_tokens and not seq.lidu_cache_initialized:
+                lidu_init_rows.append(row)
+            needs_dsa_update = needs_dsa_update or cache_tokens > 0
+            has_first_decode = (
+                has_first_decode or seq.is_first_decode_after_prefill
             )
-            cu_seqlens_q.append(cu_seqlens_q[-1] + k + 1)
+            candidate_lens.append(candidate_len)
+            sparse_kv_lens.append(
+                (
+                    seq.num_sparse_tokens
+                    + seq.prefill_tail_len
+                    + seq.num_decode_tokens_since_prefill
+                    + k
+                )
+                if self.uses_offload
+                else len(seq) + k
+            )
+            req_pool_entries.append(seq.offload_pool_entry)
+            cache_tokens_by_row.append(cache_tokens)
 
         input_ids_tensor = torch.tensor(
             input_ids, dtype=torch.int64, device=self.device
@@ -1145,8 +1271,20 @@ class ModelRunner:
         cu_seqlens_tensor = torch.tensor(
             cu_seqlens_q, dtype=torch.int32, device=self.device
         )
-        block_tables = self.prepare_block_tables(
-            seqs, "hbm_block_table"
+        static_metadata = self._get_decode_static_metadata(
+            seqs,
+            candidate_lens,
+            req_pool_entries,
+            cache_tokens_by_row,
+            query_len=query_len,
+        )
+        lidu_init_rows_tensor = None
+        if lidu_init_rows:
+            lidu_init_rows_tensor = torch.tensor(
+                lidu_init_rows, dtype=torch.long, device=self.device
+            )
+        actual_seq_lengths_kv_tensor = torch.tensor(
+            sparse_kv_lens, dtype=torch.int32, device=self.device
         )
         set_context(
             False,
@@ -1155,15 +1293,38 @@ class ModelRunner:
             actual_seq_lengths_q=cu_seqlens_q[1:],
             flat_slot_mapping=slots_tensor,
             flat_slot_mapping_i32=slots_tensor.to(torch.int32),
-            actual_seq_lengths_kv=[len(seq) + k for seq in seqs],
-            block_tables=block_tables,
+            actual_seq_lengths_kv=sparse_kv_lens,
+            actual_seq_lengths_kv_tensor=actual_seq_lengths_kv_tensor,
+            block_tables=static_metadata.block_tables,
+            index_block_tables=static_metadata.index_block_tables,
+            dram_block_tables=static_metadata.dram_block_tables,
+            req_pool_entries=static_metadata.req_pool_entries,
+            candidate_lens=static_metadata.candidate_lens,
+            candidate_query_lens=static_metadata.candidate_query_lens,
+            lidu_cache_tokens=static_metadata.lidu_cache_tokens,
+            needs_dsa_update=needs_dsa_update,
+            lidu_init_rows=lidu_init_rows_tensor,
+            lidu_all_rows_ready=not lidu_init_rows,
+            has_first_decode=has_first_decode,
+            decode_metadata_key=static_metadata.key,
         )
         drafts = torch.tensor(
             [seq.draft_token_ids for seq in seqs],
             dtype=torch.long,
             device=self.device,
         )
-        return input_ids_tensor, positions_tensor, drafts, block_tables
+        mtp_block_tables = (
+            self.prepare_block_tables(seqs, "mtp_block_table")
+            if self.uses_separate_mtp_cache
+            else static_metadata.block_tables
+        )
+        return (
+            input_ids_tensor,
+            positions_tensor,
+            drafts,
+            static_metadata.block_tables,
+            mtp_block_tables,
+        )
 
     def _mtp_target_forward(
         self,
@@ -1275,7 +1436,14 @@ class ModelRunner:
             positions,
             draft_token_ids,
             block_tables,
+            mtp_block_tables,
         ) = self._prepare_mtp_verify(seqs)
+        init_rows = get_context().lidu_init_rows
+        init_rows_host = (
+            []
+            if init_rows is None
+            else [int(row) for row in init_rows.detach().cpu().tolist()]
+        )
         base_seq_lengths = [len(seq) for seq in seqs]
         graph_manager = self.decode_graph_manager
         if (
@@ -1304,7 +1472,7 @@ class ModelRunner:
                 next_token_ids,
                 selected_positions,
                 selected_hidden_states,
-                block_tables,
+                mtp_block_tables,
                 self.num_speculative_tokens,
                 actual_seq_lengths_by_step=self._mtp_draft_seq_lengths(
                     base_seq_lengths,
@@ -1312,6 +1480,17 @@ class ModelRunner:
                     self.num_speculative_tokens,
                 ),
             )
+
+        if init_rows_host:
+            # Every target layer has now completed cache initialization. The
+            # scheduler-visible state is published only after device work is
+            # complete; subsequent steps can use the stable MTP-LIDU path.
+            torch.npu.synchronize()
+            for row in init_rows_host:
+                seq = seqs[row]
+                if isinstance(seq, Sequence):
+                    seq.lidu_cache_initialized = True
+                    seq.bump_decode_metadata_version()
 
         if self.rank != 0:
             return None
@@ -1338,6 +1517,8 @@ class ModelRunner:
                 continue
             old_hbm_block_table = list(seq.hbm_block_table)
             for module in self.model.modules():
+                if not getattr(module, "uses_offload", False):
+                    continue
                 finalize = getattr(module, "finalize_prefill_offload", None)
                 if finalize is not None:
                     finalize(seq, old_hbm_block_table)

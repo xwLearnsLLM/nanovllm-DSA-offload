@@ -8,6 +8,7 @@ from nanovllm.engine.dsa_offload import (
     PoolEntryManager,
     SimpleBlockManager,
     lidu_cache_tokens,
+    mtp_lidu_cache_tokens,
 )
 from nanovllm.engine.sequence import (
     FinishReason,
@@ -31,6 +32,9 @@ class Scheduler:
             getattr(config, "num_speculative_tokens", 0)
         )
         self.uses_offload = self.offload_mode != OFFLOAD_NONE
+        self.uses_separate_mtp_cache = bool(
+            self.uses_offload and self.num_speculative_tokens
+        )
         eos = config.eos
         if isinstance(eos, int):
             eos = (eos,)
@@ -42,6 +46,7 @@ class Scheduler:
         self.index_block_manager = None
         self.dram_block_manager = None
         self.pool_entry_manager = None
+        self.mtp_block_manager = None
         if self.uses_offload:
             self.index_block_manager = SimpleBlockManager(
                 config.num_dram_kvcache_blocks - 1,
@@ -54,6 +59,14 @@ class Scheduler:
             self.pool_entry_manager = PoolEntryManager(
                 config.max_num_decode_seqs_per_step
             )
+            if self.uses_separate_mtp_cache:
+                # One dense MTP layer is cheap enough to keep in HBM. Its
+                # capacity follows the full-source DRAM pool rather than the
+                # much smaller sparse target-layer HBM pool.
+                self.mtp_block_manager = SimpleBlockManager(
+                    config.num_dram_kvcache_blocks - 1,
+                    reserve_null_block=True,
+                )
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
         self.prefilling: Sequence | None = None
@@ -101,7 +114,11 @@ class Scheduler:
         num_prefill_tail_blocks = num_prefill_blocks - num_prefill_full_blocks
         lidu_tokens = 0
         if self.uses_offload:
-            lidu_tokens = lidu_cache_tokens(seq.num_prompt_tokens)
+            lidu_tokens = (
+                mtp_lidu_cache_tokens(seq.num_prompt_tokens, self.block_size)
+                if self.num_speculative_tokens
+                else lidu_cache_tokens(seq.num_prompt_tokens)
+            )
             num_sparse_blocks = (
                 lidu_tokens // seq.block_size
                 if lidu_tokens
@@ -135,6 +152,8 @@ class Scheduler:
         tail_and_decode_tokens = max(0, len(seq) - source_tokens)
         if not seq.offload_finalized:
             tail_and_decode_tokens += 1
+        if self.num_speculative_tokens:
+            tail_and_decode_tokens += self.num_speculative_tokens
         tail_and_decode_blocks = (
             tail_and_decode_tokens + self.block_size - 1
         ) // self.block_size
@@ -165,6 +184,13 @@ class Scheduler:
             self._prefill_hbm_blocks(seq)
         ):
             return False
+        if (
+            self.mtp_block_manager is not None
+            and not self.mtp_block_manager.can_allocate_blocks(
+                self._mtp_prefill_blocks(seq)
+            )
+        ):
+            return False
         if not self.uses_offload:
             return True
         if seq.lidu_cache_tokens == 0:
@@ -180,11 +206,16 @@ class Scheduler:
     def _allocate_prefill(self, seq: Sequence) -> None:
         assert not seq.index_block_table
         assert not seq.hbm_block_table
+        assert not seq.mtp_block_table
         assert not seq.dram_block_table
         seq.hbm_block_table = self.hbm_block_manager.allocate_blocks(
             self._prefill_hbm_blocks(seq),
         )
         seq.block_table = seq.hbm_block_table
+        if self.mtp_block_manager is not None:
+            seq.mtp_block_table = self.mtp_block_manager.allocate_blocks(
+                self._mtp_prefill_blocks(seq)
+            )
         if self.uses_offload:
             seq.offload_pool_entry = self.pool_entry_manager.allocate()
             if seq.lidu_cache_tokens != 0:
@@ -206,6 +237,10 @@ class Scheduler:
             seq.num_prefill_blocks,
             (required_tokens + self.block_size - 1) // self.block_size,
         )
+
+    def _mtp_prefill_blocks(self, seq: Sequence) -> int:
+        required_tokens = len(seq) + self.num_speculative_tokens
+        return (required_tokens + self.block_size - 1) // self.block_size
 
     def schedule(self) -> tuple[list[Sequence], bool]:
         if self.prefill_chunk_size and (
@@ -330,9 +365,15 @@ class Scheduler:
             else 0
         )
         growth_blocks = self._decode_growth_blocks(seq)
-        return self.hbm_block_manager.can_allocate_blocks(
+        target_ready = self.hbm_block_manager.can_allocate_blocks(
             pending_sparse_blocks + growth_blocks
         )
+        mtp_growth = self._mtp_decode_growth_blocks(seq)
+        mtp_ready = (
+            self.mtp_block_manager is None
+            or self.mtp_block_manager.can_allocate_blocks(mtp_growth)
+        )
+        return target_ready and mtp_ready
 
     def may_append(self, seq: Sequence) -> None:
         pending_sparse_blocks = (
@@ -344,9 +385,14 @@ class Scheduler:
         )
         growth_blocks = self._decode_growth_blocks(seq)
         num_new_blocks = pending_sparse_blocks + growth_blocks
-        if not num_new_blocks:
+        mtp_growth = self._mtp_decode_growth_blocks(seq)
+        if not num_new_blocks and not mtp_growth:
             return
-        new_blocks = self.hbm_block_manager.allocate_blocks(num_new_blocks)
+        new_blocks = (
+            self.hbm_block_manager.allocate_blocks(num_new_blocks)
+            if num_new_blocks
+            else []
+        )
         if pending_sparse_blocks:
             seq.hbm_block_table = (
                 new_blocks[:pending_sparse_blocks]
@@ -357,12 +403,37 @@ class Scheduler:
         # request must not consume IndexCache blocks.
         if growth_blocks:
             seq.hbm_block_table.extend(new_blocks[pending_sparse_blocks:])
+        if mtp_growth:
+            if self.mtp_block_manager is None:
+                raise RuntimeError("MTP decode growth requires an MTP block pool.")
+            seq.mtp_block_table.extend(
+                self.mtp_block_manager.allocate_blocks(mtp_growth)
+            )
         seq.block_table = seq.hbm_block_table
-        seq.bump_decode_metadata_version()
+        if num_new_blocks or mtp_growth:
+            seq.bump_decode_metadata_version()
 
     def _decode_growth_blocks(self, seq: Sequence) -> int:
-        if not self.num_speculative_tokens or self.uses_offload:
+        if not self.num_speculative_tokens:
             return int(len(seq) % self.block_size == 1)
+        if self.uses_offload:
+            lookahead = (
+                self.num_speculative_tokens
+                if len(seq.draft_token_ids) == self.num_speculative_tokens
+                else 0
+            )
+            source_tokens = seq.num_prefill_full_blocks * self.block_size
+            required_tail_tokens = max(
+                0,
+                len(seq) + lookahead - source_tokens,
+            )
+            required_tail_blocks = (
+                required_tail_tokens + self.block_size - 1
+            ) // self.block_size
+            current_tail_blocks = max(
+                0, len(seq.hbm_block_table) - seq.num_sparse_blocks
+            )
+            return max(0, required_tail_blocks - current_tail_blocks)
         lookahead = (
             self.num_speculative_tokens
             if len(seq.draft_token_ids) == self.num_speculative_tokens
@@ -378,6 +449,20 @@ class Scheduler:
         ) // self.block_size
         return max(0, required_blocks - len(seq.hbm_block_table))
 
+    def _mtp_decode_growth_blocks(self, seq: Sequence) -> int:
+        if self.mtp_block_manager is None:
+            return 0
+        lookahead = (
+            self.num_speculative_tokens
+            if len(seq.draft_token_ids) == self.num_speculative_tokens
+            else 0
+        )
+        required_tokens = len(seq) + (2 * lookahead - 1 if lookahead else 0)
+        required_blocks = (
+            required_tokens + self.block_size - 1
+        ) // self.block_size
+        return max(0, required_blocks - len(seq.mtp_block_table))
+
     def release_prefill_hbm_blocks(self, seqs: list[Sequence]) -> None:
         if not self.uses_offload:
             return
@@ -392,6 +477,8 @@ class Scheduler:
             self.index_block_manager.free_blocks(seq.index_block_table)
         self.hbm_block_manager.free_blocks(seq.hbm_block_table)
         self.hbm_block_manager.free_blocks(seq.hbm_blocks_to_release)
+        if self.mtp_block_manager is not None:
+            self.mtp_block_manager.free_blocks(seq.mtp_block_table)
         if self.dram_block_manager is not None:
             self.dram_block_manager.free_blocks(seq.dram_block_table)
         if self.pool_entry_manager is not None:
@@ -399,6 +486,7 @@ class Scheduler:
 
         seq.index_block_table.clear()
         seq.hbm_block_table.clear()
+        seq.mtp_block_table.clear()
         seq.block_table = seq.hbm_block_table
         seq.dram_block_table.clear()
         seq.hbm_blocks_to_release.clear()

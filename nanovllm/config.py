@@ -10,6 +10,8 @@ from nanovllm.engine.dsa_offload import (
     LIDU_OFFLOAD_MODES,
     LIDU_MAX_SOURCE_TOKENS,
     OFFLOAD_NONE,
+    OFFLOAD_FUSE,
+    OFFLOAD_SPLIT,
     normalize_offload_mode,
     validate_lidu_cache_token_budgets,
 )
@@ -156,9 +158,16 @@ class Config:
             raise ValueError(
                 "Built-in MTP currently supports GLM-5.1-W4A8 only."
             )
-        if self.offload_mode != OFFLOAD_NONE:
+        if self.offload_mode == OFFLOAD_FUSE:
             raise ValueError(
-                "GLM MTP currently requires offload_mode='none'."
+                "GLM MTP does not support offload_mode='offload_fuse'; use "
+                "'none' or the MTP LIDU+SCATTER mode 'offload_split'."
+            )
+        if self.offload_mode == OFFLOAD_SPLIT and not self.enforce_eager:
+            raise ValueError(
+                "GLM MTP with offload_mode='offload_split' currently requires "
+                "enforce_eager=True. FULL_DECODE_ONLY will be added after the "
+                "eager path is validated."
             )
         if int(getattr(self.hf_config, "num_nextn_predict_layers", 0)) != 1:
             raise ValueError(

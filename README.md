@@ -32,7 +32,7 @@ PYTHONPATH=$PWD:$PYTHONPATH PYTHONUNBUFFERED=1 NANOVLLM_CANN_BUILD_JOBS=64 SOC_V
 
 ## MTP-LIDU 算子验收
 
-仓库内置 `NanovllmLiduDecodeUpdateMtp`，固定处理 GLM MTP3 的每请求 4 个 query。四路 top-2048 先求有序并集，再做一次 request-pool 命中、淘汰和状态更新。活跃请求要求 `C >= min(candidate_len, 8192)`。配套 SCATTER 已支持最多 8192 个 union miss；`NanovllmSparseAndTailAttentionMtp` 分别消费四路 top-2048，并按四个验证位置计算各自的因果 tail。三者均有独立 UT，LIDU 到 SCATTER 另有链式 UT；整网接入仍在后续阶段。
+仓库内置 `NanovllmLiduDecodeUpdateMtp`，固定处理 GLM MTP3 的每请求 4 个 query。四路 top-2048 先求有序并集，再做一次 request-pool 命中、淘汰和状态更新。活跃请求要求 `C >= min(candidate_len, 8192)`。配套 SCATTER 支持最多 8192 个 union miss；`NanovllmSparseAndTailAttentionMtp` 分别消费四路 top-2048，并按四个验证位置计算各自的因果 tail。整网 eager 路径已经接入三者；target 78 层使用 LIDU 卸载，MTP 单层使用独立 dense HBM KV。
 
 修改或首次拉取该算子后先执行上面的完整编译，再运行：
 
@@ -81,7 +81,59 @@ python3 ut_ops/test_sparse_and_tail_attention_mtp.py \
   --seed 7
 ```
 
-两个成功标志分别为 `MTP_LIDU_UT_OK` 和 `MTP_SPARSE_TAIL_ATTENTION_UT_OK`。UT 覆盖 BF16/FP16、混合缓存档位、乱序 request-pool、重复更新、普通接口与 `_out`、四行因果 tail、动态 metadata 图回放，以及 B=24 下与四次串行单-query 算子的时延对比。
+最后验证整条算子链：
+
+```bash
+python3 ut_ops/test_mtp_offload_chain.py \
+  --device npu:0 \
+  --batch-size 4 \
+  --heads 2 \
+  --source-len 20992 \
+  --cache-tokens 8192 \
+  --tail-tokens 64 \
+  --graph-replays 3 \
+  --seed 7
+```
+
+三个成功标志分别为 `MTP_LIDU_UT_OK`、`MTP_SPARSE_TAIL_ATTENTION_UT_OK` 和 `MTP_OFFLOAD_CHAIN_UT_OK`。
+
+
+## MTP3 + LIDU eager 整网验收
+
+该组合固定使用 `NANOVLLM_OFFLOAD_MODE=offload_split` 和 `NANOVLLM_ENFORCE_EAGER=1`。MTP union 最多为 8192，因此 2049 token 以上的请求会自动把 C 提高到 `min(prefill_full_tokens, 8192)`；原本更大的可调预算保持不变。`NANOVLLM_DRAM_NUM_BLOCKS` 同时决定完整 target source 和 MTP 单层 dense KV 池容量。
+
+```bash
+unset NANOVLLM_ENABLE_DSA_OFFLOAD
+unset NANOVLLM_GS_MISS_RATE_ON_LAYERS
+unset NANOVLLM_LIDU_MISS_COUNT_ON_LAYERS
+unset NANOVLLM_PROFILE_DECODE_OUTPUT
+unset NANOVLLM_CUST_OPAPI_LIB
+unset ASCEND_CUSTOM_OPP_PATH
+unset NANOVLLM_DSA_BOUNDARY_PROBE
+unset NANOVLLM_MAX_GEN_TOKENS
+
+export ASCEND_HOME_PATH=/usr/local/Ascend/cann-8.5.1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH=$PWD:$PYTHONPATH
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export ASCEND_LAUNCH_BLOCKING=0
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+
+export NANOVLLM_MODEL=/mnt/models/GLM-5.1-w4a8/
+export NANOVLLM_TP_SIZE=16
+export NANOVLLM_ENABLE_EXPERT_PARALLEL=1
+export NANOVLLM_OFFLOAD_MODE=offload_split
+export NANOVLLM_ENFORCE_EAGER=1
+export NANOVLLM_KVCACHE_BLOCK_SIZE=128
+export NANOVLLM_HBM_NUM_BLOCKS=700
+export NANOVLLM_DRAM_NUM_BLOCKS=2000
+export NANOVLLM_PREFILL_CHUNK_SIZE=1024
+export NANOVLLM_NUM_SPECULATIVE_TOKENS=3
+export NANOVLLM_IGNORE_EOS=1
+export NANOVLLM_MAX_STEPS=8
+
+python3 example/test_dureader.py --prompt_count 8
+```
 
 
 
@@ -126,7 +178,7 @@ NANOVLLM_PROFILE_DECODE_OUTPUT=$PWD/profile python3 example/test.py
 
 ## 非卸载 MTP 验收
 
-MTP 只支持 `GLM-5.1-w4a8`、`offload_mode=none` 和 greedy。`NANOVLLM_NUM_SPECULATIVE_TOKENS` 仅接受 `0`（关闭）或 `3`（MTP3）；MTP3 同时支持 eager 和 `FULL_DECODE_ONLY`。图模式只捕获 exact batch：该 batch 的第一次 MTP decode 保持 eager，随后懒 capture target verification 图和三步 draft 图；batch 缩小时自动回到 eager。
+非卸载 MTP 支持 `offload_mode=none` 和 greedy。`NANOVLLM_NUM_SPECULATIVE_TOKENS` 仅接受 `0`（关闭）或 `3`（MTP3）；非卸载 MTP3 同时支持 eager 和 `FULL_DECODE_ONLY`。图模式只捕获 exact batch：该 batch 的第一次 MTP decode 保持 eager，随后懒 capture target verification 图和三步 draft 图；batch 缩小时自动回到 eager。
 
 MTP3 加载第 78 层 BF16 MTP 权重和模型根目录的 `rot.safetensors`。本功能只修改 Python，无需重新编译 Ascend 自定义算子。先验证 qlen=4 的 target attention 能 capture、动态刷新 KV 长度并 replay：
 
