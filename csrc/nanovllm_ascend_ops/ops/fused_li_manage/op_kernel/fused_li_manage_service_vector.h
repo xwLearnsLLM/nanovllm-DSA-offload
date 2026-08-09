@@ -1233,11 +1233,12 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
     // The hash uses disjoint UB storage, so its construction overlaps the
     // two miss-array copies above.  The scalar miss-count copy now acts as the
     // common MTE3 completion point before any source buffer is overwritten.
-    WriteMissCount(info.bIdx, static_cast<int32_t>(updateCount), topkPayloads);
-    // topkPayloads is also the source buffer used by WriteMissCount.  The next
-    // operation refills it through MTE2, so MTE3 must finish reading the
-    // scalar first.  MTE3_V inside WriteMissCount only protects a following
-    // vector operation and is insufficient for this MTE2 reuse.
+    topkPayloads.SetValue(0, static_cast<int32_t>(updateCount));
+    SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
+    LIServiceVec::CopyOut(missCountGm[info.bIdx], topkPayloads, 1);
+    // topkPayloads is refilled through MTE2 next.  A direct MTE3->MTE2
+    // dependency is sufficient here and avoids WriteMissCount's additional
+    // MTE3->V round trip.
     SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
 
     // Resolve both caller-visible rows from the original packed payload.
