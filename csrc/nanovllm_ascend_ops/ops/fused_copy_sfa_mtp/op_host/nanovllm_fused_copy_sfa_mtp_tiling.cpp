@@ -210,6 +210,12 @@ ge::graphStatus TilingNanovllmFusedCopySfaMtp(
         return ge::GRAPH_FAILED;
     }
 
+    // The shared SFA tiler serializes the payload we need, but its generic
+    // template key (578 for the GLM MTP3 shape) belongs to the standalone
+    // SFA kernel.  The fused MTP operator has one fixed specialization,
+    // matching sparse_tail_attention_mtp, and is compiled under key 1.
+    context->SetTilingKey(1U);
+
     auto raw = context->GetRawTilingData();
     OPS_ERR_IF(raw == nullptr,
                OPS_LOG_E(context->GetNodeName(), "Raw tiling data is missing."),
