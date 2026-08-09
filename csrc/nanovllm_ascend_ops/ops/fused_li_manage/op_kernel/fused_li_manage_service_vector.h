@@ -953,8 +953,10 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
     Duplicate(unionBits, 0U, activeUnionWords);
     PipeBarrier<PIPE_V>();
     {
-        LocalTensor<int32_t> decodedSlots = destinationSlots;
-        LocalTensor<int32_t> decodeScratch = destinationSlots[BASE_TOPK];
+        LocalTensor<uint32_t> rawSlots =
+            destinationSlots.template ReinterpretCast<uint32_t>();
+        LocalTensor<uint8_t> missMask =
+            destinationSlots[BASE_TOPK].template ReinterpretCast<uint8_t>();
         LocalTensor<int32_t> rowMissTokens = destinationSlots[BASE_TOPK * 2U];
         AscendC::GatherMaskParams compactParams;
         compactParams.repeatTimes = 1;
@@ -973,17 +975,17 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
                 DataCopyPad(topkPayloads, mtpTopkPayloadsGm[rowOffset], copyIn, intPad);
                 SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
             }
-            DecodeSlotFromPayload(
-                decodedSlots.template ReinterpretCast<uint32_t>(),
+            ShiftRight(
+                rawSlots,
                 topkPayloads.template ReinterpretCast<uint32_t>(),
-                decodeScratch, BASE_TOPK);
+                INDEX_BITS, BASE_TOPK);
+            PipeBarrier<PIPE_V>();
             DecodeIndexFromPayload(
                 topkPayloads.template ReinterpretCast<uint32_t>(),
                 topkPayloads.template ReinterpretCast<uint32_t>(), BASE_TOPK);
-            LocalTensor<uint8_t> missMask =
-                decodeScratch.template ReinterpretCast<uint8_t>();
-            CompareScalar(missMask, decodedSlots,
-                          LICommon::ConstInfo::INVALID_IDX,
+            CompareScalar(missMask,
+                          rawSlots.template ReinterpretCast<int32_t>(),
+                          INVALID_SLOT14,
                           AscendC::CMPMODE::EQ, BASE_TOPK);
             PipeBarrier<PIPE_V>();
 
