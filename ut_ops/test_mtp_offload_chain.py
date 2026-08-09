@@ -206,6 +206,8 @@ def cache_mismatch_diagnostic(
     expected: torch.Tensor,
     initial: torch.Tensor,
     hbm_table: torch.Tensor,
+    dram_cache: torch.Tensor,
+    dram_table: torch.Tensor,
     lidu_outputs: tuple[torch.Tensor, ...],
 ) -> str:
     mismatch = actual != expected
@@ -223,6 +225,7 @@ def cache_mismatch_diagnostic(
     request = -1
     logical_slot = -1
     expected_source = -1
+    actual_source = -1
     if table_match.numel():
         request = int(table_match[0, 0])
         block_column = int(table_match[0, 1])
@@ -243,13 +246,23 @@ def cache_mismatch_diagnostic(
     actual_row = actual[physical_block, block_offset]
     expected_row = expected[physical_block, block_offset]
     initial_row = initial[physical_block, block_offset]
+    if request >= 0:
+        request_blocks = dram_table[request].to(torch.int64)
+        request_rows = dram_cache.index_select(0, request_blocks).reshape(
+            -1, actual_row.numel()
+        )
+        source_match = torch.nonzero(
+            (request_rows == actual_row).all(dim=-1), as_tuple=False
+        )
+        if source_match.numel():
+            actual_source = int(source_match[0, 0])
     return (
         f"{name} payload mismatch: mismatch_elements={mismatch_elements} "
         f"mismatch_token_rows={mismatch_token_rows} "
         f"first_physical_block={physical_block} "
         f"first_block_offset={block_offset} first_feature={feature} "
         f"request={request} logical_slot={logical_slot} "
-        f"expected_source={expected_source} "
+        f"expected_source={expected_source} actual_source={actual_source} "
         f"actual_still_initial={int(torch.equal(actual_row, initial_row))} "
         f"actual_first={float(actual_row[feature]):.7f} "
         f"expected_first={float(expected_row[feature]):.7f} "
@@ -519,6 +532,8 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
                     expected=expected_kpe,
                     initial=initial_kpe_cpu,
                     hbm_table=hbm_table_cpu,
+                    dram_cache=dram_kpe_cpu,
+                    dram_table=dram_table_cpu,
                     lidu_outputs=lidu_outputs,
                 )
             )
@@ -531,6 +546,8 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
                     expected=expected_ckv,
                     initial=initial_ckv_cpu,
                     hbm_table=hbm_table_cpu,
+                    dram_cache=dram_ckv_cpu,
+                    dram_table=dram_table_cpu,
                     lidu_outputs=lidu_outputs,
                 )
             )
