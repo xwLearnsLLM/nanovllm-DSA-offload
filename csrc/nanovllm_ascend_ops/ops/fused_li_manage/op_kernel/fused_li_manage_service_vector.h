@@ -1176,27 +1176,6 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
     }
     PipeBarrier<PIPE_ALL>();
 
-    if (updateCount > 0U) {
-        AscendC::DataCopyParams copyOut{
-            1, static_cast<uint16_t>(updateCount * sizeof(int32_t)), 0, 0};
-        uint64_t missOffset = static_cast<uint64_t>(info.bIdx) * MTP_UNION_CAPACITY;
-        SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
-        DataCopyPad(mtpMissSourceIdsGm[missOffset], missTokens, copyOut);
-        DataCopyPad(mtpMissDestinationSlotsGm[missOffset], destinationSlots, copyOut);
-        SetWaitFlag<HardEvent::MTE3_S>(HardEvent::MTE3_S);
-    }
-    WriteMissCount(info.bIdx, static_cast<int32_t>(updateCount), topkPayloads);
-    // topkPayloads is also the source buffer used by WriteMissCount.  The next
-    // operation refills it through MTE2, so MTE3 must finish reading the
-    // scalar first.  MTE3_V inside WriteMissCount only protects a following
-    // vector operation and is insufficient for this MTE2 reuse.
-    SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
-
-    // Resolve both caller-visible rows from the original packed payload.
-    // Decode all 2048 payloads with vector instructions, compact only the
-    // original miss positions/tokens, then scalar-patch those O(row misses)
-    // slots from the updated cache map. This keeps the scalar work near the
-    // typical ~200 misses/query instead of scanning 2048 entries/query.
     LocalTensor<int32_t> unionScratch =
         unionStorage.template ReinterpretCast<int32_t>();
     LocalTensor<int32_t> allPositions = unionScratch;
@@ -1209,6 +1188,15 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
             .template ReinterpretCast<uint32_t>();
     LocalTensor<int32_t> rowMissTokens =
         missStorage.template ReinterpretCast<int32_t>();
+
+    if (updateCount > 0U) {
+        AscendC::DataCopyParams copyOut{
+            1, static_cast<uint16_t>(updateCount * sizeof(int32_t)), 0, 0};
+        uint64_t missOffset = static_cast<uint64_t>(info.bIdx) * MTP_UNION_CAPACITY;
+        SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
+        DataCopyPad(mtpMissSourceIdsGm[missOffset], missTokens, copyOut);
+        DataCopyPad(mtpMissDestinationSlotsGm[missOffset], destinationSlots, copyOut);
+    }
 
     // The same unique miss can occur in multiple query TopK rows.  Resolve
     // those repeated occurrences through a compact UB hash table instead of
@@ -1237,6 +1225,22 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
             missSlotMap.SetValue(mapIdx, packed);
         }
     }
+
+    // The hash uses disjoint UB storage, so its construction overlaps the
+    // two miss-array copies above.  The scalar miss-count copy now acts as the
+    // common MTE3 completion point before any source buffer is overwritten.
+    WriteMissCount(info.bIdx, static_cast<int32_t>(updateCount), topkPayloads);
+    // topkPayloads is also the source buffer used by WriteMissCount.  The next
+    // operation refills it through MTE2, so MTE3 must finish reading the
+    // scalar first.  MTE3_V inside WriteMissCount only protects a following
+    // vector operation and is insufficient for this MTE2 reuse.
+    SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
+
+    // Resolve both caller-visible rows from the original packed payload.
+    // Decode all 2048 payloads with vector instructions, compact only the
+    // original miss positions/tokens, then scalar-patch those O(row misses)
+    // slots from the updated cache map. This keeps the scalar work near the
+    // typical ~200 misses/query instead of scanning 2048 entries/query.
 
     ArithProgression(allPositions, 0, 1, BASE_TOPK);
     Duplicate(invalidSource, LICommon::ConstInfo::INVALID_IDX, BASE_TOPK);
