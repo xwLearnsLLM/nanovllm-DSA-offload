@@ -1575,7 +1575,23 @@ def run_performance_case(
         [case.topk_cpu[request * QUERY_COUNT] for request in range(batch_size)],
         label="official_li_single",
     )
-    _assert_topk_sets(native_mtp, case.topk_cpu, label="official_li_mtp3")
+    expected_native_mtp_shape = (batch_size * QUERY_COUNT, 1, TOPK)
+    if tuple(native_mtp.shape) != expected_native_mtp_shape:
+        raise AssertionError(
+            f"official LI MTP3 shape={tuple(native_mtp.shape)}, "
+            f"expected={expected_native_mtp_shape}"
+        )
+    # This call is the score/topk timing baseline, not the semantic golden.
+    # With sparse_mode=3, a qlen=4 TND sequence uses right-down causal
+    # boundaries, whereas LIM-MTP intentionally searches the same immutable
+    # prefill source for all four rows. The independent qlen=1 native golden
+    # used to build `case.topk_cpu` validates LIM-MTP semantics above.
+    print(
+        "FUSED_LI_MANAGE_MTP_OFFICIAL_BASELINE_CHECK "
+        "layout=TND query_len=4 sparse_mode=3 "
+        "role=score_topk_timing semantic_golden=independent_qlen1 ok=1",
+        flush=True,
+    )
 
     single_correctness_cache = case.initial_cache_cpu.to(device)
     single_correctness_buffers = (
@@ -1682,6 +1698,7 @@ def run_performance_case(
         f"fused_lim_single_us={fused_lim_single_us:.3f} "
         f"index_management_single_us={management_single_us:+.3f} "
         f"official_li_mtp3_us={official_li_mtp3_us:.3f} "
+        "official_li_mtp3_layout=TND_qlen4_sparse3 "
         f"fused_lim_mtp3_us={fused_lim_mtp3_us:.3f} "
         f"index_management_mtp3_us={management_mtp3_us:+.3f} "
         f"management_ratio={management_ratio:.4f} target_ratio=4.0000 "
