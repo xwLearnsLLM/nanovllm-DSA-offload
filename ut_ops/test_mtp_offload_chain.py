@@ -226,6 +226,8 @@ def cache_mismatch_diagnostic(
     logical_slot = -1
     expected_source = -1
     actual_source = -1
+    expected_occurrences = "[]"
+    actual_occurrences = "[]"
     if table_match.numel():
         request = int(table_match[0, 0])
         block_column = int(table_match[0, 1])
@@ -256,6 +258,27 @@ def cache_mismatch_diagnostic(
         )
         if source_match.numel():
             actual_source = int(source_match[0, 0])
+        aligned_sources = lidu_outputs[1].reshape(
+            -1, QUERY_COUNT, TOPK
+        )[request].cpu().to(torch.int64)
+        aligned_slots = lidu_outputs[0].reshape(
+            -1, QUERY_COUNT, TOPK
+        )[request].cpu().to(torch.int64)
+
+        def _format_occurrences(source: int) -> str:
+            if source < 0:
+                return "[]"
+            positions = torch.nonzero(
+                aligned_sources == source, as_tuple=False
+            )
+            values: list[str] = []
+            for query_idx, topk_idx in positions[:8].tolist():
+                slot = int(aligned_slots[query_idx, topk_idx])
+                values.append(f"q{query_idx}:k{topk_idx}->s{slot}")
+            return "[" + ",".join(values) + "]"
+
+        expected_occurrences = _format_occurrences(expected_source)
+        actual_occurrences = _format_occurrences(actual_source)
     return (
         f"{name} payload mismatch: mismatch_elements={mismatch_elements} "
         f"mismatch_token_rows={mismatch_token_rows} "
@@ -263,6 +286,8 @@ def cache_mismatch_diagnostic(
         f"first_block_offset={block_offset} first_feature={feature} "
         f"request={request} logical_slot={logical_slot} "
         f"expected_source={expected_source} actual_source={actual_source} "
+        f"expected_occurrences={expected_occurrences} "
+        f"actual_occurrences={actual_occurrences} "
         f"actual_still_initial={int(torch.equal(actual_row, initial_row))} "
         f"actual_first={float(actual_row[feature]):.7f} "
         f"expected_first={float(expected_row[feature]):.7f} "
