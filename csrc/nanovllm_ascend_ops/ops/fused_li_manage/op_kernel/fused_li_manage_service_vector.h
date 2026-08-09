@@ -1036,34 +1036,75 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
     SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
 
     // Resolve both caller-visible rows from the original packed payload.
-    // Hits retain their old slot. Only original misses perform a random
-    // lookup in the updated cache map; the old-slot tag also generates the
-    // aligned topk source row without rebuilding a miss-membership bitset.
+    // Decode all 2048 payloads with vector instructions, compact only the
+    // original miss positions/tokens, then scalar-patch those O(row misses)
+    // slots from the updated cache map. This keeps the scalar work near the
+    // typical ~200 misses/query instead of scanning 2048 entries/query.
+    LocalTensor<int32_t> unionScratch =
+        unionStorage.template ReinterpretCast<int32_t>();
+    LocalTensor<int32_t> allPositions = unionScratch;
+    LocalTensor<int32_t> missPositions = unionScratch[BASE_TOPK];
+    LocalTensor<int32_t> invalidSource = unionScratch[BASE_TOPK * 2U];
+    LocalTensor<uint8_t> missMask =
+        unionScratch[BASE_TOPK * 3U].template ReinterpretCast<uint8_t>();
+    LocalTensor<int32_t> rowMissTokens =
+        missStorage.template ReinterpretCast<int32_t>();
+    LocalTensor<int32_t> slotScratch = rowMissTokens[BASE_TOPK];
+    ArithProgression(allPositions, 0, 1, BASE_TOPK);
+    Duplicate(invalidSource, LICommon::ConstInfo::INVALID_IDX, BASE_TOPK);
+    PipeBarrier<PIPE_V>();
+
+    AscendC::GatherMaskParams compactParams;
+    compactParams.repeatTimes = 1;
+    compactParams.src0BlockStride = 1;
+    compactParams.src0RepeatStride = B32_VEC_REPEAT_STRIDE;
+    compactParams.src1RepeatStride = B32_VEC_REPEAT_STRIDE;
     AscendC::DataCopyParams topkCopy{
         1, static_cast<uint16_t>(BASE_TOPK * sizeof(int32_t)), 0, 0};
     for (uint32_t queryIdx = 0; queryIdx < MTP_QUERY_COUNT; ++queryIdx) {
         uint64_t rowOffset =
             static_cast<uint64_t>(info.bIdx * MTP_QUERY_COUNT + queryIdx) * BASE_TOPK;
         DataCopyPad(topkPayloads, mtpTopkPayloadsGm[rowOffset], copyIn, intPad);
-        SetWaitFlag<HardEvent::MTE2_S>(HardEvent::MTE2_S);
-        for (uint32_t topkIdx = 0; topkIdx < BASE_TOPK; ++topkIdx) {
-            uint32_t payload =
-                static_cast<uint32_t>(topkPayloads.GetValue(topkIdx));
-            uint32_t token = payload & INDEX_MASK;
-            int32_t oldSlot = static_cast<int32_t>(payload >> INDEX_BITS);
-            bool wasMiss = oldSlot == INVALID_SLOT14 ||
-                           static_cast<uint32_t>(oldSlot) >=
-                               info.cacheTokenCount;
-            int32_t slot = oldSlot;
-            int32_t source = LICommon::ConstInfo::INVALID_IDX;
-            if (token >= info.actS2Size) {
-                slot = LICommon::ConstInfo::INVALID_IDX;
-            } else if (wasMiss) {
-                slot = cacheSlotsGm.GetValue(cacheBase + token);
-                source = static_cast<int32_t>(token);
+        SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
+        DecodeSlotFromPayload(
+            destinationSlots.template ReinterpretCast<uint32_t>(),
+            topkPayloads.template ReinterpretCast<uint32_t>(), slotScratch,
+            BASE_TOPK);
+        DecodeIndexFromPayload(
+            topkPayloads.template ReinterpretCast<uint32_t>(),
+            topkPayloads.template ReinterpretCast<uint32_t>(), BASE_TOPK);
+        CompareScalar(missMask, destinationSlots,
+                      LICommon::ConstInfo::INVALID_IDX,
+                      AscendC::CMPMODE::EQ, BASE_TOPK);
+        PipeBarrier<PIPE_V>();
+
+        uint64_t rowMissCount = 0;
+        GatherMask(missPositions, allPositions,
+                   missMask.template ReinterpretCast<uint32_t>(), true,
+                   BASE_TOPK, compactParams, rowMissCount);
+        PipeBarrier<PIPE_V>();
+        uint64_t tokenMissCount = 0;
+        GatherMask(rowMissTokens, topkPayloads,
+                   missMask.template ReinterpretCast<uint32_t>(), true,
+                   BASE_TOPK, compactParams, tokenMissCount);
+        PipeBarrier<PIPE_V>();
+        Select(topkPayloads, missMask, topkPayloads, invalidSource,
+               AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE, BASE_TOPK);
+        PipeBarrier<PIPE_V>();
+        SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
+
+        uint32_t patchCount = static_cast<uint32_t>(
+            Min(rowMissCount, tokenMissCount));
+        for (uint32_t missIdx = 0; missIdx < patchCount; ++missIdx) {
+            uint32_t position =
+                static_cast<uint32_t>(missPositions.GetValue(missIdx));
+            uint32_t token =
+                static_cast<uint32_t>(rowMissTokens.GetValue(missIdx));
+            if (position >= BASE_TOPK || token >= info.actS2Size) {
+                continue;
             }
-            destinationSlots.SetValue(topkIdx, slot);
-            topkPayloads.SetValue(topkIdx, source);
+            destinationSlots.SetValue(
+                position, cacheSlotsGm.GetValue(cacheBase + token));
         }
         SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
         DataCopyPad(topkSlotsGm[rowOffset], destinationSlots, topkCopy);
