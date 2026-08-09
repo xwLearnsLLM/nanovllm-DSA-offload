@@ -1,11 +1,17 @@
 #ifndef NANOVLLM_FUSED_COPY_SFA_MTP_TORCH_ADPT_H
 #define NANOVLLM_FUSED_COPY_SFA_MTP_TORCH_ADPT_H
 
+#include "../kvcache_scatter_copy/kvcache_scatter_copy_torch_adpt.h"
+#include "../sparse_tail_attention_mtp/sparse_tail_attention_mtp_torch_adpt.h"
+
 namespace vllm_ascend {
 
-// MTP3 source-aware copy + causal sparse Attention in one AscendC launch.
-// HBM caches are mutated in place and the caller owns attention_out; no cache
-// aliases are exposed through the public torch.library schema.
+// Stable MTP3 COPYSFA ABI implemented as two ordered device commands.
+//
+// First materialize the unique union misses in HBM, then run the proven MTP3
+// sparse-and-tail Attention over four queries. Both commands are submitted on
+// the current stream, so eager and full-decode-only graph preserve the same
+// dependency without exposing intermediate cache aliases.
 inline void npu_fused_copy_sfa_mtp(
     const at::Tensor& query_rope,
     const at::Tensor& query,
@@ -132,44 +138,27 @@ inline void npu_fused_copy_sfa_mtp(
                 "All fused MTP tensors must be contiguous.");
   }
 
-  std::string query_layout = "TND";
-  std::string kv_layout = "PA_BSND";
-  char* query_layout_ptr = const_cast<char*>(query_layout.c_str());
-  char* kv_layout_ptr = const_cast<char*>(kv_layout.c_str());
-  constexpr int64_t kSparseBlockSize = 1;
-  constexpr int64_t kSparseMode = 3;
-  auto keepalive = std::make_tuple(
+  // topk_src_ids is retained in the public ABI for a future source-aware
+  // single-kernel implementation. The correctness-first composition consumes
+  // the compact union miss buffers instead.
+  (void)topk_src_ids;
+
+  // SCATTER uses [blocks, 128, dim], while Attention uses PA_BSND
+  // [blocks, 128, 1, dim]. These views alias storage and enqueue no work.
+  auto flat_hbm_k_rope = hbm_k_rope.view(
+      {hbm_k_rope.size(0), kBlockSize, kKpeDim});
+  auto flat_hbm_kv_cache = hbm_kv_cache.view(
+      {hbm_kv_cache.size(0), kBlockSize, kCkvDim});
+  npu_scatter_copy(
+      miss_src_ids, miss_dst_slots, miss_counts,
+      hbm_block_table, dram_block_table,
+      flat_hbm_k_rope, flat_hbm_kv_cache,
+      dram_k_rope, dram_kv_cache);
+  npu_sparse_tail_attention_mtp(
       query_rope, query, actual_seq_lengths_query,
       actual_seq_lengths_kv, num_cache_tokens, topk_dst_slots,
-      topk_src_ids, miss_src_ids, miss_dst_slots, miss_counts,
-      hbm_block_table, dram_block_table, hbm_k_rope,
-      hbm_kv_cache, dram_k_rope, dram_kv_cache, attention_out);
-  EXEC_NPU_CMD_ORDERED(
-      aclnnNanovllmFusedCopySfaMtp,
-      keepalive,
-      query,
-      hbm_kv_cache,
-      hbm_kv_cache,
-      topk_dst_slots,
-      num_cache_tokens,
-      hbm_block_table,
-      actual_seq_lengths_query,
-      actual_seq_lengths_kv,
-      query_rope,
-      hbm_k_rope,
-      dram_k_rope,
-      dram_kv_cache,
-      dram_block_table,
-      topk_src_ids,
-      miss_src_ids,
-      miss_dst_slots,
-      miss_counts,
-      scale_value,
-      kSparseBlockSize,
-      query_layout_ptr,
-      kv_layout_ptr,
-      kSparseMode,
-      attention_out);
+      hbm_block_table, hbm_k_rope, hbm_kv_cache,
+      scale_value, attention_out);
 }
 
 }  // namespace vllm_ascend

@@ -10,7 +10,7 @@
 | `sparse_tail_attention` | 单 query 的 top-2048 + dense tail Attention | MTP0 |
 | `sparse_tail_attention_mtp` | 四个验证位置各自的 top-2048 + causal dense tail Attention | MTP3 |
 | `fused_copy_sfa` | 融合 `scatter_copy + sparse_tail_attention`，支持 bs>24 | MTP0 |
-| `fused_copy_sfa_mtp` | MTP3 union miss 搬移与四行 causal sparse Attention | MTP3 |
+| `fused_copy_sfa_mtp` | 固定 ABI 内按序执行 MTP3 union miss 搬移与四行 causal sparse Attention | MTP3 |
 
 七个算子都只有一个公开入口：调用方预先创建 mutable/output buffer，算子原地写入并返回 `None`。不存在 allocating 入口、`_out` 后缀或 alias 输出。
 全部 `torch.ops.nanovllm_dsa.*` 注册都有 Meta/Fake 可见实现，可用于 eager 和 `FULL_DECODE_ONLY` capture/replay。
@@ -148,7 +148,7 @@ fused_copy_sfa_mtp (
 - 单 query LIM 保留 21-bit source index 能力；MTP3 LIM 暂只支持 18-bit。
 - `scatter_copy` 同时支持非 MTP 的 2048 capacity 和 MTP3 的 8192 capacity，不感知 query_len。
 - `sparse_tail_attention_mtp` 保证四个验证位置分别使用各自 top-2048 和 causal dense tail。
-- `fused_copy_sfa` 支持 bs>24；`fused_copy_sfa_mtp` 当前的 Attention 数值偏差留待性能优化阶段修复。
+- `fused_copy_sfa` 支持 bs>24；`fused_copy_sfa_mtp` 当前复用已验收的 `scatter_copy + sparse_tail_attention_mtp`，以 split 路径作为精确语义。
 
 其余五个本仓算子 `moe_gating_top_k`、`matmul_allreduce_add_rmsnorm`、`batch_matmul_transpose`、`dsa_indexer_query_rope_inplace`、mla_preprocess` 也统一从
 `torch.ops.nanovllm_dsa` 暴露；它们的接口、行为和内核没有改动。
@@ -255,14 +255,14 @@ python3 ut_ops/test_sparse_tail_attention_mtp.py \
 python3 ut_ops/test_mtp_offload_chain.py \
   --device npu:0 --batch-size 4 --heads 2 \
   --source-len 20992 --cache-tokens 8192 --tail-tokens 64 \
-  --graph-replays 3 --seed 7 --allow-fused-attention-diff
+  --graph-replays 3 --seed 7
 
 # fused_copy_sfa_mtp：split 对照、caller-owned output、graph replay 与时延打印
 python3 ut_ops/test_fused_copy_sfa_mtp.py \
   --device npu:0 --batch-size 4 --heads 2 \
   --source-len 20992 --cache-tokens 8192 --tail-tokens 64 \
   --perf-miss-count 300 --graph-replays 3 --warmup 10 --iters 100 \
-  --seed 7 --allow-fused-attention-diff
+  --seed 7
 
 # Target qlen=4 MLA 与逐 token 参考结果及 graph replay
 python3 ut_ops/test_glm_mtp_target_verify.py \

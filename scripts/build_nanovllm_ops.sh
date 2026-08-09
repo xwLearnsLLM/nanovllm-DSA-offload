@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON_BIN="${PYTHON:-python}"
 RAW_SOC_VERSION="${SOC_VERSION:-ascend910_9391}"
 ASCEND_HOME_PATH="${ASCEND_HOME_PATH:-/usr/local/Ascend/ascend-toolkit/latest}"
-CUSTOM_OPS="fused_li_manage;fused_li_manage_mtp;kvcache_scatter_copy;sparse_tail_attention;sparse_tail_attention_mtp;fused_copy_sfa;fused_copy_sfa_mtp;moe_gating_top_k;matmul_allreduce_add_rmsnorm"
+CUSTOM_OPS="fused_li_manage;fused_li_manage_mtp;kvcache_scatter_copy;sparse_tail_attention;sparse_tail_attention_mtp;fused_copy_sfa;moe_gating_top_k;matmul_allreduce_add_rmsnorm"
 NANOVLLM_EXT_BUILD_JOBS="${NANOVLLM_EXT_BUILD_JOBS:-1}"
 
 prepare_catlass() {
@@ -77,7 +77,7 @@ else
     echo "[nanovllm ops] ERROR: installed binary_info_config.json was not found." >&2
     exit 1
   fi
-  for OP_TYPE in NanovllmFusedLiManage NanovllmFusedLiManageMtp NanovllmKvcacheScatterCopy NanovllmSparseTailAttention NanovllmSparseTailAttentionMtp NanovllmFusedCopySfa NanovllmFusedCopySfaMtp; do
+  for OP_TYPE in NanovllmFusedLiManage NanovllmFusedLiManageMtp NanovllmKvcacheScatterCopy NanovllmSparseTailAttention NanovllmSparseTailAttentionMtp NanovllmFusedCopySfa; do
     if ! grep -q "${OP_TYPE}" "${BINARY_INFO_CONFIG}"; then
       echo "[nanovllm ops] ERROR: ${OP_TYPE} is missing from ${BINARY_INFO_CONFIG}." >&2
       exit 1
