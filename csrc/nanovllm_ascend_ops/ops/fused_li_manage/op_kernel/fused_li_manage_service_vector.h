@@ -462,6 +462,10 @@ __aicore__ inline void LIVector<LIT>::WriteMtpAggregateScoreChunk(
     // queries; using it as async GM scratch corrupts query 1+ payloads on
     // Ascend910_93 even when it is rewritten before the next chunk.
     LocalTensor<float> previousScore = aggregateScoreBuf_.Get<float>();
+    // q1..q3 write the previous chunk's aggregate from this same UB scratch.
+    // Delay that write's completion until the scratch is actually reused so
+    // MTE3 can overlap the intervening TopK merge and next MM/scale work.
+    SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
     SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
     DataCopyPad(previousScore, scoresGm[gmOffset],
                 AscendC::DataCopyExtParams{
@@ -472,8 +476,6 @@ __aicore__ inline void LIVector<LIT>::WriteMtpAggregateScoreChunk(
     PipeBarrier<PIPE_V>();
     SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
     LIServiceVec::CopyOut(scoresGm[gmOffset], previousScore, alignedLen);
-    SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
-
 }
 
 template <typename LIT>
