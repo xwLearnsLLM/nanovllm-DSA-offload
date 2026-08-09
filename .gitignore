@@ -4,7 +4,6 @@ __pycache__/
 
 build/
 nanovllm/_C*.so
-nanovllm/libnanovllm_ascend_kernels.so
 nanovllm/_cann_ops_custom/
 csrc/nanovllm_ascend_ops/cann_ops/build/
 csrc/nanovllm_ascend_ops/cann_ops/output/

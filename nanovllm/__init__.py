@@ -1,11 +1,5 @@
-from nanovllm.sampling_params import SamplingParams
+"""Standalone Python loader for the bundled LIM-MTP custom operator."""
 
-__all__ = ["LLM", "SamplingParams"]
+from nanovllm.ops import fused_li_manage_mtp
 
-
-def __getattr__(name: str):
-    if name == "LLM":
-        from nanovllm.llm import LLM
-
-        return LLM
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+__all__ = ["fused_li_manage_mtp"]

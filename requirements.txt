@@ -1,10 +1,3 @@
-# Ascend worker environment for GLM-5.1-w4a8.
-# torch/torch-npu wheels are platform-specific; install them from the Ascend
-# wheel source that matches your machine.
-
+# torch and torch-npu are supplied by the matching Ascend worker image.
 cmake
 pybind11
-transformers==5.5.3
-torch==2.9.0+cpu
-torch-npu==2.9.0
-mistral-common==1.11.1

@@ -1,9 +1,0 @@
----
-name: catlass-dev
-
-channels:
-  - ascend
-
-dependencies:
-  - ascend::cann-910b-ops>=8.5.0
-

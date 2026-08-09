@@ -7,9 +7,9 @@
 
 #include "kernel_operator.h"
 #include "lib/matmul_intf.h"
-#include "../fused_li_manage/fused_li_manage_common.h"
-#include "../fused_li_manage/fused_li_manage_service_vector.h"
-#include "../fused_li_manage/fused_li_manage_service_cube.h"
+#include "fused_li_manage_common.h"
+#include "fused_li_manage_service_vector.h"
+#include "fused_li_manage_service_cube.h"
 
 namespace LIMtpKernel {
 using namespace AscendC;

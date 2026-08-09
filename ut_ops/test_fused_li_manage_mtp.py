@@ -21,8 +21,6 @@ BLOCK_SIZE = 128
 TOPK = 2048
 UNION_CAPACITY = QUERY_COUNT * TOPK
 MAX_SOURCE_CAPACITY = 1 << 18
-KPE_DIM = 64
-CKV_DIM = 512
 
 
 @dataclass
@@ -649,72 +647,6 @@ def make_outputs(case: MtpCase) -> tuple[torch.Tensor, ...]:
     )
 
 
-def _swapped_from_cpu(cpu: torch.Tensor, device: torch.device) -> torch.Tensor:
-    tensor = torch_npu.empty_with_swapped_memory(
-        cpu.shape,
-        dtype=cpu.dtype,
-        device=device,
-    )
-    tensor.fill_(0)
-    tensor.add_(cpu.to(device))
-    return tensor
-
-
-def _apply_scatter_reference(
-    expected_kpe: torch.Tensor,
-    expected_ckv: torch.Tensor,
-    dram_kpe: torch.Tensor,
-    dram_ckv: torch.Tensor,
-    hbm_block_table: torch.Tensor,
-    dram_block_table: torch.Tensor,
-    source_ids: torch.Tensor,
-    destination_slots: torch.Tensor,
-    copy_counts: torch.Tensor,
-) -> None:
-    for request, count_value in enumerate(copy_counts.tolist()):
-        count = int(count_value)
-        if count == 0:
-            continue
-        sources = source_ids[request, :count].to(torch.int64)
-        destinations = destination_slots[request, :count].to(torch.int64)
-        src_blocks = dram_block_table[
-            request, sources // BLOCK_SIZE
-        ].to(torch.int64)
-        src_offsets = sources % BLOCK_SIZE
-        dst_blocks = hbm_block_table[
-            request, destinations // BLOCK_SIZE
-        ].to(torch.int64)
-        dst_offsets = destinations % BLOCK_SIZE
-        expected_kpe[dst_blocks, dst_offsets] = dram_kpe[
-            src_blocks, src_offsets
-        ]
-        expected_ckv[dst_blocks, dst_offsets] = dram_ckv[
-            src_blocks, src_offsets
-        ]
-
-
-def _run_scatter(
-    hbm_kpe: torch.Tensor,
-    hbm_ckv: torch.Tensor,
-    dram_kpe: torch.Tensor,
-    dram_ckv: torch.Tensor,
-    hbm_block_table: torch.Tensor,
-    dram_block_table: torch.Tensor,
-    outputs: tuple[torch.Tensor, ...],
-) -> None:
-    torch.ops.nanovllm_dsa.scatter_copy.default(
-        outputs[2],
-        outputs[3],
-        outputs[4],
-        hbm_block_table,
-        dram_block_table,
-        hbm_kpe,
-        hbm_ckv,
-        dram_kpe,
-        dram_ckv,
-    )
-
-
 def run_meta_check() -> None:
     batch_size = 2
     source_capacity = 8192
@@ -1148,239 +1080,6 @@ def run_graph_case(device: torch.device, seed: int, replays: int) -> None:
     torch.npu.empty_cache()
 
 
-def run_fused_li_manage_scatter_chain_case(
-    device: torch.device,
-    seed: int,
-) -> None:
-    """Validate the fixed-capacity 8192 LIM -> SCATTER contract."""
-
-    batch_size = 4
-    source_len = 20992
-    cache_tokens = 8192
-    case = make_case(
-        name="fused_li_manage_scatter_chain",
-        device=device,
-        dtype=torch.bfloat16,
-        candidate_lens=(source_len,) * batch_size,
-        cache_tokens=(cache_tokens,) * batch_size,
-        miss_fractions=(0.0, 0.25, 0.6, 1.0),
-        source_capacity=source_len,
-        seed=seed + 4000,
-    )
-    generator = torch.Generator().manual_seed(seed + 4017)
-    dram_table_cpu, dram_blocks = _random_block_table(
-        batch_size, source_len // BLOCK_SIZE, generator
-    )
-    hbm_table_cpu, hbm_blocks = _random_block_table(
-        batch_size, cache_tokens // BLOCK_SIZE, generator
-    )
-    dram_kpe_cpu = torch.randn(
-        dram_blocks,
-        BLOCK_SIZE,
-        KPE_DIM,
-        generator=generator,
-        dtype=torch.float32,
-    ).to(torch.bfloat16)
-    dram_ckv_cpu = torch.randn(
-        dram_blocks,
-        BLOCK_SIZE,
-        CKV_DIM,
-        generator=generator,
-        dtype=torch.float32,
-    ).to(torch.bfloat16)
-    dram_kpe = _swapped_from_cpu(dram_kpe_cpu, device)
-    dram_ckv = _swapped_from_cpu(dram_ckv_cpu, device)
-    dram_table = dram_table_cpu.to(device)
-    hbm_table = hbm_table_cpu.to(device)
-
-    def assert_scatter_result(
-        hbm_kpe: torch.Tensor,
-        hbm_ckv: torch.Tensor,
-        outputs: tuple[torch.Tensor, ...],
-        *,
-        label: str,
-    ) -> list[int]:
-        counts_cpu = outputs[4].cpu()
-        expected_kpe = torch.zeros(
-            hbm_blocks, BLOCK_SIZE, KPE_DIM, dtype=torch.bfloat16
-        )
-        expected_ckv = torch.zeros(
-            hbm_blocks, BLOCK_SIZE, CKV_DIM, dtype=torch.bfloat16
-        )
-        _apply_scatter_reference(
-            expected_kpe,
-            expected_ckv,
-            dram_kpe_cpu,
-            dram_ckv_cpu,
-            hbm_table_cpu,
-            dram_table_cpu,
-            outputs[2].cpu(),
-            outputs[3].cpu(),
-            counts_cpu,
-        )
-        if not torch.equal(hbm_kpe.cpu(), expected_kpe):
-            raise AssertionError(f"{label}: SCATTER KPE payload mismatch")
-        if not torch.equal(hbm_ckv.cpu(), expected_ckv):
-            raise AssertionError(f"{label}: SCATTER CKV payload mismatch")
-        return [int(value) for value in counts_cpu.tolist()]
-
-    # Eager chain: the actual MTP LIM buffers are passed directly to SCATTER.
-    eager_cache = case.initial_cache_cpu.to(device)
-    eager_kpe = torch.zeros(
-        hbm_blocks, BLOCK_SIZE, KPE_DIM, dtype=torch.bfloat16, device=device
-    )
-    eager_ckv = torch.zeros(
-        hbm_blocks, BLOCK_SIZE, CKV_DIM, dtype=torch.bfloat16, device=device
-    )
-    eager_outputs = call_mtp_with_buffers(
-        case, eager_cache, *make_outputs(case)
-    )
-    _run_scatter(
-        eager_kpe,
-        eager_ckv,
-        dram_kpe,
-        dram_ckv,
-        hbm_table,
-        dram_table,
-        eager_outputs,
-    )
-    torch.npu.synchronize()
-    eager_counts = validate_result(
-        case,
-        case.initial_cache_cpu,
-        eager_cache,
-        eager_outputs,
-        label="fused_li_manage_scatter_chain/eager",
-    )
-    payload_counts = assert_scatter_result(
-        eager_kpe,
-        eager_ckv,
-        eager_outputs,
-        label="fused_li_manage_scatter_chain/eager",
-    )
-    if payload_counts != eager_counts:
-        raise AssertionError("LIM and SCATTER eager copy counts differ")
-    if max(eager_counts) <= TOPK or max(eager_counts) > UNION_CAPACITY:
-        raise AssertionError(
-            "MTP SCATTER coverage must include a copy_count in (2048,8192]"
-        )
-    print(
-        "FUSED_LI_MANAGE_MTP_SCATTER_CHAIN_CHECK "
-        f"batch={batch_size} copy_cap={UNION_CAPACITY} "
-        f"miss_counts={eager_counts} total_misses={sum(eager_counts)} "
-        "over_2048=1 ok=1",
-        flush=True,
-    )
-
-    # Capture both nodes together.  Capture may execute, so reset all mutable
-    # state before replaying from the golden initial state.
-    graph_cache = case.initial_cache_cpu.to(device)
-    graph_kpe = torch.zeros_like(eager_kpe)
-    graph_ckv = torch.zeros_like(eager_ckv)
-    graph_buffers = make_outputs(case)
-    graph = torch.npu.NPUGraph()
-    pool = torch.npu.graph_pool_handle()
-    with torch.npu.graph(graph, pool=pool):
-        graph_outputs = call_mtp_with_buffers(
-            case, graph_cache, *graph_buffers
-        )
-        _run_scatter(
-            graph_kpe,
-            graph_ckv,
-            dram_kpe,
-            dram_ckv,
-            hbm_table,
-            dram_table,
-            graph_outputs,
-        )
-    torch.npu.synchronize()
-
-    graph_cache.copy_(case.initial_cache_cpu.to(device))
-    graph_kpe.zero_()
-    graph_ckv.zero_()
-    torch.npu.synchronize()
-    graph.replay()
-    torch.npu.synchronize()
-    graph_counts = validate_result(
-        case,
-        case.initial_cache_cpu,
-        graph_cache,
-        graph_outputs,
-        label="fused_li_manage_scatter_chain/graph",
-    )
-    assert_scatter_result(
-        graph_kpe,
-        graph_ckv,
-        graph_outputs,
-        label="fused_li_manage_scatter_chain/graph",
-    )
-    if graph_counts != eager_counts:
-        raise AssertionError("eager and graph LIM->SCATTER counts differ")
-
-    repeat_before = graph_cache.cpu()
-    kpe_before = graph_kpe.cpu()
-    ckv_before = graph_ckv.cpu()
-    graph.replay()
-    torch.npu.synchronize()
-    repeat_counts = validate_result(
-        case,
-        repeat_before,
-        graph_cache,
-        graph_outputs,
-        label="fused_li_manage_scatter_chain/graph_repeat",
-    )
-    if any(repeat_counts):
-        raise AssertionError("identical graph replay must produce zero misses")
-    if not torch.equal(graph_kpe.cpu(), kpe_before) or not torch.equal(
-        graph_ckv.cpu(), ckv_before
-    ):
-        raise AssertionError("zero-miss graph replay modified HBM cache")
-    print(
-        "FUSED_LI_MANAGE_MTP_SCATTER_GRAPH_CHECK "
-        f"batch={batch_size} copy_cap={UNION_CAPACITY} "
-        "nonzero_replay=1 zero_miss_repeat=1 data_dependency=1 ok=1",
-        flush=True,
-    )
-    del (
-        case,
-        dram_kpe,
-        dram_ckv,
-        eager_cache,
-        eager_kpe,
-        eager_ckv,
-        graph_cache,
-        graph_kpe,
-        graph_ckv,
-        graph,
-    )
-    torch.npu.empty_cache()
-
-
-def _single_query_with_buffers(
-    case: MtpCase,
-    query: torch.Tensor,
-    weights: torch.Tensor,
-    cache_slots: torch.Tensor,
-    source_ids: torch.Tensor,
-    destination_slots: torch.Tensor,
-    miss_counts: torch.Tensor,
-):
-    torch.ops.nanovllm_dsa.fused_li_manage.default(
-        query,
-        weights,
-        case.key,
-        case.block_table,
-        case.candidate_lens,
-        case.cache_tokens,
-        case.req_pool_entries,
-        cache_slots,
-        source_ids,
-        destination_slots,
-        miss_counts,
-    )
-    return source_ids, destination_slots, miss_counts
-
-
 def _event_us(
     runner: Callable[[], object],
     *,
@@ -1593,39 +1292,6 @@ def run_performance_case(
         flush=True,
     )
 
-    single_correctness_cache = case.initial_cache_cpu.to(device)
-    single_correctness_buffers = (
-        torch.empty((batch_size, 1, TOPK), dtype=torch.int32, device=device),
-        torch.empty((batch_size, 1, TOPK), dtype=torch.int32, device=device),
-        torch.empty((batch_size,), dtype=torch.int32, device=device),
-    )
-    single_result = _single_query_with_buffers(
-        case,
-        single_query,
-        single_weights,
-        single_correctness_cache,
-        *single_correctness_buffers,
-    )
-    torch.npu.synchronize()
-    single_counts = single_result[2].cpu().tolist()
-    if single_counts != [perf_query_miss_count] * batch_size:
-        raise AssertionError(
-            f"single LIM miss_counts={single_counts}, "
-            f"expected={perf_query_miss_count} per request"
-        )
-    _assert_topk_sets(
-        single_result[0],
-        [case.topk_cpu[request * QUERY_COUNT] for request in range(batch_size)],
-        label="fused_lim_single",
-    )
-
-    single_initial = case.initial_cache_cpu.to(device)
-    single_cache = torch.empty_like(single_initial)
-    single_buffers = (
-        torch.empty((batch_size, 1, TOPK), dtype=torch.int32, device=device),
-        torch.empty((batch_size, 1, TOPK), dtype=torch.int32, device=device),
-        torch.empty((batch_size,), dtype=torch.int32, device=device),
-    )
     mtp_initial = case.initial_cache_cpu.to(device)
     mtp_cache = torch.empty_like(mtp_initial)
     mtp_buffers = make_outputs(case)
@@ -1638,15 +1304,6 @@ def run_performance_case(
             case.block_table,
             case.candidate_lens,
             single_query_ends,
-        )
-
-    def fused_single_step() -> object:
-        return _single_query_with_buffers(
-            case,
-            single_query,
-            single_weights,
-            single_cache,
-            *single_buffers,
         )
 
     def native_mtp_step() -> object:
@@ -1665,12 +1322,6 @@ def run_performance_case(
     official_li_single_us = _event_us(
         native_single_step, warmup=warmup, iters=iters
     )
-    fused_lim_single_us = _event_us(
-        fused_single_step,
-        warmup=warmup,
-        iters=iters,
-        reset=lambda: single_cache.copy_(single_initial),
-    )
     official_li_mtp3_us = _event_us(
         native_mtp_step, warmup=warmup, iters=iters
     )
@@ -1680,13 +1331,7 @@ def run_performance_case(
         iters=iters,
         reset=lambda: mtp_cache.copy_(mtp_initial),
     )
-    management_single_us = fused_lim_single_us - official_li_single_us
     management_mtp3_us = fused_lim_mtp3_us - official_li_mtp3_us
-    management_ratio = (
-        management_mtp3_us / management_single_us
-        if management_single_us > 0
-        else float("nan")
-    )
     print(
         "FUSED_LI_MANAGE_MTP_MANAGEMENT_RESULT "
         f"batch={batch_size} candidate_len={source_len} "
@@ -1695,13 +1340,11 @@ def run_performance_case(
         f"unique_union_misses_mean={unique_union_mean:.2f} "
         f"topk_union_mean={union_mean:.2f} "
         f"official_li_single_us={official_li_single_us:.3f} "
-        f"fused_lim_single_us={fused_lim_single_us:.3f} "
-        f"index_management_single_us={management_single_us:+.3f} "
         f"official_li_mtp3_us={official_li_mtp3_us:.3f} "
         "official_li_mtp3_layout=TND_qlen4_sparse3 "
         f"fused_lim_mtp3_us={fused_lim_mtp3_us:.3f} "
         f"index_management_mtp3_us={management_mtp3_us:+.3f} "
-        f"management_ratio={management_ratio:.4f} target_ratio=4.0000 "
+        "single_lim_baseline=external "
         f"timer=npu_event performance_assert=0 warmup={warmup} iters={iters}",
         flush=True,
     )
@@ -1757,7 +1400,6 @@ def main() -> None:
     torch.npu.empty_cache()
 
     run_graph_case(device, args.seed, args.graph_replays)
-    run_fused_li_manage_scatter_chain_case(device, args.seed)
     if not args.skip_performance:
         run_performance_case(
             device,

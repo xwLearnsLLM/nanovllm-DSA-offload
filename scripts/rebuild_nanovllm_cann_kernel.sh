@@ -24,7 +24,6 @@ fi
 
 KERNEL_NAME="nanovllm_fused_li_manage_mtp"
 OP_TYPE="NanovllmFusedLiManageMtp"
-DEPENDENCY_SOURCE_DIRS=("fused_li_manage")
 
 RAW_SOC_VERSION="${SOC_VERSION:-ascend910_9391}"
 case "${RAW_SOC_VERSION}" in
@@ -117,18 +116,13 @@ echo "[nanovllm incremental] install: ${INSTALLED_OPP_ROOT}"
 echo "[nanovllm incremental] jobs: ${BUILD_JOBS}"
 
 # CANN's generated build graph uses copied sources and .done files as outputs.
-# Invalidate only this kernel and its shared source copy; all unrelated kernels
-# retain their stamps and are therefore no-ops when ops_config is regenerated.
+# Invalidate only the standalone LIM-MTP kernel copy and its generated stamps.
 rm -rf "${SRC_DIR}/${KERNEL_NAME}" "${SRC_DIR}/${OP_NAME}"
-for dependency in "${DEPENDENCY_SOURCE_DIRS[@]}"; do
-  rm -rf "${SRC_DIR}/${dependency}"
-done
 find "${GEN_DIR}" -maxdepth 1 -type f \
   -name "${TARGET_NAME}_*.done" -delete
 find "${CANN_BUILD_DIR}" -type f \
   \( -name "${TARGET_NAME}_src_copy.done" \
-     -o -name "${OP_NAME}_${CANN_SOC_VERSION}_src_copy.done" \
-     -o -name "fused_li_manage_${CANN_SOC_VERSION}_src_copy.done" \) \
+     -o -name "${OP_NAME}_${CANN_SOC_VERSION}_src_copy.done" \) \
   -delete
 rm -rf "${BIN_DIR:?}/${KERNEL_NAME}" "${BIN_DIR:?}/${OP_NAME}"
 rm -f \
