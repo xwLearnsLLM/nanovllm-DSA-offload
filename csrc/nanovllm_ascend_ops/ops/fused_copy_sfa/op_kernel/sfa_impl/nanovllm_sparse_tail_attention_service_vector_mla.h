@@ -1211,30 +1211,68 @@ SFAVectorService<SFAT>::CopyOutSourceAwareResult(
     const int64_t missEnd = ALIGNED_MISS
         ? mte2Size
         : (mte2Size < missRangeSize ? mte2Size : missRangeSize);
+    if constexpr (ALIGNED_MISS) {
+        // Attention may permute rows while gathering paged HBM pairs; that is
+        // mathematically harmless for softmax, but the resulting merge-UB row
+        // is not a stable token->destination mapping.  Once the Attention
+        // payload is in workspace, reload only this flush's misses compactly
+        // and use that explicit order for persistent cache writes.
+        SetFlag<AscendC::HardEvent::MTE3_S>(0);
+        WaitFlag<AscendC::HardEvent::MTE3_S>(0);
+
+        int64_t compactMte2Size = 0;
+        for (int64_t rangeOffset = mte3Size;
+             rangeOffset < missEnd; ++rangeOffset) {
+            const int64_t sourceIndex =
+                sourceRangeStart + rangeOffset;
+            const int32_t sourceToken = sourceTokenIdsGm_.GetValue(
+                runInfo.topKBaseOffset + sourceIndex);
+            if (sourceToken < 0) {
+                continue;
+            }
+            CopyInDramKv(
+                compactMte2Size, 0, mergeMte3Idx,
+                sourceToken, runInfo);
+        }
+        if (compactMte2Size == 0) {
+            return;
+        }
+
+        SetFlag<AscendC::HardEvent::MTE2_MTE3>(0);
+        WaitFlag<AscendC::HardEvent::MTE2_MTE3>(0);
+        int64_t compactRow = 0;
+        for (int64_t rangeOffset = mte3Size;
+             rangeOffset < missEnd; ++rangeOffset) {
+            const int64_t sourceIndex =
+                sourceRangeStart + rangeOffset;
+            if (sourceTokenIdsGm_.GetValue(
+                    runInfo.topKBaseOffset + sourceIndex) < 0) {
+                continue;
+            }
+            const int32_t destinationSlot = topkGm_.GetValue(
+                runInfo.topKBaseOffset + sourceIndex);
+            const int64_t ubRow =
+                mergeMte3Idx % 2 * 32 + compactRow;
+            CopyMissToPersistentCache(
+                ubRow, destinationSlot, runInfo);
+            ++compactRow;
+        }
+        SetFlag<AscendC::HardEvent::MTE3_S>(0);
+        WaitFlag<AscendC::HardEvent::MTE3_S>(0);
+        return;
+    }
+
     for (int64_t rangeOffset = mte3Size;
          rangeOffset < missEnd; ++rangeOffset) {
         const int64_t ubRow =
             mergeMte3Idx % 2 * 32 + rangeOffset - mte3Size;
         const int64_t sourceIndex =
             sourceRangeStart + rangeOffset;
-        if constexpr (ALIGNED_MISS) {
-            if (sourceTokenIdsGm_.GetValue(
-                    runInfo.topKBaseOffset + sourceIndex) < 0) {
-                continue;
-            }
-        }
         const int32_t destinationSlot =
             topkGm_.GetValue(
                 runInfo.topKBaseOffset + sourceIndex);
         CopyMissToPersistentCache(
             ubRow, destinationSlot, runInfo);
-    }
-    if constexpr (ALIGNED_MISS) {
-        // The aligned MTP path can issue many sparse persistent writes from
-        // the same ping-pong merge buffer.  Do not let the next MTE2 refill
-        // reuse that UB until every queued UB->GM write has consumed it.
-        SetFlag<AscendC::HardEvent::MTE3_S>(0);
-        WaitFlag<AscendC::HardEvent::MTE3_S>(0);
     }
 }
 
