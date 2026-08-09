@@ -1248,24 +1248,37 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
     compactParams.src1RepeatStride = B32_VEC_REPEAT_STRIDE;
     AscendC::DataCopyParams topkCopy{
         1, static_cast<uint16_t>(BASE_TOPK * sizeof(int32_t)), 0, 0};
+    LocalTensor<int32_t> slotPong = destinationSlots[BASE_TOPK];
+    LocalTensor<int32_t> sourcePong = destinationSlots[BASE_TOPK * 2U];
     for (uint32_t queryIdx = 0; queryIdx < MTP_QUERY_COUNT; ++queryIdx) {
+        if (queryIdx == 2U) {
+            // q0/q1 used the two ping-pong output pairs.  Wait only when q2
+            // is about to reuse q0's pair, after q1 computation has already
+            // overlapped q0's MTE3 output.
+            SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
+            SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
+        }
+        LocalTensor<int32_t> rowSlots =
+            (queryIdx & 1U) == 0U ? destinationSlots : slotPong;
+        LocalTensor<int32_t> rowSources =
+            (queryIdx & 1U) == 0U ? topkPayloads : sourcePong;
         uint64_t rowOffset =
             static_cast<uint64_t>(info.bIdx * MTP_QUERY_COUNT + queryIdx) * BASE_TOPK;
         if (queryIdx + 1U == MTP_QUERY_COUNT && lastQueryPayloadInUb) {
-            DataCopy(topkPayloads, lastQueryPayload, BASE_TOPK);
+            DataCopy(rowSources, lastQueryPayload, BASE_TOPK);
             PipeBarrier<PIPE_V>();
         } else {
-            DataCopyPad(topkPayloads, mtpTopkPayloadsGm[rowOffset], copyIn, intPad);
+            DataCopyPad(rowSources, mtpTopkPayloadsGm[rowOffset], copyIn, intPad);
             SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
         }
         DecodeSlotFromPayload(
-            destinationSlots.template ReinterpretCast<uint32_t>(),
-            topkPayloads.template ReinterpretCast<uint32_t>(), slotScratch,
+            rowSlots.template ReinterpretCast<uint32_t>(),
+            rowSources.template ReinterpretCast<uint32_t>(), slotScratch,
             BASE_TOPK);
         DecodeIndexFromPayload(
-            topkPayloads.template ReinterpretCast<uint32_t>(),
-            topkPayloads.template ReinterpretCast<uint32_t>(), BASE_TOPK);
-        CompareScalar(missMask, destinationSlots,
+            rowSources.template ReinterpretCast<uint32_t>(),
+            rowSources.template ReinterpretCast<uint32_t>(), BASE_TOPK);
+        CompareScalar(missMask, rowSlots,
                       LICommon::ConstInfo::INVALID_IDX,
                       AscendC::CMPMODE::EQ, BASE_TOPK);
         PipeBarrier<PIPE_V>();
@@ -1276,15 +1289,15 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
                    BASE_TOPK, compactParams, rowMissCount);
         PipeBarrier<PIPE_V>();
         uint64_t tokenMissCount = 0;
-        GatherMask(rowMissTokens, topkPayloads,
+        GatherMask(rowMissTokens, rowSources,
                    missMask.template ReinterpretCast<uint32_t>(), true,
                    BASE_TOPK, compactParams, tokenMissCount);
         PipeBarrier<PIPE_V>();
         // C220 vsel has no int32 tensor overload. Reinterpret the int32
         // payloads as float so vsel copies the same 32-bit lanes without a
         // numeric conversion.
-        Select(topkPayloads.template ReinterpretCast<float>(), missMask,
-               topkPayloads.template ReinterpretCast<float>(),
+        Select(rowSources.template ReinterpretCast<float>(), missMask,
+               rowSources.template ReinterpretCast<float>(),
                invalidSource.template ReinterpretCast<float>(),
                AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE, BASE_TOPK);
         PipeBarrier<PIPE_V>();
@@ -1319,13 +1332,13 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
             if (resolvedSlot == LICommon::ConstInfo::INVALID_IDX) {
                 resolvedSlot = cacheSlotsGm.GetValue(cacheBase + token);
             }
-            destinationSlots.SetValue(position, resolvedSlot);
+            rowSlots.SetValue(position, resolvedSlot);
         }
         SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
-        DataCopyPad(topkSlotsGm[rowOffset], destinationSlots, topkCopy);
-        DataCopyPad(mtpTopkSourceIdsGm[rowOffset], topkPayloads, topkCopy);
-        SetWaitFlag<HardEvent::MTE3_S>(HardEvent::MTE3_S);
+        DataCopyPad(topkSlotsGm[rowOffset], rowSlots, topkCopy);
+        DataCopyPad(mtpTopkSourceIdsGm[rowOffset], rowSources, topkCopy);
     }
+    SetWaitFlag<HardEvent::MTE3_S>(HardEvent::MTE3_S);
 
     outQueue_.FreeTensor(slotStorage);
     inQueue_.FreeTensor(missStorage);
