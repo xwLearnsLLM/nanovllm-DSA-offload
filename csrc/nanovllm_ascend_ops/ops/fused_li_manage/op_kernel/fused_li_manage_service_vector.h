@@ -1055,22 +1055,22 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
         }
         const float safeStopKey = -minThreshold;
         SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
-        safeCandidatePrefix = thresholdsValid;
-        for (uint32_t candidateIdx = 0; candidateIdx < missCount; ++candidateIdx) {
-            float candidateKey = evictCandidateUb_.GetValue(
-                candidateIdx * VALUE_AND_INDEX_NUM);
-            uint32_t payload = candidateBits.GetValue(
-                candidateIdx * VALUE_AND_INDEX_NUM + 1U);
-            uint32_t token = payload & INDEX_MASK;
-            int32_t slot = static_cast<int32_t>(payload >> INDEX_BITS);
-            // Strict inequality keeps threshold ties on the exact path.
-            if (!(candidateKey > safeStopKey) || slot == INVALID_SLOT14 ||
-                token >= info.actS2Size ||
-                static_cast<uint32_t>(slot) >= info.cacheTokenCount) {
-                safeCandidatePrefix = false;
-                break;
-            }
-        }
+        // Candidates are sorted by -aggregate_score in descending order.
+        // Therefore the last element of the requested prefix proves the
+        // complete prefix safe; checking every entry would add O(miss_count)
+        // scalar work for no additional information.
+        uint32_t lastCandidateIdx = missCount - 1U;
+        float lastCandidateKey = evictCandidateUb_.GetValue(
+            lastCandidateIdx * VALUE_AND_INDEX_NUM);
+        uint32_t lastPayload = candidateBits.GetValue(
+            lastCandidateIdx * VALUE_AND_INDEX_NUM + 1U);
+        uint32_t lastToken = lastPayload & INDEX_MASK;
+        int32_t lastSlot = static_cast<int32_t>(lastPayload >> INDEX_BITS);
+        // Strict inequality keeps threshold ties on the exact path.
+        safeCandidatePrefix = thresholdsValid &&
+            lastCandidateKey > safeStopKey && lastSlot != INVALID_SLOT14 &&
+            lastToken < info.actS2Size &&
+            static_cast<uint32_t>(lastSlot) < info.cacheTokenCount;
     }
 
     if (safeCandidatePrefix) {
