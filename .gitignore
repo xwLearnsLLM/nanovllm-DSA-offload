@@ -9,5 +9,3 @@ csrc/nanovllm_ascend_ops/cann_ops/build/
 csrc/nanovllm_ascend_ops/cann_ops/output/
 resume_log.txt
 runlog/
-
-TODO.md

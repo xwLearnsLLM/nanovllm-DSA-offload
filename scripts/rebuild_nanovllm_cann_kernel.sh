@@ -10,6 +10,7 @@ usage() {
   cat <<'EOF'
 Usage:
   bash scripts/rebuild_nanovllm_cann_kernel.sh fused_li_manage_mtp
+  bash scripts/rebuild_nanovllm_cann_kernel.sh fused_copy_sfa_mtp
 
 This incremental path requires one successful full build first. It is only
 for AscendC device-kernel/header changes; host tiling, schema, op-api, binding,
@@ -17,13 +18,25 @@ or CMake changes still require scripts/build_nanovllm_ops.sh.
 EOF
 }
 
-if [[ "${OP_NAME}" != "fused_li_manage_mtp" || $# -ne 1 ]]; then
+if [[ $# -ne 1 ]]; then
   usage >&2
   exit 2
 fi
 
-KERNEL_NAME="nanovllm_fused_li_manage_mtp"
-OP_TYPE="NanovllmFusedLiManageMtp"
+case "${OP_NAME}" in
+  fused_li_manage_mtp)
+    KERNEL_NAME="nanovllm_fused_li_manage_mtp"
+    OP_TYPE="NanovllmFusedLiManageMtp"
+    ;;
+  fused_copy_sfa_mtp)
+    KERNEL_NAME="nanovllm_fused_copy_sfa_mtp"
+    OP_TYPE="NanovllmFusedCopySfaMtp"
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac
 
 RAW_SOC_VERSION="${SOC_VERSION:-ascend910_9391}"
 case "${RAW_SOC_VERSION}" in
@@ -90,7 +103,7 @@ CONFIG_TARGET="ops_config_${CANN_SOC_VERSION}"
 TARGET_HELP="$(cmake --build "${CANN_BUILD_DIR}" --target help 2>/dev/null || true)"
 if ! grep -Fq "${TARGET_NAME}" <<<"${TARGET_HELP}"; then
   echo "[nanovllm incremental] ERROR: CMake target ${TARGET_NAME} is unavailable." >&2
-  grep -F "fused_li_manage_mtp" <<<"${TARGET_HELP}" >&2 || true
+  grep -F "${OP_NAME}" <<<"${TARGET_HELP}" >&2 || true
   echo "[nanovllm incremental] Run a full build before using the incremental path." >&2
   exit 1
 fi
@@ -116,7 +129,7 @@ echo "[nanovllm incremental] install: ${INSTALLED_OPP_ROOT}"
 echo "[nanovllm incremental] jobs: ${BUILD_JOBS}"
 
 # CANN's generated build graph uses copied sources and .done files as outputs.
-# Invalidate only the standalone LIM-MTP kernel copy and its generated stamps.
+# Invalidate only the selected standalone kernel copy and generated stamps.
 rm -rf "${SRC_DIR}/${KERNEL_NAME}" "${SRC_DIR}/${OP_NAME}"
 find "${GEN_DIR}" -maxdepth 1 -type f \
   -name "${TARGET_NAME}_*.done" -delete

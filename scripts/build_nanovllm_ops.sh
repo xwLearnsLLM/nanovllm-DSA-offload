@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON_BIN="${PYTHON:-python}"
 RAW_SOC_VERSION="${SOC_VERSION:-ascend910_9391}"
 ASCEND_HOME_PATH="${ASCEND_HOME_PATH:-/usr/local/Ascend/ascend-toolkit/latest}"
-CUSTOM_OPS="fused_li_manage_mtp"
+CUSTOM_OPS="fused_li_manage_mtp;kvcache_scatter_copy;sparse_tail_attention_mtp;fused_copy_sfa_mtp"
 EXT_BUILD_JOBS="${NANOVLLM_EXT_BUILD_JOBS:-1}"
 
 case "${RAW_SOC_VERSION}" in
@@ -17,19 +17,19 @@ esac
 
 export ASCEND_HOME_PATH
 
-echo "[lim-mtp] root: ${ROOT_DIR}"
-echo "[lim-mtp] python: $(${PYTHON_BIN} -c 'import sys; print(sys.executable)')"
-echo "[lim-mtp] soc: raw=${RAW_SOC_VERSION}, cann_opp=${CANN_SOC_VERSION}"
-echo "[lim-mtp] ascend: ${ASCEND_HOME_PATH}"
-echo "[lim-mtp] extension build jobs: ${EXT_BUILD_JOBS}"
+echo "[mtp-ops] root: ${ROOT_DIR}"
+echo "[mtp-ops] python: $(${PYTHON_BIN} -c 'import sys; print(sys.executable)')"
+echo "[mtp-ops] soc: raw=${RAW_SOC_VERSION}, cann_opp=${CANN_SOC_VERSION}"
+echo "[mtp-ops] ascend: ${ASCEND_HOME_PATH}"
+echo "[mtp-ops] extension build jobs: ${EXT_BUILD_JOBS}"
 
-echo "[lim-mtp] normalize build script line endings"
+echo "[mtp-ops] normalize build script line endings"
 find "${ROOT_DIR}/csrc/nanovllm_ascend_ops" -type f \
   \( -name "*.sh" -o -name "*.cmake" -o -name "CMakeLists.txt" \) \
   -exec sed -i 's/\r$//' {} +
 
 if [[ "${NANOVLLM_SKIP_CANN_OPP_BUILD:-0}" == "1" ]]; then
-  echo "[lim-mtp] skip CANN custom OPP build"
+  echo "[mtp-ops] skip CANN custom OPP build"
 else
   pushd "${ROOT_DIR}/csrc/nanovllm_ascend_ops/cann_ops" >/dev/null
   rm -rf build output
@@ -42,12 +42,18 @@ else
     find "${ROOT_DIR}/nanovllm/_cann_ops_custom" \
       -name binary_info_config.json -print -quit
   )"
-  if [[ -z "${BINARY_INFO_CONFIG}" ]] || \
-     ! grep -q "NanovllmFusedLiManageMtp" "${BINARY_INFO_CONFIG}"; then
-    echo "[lim-mtp] ERROR: NanovllmFusedLiManageMtp is missing from installed OPP." >&2
-    exit 1
-  fi
-  echo "[lim-mtp] verified NanovllmFusedLiManageMtp in ${BINARY_INFO_CONFIG}"
+  for op_type in \
+    NanovllmFusedLiManageMtp \
+    NanovllmKvcacheScatterCopy \
+    NanovllmSparseTailAttentionMtp \
+    NanovllmFusedCopySfaMtp; do
+    if [[ -z "${BINARY_INFO_CONFIG}" ]] || \
+       ! grep -q "${op_type}" "${BINARY_INFO_CONFIG}"; then
+      echo "[mtp-ops] ERROR: ${op_type} is missing from installed OPP." >&2
+      exit 1
+    fi
+  done
+  echo "[mtp-ops] verified MTP offloading kernels in ${BINARY_INFO_CONFIG}"
   popd >/dev/null
 fi
 
@@ -74,7 +80,7 @@ EXTENSION="$(
   find "${ROOT_DIR}/build/ops_lim_mtp" -maxdepth 1 -name "_C*.so" -print -quit
 )"
 if [[ -z "${EXTENSION}" ]]; then
-  echo "[lim-mtp] ERROR: built extension _C*.so was not found." >&2
+  echo "[mtp-ops] ERROR: built extension _C*.so was not found." >&2
   exit 1
 fi
 cp -f "${EXTENSION}" "${ROOT_DIR}/nanovllm/"
@@ -85,4 +91,4 @@ if [[ -f "${OPAPI_DIR}/libcust_opapi.so" ]]; then
 fi
 
 ls -lh "${ROOT_DIR}/nanovllm"/_C*.so
-echo "[lim-mtp] built the standalone fused_li_manage_mtp extension and local OPP"
+echo "[mtp-ops] built the standalone MTP offloading extension and local OPP"

@@ -21,6 +21,8 @@ BLOCK_SIZE = 128
 TOPK = 2048
 UNION_CAPACITY = QUERY_COUNT * TOPK
 MAX_SOURCE_CAPACITY = 1 << 18
+KPE_DIM = 64
+CKV_DIM = 512
 
 
 @dataclass
@@ -1350,6 +1352,50 @@ def run_performance_case(
     )
     del case
     torch.npu.empty_cache()
+
+
+def _swapped_from_cpu(cpu: torch.Tensor, device: torch.device) -> torch.Tensor:
+    tensor = torch_npu.empty_with_swapped_memory(
+        cpu.shape,
+        dtype=cpu.dtype,
+        device=device,
+    )
+    tensor.fill_(0)
+    tensor.add_(cpu.to(device))
+    return tensor
+
+
+def _apply_scatter_reference(
+    expected_kpe: torch.Tensor,
+    expected_ckv: torch.Tensor,
+    dram_kpe: torch.Tensor,
+    dram_ckv: torch.Tensor,
+    hbm_block_table: torch.Tensor,
+    dram_block_table: torch.Tensor,
+    source_ids: torch.Tensor,
+    destination_slots: torch.Tensor,
+    copy_counts: torch.Tensor,
+) -> None:
+    for request, count_value in enumerate(copy_counts.tolist()):
+        count = int(count_value)
+        if count == 0:
+            continue
+        sources = source_ids[request, :count].to(torch.int64)
+        destinations = destination_slots[request, :count].to(torch.int64)
+        src_blocks = dram_block_table[
+            request, sources // BLOCK_SIZE
+        ].to(torch.int64)
+        src_offsets = sources % BLOCK_SIZE
+        dst_blocks = hbm_block_table[
+            request, destinations // BLOCK_SIZE
+        ].to(torch.int64)
+        dst_offsets = destinations % BLOCK_SIZE
+        expected_kpe[dst_blocks, dst_offsets] = dram_kpe[
+            src_blocks, src_offsets
+        ]
+        expected_ckv[dst_blocks, dst_offsets] = dram_ckv[
+            src_blocks, src_offsets
+        ]
 
 
 def main() -> None:

@@ -1,6 +1,6 @@
-# fused_li_manage_mtp
+# GLM MTP3 offloading operators
 
-这是 `fused_li_manage_mtp`（LIM-MTP）的独立调优工程。仓库只编译、注册和测试这一个自定义算子，不包含 nanovllm 推理框架，也不依赖 `nanovllm-DSA-offload-mtp` 的源码或编译产物。
+这是 GLM MTP3 decode offloading 算子的独立调优工程，不包含 nanovllm 推理框架，也不依赖 `nanovllm-DSA-offload-mtp` 的源码或编译产物。当前公开并测试 `fused_li_manage_mtp`、`scatter_copy`、`sparse_tail_attention_mtp` 和实验性的 `fused_copy_sfa_mtp`。
 
 　
 
@@ -63,6 +63,9 @@ export SOC_VERSION=ascend910_9391
 export NANOVLLM_CANN_BUILD_JOBS=64
 
 bash scripts/rebuild_nanovllm_cann_kernel.sh fused_li_manage_mtp
+
+# 仅重编实验性的 source-aware COPYSFA-MTP 内核
+bash scripts/rebuild_nanovllm_cann_kernel.sh fused_copy_sfa_mtp
 ```
 
 　
@@ -100,3 +103,52 @@ fused_lim_mtp3_us - official_li_mtp3_us
 ```
 
 非 MTP 的单 query LIM 基准不属于本单算子工程，跨版本对比时使用主仓库已记录的基线。
+
+　
+
+## 实验性 COPYSFA-MTP
+
+`fused_copy_sfa_mtp` 保持 nanovllm 的固定 ABI：调用方提供输出 buffer，HBM cache 原地更新，算子不返回 alias。当前实现是 source-aware 单内核研究版本。
+
+```python
+torch.ops.nanovllm_dsa.fused_copy_sfa_mtp(
+    query_rope,
+    query,
+    actual_seq_lengths_query,
+    actual_seq_lengths_kv,
+    num_cache_tokens,
+    topk_dst_slots,
+    topk_src_ids,
+    miss_src_ids,
+    miss_dst_slots,
+    miss_counts,
+    hbm_block_table,
+    dram_block_table,
+    hbm_k_rope,              # mutable
+    hbm_kv_cache,            # mutable
+    dram_k_rope,
+    dram_kv_cache,
+    scale_value,
+    attention_out,           # output
+) -> None
+```
+
+诊断测试：
+
+```bash
+python3 ut_ops/test_fused_copy_sfa_mtp.py \
+  --device npu:0 \
+  --batch-size 4 \
+  --heads 2 \
+  --source-len 20992 \
+  --cache-tokens 8192 \
+  --tail-tokens 64 \
+  --perf-miss-count 300 \
+  --graph-replays 2 \
+  --warmup 0 \
+  --iters 1 \
+  --skip-performance \
+  --diagnose-attention
+```
+
+当前精度问题及后续约束记录在 `TODO.md`；在精度与时延都验收通过前，不合回 nanovllm。
