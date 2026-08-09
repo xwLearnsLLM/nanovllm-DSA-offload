@@ -450,10 +450,15 @@ __aicore__ inline void LIVector<LIT>::WriteMtpAggregateScoreChunk(
 {
     uint64_t gmOffset = static_cast<uint64_t>(bIdx) * scoreStride_ +
                         static_cast<uint32_t>(s2BaseIdx);
+    LocalTensor<float> previousScore = aggregateScoreBuf_.Get<float>();
     if (queryIdx == 0U) {
+        if (s2BaseIdx > 0) {
+            SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
+        }
+        DataCopy(previousScore, scoreLocal, alignedLen);
+        PipeBarrier<PIPE_V>();
         SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
-        LIServiceVec::CopyOut(scoresGm[gmOffset], scoreLocal, alignedLen);
-        SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
+        LIServiceVec::CopyOut(scoresGm[gmOffset], previousScore, alignedLen);
         return;
     }
 
@@ -461,7 +466,6 @@ __aicore__ inline void LIVector<LIT>::WriteMtpAggregateScoreChunk(
     // buffer remaining the exact 0..511 progression across all four MTP
     // queries; using it as async GM scratch corrupts query 1+ payloads on
     // Ascend910_93 even when it is rewritten before the next chunk.
-    LocalTensor<float> previousScore = aggregateScoreBuf_.Get<float>();
     // q1..q3 write the previous chunk's aggregate from this same UB scratch.
     // Delay that write's completion until the scratch is actually reused so
     // MTE3 can overlap the intervening TopK merge and next MM/scale work.
