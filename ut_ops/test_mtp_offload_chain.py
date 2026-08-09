@@ -199,6 +199,64 @@ def expected_after_scatter(
     )
 
 
+def cache_mismatch_diagnostic(
+    *,
+    name: str,
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    initial: torch.Tensor,
+    hbm_table: torch.Tensor,
+    lidu_outputs: tuple[torch.Tensor, ...],
+) -> str:
+    mismatch = actual != expected
+    mismatch_elements = int(mismatch.sum())
+    mismatch_rows = mismatch.any(dim=-1)
+    mismatch_token_rows = int(mismatch_rows.sum())
+    first = torch.nonzero(mismatch, as_tuple=False)[0]
+    physical_block = int(first[0])
+    block_offset = int(first[1])
+    feature = int(first[2])
+
+    table_match = torch.nonzero(
+        hbm_table == physical_block, as_tuple=False
+    )
+    request = -1
+    logical_slot = -1
+    expected_source = -1
+    if table_match.numel():
+        request = int(table_match[0, 0])
+        block_column = int(table_match[0, 1])
+        logical_slot = block_column * BLOCK_SIZE + block_offset
+        counts = lidu_outputs[4].cpu().to(torch.int64)
+        destinations = lidu_outputs[3].cpu().to(torch.int64)
+        sources = lidu_outputs[2].cpu().to(torch.int64)
+        count = int(counts[request])
+        destination_match = torch.nonzero(
+            destinations[request, :count] == logical_slot,
+            as_tuple=False,
+        )
+        if destination_match.numel():
+            expected_source = int(
+                sources[request, int(destination_match[0, 0])]
+            )
+
+    actual_row = actual[physical_block, block_offset]
+    expected_row = expected[physical_block, block_offset]
+    initial_row = initial[physical_block, block_offset]
+    return (
+        f"{name} payload mismatch: mismatch_elements={mismatch_elements} "
+        f"mismatch_token_rows={mismatch_token_rows} "
+        f"first_physical_block={physical_block} "
+        f"first_block_offset={block_offset} first_feature={feature} "
+        f"request={request} logical_slot={logical_slot} "
+        f"expected_source={expected_source} "
+        f"actual_still_initial={int(torch.equal(actual_row, initial_row))} "
+        f"actual_first={float(actual_row[feature]):.7f} "
+        f"expected_first={float(expected_row[feature]):.7f} "
+        f"initial_first={float(initial_row[feature]):.7f}"
+    )
+
+
 def attention_golden(
     *,
     query: torch.Tensor,
@@ -450,10 +508,32 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
         )
         if counts != payload_counts:
             raise AssertionError(f"{label}: LIDU and SCATTER counts differ")
-        if not torch.equal(hbm_kpe.cpu(), expected_kpe):
-            raise AssertionError(f"{label}: SCATTER KPE payload mismatch")
-        if not torch.equal(hbm_ckv.cpu(), expected_ckv):
-            raise AssertionError(f"{label}: SCATTER CKV payload mismatch")
+        actual_kpe = hbm_kpe.cpu()
+        actual_ckv = hbm_ckv.cpu()
+        if not torch.equal(actual_kpe, expected_kpe):
+            raise AssertionError(
+                f"{label}: "
+                + cache_mismatch_diagnostic(
+                    name="COPYSFA KPE",
+                    actual=actual_kpe,
+                    expected=expected_kpe,
+                    initial=initial_kpe_cpu,
+                    hbm_table=hbm_table_cpu,
+                    lidu_outputs=lidu_outputs,
+                )
+            )
+        if not torch.equal(actual_ckv, expected_ckv):
+            raise AssertionError(
+                f"{label}: "
+                + cache_mismatch_diagnostic(
+                    name="COPYSFA CKV",
+                    actual=actual_ckv,
+                    expected=expected_ckv,
+                    initial=initial_ckv_cpu,
+                    hbm_table=hbm_table_cpu,
+                    lidu_outputs=lidu_outputs,
+                )
+            )
         golden = attention_golden(
             query=query_cpu,
             query_rope=query_rope_cpu,
