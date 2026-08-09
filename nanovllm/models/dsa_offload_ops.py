@@ -277,6 +277,53 @@ def fused_copy_sfa(
     )
 
 
+def fused_copy_sfa_mtp(
+    query_rope: torch.Tensor,
+    query: torch.Tensor,
+    actual_seq_lengths_query: torch.Tensor,
+    actual_seq_lengths_kv: torch.Tensor,
+    cache_tokens: torch.Tensor,
+    topk_slots: torch.Tensor,
+    miss_source_ids: torch.Tensor,
+    miss_destination_slots: torch.Tensor,
+    miss_counts: torch.Tensor,
+    hbm_block_table: torch.Tensor,
+    dram_block_table: torch.Tensor,
+    hbm_kpe: torch.Tensor,
+    hbm_ckv: torch.Tensor,
+    dram_kpe: torch.Tensor,
+    dram_ckv: torch.Tensor,
+    scale_value: float,
+    attention_out: torch.Tensor,
+) -> torch.Tensor:
+    """Copy MTP3 union misses and write sparse Attention to ``attention_out``.
+
+    The cache tensors are mutated in place.  They are intentionally not
+    returned as alias outputs; the caller owns both cache storage and the
+    fixed output buffer used by eager execution and full-decode-only graphs.
+    """
+
+    return torch.ops.nanovllm_dsa.fused_copy_sfa_mtp_out.default(
+        query_rope,
+        query,
+        actual_seq_lengths_query,
+        actual_seq_lengths_kv,
+        cache_tokens,
+        topk_slots,
+        miss_source_ids,
+        miss_destination_slots,
+        miss_counts,
+        hbm_block_table,
+        dram_block_table,
+        hbm_kpe,
+        hbm_ckv,
+        dram_kpe,
+        dram_ckv,
+        float(scale_value),
+        attention_out,
+    )
+
+
 @torch.inference_mode()
 def initialize_lidu_row(
     *,

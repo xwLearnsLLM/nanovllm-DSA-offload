@@ -1,6 +1,6 @@
 # GLM-5.1 DSA 卸载算子
 
-本仓库内置以下六个算子，不依赖外部算子仓库：
+本仓库内置以下七个算子，不依赖外部算子仓库：
 
 | 算子 | 用途 | MTP3 |
 | --- | --- | :---: |
@@ -10,6 +10,7 @@
 | `sparse_tail_attention` | 单 query 的 top-2048 + dense tail Attention | 否 |
 | `sparse_tail_attention_mtp` | 四个验证位置各自的 top-2048 + causal dense tail Attention | 是 |
 | `fused_copy_sfa` | 融合 `scatter_copy + sparse_tail_attention`，支持 bs>24 | 否 |
+| `fused_copy_sfa_mtp` | MTP3 union miss 搬移与四行 causal sparse Attention | 是 |
 
 全部 `torch.ops.nanovllm_dsa.*` 注册都有 Meta/Fake 可见实现；带 `_out` 的接口使用调用方持久 buffer，供 `FULL_DECODE_ONLY` capture/replay。
 
@@ -62,7 +63,11 @@ topk_slots, miss_ids, miss_slots, miss_counts, cache_alias = (
 - `sparse_tail_attention` 消费 `[B,1,2048]` slots。
 - `sparse_tail_attention_mtp` 消费 `[B*4,1,2048]` slots，并保证第 0～3 个验证位置只看到各自允许的 causal tail。
 - `fused_copy_sfa` 仅用于非 MTP `offload_fuse`。它使用 quotient/remainder 均衡分核，支持 bs=24、25、48、64 等跨 24-core 边界 batch。
-- MTP 暂不支持 `offload_fuse`；后续需要单独实现 `fused_copy_sfa_mtp`。
+- `fused_copy_sfa_mtp_out` 固定使用调用方创建的 Attention 输出 buffer，原地更新 HBM cache，且不返回 cache alias。首版内部按同一 stream 顺序执行 SCATTER 与 MTP Attention，先建立 eager/graph 的稳定接口和正确性基线；后续将在接口不变的前提下替换为 source-aware 单 kernel。
+
+### 后续统一接口约定
+
+后续会单独整理仓库内其余自定义算子：可变输入不再为依赖表达而返回 `_alias`，输出 tensor 统一由调用方预先创建并传给唯一的 `_out` 接口。该整理不属于本次 `fused_copy_sfa_mtp` 实现，现有算子接口暂时保持不变。
 
 ## 编译环境
 
@@ -174,6 +179,12 @@ python3 ut_ops/test_mtp_offload_chain.py \
   --device npu:0 --batch-size 4 --heads 2 \
   --source-len 20992 --cache-tokens 8192 --tail-tokens 64 \
   --graph-replays 3 --seed 7
+
+# fused_copy_sfa_mtp：split 对照、caller-owned output、graph replay 与时延打印
+python3 ut_ops/test_fused_copy_sfa_mtp.py \
+  --device npu:0 --batch-size 4 --heads 2 \
+  --source-len 20992 --cache-tokens 8192 --tail-tokens 64 \
+  --graph-replays 3 --warmup 10 --iters 100 --seed 7
 
 # Target qlen=4 MLA 与逐 token 参考结果及 graph replay
 python3 ut_ops/test_glm_mtp_target_verify.py \

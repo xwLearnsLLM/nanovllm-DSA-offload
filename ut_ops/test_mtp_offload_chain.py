@@ -35,6 +35,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache-tokens", type=int, default=8192)
     parser.add_argument("--tail-tokens", type=int, default=64)
     parser.add_argument("--graph-replays", type=int, default=3)
+    parser.add_argument("--warmup", type=int, default=5)
+    parser.add_argument("--iters", type=int, default=20)
+    parser.add_argument("--skip-performance", action="store_true")
     parser.add_argument("--seed", type=int, default=7)
     return parser.parse_args()
 
@@ -60,6 +63,8 @@ def validate_args(args: argparse.Namespace) -> None:
         )
     if args.tail_tokens < 0 or args.graph_replays < 2:
         raise ValueError("--tail-tokens must be >=0 and --graph-replays must be >=2")
+    if args.warmup < 0 or args.iters <= 0:
+        raise ValueError("--warmup must be >=0 and --iters must be positive")
 
 
 def logical_rows(
@@ -369,6 +374,43 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
         )
         return lidu_outputs, attention
 
+    def launch_fused(
+        cache_slots: torch.Tensor,
+        hbm_kpe: torch.Tensor,
+        hbm_ckv: torch.Tensor,
+        lidu_buffers: tuple[torch.Tensor, ...],
+        attention_output: torch.Tensor,
+    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        lidu_outputs = lidu_ut.call_mtp_out(
+            case, cache_slots, *lidu_buffers
+        )
+        attention = (
+            torch.ops.nanovllm_dsa.fused_copy_sfa_mtp_out.default(
+                query_rope,
+                query,
+                actual_q,
+                actual_kv,
+                case.cache_tokens,
+                lidu_outputs[0],
+                lidu_outputs[1],
+                lidu_outputs[2],
+                lidu_outputs[3],
+                hbm_table,
+                dram_table,
+                hbm_kpe.view(-1, BLOCK_SIZE, 1, KPE_DIM),
+                hbm_ckv.view(-1, BLOCK_SIZE, 1, CKV_DIM),
+                dram_kpe,
+                dram_ckv,
+                scale,
+                attention_output,
+            )
+        )
+        if attention.data_ptr() != attention_output.data_ptr():
+            raise AssertionError(
+                "fused_copy_sfa_mtp_out did not return its caller-owned output"
+            )
+        return lidu_outputs, attention
+
     def validate_chain(
         *,
         label: str,
@@ -456,12 +498,56 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
         flush=True,
     )
 
-    # Warm up all three operators on disposable mutable state before capture.
+    fused_cache = case.initial_cache_cpu.to(device)
+    fused_kpe = initial_kpe_cpu.to(device)
+    fused_ckv = initial_ckv_cpu.to(device)
+    fused_attention_buffer = torch.empty_like(eager_attention_buffer)
+    fused_outputs, fused_attention = launch_fused(
+        fused_cache,
+        fused_kpe,
+        fused_ckv,
+        lidu_ut.make_outputs(case),
+        fused_attention_buffer,
+    )
+    torch.npu.synchronize()
+    fused_counts, fused_max_abs = validate_chain(
+        label="mtp_offload_chain/fused_eager",
+        before_cache=case.initial_cache_cpu,
+        cache_slots=fused_cache,
+        hbm_kpe=fused_kpe,
+        hbm_ckv=fused_ckv,
+        lidu_outputs=fused_outputs,
+        attention=fused_attention,
+    )
+    if fused_counts != eager_counts:
+        raise AssertionError("split and fused eager miss counts differ")
+    lidu_ut._compare_valid_outputs(
+        case,
+        fused_outputs,
+        eager_outputs,
+        label="mtp_offload_chain/split_fused",
+    )
+    if not torch.equal(fused_cache.cpu(), eager_cache.cpu()):
+        raise AssertionError("split and fused LIDU states differ")
+    if not torch.equal(fused_kpe.cpu(), eager_kpe.cpu()) or not torch.equal(
+        fused_ckv.cpu(), eager_ckv.cpu()
+    ):
+        raise AssertionError("split and fused HBM cache payloads differ")
+    torch.testing.assert_close(fused_attention, eager_attention, rtol=0, atol=0)
+    print(
+        "FUSED_COPY_SFA_MTP_CHECK "
+        f"batch={batch_size} misses={fused_counts} "
+        "caller_owned_output=1 cache_alias_outputs=0 "
+        f"attention_max_abs={fused_max_abs:.6f} split_equal=1 ok=1",
+        flush=True,
+    )
+
+    # Warm up LIDU plus the caller-owned fused interface on disposable state.
     warm_cache = case.initial_cache_cpu.to(device)
     warm_kpe = initial_kpe_cpu.to(device)
     warm_ckv = initial_ckv_cpu.to(device)
     warm_attention = torch.empty_like(eager_attention_buffer)
-    launch(
+    launch_fused(
         warm_cache,
         warm_kpe,
         warm_ckv,
@@ -478,7 +564,7 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
     graph = torch.npu.NPUGraph()
     pool = torch.npu.graph_pool_handle()
     with torch.npu.graph(graph, pool=pool):
-        graph_outputs, graph_attention = launch(
+        graph_outputs, graph_attention = launch_fused(
             graph_cache,
             graph_kpe,
             graph_ckv,
@@ -503,18 +589,18 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
         lidu_outputs=graph_outputs,
         attention=graph_attention,
     )
-    if graph_counts != eager_counts:
+    if graph_counts != fused_counts:
         raise AssertionError("eager and graph chain miss counts differ")
     lidu_ut._compare_valid_outputs(
-        case, graph_outputs, eager_outputs, label="mtp_offload_chain/eager_graph"
+        case, graph_outputs, fused_outputs, label="mtp_offload_chain/eager_graph"
     )
-    if not torch.equal(graph_cache.cpu(), eager_cache.cpu()):
+    if not torch.equal(graph_cache.cpu(), fused_cache.cpu()):
         raise AssertionError("eager and graph LIDU states differ")
-    if not torch.equal(graph_kpe.cpu(), eager_kpe.cpu()) or not torch.equal(
-        graph_ckv.cpu(), eager_ckv.cpu()
+    if not torch.equal(graph_kpe.cpu(), fused_kpe.cpu()) or not torch.equal(
+        graph_ckv.cpu(), fused_ckv.cpu()
     ):
         raise AssertionError("eager and graph HBM cache payloads differ")
-    torch.testing.assert_close(graph_attention, eager_attention, rtol=0, atol=0)
+    torch.testing.assert_close(graph_attention, fused_attention, rtol=0, atol=0)
 
     # Identical replay must be zero-miss; SCATTER must leave HBM unchanged and
     # Attention must remain deterministic while consuming the same top-k slots.
@@ -547,6 +633,86 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
         f"attention_max_abs={graph_max_abs:.6f} ok=1",
         flush=True,
     )
+
+    if not args.skip_performance:
+        split_perf_kpe = initial_kpe_cpu.to(device)
+        split_perf_ckv = initial_ckv_cpu.to(device)
+        split_perf_out = torch.empty_like(eager_attention_buffer)
+        fused_perf_kpe = initial_kpe_cpu.to(device)
+        fused_perf_ckv = initial_ckv_cpu.to(device)
+        fused_perf_out = torch.empty_like(eager_attention_buffer)
+
+        def split_copy_attention() -> torch.Tensor:
+            kpe_alias, ckv_alias = torch.ops.nanovllm_dsa.scatter_copy.default(
+                split_perf_kpe,
+                split_perf_ckv,
+                dram_kpe,
+                dram_ckv,
+                hbm_table,
+                dram_table,
+                eager_outputs[1],
+                eager_outputs[2],
+                eager_outputs[3],
+            )
+            return call_attention_out(
+                query=query,
+                query_rope=query_rope,
+                kpe=kpe_alias,
+                ckv=ckv_alias,
+                sparse_slots=eager_outputs[0],
+                cache_tokens=case.cache_tokens,
+                hbm_table=hbm_table,
+                actual_q=actual_q,
+                actual_kv=actual_kv,
+                scale=scale,
+                output=split_perf_out,
+            )
+
+        def fused_copy_attention() -> torch.Tensor:
+            return torch.ops.nanovllm_dsa.fused_copy_sfa_mtp_out.default(
+                query_rope,
+                query,
+                actual_q,
+                actual_kv,
+                case.cache_tokens,
+                eager_outputs[0],
+                eager_outputs[1],
+                eager_outputs[2],
+                eager_outputs[3],
+                hbm_table,
+                dram_table,
+                fused_perf_kpe.view(-1, BLOCK_SIZE, 1, KPE_DIM),
+                fused_perf_ckv.view(-1, BLOCK_SIZE, 1, CKV_DIM),
+                dram_kpe,
+                dram_ckv,
+                scale,
+                fused_perf_out,
+            )
+
+        def elapsed_ms(fn) -> float:
+            for _ in range(args.warmup):
+                fn()
+            torch.npu.synchronize()
+            start = torch.npu.Event(enable_timing=True)
+            end = torch.npu.Event(enable_timing=True)
+            start.record()
+            for _ in range(args.iters):
+                fn()
+            end.record()
+            end.synchronize()
+            return float(start.elapsed_time(end)) / args.iters
+
+        split_ms = elapsed_ms(split_copy_attention)
+        fused_ms = elapsed_ms(fused_copy_attention)
+        print(
+            "FUSED_COPY_SFA_MTP_PERF_RESULT "
+            f"batch={batch_size} total_misses={sum(eager_counts)} "
+            f"split_ms={split_ms:.6f} fused_ms={fused_ms:.6f} "
+            f"speedup={split_ms / fused_ms:.4f} "
+            "performance_assert=0 implementation=functional_v0 "
+            f"warmup={args.warmup} iters={args.iters}",
+            flush=True,
+        )
 
     # Additional identical replays exercise persistent state without repeating
     # expensive CPU golden construction.

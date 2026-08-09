@@ -65,6 +65,7 @@ extern void mla_preprocess_impl(
 #include "ops/sparse_tail_attention/sparse_tail_attention_torch_adpt.h"
 #include "ops/sparse_tail_attention_mtp/sparse_tail_attention_mtp_torch_adpt.h"
 #include "ops/fused_copy_sfa/fused_copy_sfa_torch_adpt.h"
+#include "ops/fused_copy_sfa_mtp/fused_copy_sfa_mtp_torch_adpt.h"
 #include "ops/matmul_allreduce_add_rmsnorm/matmul_allreduce_add_rmsnorm_torch_adpt.h"
 #include "ops/moe_gating_top_k/moe_gating_top_k_torch_adpt.h"
 #include "ops/dsa_indexer_project/dsa_indexer_project_torch_adpt.h"
@@ -496,6 +497,70 @@ fused_copy_sfa_meta(
       at::empty_like(query), hbm_k_rope, hbm_kv_cache);
 }
 
+at::Tensor fused_copy_sfa_mtp_out_torch_op(
+    const at::Tensor& query_rope,
+    const at::Tensor& query,
+    const at::Tensor& actual_seq_lengths_query,
+    const at::Tensor& actual_seq_lengths_kv,
+    const at::Tensor& cache_tokens,
+    const at::Tensor& topk_slots,
+    const at::Tensor& miss_source_ids,
+    const at::Tensor& miss_destination_slots,
+    const at::Tensor& miss_counts,
+    const at::Tensor& hbm_block_table,
+    const at::Tensor& dram_block_table,
+    at::Tensor hbm_k_rope,
+    at::Tensor hbm_kv_cache,
+    const at::Tensor& dram_k_rope,
+    const at::Tensor& dram_kv_cache,
+    double scale_value,
+    at::Tensor attention_out) {
+  vllm_ascend::npu_fused_copy_sfa_mtp_out(
+      query_rope, query, actual_seq_lengths_query,
+      actual_seq_lengths_kv, cache_tokens, topk_slots, miss_source_ids,
+      miss_destination_slots, miss_counts, hbm_block_table,
+      dram_block_table, hbm_k_rope, hbm_kv_cache, dram_k_rope,
+      dram_kv_cache, scale_value, attention_out);
+  return attention_out;
+}
+
+at::Tensor fused_copy_sfa_mtp_out_meta(
+    const at::Tensor& query_rope,
+    const at::Tensor& query,
+    const at::Tensor& actual_seq_lengths_query,
+    const at::Tensor& actual_seq_lengths_kv,
+    const at::Tensor& cache_tokens,
+    const at::Tensor& topk_slots,
+    const at::Tensor& miss_source_ids,
+    const at::Tensor& miss_destination_slots,
+    const at::Tensor& miss_counts,
+    const at::Tensor& hbm_block_table,
+    const at::Tensor& dram_block_table,
+    at::Tensor hbm_k_rope,
+    at::Tensor hbm_kv_cache,
+    const at::Tensor& dram_k_rope,
+    const at::Tensor& dram_kv_cache,
+    double scale_value,
+    at::Tensor attention_out) {
+  (void)query_rope;
+  (void)query;
+  (void)actual_seq_lengths_query;
+  (void)actual_seq_lengths_kv;
+  (void)cache_tokens;
+  (void)topk_slots;
+  (void)miss_source_ids;
+  (void)miss_destination_slots;
+  (void)miss_counts;
+  (void)hbm_block_table;
+  (void)dram_block_table;
+  (void)hbm_k_rope;
+  (void)hbm_kv_cache;
+  (void)dram_k_rope;
+  (void)dram_kv_cache;
+  (void)scale_value;
+  return attention_out;
+}
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_gating_top_k_py(
     const at::Tensor& x,
     int64_t k,
@@ -699,6 +764,17 @@ TORCH_LIBRARY(nanovllm_dsa, ops) {
       " Tensor dram_block_table, Tensor source_token_ids,"
       " Tensor copy_counts, float scale_value)"
       " -> (Tensor, Tensor(b!), Tensor(a!))");
+  ops.def(
+      "fused_copy_sfa_mtp_out("
+      "Tensor query_rope, Tensor query,"
+      " Tensor actual_seq_lengths_query, Tensor actual_seq_lengths_kv,"
+      " Tensor cache_tokens, Tensor topk_slots,"
+      " Tensor miss_source_ids, Tensor miss_destination_slots,"
+      " Tensor miss_counts, Tensor hbm_block_table,"
+      " Tensor dram_block_table, Tensor(a!) hbm_k_rope,"
+      " Tensor(b!) hbm_kv_cache, Tensor dram_k_rope,"
+      " Tensor dram_kv_cache, float scale_value,"
+      " Tensor(c!) attention_out) -> Tensor(c!)");
 }
 
 TORCH_LIBRARY_IMPL(nanovllm_dsa, PrivateUse1, ops) {
@@ -711,6 +787,7 @@ TORCH_LIBRARY_IMPL(nanovllm_dsa, PrivateUse1, ops) {
   ops.impl("sparse_tail_attention_mtp", &sparse_tail_attention_mtp_torch_op);
   ops.impl("sparse_tail_attention_mtp_out", &sparse_tail_attention_mtp_out_torch_op);
   ops.impl("fused_copy_sfa", &fused_copy_sfa_torch_op);
+  ops.impl("fused_copy_sfa_mtp_out", &fused_copy_sfa_mtp_out_torch_op);
 }
 
 TORCH_LIBRARY_IMPL(nanovllm_dsa, Meta, ops) {
@@ -723,6 +800,7 @@ TORCH_LIBRARY_IMPL(nanovllm_dsa, Meta, ops) {
   ops.impl("sparse_tail_attention_mtp", &sparse_tail_attention_mtp_meta);
   ops.impl("sparse_tail_attention_mtp_out", &sparse_tail_attention_mtp_out_meta);
   ops.impl("fused_copy_sfa", &fused_copy_sfa_meta);
+  ops.impl("fused_copy_sfa_mtp_out", &fused_copy_sfa_mtp_out_meta);
 }
 
 PYBIND11_MODULE(_C, m) {
