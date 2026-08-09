@@ -66,6 +66,12 @@ __aicore__ inline void RunFusedMtp(
         CrossCoreWaitFlag(COPY_READY_FLAG);
     }
 
+    // SCATTER and SFA execute sequentially but both size their local buffers
+    // as an independent kernel stage.  Reclaim the SCATTER queue before SFA
+    // initializes its production UB layout; otherwise the extra queue shifts
+    // or overcommits SFA buffers and corrupts the attention result.
+    pipe->Reset();
+
     using MtpType = SFAType<
         T, T, T, false, SFA_LAYOUT::TND, SFA_LAYOUT::PA_BSND,
         V_TEMPLATE, SFA_STAGE_NORMAL, true>;
