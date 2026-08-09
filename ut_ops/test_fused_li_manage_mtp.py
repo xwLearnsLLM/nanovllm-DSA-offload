@@ -182,7 +182,12 @@ def _make_cache_state(
     miss_fractions: tuple[float, ...],
     generator: torch.Generator,
     pool_size: int,
+    exact_miss_counts: tuple[int, ...] | None = None,
 ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    if exact_miss_counts is not None and len(exact_miss_counts) != len(
+        candidate_lens
+    ):
+        raise ValueError("exact miss counts must match the batch size")
     # Non-active rows use a distinct sentinel so accidental writes are visible.
     state = torch.full((pool_size, source_capacity), -777, dtype=torch.int32)
     unions: list[torch.Tensor] = []
@@ -192,6 +197,8 @@ def _make_cache_state(
         pool_row = int(req_pool_entries[request])
         state[pool_row].fill_(-1)
         if budget == 0:
+            if exact_miss_counts is not None and exact_miss_counts[request] != 0:
+                raise ValueError("C=0 rows require exact miss_count=0")
             unions.append(torch.empty(0, dtype=torch.int64))
             continue
 
@@ -206,12 +213,22 @@ def _make_cache_state(
             )
 
         if budget == candidate_len:
+            if exact_miss_counts is not None and exact_miss_counts[request] != 0:
+                raise ValueError("fully cached rows require exact miss_count=0")
             cached = torch.arange(candidate_len, dtype=torch.int64)
         else:
-            miss_count = min(
-                int(round(float(union.numel()) * miss_fraction)),
-                int(union.numel()),
-            )
+            if exact_miss_counts is None:
+                miss_count = min(
+                    int(round(float(union.numel()) * miss_fraction)),
+                    int(union.numel()),
+                )
+            else:
+                miss_count = int(exact_miss_counts[request])
+                if miss_count < 0 or miss_count > int(union.numel()):
+                    raise ValueError(
+                        f"request={request}: exact miss_count={miss_count} "
+                        f"must be in [0,{union.numel()}]"
+                    )
             hits = union[miss_count:]
             union_mask = torch.zeros(candidate_len, dtype=torch.bool)
             union_mask[union] = True

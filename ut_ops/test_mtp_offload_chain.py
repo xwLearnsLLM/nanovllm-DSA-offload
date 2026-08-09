@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import math
+from dataclasses import replace
 
 import torch
 import torch_npu  # type: ignore
@@ -37,6 +38,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--graph-replays", type=int, default=3)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
+    parser.add_argument(
+        "--perf-miss-count",
+        type=int,
+        default=300,
+        help=(
+            "Exact miss count per request in the performance-only case. "
+            "Semantic and graph checks retain broad miss coverage."
+        ),
+    )
     parser.add_argument("--skip-performance", action="store_true")
     parser.add_argument("--seed", type=int, default=7)
     return parser.parse_args()
@@ -65,6 +75,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--tail-tokens must be >=0 and --graph-replays must be >=2")
     if args.warmup < 0 or args.iters <= 0:
         raise ValueError("--warmup must be >=0 and --iters must be positive")
+    if not 0 <= args.perf_miss_count <= UNION_CAPACITY:
+        raise ValueError("--perf-miss-count must be in [0,8192]")
 
 
 def logical_rows(
@@ -635,11 +647,51 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
     )
 
     if not args.skip_performance:
-        split_perf_kpe = initial_kpe_cpu.to(device)
-        split_perf_ckv = initial_ckv_cpu.to(device)
+        perf_initial_cache_cpu, _ = lidu_ut._make_cache_state(
+            topk_rows=case.topk_cpu,
+            candidate_lens=(args.source_len,) * batch_size,
+            cache_tokens=(cache_tokens,) * batch_size,
+            req_pool_entries=case.req_pool_entries_cpu,
+            source_capacity=case.source_capacity,
+            miss_fractions=(0.0,) * batch_size,
+            exact_miss_counts=(args.perf_miss_count,) * batch_size,
+            generator=torch.Generator().manual_seed(args.seed + 8000),
+            pool_size=batch_size + 3,
+        )
+        perf_case = replace(
+            case,
+            name="mtp_offload_chain_typical_perf",
+            initial_cache_cpu=perf_initial_cache_cpu,
+        )
+        perf_initial_kpe_cpu, perf_initial_ckv_cpu = initialize_hbm(
+            case=perf_case,
+            cache_tokens=cache_tokens,
+            final_kv_len=final_kv_len,
+            dram_kpe=dram_kpe_cpu,
+            dram_ckv=dram_ckv_cpu,
+            dram_table=dram_table_cpu,
+            hbm_table=hbm_table_cpu,
+            hbm_blocks=hbm_blocks,
+            generator=torch.Generator().manual_seed(args.seed + 8017),
+        )
+        perf_cache = perf_initial_cache_cpu.to(device)
+        perf_outputs = lidu_ut.call_mtp_out(
+            perf_case, perf_cache, *lidu_ut.make_outputs(perf_case)
+        )
+        torch.npu.synchronize()
+        perf_counts = [int(value) for value in perf_outputs[3].cpu().tolist()]
+        expected_perf_counts = [args.perf_miss_count] * batch_size
+        if perf_counts != expected_perf_counts:
+            raise AssertionError(
+                f"typical performance miss counts={perf_counts}, "
+                f"expected={expected_perf_counts}"
+            )
+
+        split_perf_kpe = perf_initial_kpe_cpu.to(device)
+        split_perf_ckv = perf_initial_ckv_cpu.to(device)
         split_perf_out = torch.empty_like(eager_attention_buffer)
-        fused_perf_kpe = initial_kpe_cpu.to(device)
-        fused_perf_ckv = initial_ckv_cpu.to(device)
+        fused_perf_kpe = perf_initial_kpe_cpu.to(device)
+        fused_perf_ckv = perf_initial_ckv_cpu.to(device)
         fused_perf_out = torch.empty_like(eager_attention_buffer)
 
         def split_copy_attention() -> torch.Tensor:
@@ -650,17 +702,17 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
                 dram_ckv,
                 hbm_table,
                 dram_table,
-                eager_outputs[1],
-                eager_outputs[2],
-                eager_outputs[3],
+                perf_outputs[1],
+                perf_outputs[2],
+                perf_outputs[3],
             )
             return call_attention_out(
                 query=query,
                 query_rope=query_rope,
                 kpe=kpe_alias,
                 ckv=ckv_alias,
-                sparse_slots=eager_outputs[0],
-                cache_tokens=case.cache_tokens,
+                sparse_slots=perf_outputs[0],
+                cache_tokens=perf_case.cache_tokens,
                 hbm_table=hbm_table,
                 actual_q=actual_q,
                 actual_kv=actual_kv,
@@ -674,11 +726,11 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
                 query,
                 actual_q,
                 actual_kv,
-                case.cache_tokens,
-                eager_outputs[0],
-                eager_outputs[1],
-                eager_outputs[2],
-                eager_outputs[3],
+                perf_case.cache_tokens,
+                perf_outputs[0],
+                perf_outputs[1],
+                perf_outputs[2],
+                perf_outputs[3],
                 hbm_table,
                 dram_table,
                 fused_perf_kpe.view(-1, BLOCK_SIZE, 1, KPE_DIM),
@@ -706,7 +758,8 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
         fused_ms = elapsed_ms(fused_copy_attention)
         print(
             "FUSED_COPY_SFA_MTP_PERF_RESULT "
-            f"batch={batch_size} total_misses={sum(eager_counts)} "
+            f"batch={batch_size} miss_per_request={args.perf_miss_count} "
+            f"total_misses={sum(perf_counts)} "
             f"split_ms={split_ms:.6f} fused_ms={fused_ms:.6f} "
             f"speedup={split_ms / fused_ms:.4f} "
             "performance_assert=0 implementation=single_kernel_v1 "
