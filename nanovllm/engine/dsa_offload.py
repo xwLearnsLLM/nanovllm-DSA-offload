@@ -16,7 +16,7 @@ OFFLOAD_MODES: Final = (OFFLOAD_NONE, *LIDU_OFFLOAD_MODES)
 # User-tunable LIDU budgets for prompt ranges 8193-16384,
 # 16385-32768, 32769-65536, and >=65537 respectively.  The <=8192 tiers
 # remain fixed at C=0/2048.  Edit only this tuple when comparing cache sizes.
-LIDU_CACHE_TOKEN_BUDGETS: Final = (3072, 6144, 8192, 12288)
+LIDU_CACHE_TOKEN_BUDGETS: Final = (6144, 6144, 8192, 12288)
 # Each entry is bounded by the complete-block source length at the lower edge
 # of its prompt range.  Once this repository's operators have been compiled,
 # any block-aligned values within these limits can be selected in Python.
