@@ -102,7 +102,7 @@ public:
         GlobalTensor<int32_t> missDestinationSlotsGm,
         GlobalTensor<int32_t> missCountGm,
         GlobalTensor<float> scoresGm,
-        GlobalTensor<int32_t> mtpTopkIndicesGm);
+        GlobalTensor<int32_t> mtpTopkPayloadsGm);
     __aicore__ inline void InitPartialMetadata(uint32_t coreIdx);
     __aicore__ inline void FinalizePartialRequest(uint32_t bIdx, uint32_t cacheRowIdx,
                                                   uint32_t actualSeqLen,
@@ -121,7 +121,10 @@ protected:
     GlobalTensor<float> scoresGm;
     GlobalTensor<float> partialTopkGm;
     GlobalTensor<int32_t> partialMetaGm;
-    GlobalTensor<int32_t> mtpTopkIndicesGm;
+    // MTP stays on the validated 18-bit source format. Preserve TopK's full
+    // (old_slot14, token18) payload so finalization does not reconstruct the
+    // pre-update hit/miss state through random GM lookups.
+    GlobalTensor<int32_t> mtpTopkPayloadsGm;
     GlobalTensor<int32_t> mtpTopkSourceIdsGm;
     GlobalTensor<int32_t> mtpMissSourceIdsGm;
     GlobalTensor<int32_t> mtpMissDestinationSlotsGm;
@@ -295,7 +298,7 @@ __aicore__ inline void LIVector<LIT>::InitMtpGlobalTensor(
     GlobalTensor<int32_t> missDestinationSlotsGm,
     GlobalTensor<int32_t> missCountGm,
     GlobalTensor<float> scoresGm,
-    GlobalTensor<int32_t> mtpTopkIndicesGm)
+    GlobalTensor<int32_t> mtpTopkPayloadsGm)
 {
     this->mm1ResGm = mm1ResGm;
     this->weightsGm = weightsGm;
@@ -306,7 +309,7 @@ __aicore__ inline void LIVector<LIT>::InitMtpGlobalTensor(
     this->mtpMissDestinationSlotsGm = missDestinationSlotsGm;
     this->missCountGm = missCountGm;
     this->scoresGm = scoresGm;
-    this->mtpTopkIndicesGm = mtpTopkIndicesGm;
+    this->mtpTopkPayloadsGm = mtpTopkPayloadsGm;
 }
 
 template <typename LIT>
@@ -885,17 +888,12 @@ __aicore__ inline void LIVector<LIT>::StoreMtpQueryTopK(const LICommon::RunInfo 
 {
     LocalTensor<float> valueLocal = outQueue_.AllocTensor<float>();
     LocalTensor<uint32_t> payloadLocal = valueLocal.template ReinterpretCast<uint32_t>();
-    LocalTensor<int32_t> indexLocal =
-        valueLocal.template ReinterpretCast<int32_t>()[BASE_TOPK];
     ExtractIndex(payloadLocal, globalTopkUb_.template ReinterpretCast<uint32_t>(), BASE_TOPK);
-    PipeBarrier<PIPE_V>();
-    DecodeIndexFromPayload(indexLocal.template ReinterpretCast<uint32_t>(),
-                           payloadLocal, BASE_TOPK);
-    PipeBarrier<PIPE_V>();
 
     uint64_t rowOffset = static_cast<uint64_t>(info.queryRow) * BASE_TOPK;
     SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
-    DataCopyPad(mtpTopkIndicesGm[rowOffset], indexLocal,
+    DataCopyPad(mtpTopkPayloadsGm[rowOffset],
+                payloadLocal.template ReinterpretCast<int32_t>(),
                 {1, static_cast<uint16_t>(BASE_TOPK * sizeof(int32_t)), 0, 0});
     SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
     outQueue_.FreeTensor(valueLocal);
@@ -913,7 +911,7 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
     LocalTensor<uint32_t> unionBits = unionStorage.template ReinterpretCast<uint32_t>();
     LocalTensor<int32_t> missTokens = missStorage.template ReinterpretCast<int32_t>();
     LocalTensor<int32_t> destinationSlots = slotStorage.template ReinterpretCast<int32_t>();
-    LocalTensor<int32_t> topkIndices = payloadBuf_.Get<int32_t>();
+    LocalTensor<int32_t> topkPayloads = payloadBuf_.Get<int32_t>();
 
     Duplicate(unionBits, 0U, MTP_UNION_BITSET_WORDS);
     PipeBarrier<PIPE_V>();
@@ -927,14 +925,16 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
     for (uint32_t queryIdx = 0; queryIdx < MTP_QUERY_COUNT; ++queryIdx) {
         uint64_t rowOffset =
             static_cast<uint64_t>(info.bIdx * MTP_QUERY_COUNT + queryIdx) * BASE_TOPK;
-        DataCopyPad(topkIndices, mtpTopkIndicesGm[rowOffset], copyIn, intPad);
+        DataCopyPad(topkPayloads, mtpTopkPayloadsGm[rowOffset], copyIn, intPad);
         SetWaitFlag<HardEvent::MTE2_S>(HardEvent::MTE2_S);
         for (uint32_t topkIdx = 0; topkIdx < BASE_TOPK; ++topkIdx) {
-            int32_t signedToken = topkIndices.GetValue(topkIdx);
-            if (signedToken < 0 || static_cast<uint32_t>(signedToken) >= info.actS2Size) {
+            uint32_t payload =
+                static_cast<uint32_t>(topkPayloads.GetValue(topkIdx));
+            uint32_t token = payload & INDEX_MASK;
+            int32_t oldSlot = static_cast<int32_t>(payload >> INDEX_BITS);
+            if (token >= info.actS2Size) {
                 continue;
             }
-            uint32_t token = static_cast<uint32_t>(signedToken);
             uint32_t wordIdx = token >> 5U;
             uint32_t mask = 1U << (token & 31U);
             uint32_t word = unionBits.GetValue(wordIdx);
@@ -942,8 +942,8 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
                 continue;
             }
             unionBits.SetValue(wordIdx, word | mask);
-            int32_t slot = cacheSlotsGm.GetValue(cacheBase + token);
-            if (slot < 0 || static_cast<uint32_t>(slot) >= info.cacheTokenCount) {
+            if (oldSlot == INVALID_SLOT14 ||
+                static_cast<uint32_t>(oldSlot) >= info.cacheTokenCount) {
                 missTokens.SetValue(missCount++, static_cast<int32_t>(token));
             }
         }
@@ -1025,51 +1025,46 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
         DataCopyPad(mtpMissDestinationSlotsGm[missOffset], destinationSlots, copyOut);
         SetWaitFlag<HardEvent::MTE3_S>(HardEvent::MTE3_S);
     }
-    WriteMissCount(info.bIdx, static_cast<int32_t>(updateCount), topkIndices);
-    // topkIndices is also the source buffer used by WriteMissCount.  The next
+    WriteMissCount(info.bIdx, static_cast<int32_t>(updateCount), topkPayloads);
+    // topkPayloads is also the source buffer used by WriteMissCount.  The next
     // operation refills it through MTE2, so MTE3 must finish reading the
     // scalar first.  MTE3_V inside WriteMissCount only protects a following
     // vector operation and is insufficient for this MTE2 reuse.
     SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
 
-    // Reuse the union bitset as this step's miss-membership table.  The
-    // aligned source rows let source-aware Attention decide in O(1) whether
-    // each selected token comes from DRAM; -1 denotes an HBM hit.
-    Duplicate(unionBits, 0U, MTP_UNION_BITSET_WORDS);
-    PipeBarrier<PIPE_V>();
-    SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
-    for (uint32_t missIdx = 0; missIdx < updateCount; ++missIdx) {
-        uint32_t token = static_cast<uint32_t>(missTokens.GetValue(missIdx));
-        uint32_t wordIdx = token >> 5U;
-        uint32_t mask = 1U << (token & 31U);
-        unionBits.SetValue(wordIdx, unionBits.GetValue(wordIdx) | mask);
-    }
-
-    // Resolve all four top-k rows against the single final cache state.
+    // Resolve both caller-visible rows from the original packed payload.
+    // Hits retain their old slot. Only original misses perform a random
+    // lookup in the updated cache map; the old-slot tag also generates the
+    // aligned topk source row without rebuilding a miss-membership bitset.
     AscendC::DataCopyParams topkCopy{
         1, static_cast<uint16_t>(BASE_TOPK * sizeof(int32_t)), 0, 0};
     for (uint32_t queryIdx = 0; queryIdx < MTP_QUERY_COUNT; ++queryIdx) {
         uint64_t rowOffset =
             static_cast<uint64_t>(info.bIdx * MTP_QUERY_COUNT + queryIdx) * BASE_TOPK;
-        DataCopyPad(topkIndices, mtpTopkIndicesGm[rowOffset], copyIn, intPad);
+        DataCopyPad(topkPayloads, mtpTopkPayloadsGm[rowOffset], copyIn, intPad);
         SetWaitFlag<HardEvent::MTE2_S>(HardEvent::MTE2_S);
         for (uint32_t topkIdx = 0; topkIdx < BASE_TOPK; ++topkIdx) {
-            int32_t token = topkIndices.GetValue(topkIdx);
-            int32_t slot = token < 0
-                               ? LICommon::ConstInfo::INVALID_IDX
-                               : cacheSlotsGm.GetValue(cacheBase + static_cast<uint32_t>(token));
-            destinationSlots.SetValue(topkIdx, slot);
-            bool isMiss = false;
-            if (token >= 0) {
-                uint32_t unsignedToken = static_cast<uint32_t>(token);
-                uint32_t word = unionBits.GetValue(unsignedToken >> 5U);
-                isMiss = (word & (1U << (unsignedToken & 31U))) != 0U;
+            uint32_t payload =
+                static_cast<uint32_t>(topkPayloads.GetValue(topkIdx));
+            uint32_t token = payload & INDEX_MASK;
+            int32_t oldSlot = static_cast<int32_t>(payload >> INDEX_BITS);
+            bool wasMiss = oldSlot == INVALID_SLOT14 ||
+                           static_cast<uint32_t>(oldSlot) >=
+                               info.cacheTokenCount;
+            int32_t slot = oldSlot;
+            int32_t source = LICommon::ConstInfo::INVALID_IDX;
+            if (token >= info.actS2Size) {
+                slot = LICommon::ConstInfo::INVALID_IDX;
+            } else if (wasMiss) {
+                slot = cacheSlotsGm.GetValue(cacheBase + token);
+                source = static_cast<int32_t>(token);
             }
-            topkIndices.SetValue(topkIdx, isMiss ? token : -1);
+            destinationSlots.SetValue(topkIdx, slot);
+            topkPayloads.SetValue(topkIdx, source);
         }
         SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
         DataCopyPad(topkSlotsGm[rowOffset], destinationSlots, topkCopy);
-        DataCopyPad(mtpTopkSourceIdsGm[rowOffset], topkIndices, topkCopy);
+        DataCopyPad(mtpTopkSourceIdsGm[rowOffset], topkPayloads, topkCopy);
         SetWaitFlag<HardEvent::MTE3_S>(HardEvent::MTE3_S);
     }
 

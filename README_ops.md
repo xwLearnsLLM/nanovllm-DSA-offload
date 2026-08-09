@@ -241,7 +241,7 @@ done
 # MTP3 LIM 语义、乱序 request pool、动态图 metadata 和性能
 python3 ut_ops/test_fused_li_manage_mtp.py \
   --device npu:0 --batch-size 24 --source-len 20992 \
-  --cache-tokens 8192 --graph-replays 3 \
+  --cache-tokens 8192 --perf-miss-count 300 --graph-replays 3 \
   --warmup 10 --iters 100 --seed 7
 
 # 四行因果 sparse Attention、caller-owned output 和 graph replay

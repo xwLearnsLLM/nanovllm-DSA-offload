@@ -60,6 +60,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--graph-replays", type=int, default=3)
     parser.add_argument(
+        "--perf-miss-count",
+        type=int,
+        default=300,
+        help="Exact unique union misses per request in the target benchmark.",
+    )
+    parser.add_argument(
         "--skip-performance",
         action="store_true",
         help="Run semantic and graph checks without the B=24 benchmark.",
@@ -84,6 +90,18 @@ def _validate_cli(args: argparse.Namespace) -> None:
         raise ValueError(
             "--warmup/--graph-replays must be >=0 and --iters must be >0."
         )
+    if not 0 <= args.perf_miss_count <= UNION_CAPACITY:
+        raise ValueError("--perf-miss-count must be in [0,8192].")
+    if (
+        not args.skip_performance
+        and args.cache_tokens == args.source_len
+        and args.perf_miss_count != 0
+    ):
+        raise ValueError(
+            "--perf-miss-count must be 0 when the full source is cached."
+        )
+
+
 def _random_block_table(
     batch_size: int,
     blocks_per_request: int,
@@ -222,6 +240,7 @@ def _make_cache_state(
                     int(round(float(union.numel()) * miss_fraction)),
                     int(union.numel()),
                 )
+                hits = union[miss_count:]
             else:
                 miss_count = int(exact_miss_counts[request])
                 if miss_count < 0 or miss_count > int(union.numel()):
@@ -229,7 +248,18 @@ def _make_cache_state(
                         f"request={request}: exact miss_count={miss_count} "
                         f"must be in [0,{union.numel()}]"
                     )
-            hits = union[miss_count:]
+                # Prefer source tokens shared by multiple query rows. This
+                # models the GLM MTP3 workload: four TopK sets overlap, and
+                # about 300 unique union tokens need one physical copy each.
+                occurrences = torch.bincount(
+                    torch.cat(request_topk), minlength=candidate_len
+                )
+                repeated = union[occurrences[union] > 1]
+                single = union[occurrences[union] == 1]
+                misses = torch.cat((repeated, single))[:miss_count]
+                miss_mask = torch.zeros(candidate_len, dtype=torch.bool)
+                miss_mask[misses] = True
+                hits = union[~miss_mask[union]]
             union_mask = torch.zeros(candidate_len, dtype=torch.bool)
             union_mask[union] = True
             fillers = torch.arange(candidate_len, dtype=torch.int64)[~union_mask]
@@ -257,6 +287,7 @@ def make_case(
     miss_fractions: tuple[float, ...],
     seed: int,
     source_capacity: int | None = None,
+    exact_miss_counts: tuple[int, ...] | None = None,
 ) -> MtpCase:
     batch_size = len(candidate_lens)
     if not (
@@ -331,6 +362,7 @@ def make_case(
         miss_fractions=miss_fractions,
         generator=generator,
         pool_size=batch_size + 3,
+        exact_miss_counts=exact_miss_counts,
     )
     return MtpCase(
         name=name,
@@ -1196,6 +1228,7 @@ def run_performance_case(
     seed: int,
     warmup: int,
     iters: int,
+    perf_miss_count: int,
 ) -> None:
     case = make_case(
         name="performance",
@@ -1203,8 +1236,9 @@ def run_performance_case(
         dtype=torch.bfloat16,
         candidate_lens=(source_len,) * batch_size,
         cache_tokens=(cache_tokens,) * batch_size,
-        miss_fractions=(0.5,) * batch_size,
+        miss_fractions=(0.0,) * batch_size,
         seed=seed + 6000,
+        exact_miss_counts=(perf_miss_count,) * batch_size,
     )
     correctness_cache = case.initial_cache_cpu.to(device)
     correctness_outputs = call_mtp(case, correctness_cache)
@@ -1219,8 +1253,43 @@ def run_performance_case(
     print(
         "FUSED_LI_MANAGE_MTP_TARGET_BATCH_CHECK "
         f"batch={batch_size} candidate_len={source_len} "
-        f"cache_tokens={cache_tokens} total_union_misses={sum(correctness_counts)} "
+        f"cache_tokens={cache_tokens} "
+        f"unique_misses_per_request={perf_miss_count} "
+        f"total_union_misses={sum(correctness_counts)} "
         "one_request_per_owner=1 ok=1",
+        flush=True,
+    )
+
+    total_unique_misses = 0
+    total_query_occurrences = 0
+    shared_unique_misses = 0
+    for request in range(case.batch_size):
+        pool_row = int(case.req_pool_entries_cpu[request])
+        candidate_len = int(case.candidate_lens_cpu[request])
+        before = case.initial_cache_cpu[pool_row]
+        union = case.union_cpu[request]
+        misses = union[before[union] < 0]
+        rows = case.topk_cpu[
+            request * QUERY_COUNT : (request + 1) * QUERY_COUNT
+        ]
+        occurrences = torch.bincount(
+            torch.cat(rows), minlength=candidate_len
+        )
+        total_unique_misses += int(misses.numel())
+        total_query_occurrences += int(occurrences[misses].sum())
+        shared_unique_misses += int((occurrences[misses] > 1).sum())
+    if perf_miss_count > 0 and (
+        total_query_occurrences <= total_unique_misses
+        or shared_unique_misses == 0
+    ):
+        raise AssertionError(
+            "target benchmark must include misses shared by multiple queries"
+        )
+    print(
+        "FUSED_LI_MANAGE_MTP_REPEATED_MISS_CHECK "
+        f"unique_union_misses={total_unique_misses} "
+        f"query_occurrences={total_query_occurrences} "
+        f"shared_unique_misses={shared_unique_misses} ok=1",
         flush=True,
     )
     fused_cache = case.initial_cache_cpu.to(device)
@@ -1289,22 +1358,30 @@ def run_performance_case(
     serial_ms = _wall_ms(serial_step, warmup, iters)
     speedup = serial_ms / fused_ms
 
-    level_results: list[tuple[str, int, float]] = []
-    for label, fraction in (("zero", 0.0), ("typical", 0.5), ("high", 1.0)):
+    level_specs = (
+        ("zero", (0.0,) * batch_size, (0,) * batch_size),
+        (
+            "typical",
+            (0.0,) * batch_size,
+            (perf_miss_count,) * batch_size,
+        ),
+        ("high", (1.0,) * batch_size, None),
+    )
+    for label, fractions, exact_counts in level_specs:
         level_cpu, _ = _make_cache_state(
             topk_rows=case.topk_cpu,
             candidate_lens=(source_len,) * batch_size,
             cache_tokens=(cache_tokens,) * batch_size,
             req_pool_entries=case.req_pool_entries_cpu,
             source_capacity=case.source_capacity,
-            miss_fractions=(fraction,) * batch_size,
+            miss_fractions=fractions,
             generator=torch.Generator().manual_seed(seed + 7000),
             pool_size=batch_size + 3,
+            exact_miss_counts=exact_counts,
         )
         avg_ms, misses = _fresh_state_ms(
             case, level_cpu, min(warmup, 3), min(iters, 10)
         )
-        level_results.append((label, misses, avg_ms))
         print(
             "FUSED_LI_MANAGE_MTP_MISS_LEVEL_RESULT "
             f"level={label} batch={batch_size} candidate_len={source_len} "
@@ -1323,7 +1400,9 @@ def run_performance_case(
     print(
         "FUSED_LI_MANAGE_MTP_PERF_RESULT "
         f"batch={batch_size} candidate_len={source_len} "
-        f"cache_tokens={cache_tokens} fused_ms={fused_ms:.6f} "
+        f"cache_tokens={cache_tokens} "
+        f"unique_misses_per_request={perf_miss_count} "
+        f"fused_ms={fused_ms:.6f} "
         f"four_serial_lim_ms={serial_ms:.6f} speedup={speedup:.4f} "
         f"warmup={warmup} iters={iters}",
         flush=True,
@@ -1390,6 +1469,7 @@ def main() -> None:
             seed=args.seed,
             warmup=args.warmup,
             iters=args.iters,
+            perf_miss_count=args.perf_miss_count,
         )
     print("FUSED_LI_MANAGE_MTP_UT_OK", flush=True)
 
