@@ -1209,7 +1209,6 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
             .template ReinterpretCast<uint32_t>();
     LocalTensor<int32_t> rowMissTokens =
         missStorage.template ReinterpretCast<int32_t>();
-    LocalTensor<int32_t> slotScratch = rowMissTokens[BASE_TOPK];
 
     // The same unique miss can occur in multiple query TopK rows.  Resolve
     // those repeated occurrences through a compact UB hash table instead of
@@ -1273,15 +1272,16 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
             DataCopyPad(rowSources, mtpTopkPayloadsGm[rowOffset], copyIn, intPad);
             SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
         }
-        DecodeSlotFromPayload(
+        ShiftRight(
             rowSlots.template ReinterpretCast<uint32_t>(),
-            rowSources.template ReinterpretCast<uint32_t>(), slotScratch,
-            BASE_TOPK);
+            rowSources.template ReinterpretCast<uint32_t>(),
+            INDEX_BITS, BASE_TOPK);
+        PipeBarrier<PIPE_V>();
         DecodeIndexFromPayload(
             rowSources.template ReinterpretCast<uint32_t>(),
             rowSources.template ReinterpretCast<uint32_t>(), BASE_TOPK);
         CompareScalar(missMask, rowSlots,
-                      LICommon::ConstInfo::INVALID_IDX,
+                      INVALID_SLOT14,
                       AscendC::CMPMODE::EQ, BASE_TOPK);
         PipeBarrier<PIPE_V>();
 
