@@ -42,7 +42,7 @@ constexpr uint32_t PARTIAL_SLOTS_PER_CORE = 2;
 constexpr uint32_t PARTIAL_META_INTS_PER_CORE = 8;
 constexpr uint32_t MTP_QUERY_COUNT = 4;
 constexpr uint32_t MTP_UNION_CAPACITY = MTP_QUERY_COUNT * BASE_TOPK;
-// MTP-LIDU intentionally remains on the validated 18-bit source format.
+// MTP LIM intentionally remains on the validated 18-bit source format.
 constexpr uint32_t MTP_SOURCE_CAPACITY = 1U << 18;
 constexpr uint32_t MTP_UNION_BITSET_WORDS = MTP_SOURCE_CAPACITY / 32U;
 // The qlen=1 path can reconstruct three additional index bits from the score.
@@ -253,8 +253,8 @@ __aicore__ inline void LIVector<LIT>::InitMtpBuffers(TPipe *pipe)
         return;
     }
     InitBuffers(pipe);
-    // Only MTP needs the fourth-query aggregate-score scratch.  Keep it out
-    // of the single-query LIDU UB footprint.
+    // Only MTP needs the fourth-query aggregate-score scratch. Keep it out
+    // of the single-query LIM UB footprint.
     pipe->InitBuffer(aggregateScoreBuf_, S2_BASE_SIZE * sizeof(float));
 }
 
@@ -902,8 +902,9 @@ __aicore__ inline void LIVector<LIT>::StoreMtpQueryTopK(const LICommon::RunInfo 
 template <typename LIT>
 __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo &info)
 {
-    // Two VECIN buffers hold the 2^18-token membership bitset and the ordered
-    // union misses.  The VECOUT buffer first stages destination slots, then is
+    // Two VECIN buffers hold the membership bitset and ordered union misses.
+    // The bitset has 2^18-token capacity, but only its active candidate prefix
+    // is touched. The VECOUT buffer first stages destination slots, then is
     // reused to materialize the four per-query sparse-slot rows.
     LocalTensor<float> unionStorage = inQueue_.AllocTensor<float>();
     LocalTensor<float> missStorage = inQueue_.AllocTensor<float>();
@@ -913,7 +914,9 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
     LocalTensor<int32_t> destinationSlots = slotStorage.template ReinterpretCast<int32_t>();
     LocalTensor<int32_t> topkPayloads = payloadBuf_.Get<int32_t>();
 
-    Duplicate(unionBits, 0U, MTP_UNION_BITSET_WORDS);
+    const uint32_t activeUnionWords =
+        Min(CeilDiv(info.actS2Size, 32U), MTP_UNION_BITSET_WORDS);
+    Duplicate(unionBits, 0U, activeUnionWords);
     PipeBarrier<PIPE_V>();
     SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
 
