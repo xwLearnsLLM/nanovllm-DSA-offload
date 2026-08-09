@@ -45,6 +45,9 @@ constexpr uint32_t MTP_UNION_CAPACITY = MTP_QUERY_COUNT * BASE_TOPK;
 // MTP LIM intentionally remains on the validated 18-bit source format.
 constexpr uint32_t MTP_SOURCE_CAPACITY = 1U << 18;
 constexpr uint32_t MTP_UNION_BITSET_WORDS = MTP_SOURCE_CAPACITY / 32U;
+constexpr uint32_t MTP_MISS_SLOT_MAP_CAPACITY = 2048;
+constexpr uint32_t MTP_MISS_SLOT_MAP_MAX_ITEMS =
+    MTP_MISS_SLOT_MAP_CAPACITY / 2U;
 // The qlen=1 path can reconstruct three additional index bits from the score.
 constexpr uint32_t EXACT_PACKED_SOURCE_TOKENS = 1U << INDEX_BITS;
 static_assert(S2_BASE_SIZE % (1U << INDEX_HIGH_BITS) == 0,
@@ -1160,9 +1163,41 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
     LocalTensor<int32_t> invalidSource = unionScratch[BASE_TOPK * 2U];
     LocalTensor<uint8_t> missMask =
         unionScratch[BASE_TOPK * 3U].template ReinterpretCast<uint8_t>();
+    LocalTensor<uint32_t> missSlotMap =
+        unionScratch[BASE_TOPK * 3U + BASE_TOPK / 32U]
+            .template ReinterpretCast<uint32_t>();
     LocalTensor<int32_t> rowMissTokens =
         missStorage.template ReinterpretCast<int32_t>();
     LocalTensor<int32_t> slotScratch = rowMissTokens[BASE_TOPK];
+
+    // The same unique miss can occur in multiple query TopK rows.  Resolve
+    // those repeated occurrences through a compact UB hash table instead of
+    // issuing one random cacheSlotsGm read per occurrence.  Large/atypical
+    // miss sets retain the exact GM lookup path.
+    uint32_t missSlotMapCapacity = 0U;
+    if (updateCount > 0U && updateCount <= MTP_MISS_SLOT_MAP_MAX_ITEMS) {
+        missSlotMapCapacity = 64U;
+        while (missSlotMapCapacity < updateCount * 2U) {
+            missSlotMapCapacity <<= 1U;
+        }
+        Duplicate(missSlotMap, 0xffffffffU, missSlotMapCapacity);
+        PipeBarrier<PIPE_V>();
+        SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
+        const uint32_t mapMask = missSlotMapCapacity - 1U;
+        for (uint32_t missIdx = 0; missIdx < updateCount; ++missIdx) {
+            uint32_t token =
+                static_cast<uint32_t>(missTokens.GetValue(missIdx));
+            uint32_t slot =
+                static_cast<uint32_t>(destinationSlots.GetValue(missIdx));
+            uint32_t packed = (slot << INDEX_BITS) | token;
+            uint32_t mapIdx = (token * 0x9e3779b1U) & mapMask;
+            while (missSlotMap.GetValue(mapIdx) != 0xffffffffU) {
+                mapIdx = (mapIdx + 1U) & mapMask;
+            }
+            missSlotMap.SetValue(mapIdx, packed);
+        }
+    }
+
     ArithProgression(allPositions, 0, 1, BASE_TOPK);
     Duplicate(invalidSource, LICommon::ConstInfo::INVALID_IDX, BASE_TOPK);
     PipeBarrier<PIPE_V>();
@@ -1221,8 +1256,26 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
             if (position >= BASE_TOPK || token >= info.actS2Size) {
                 continue;
             }
-            destinationSlots.SetValue(
-                position, cacheSlotsGm.GetValue(cacheBase + token));
+            int32_t resolvedSlot = LICommon::ConstInfo::INVALID_IDX;
+            if (missSlotMapCapacity > 0U) {
+                const uint32_t mapMask = missSlotMapCapacity - 1U;
+                uint32_t mapIdx = (token * 0x9e3779b1U) & mapMask;
+                for (uint32_t probe = 0; probe < missSlotMapCapacity; ++probe) {
+                    uint32_t packed = missSlotMap.GetValue(mapIdx);
+                    if (packed == 0xffffffffU) {
+                        break;
+                    }
+                    if ((packed & INDEX_MASK) == token) {
+                        resolvedSlot = static_cast<int32_t>(packed >> INDEX_BITS);
+                        break;
+                    }
+                    mapIdx = (mapIdx + 1U) & mapMask;
+                }
+            }
+            if (resolvedSlot == LICommon::ConstInfo::INVALID_IDX) {
+                resolvedSlot = cacheSlotsGm.GetValue(cacheBase + token);
+            }
+            destinationSlots.SetValue(position, resolvedSlot);
         }
         SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
         DataCopyPad(topkSlotsGm[rowOffset], destinationSlots, topkCopy);
