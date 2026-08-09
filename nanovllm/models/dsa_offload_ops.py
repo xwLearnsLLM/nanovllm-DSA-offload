@@ -11,273 +11,191 @@ _INIT_SCORE_CHUNK_TOKENS = 16 * 1024
 
 def fused_li_manage(
     query: torch.Tensor,
-    key: torch.Tensor,
-    weights: torch.Tensor,
+    index_weights: torch.Tensor,
+    index_key_cache: torch.Tensor,
+    index_block_table: torch.Tensor,
+    num_candidate_tokens: torch.Tensor,
+    num_cache_tokens: torch.Tensor,
     req_pool_entries: torch.Tensor,
     cache_slots_pool: torch.Tensor,
-    cache_tokens: torch.Tensor,
-    candidate_lens: torch.Tensor,
-    block_table: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run fused LightningIndexer and cache-index management.
-
-    The first ``miss_counts[b]`` source IDs and destination slots describe
-    SCATTER copies.  The complete destination row contains the 2048 HBM slots
-    selected for attention after the cache update.  The final return value
-    aliases ``cache_slots_pool`` so graph compilers can see mutable state.
-    """
-
-    return torch.ops.nanovllm_dsa.fused_li_manage.default(
-        query,
-        key,
-        weights,
-        req_pool_entries,
-        cache_slots_pool,
-        cache_tokens,
-        candidate_lens,
-        block_table,
-    )
-
-
-def fused_li_manage_out(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    weights: torch.Tensor,
-    req_pool_entries: torch.Tensor,
-    cache_slots_pool: torch.Tensor,
-    cache_tokens: torch.Tensor,
-    candidate_lens: torch.Tensor,
-    block_table: torch.Tensor,
-    source_ids: torch.Tensor,
-    destination_slots: torch.Tensor,
+    topk_src_ids: torch.Tensor,
+    topk_dst_slots: torch.Tensor,
     miss_counts: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run fused_li_manage into graph-stable caller-owned outputs."""
+) -> None:
+    """Run single-query LIM into caller-owned buffers."""
 
-    return torch.ops.nanovllm_dsa.fused_li_manage_out.default(
+    torch.ops.nanovllm_dsa.fused_li_manage.default(
         query,
-        key,
-        weights,
+        index_weights,
+        index_key_cache,
+        index_block_table,
+        num_candidate_tokens,
+        num_cache_tokens,
         req_pool_entries,
         cache_slots_pool,
-        cache_tokens,
-        candidate_lens,
-        block_table,
-        source_ids,
-        destination_slots,
+        topk_src_ids,
+        topk_dst_slots,
         miss_counts,
     )
 
 
 def fused_li_manage_mtp(
     query: torch.Tensor,
-    key: torch.Tensor,
-    weights: torch.Tensor,
+    index_weights: torch.Tensor,
+    index_key_cache: torch.Tensor,
+    index_block_table: torch.Tensor,
+    num_candidate_tokens: torch.Tensor,
+    num_cache_tokens: torch.Tensor,
     req_pool_entries: torch.Tensor,
     cache_slots_pool: torch.Tensor,
-    cache_tokens: torch.Tensor,
-    candidate_lens: torch.Tensor,
-    block_table: torch.Tensor,
-) -> tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-]:
-    """Run the fixed-width GLM MTP3 LIDU update.
-
-    Four consecutive query rows belong to one request. ``topk_slots`` is
-    shaped ``[4 * B, 1, 2048]``. Only the first ``miss_counts[b]`` entries of
-    each request-level miss row are valid. The final tensor aliases the
-    mutable request-state pool for graph dependency tracking.
-    """
-
-    return torch.ops.nanovllm_dsa.fused_li_manage_mtp.default(
-        query,
-        key,
-        weights,
-        req_pool_entries,
-        cache_slots_pool,
-        cache_tokens,
-        candidate_lens,
-        block_table,
-    )
-
-
-def fused_li_manage_mtp_out(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    weights: torch.Tensor,
-    req_pool_entries: torch.Tensor,
-    cache_slots_pool: torch.Tensor,
-    cache_tokens: torch.Tensor,
-    candidate_lens: torch.Tensor,
-    block_table: torch.Tensor,
-    topk_slots: torch.Tensor,
-    topk_source_ids: torch.Tensor,
-    miss_source_ids: torch.Tensor,
-    miss_destination_slots: torch.Tensor,
+    topk_src_ids: torch.Tensor,
+    topk_dst_slots: torch.Tensor,
+    miss_src_ids: torch.Tensor,
+    miss_dst_slots: torch.Tensor,
     miss_counts: torch.Tensor,
-) -> tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-]:
-    """Run fused_li_manage_mtp into graph-stable caller-owned outputs."""
+) -> None:
+    """Run fixed-width GLM MTP3 LIM into caller-owned buffers."""
 
-    return torch.ops.nanovllm_dsa.fused_li_manage_mtp_out.default(
+    torch.ops.nanovllm_dsa.fused_li_manage_mtp.default(
         query,
-        key,
-        weights,
+        index_weights,
+        index_key_cache,
+        index_block_table,
+        num_candidate_tokens,
+        num_cache_tokens,
         req_pool_entries,
         cache_slots_pool,
-        cache_tokens,
-        candidate_lens,
-        block_table,
-        topk_slots,
-        topk_source_ids,
-        miss_source_ids,
-        miss_destination_slots,
+        topk_src_ids,
+        topk_dst_slots,
+        miss_src_ids,
+        miss_dst_slots,
         miss_counts,
     )
 
 
 def scatter_copy(
-    hbm_kpe: torch.Tensor,
-    hbm_ckv: torch.Tensor,
-    dram_kpe: torch.Tensor,
-    dram_ckv: torch.Tensor,
+    src_ids: torch.Tensor,
+    dst_slots: torch.Tensor,
+    copy_counts: torch.Tensor,
     hbm_block_table: torch.Tensor,
     dram_block_table: torch.Tensor,
-    source_token_ids: torch.Tensor,
-    destination_slots: torch.Tensor,
-    copy_counts: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    hbm_k_rope: torch.Tensor,
+    hbm_kv_cache: torch.Tensor,
+    dram_k_rope: torch.Tensor,
+    dram_kv_cache: torch.Tensor,
+) -> None:
     """Copy selected CKV/KPE tokens with the bundled SCATTER operator."""
 
-    return torch.ops.nanovllm_dsa.scatter_copy.default(
-        hbm_kpe,
-        hbm_ckv,
-        dram_kpe,
-        dram_ckv,
+    torch.ops.nanovllm_dsa.scatter_copy.default(
+        src_ids,
+        dst_slots,
+        copy_counts,
         hbm_block_table,
         dram_block_table,
-        source_token_ids,
-        destination_slots,
-        copy_counts,
+        hbm_k_rope,
+        hbm_kv_cache,
+        dram_k_rope,
+        dram_kv_cache,
     )
 
 
 def sparse_tail_attention(
+    query_rope: torch.Tensor,
     query: torch.Tensor,
-    latent_kv_cache: torch.Tensor,
-    sparse_slots: torch.Tensor,
-    cache_tokens: torch.Tensor,
-    block_table: torch.Tensor,
     actual_seq_lengths_query: torch.Tensor,
     actual_seq_lengths_kv: torch.Tensor,
-    query_rope: torch.Tensor,
-    key_rope: torch.Tensor,
+    num_cache_tokens: torch.Tensor,
+    topk_dst_slots: torch.Tensor,
+    hbm_block_table: torch.Tensor,
+    hbm_k_rope: torch.Tensor,
+    hbm_kv_cache: torch.Tensor,
     scale_value: float,
-) -> torch.Tensor:
+    attention_out: torch.Tensor,
+) -> None:
     """Attend to cached top-2048 slots plus the complete dense tail."""
 
-    return torch.ops.nanovllm_dsa.sparse_tail_attention.default(
+    torch.ops.nanovllm_dsa.sparse_tail_attention.default(
+        query_rope,
         query,
-        latent_kv_cache,
-        latent_kv_cache,
-        sparse_slots,
-        cache_tokens,
-        block_table,
         actual_seq_lengths_query,
         actual_seq_lengths_kv,
-        query_rope,
-        key_rope,
+        num_cache_tokens,
+        topk_dst_slots,
+        hbm_block_table,
+        hbm_k_rope,
+        hbm_kv_cache,
         float(scale_value),
+        attention_out,
     )
 
 
 def sparse_tail_attention_mtp(
+    query_rope: torch.Tensor,
     query: torch.Tensor,
-    latent_kv_cache: torch.Tensor,
-    sparse_slots: torch.Tensor,
-    cache_tokens: torch.Tensor,
-    block_table: torch.Tensor,
     actual_seq_lengths_query: torch.Tensor,
     actual_seq_lengths_kv: torch.Tensor,
-    query_rope: torch.Tensor,
-    key_rope: torch.Tensor,
+    num_cache_tokens: torch.Tensor,
+    topk_dst_slots: torch.Tensor,
+    hbm_block_table: torch.Tensor,
+    hbm_k_rope: torch.Tensor,
+    hbm_kv_cache: torch.Tensor,
     scale_value: float,
-    *,
-    out: torch.Tensor | None = None,
-) -> torch.Tensor:
+    attention_out: torch.Tensor,
+) -> None:
     """MTP3 Attention over each query's top-2048 plus its causal dense tail."""
 
-    args = (
+    torch.ops.nanovllm_dsa.sparse_tail_attention_mtp.default(
+        query_rope,
         query,
-        latent_kv_cache,
-        latent_kv_cache,
-        sparse_slots,
-        cache_tokens,
-        block_table,
         actual_seq_lengths_query,
         actual_seq_lengths_kv,
-        query_rope,
-        key_rope,
+        num_cache_tokens,
+        topk_dst_slots,
+        hbm_block_table,
+        hbm_k_rope,
+        hbm_kv_cache,
         float(scale_value),
-    )
-    if out is None:
-        return torch.ops.nanovllm_dsa.sparse_tail_attention_mtp.default(
-            *args
-        )
-    return torch.ops.nanovllm_dsa.sparse_tail_attention_mtp_out.default(
-        *args, out
+        attention_out,
     )
 
 
 def fused_copy_sfa(
+    query_rope: torch.Tensor,
     query: torch.Tensor,
-    hbm_ckv: torch.Tensor,
-    sparse_slots: torch.Tensor,
-    cache_tokens: torch.Tensor,
-    hbm_block_table: torch.Tensor,
     actual_seq_lengths_query: torch.Tensor,
     actual_seq_lengths_kv: torch.Tensor,
-    query_rope: torch.Tensor,
-    hbm_kpe: torch.Tensor,
-    dram_kpe: torch.Tensor,
-    dram_ckv: torch.Tensor,
+    num_cache_tokens: torch.Tensor,
+    topk_dst_slots: torch.Tensor,
+    topk_src_ids: torch.Tensor,
+    miss_counts: torch.Tensor,
+    hbm_block_table: torch.Tensor,
     dram_block_table: torch.Tensor,
-    source_token_ids: torch.Tensor,
-    copy_counts: torch.Tensor,
+    hbm_k_rope: torch.Tensor,
+    hbm_kv_cache: torch.Tensor,
+    dram_k_rope: torch.Tensor,
+    dram_kv_cache: torch.Tensor,
     scale_value: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Copy LIDU misses and attend to top-2048 plus tail in one operator."""
+    attention_out: torch.Tensor,
+) -> None:
+    """Copy LIM misses and attend to top-2048 plus tail in one operator."""
 
-    return (
-        torch.ops.nanovllm_dsa
-        .fused_copy_sfa.default(
-            query,
-            hbm_ckv,
-            sparse_slots,
-            cache_tokens,
-            hbm_block_table,
-            actual_seq_lengths_query,
-            actual_seq_lengths_kv,
-            query_rope,
-            hbm_kpe,
-            dram_kpe,
-            dram_ckv,
-            dram_block_table,
-            source_token_ids,
-            copy_counts,
-            float(scale_value),
-        )
+    torch.ops.nanovllm_dsa.fused_copy_sfa.default(
+        query_rope,
+        query,
+        actual_seq_lengths_query,
+        actual_seq_lengths_kv,
+        num_cache_tokens,
+        topk_dst_slots,
+        topk_src_ids,
+        miss_counts,
+        hbm_block_table,
+        dram_block_table,
+        hbm_k_rope,
+        hbm_kv_cache,
+        dram_k_rope,
+        dram_kv_cache,
+        float(scale_value),
+        attention_out,
     )
 
 
@@ -286,21 +204,21 @@ def fused_copy_sfa_mtp(
     query: torch.Tensor,
     actual_seq_lengths_query: torch.Tensor,
     actual_seq_lengths_kv: torch.Tensor,
-    cache_tokens: torch.Tensor,
-    topk_slots: torch.Tensor,
-    topk_source_ids: torch.Tensor,
-    miss_source_ids: torch.Tensor,
-    miss_destination_slots: torch.Tensor,
+    num_cache_tokens: torch.Tensor,
+    topk_dst_slots: torch.Tensor,
+    topk_src_ids: torch.Tensor,
+    miss_src_ids: torch.Tensor,
+    miss_dst_slots: torch.Tensor,
     miss_counts: torch.Tensor,
     hbm_block_table: torch.Tensor,
     dram_block_table: torch.Tensor,
-    hbm_kpe: torch.Tensor,
-    hbm_ckv: torch.Tensor,
-    dram_kpe: torch.Tensor,
-    dram_ckv: torch.Tensor,
+    hbm_k_rope: torch.Tensor,
+    hbm_kv_cache: torch.Tensor,
+    dram_k_rope: torch.Tensor,
+    dram_kv_cache: torch.Tensor,
     scale_value: float,
     attention_out: torch.Tensor,
-) -> torch.Tensor:
+) -> None:
     """Gather MTP3 misses and write sparse Attention to ``attention_out``.
 
     The cache tensors are mutated in place.  They are intentionally not
@@ -308,23 +226,23 @@ def fused_copy_sfa_mtp(
     fixed output buffer used by eager execution and full-decode-only graphs.
     """
 
-    return torch.ops.nanovllm_dsa.fused_copy_sfa_mtp_out.default(
+    torch.ops.nanovllm_dsa.fused_copy_sfa_mtp.default(
         query_rope,
         query,
         actual_seq_lengths_query,
         actual_seq_lengths_kv,
-        cache_tokens,
-        topk_slots,
-        topk_source_ids,
-        miss_source_ids,
-        miss_destination_slots,
+        num_cache_tokens,
+        topk_dst_slots,
+        topk_src_ids,
+        miss_src_ids,
+        miss_dst_slots,
         miss_counts,
         hbm_block_table,
         dram_block_table,
-        hbm_kpe,
-        hbm_ckv,
-        dram_kpe,
-        dram_ckv,
+        hbm_k_rope,
+        hbm_kv_cache,
+        dram_k_rope,
+        dram_kv_cache,
         float(scale_value),
         attention_out,
     )
@@ -428,14 +346,15 @@ def initialize_lidu_row(
     copy_counts = torch.tensor(
         [cache_tokens], dtype=torch.int32, device=source_ids.device
     )
-    return scatter_copy(
+    scatter_copy(
+        source_ids.unsqueeze(0),
+        destination_slots.unsqueeze(0),
+        copy_counts,
+        hbm_block_table.unsqueeze(0),
+        dram_block_table.unsqueeze(0),
         hbm_kpe,
         hbm_ckv,
         dram_kpe,
         dram_ckv,
-        hbm_block_table.unsqueeze(0),
-        dram_block_table.unsqueeze(0),
-        source_ids.unsqueeze(0),
-        destination_slots.unsqueeze(0),
-        copy_counts,
     )
+    return hbm_kpe, hbm_ckv

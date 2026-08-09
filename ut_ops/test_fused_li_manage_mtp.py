@@ -1,4 +1,4 @@
-"""Semantic, graph, and latency checks for the bundled GLM MTP3 LIDU op."""
+"""Semantic, graph, and latency checks for the bundled GLM MTP3 LIM op."""
 
 from __future__ import annotations
 
@@ -124,7 +124,7 @@ def _native_topk(
         if int(cache_tokens_cpu[request]) == 0:
             continue
         if int(candidate_cpu[request]) < TOPK:
-            raise AssertionError("active MTP-LIDU rows must have >=2048 candidates")
+            raise AssertionError("active MTP LIM rows must have >=2048 candidates")
         for query_idx in range(QUERY_COUNT):
             active_query_rows.append(request * QUERY_COUNT + query_idx)
             active_request_rows.append(request)
@@ -356,19 +356,12 @@ def make_case(
 
 
 def call_mtp(case: MtpCase, cache_slots: torch.Tensor):
-    return torch.ops.nanovllm_dsa.fused_li_manage_mtp.default(
-        case.query,
-        case.key,
-        case.weights,
-        case.req_pool_entries,
-        cache_slots,
-        case.cache_tokens,
-        case.candidate_lens,
-        case.block_table,
-    )
+    outputs = make_outputs(case)
+    call_mtp_with_buffers(case, cache_slots, *outputs)
+    return outputs
 
 
-def call_mtp_out(
+def call_mtp_with_buffers(
     case: MtpCase,
     cache_slots: torch.Tensor,
     topk_slots: torch.Tensor,
@@ -377,15 +370,22 @@ def call_mtp_out(
     miss_destination_slots: torch.Tensor,
     miss_counts: torch.Tensor,
 ):
-    return torch.ops.nanovllm_dsa.fused_li_manage_mtp_out.default(
+    torch.ops.nanovllm_dsa.fused_li_manage_mtp.default(
         case.query,
-        case.key,
         case.weights,
+        case.key,
+        case.block_table,
+        case.candidate_lens,
+        case.cache_tokens,
         case.req_pool_entries,
         cache_slots,
-        case.cache_tokens,
-        case.candidate_lens,
-        case.block_table,
+        topk_source_ids,
+        topk_slots,
+        miss_source_ids,
+        miss_destination_slots,
+        miss_counts,
+    )
+    return (
         topk_slots,
         topk_source_ids,
         miss_source_ids,
@@ -475,15 +475,15 @@ def _run_scatter(
     outputs: tuple[torch.Tensor, ...],
 ) -> None:
     torch.ops.nanovllm_dsa.scatter_copy.default(
+        outputs[2],
+        outputs[3],
+        outputs[4],
+        hbm_block_table,
+        dram_block_table,
         hbm_kpe,
         hbm_ckv,
         dram_kpe,
         dram_ckv,
-        hbm_block_table,
-        dram_block_table,
-        outputs[2],
-        outputs[3],
-        outputs[4],
     )
 
 
@@ -517,60 +517,43 @@ def run_meta_check() -> None:
         device=meta,
         dtype=torch.int32,
     )
-    outputs = torch.ops.nanovllm_dsa.fused_li_manage_mtp.default(
-        query,
-        key,
-        weights,
-        req_entries,
-        cache_slots,
-        cache_tokens,
-        candidate_lens,
-        block_table,
-    )
     expected_shapes = (
         (batch_size * QUERY_COUNT, 1, TOPK),
         (batch_size * QUERY_COUNT, 1, TOPK),
         (batch_size, UNION_CAPACITY),
         (batch_size, UNION_CAPACITY),
         (batch_size,),
-        (batch_size + 1, source_capacity),
     )
-    if tuple(tuple(output.shape) for output in outputs) != expected_shapes:
-        raise AssertionError("MTP-LIDU Meta output shapes are incorrect")
-    if any(output.dtype != torch.int32 for output in outputs):
-        raise AssertionError("MTP-LIDU Meta output dtypes are not int32")
-    if not torch._C._is_alias_of(outputs[-1], cache_slots):
-        raise AssertionError("MTP-LIDU Meta cache output lost its alias")
-    out_buffers = (
+    buffers = (
         torch.empty(expected_shapes[0], device=meta, dtype=torch.int32),
         torch.empty(expected_shapes[1], device=meta, dtype=torch.int32),
         torch.empty(expected_shapes[2], device=meta, dtype=torch.int32),
         torch.empty(expected_shapes[3], device=meta, dtype=torch.int32),
         torch.empty(expected_shapes[4], device=meta, dtype=torch.int32),
     )
-    out_outputs = torch.ops.nanovllm_dsa.fused_li_manage_mtp_out.default(
+    result = torch.ops.nanovllm_dsa.fused_li_manage_mtp.default(
         query,
-        key,
         weights,
+        key,
+        block_table,
+        candidate_lens,
+        cache_tokens,
         req_entries,
         cache_slots,
-        cache_tokens,
-        candidate_lens,
-        block_table,
-        *out_buffers,
+        buffers[1],
+        buffers[0],
+        buffers[2],
+        buffers[3],
+        buffers[4],
     )
-    if tuple(tuple(output.shape) for output in out_outputs) != expected_shapes:
-        raise AssertionError("MTP-LIDU _out Meta output shapes are incorrect")
-    if any(output.dtype != torch.int32 for output in out_outputs):
-        raise AssertionError("MTP-LIDU _out Meta output dtypes are not int32")
-    for returned, supplied in zip(out_outputs[:5], out_buffers):
-        if not torch._C._is_alias_of(returned, supplied):
-            raise AssertionError("MTP-LIDU _out Meta output lost its alias")
-    if not torch._C._is_alias_of(out_outputs[-1], cache_slots):
-        raise AssertionError("MTP-LIDU _out Meta cache output lost its alias")
+    if result is not None:
+        raise AssertionError("Fused LIM Manage MTP must return None")
+    if tuple(tuple(output.shape) for output in buffers) != expected_shapes:
+        raise AssertionError("Fused LIM Manage MTP Meta buffers changed shape")
+    if any(output.dtype != torch.int32 for output in buffers):
+        raise AssertionError("Fused LIM Manage MTP Meta buffers changed dtype")
     print(
-        "FUSED_LI_MANAGE_MTP_META_CHECK alloc=1 out=1 "
-        "mutable_cache_alias=1 ok=1",
+        "FUSED_LI_MANAGE_MTP_META_CHECK caller_owned_buffers=1 return_none=1 ok=1",
         flush=True,
     )
 
@@ -589,10 +572,7 @@ def validate_result(
         miss_sources,
         miss_destinations,
         miss_counts,
-        cache_alias,
     ) = outputs
-    if cache_alias.data_ptr() != cache_slots.data_ptr():
-        raise AssertionError(f"{label}: cache output does not alias mutable pool")
     after_cpu = cache_slots.cpu()
     topk_slots_cpu = topk_slots.reshape(-1, TOPK).cpu().to(torch.int64)
     topk_source_ids_cpu = (
@@ -794,35 +774,45 @@ def _compare_valid_outputs(
 
 
 def run_semantic_case(case: MtpCase) -> None:
-    alloc_cache = case.initial_cache_cpu.to(case.device)
+    fresh_cache = case.initial_cache_cpu.to(case.device)
     before = case.initial_cache_cpu.clone()
-    alloc_outputs = call_mtp(case, alloc_cache)
+    fresh_outputs = call_mtp(case, fresh_cache)
     torch.npu.synchronize()
     counts = validate_result(
-        case, before, alloc_cache, alloc_outputs, label=f"{case.name}/alloc"
+        case, before, fresh_cache, fresh_outputs, label=f"{case.name}/fresh"
     )
 
-    out_cache = case.initial_cache_cpu.to(case.device)
-    out_buffers = make_outputs(case)
-    out_outputs = call_mtp_out(case, out_cache, *out_buffers)
+    persistent_cache = case.initial_cache_cpu.to(case.device)
+    persistent_buffers = make_outputs(case)
+    persistent_outputs = call_mtp_with_buffers(
+        case, persistent_cache, *persistent_buffers
+    )
     torch.npu.synchronize()
     validate_result(
-        case, before, out_cache, out_outputs, label=f"{case.name}/out"
+        case,
+        before,
+        persistent_cache,
+        persistent_outputs,
+        label=f"{case.name}/persistent",
     )
-    for returned, supplied in zip(out_outputs[:5], out_buffers):
+    for returned, supplied in zip(persistent_outputs, persistent_buffers):
         if returned.data_ptr() != supplied.data_ptr():
-            raise AssertionError(f"{case.name}: _out did not preserve output buffer")
-    _compare_valid_outputs(case, alloc_outputs, out_outputs, label=case.name)
-    if not torch.equal(alloc_cache.cpu(), out_cache.cpu()):
-        raise AssertionError(f"{case.name}: alloc and _out cache states differ")
+            raise AssertionError(
+                f"{case.name}: caller-owned output buffer was replaced"
+            )
+    _compare_valid_outputs(
+        case, fresh_outputs, persistent_outputs, label=case.name
+    )
+    if not torch.equal(fresh_cache.cpu(), persistent_cache.cpu()):
+        raise AssertionError(f"{case.name}: cache states differ")
 
-    repeat_before = alloc_cache.cpu()
-    repeat_outputs = call_mtp(case, alloc_cache)
+    repeat_before = fresh_cache.cpu()
+    repeat_outputs = call_mtp(case, fresh_cache)
     torch.npu.synchronize()
     repeat_counts = validate_result(
         case,
         repeat_before,
-        alloc_cache,
+        fresh_cache,
         repeat_outputs,
         label=f"{case.name}/repeat",
     )
@@ -856,21 +846,21 @@ def run_graph_case(device: torch.device, seed: int, replays: int) -> None:
     eager_cache = case.initial_cache_cpu.to(device)
     graph_buffers = make_outputs(case)
 
-    # Warm up the out contract on disposable state before capture.
+    # Warm up the caller-owned-buffer contract on disposable state.
     warm_cache = case.initial_cache_cpu.to(device)
-    call_mtp_out(case, warm_cache, *make_outputs(case))
+    call_mtp_with_buffers(case, warm_cache, *make_outputs(case))
     torch.npu.synchronize()
 
     graph = torch.npu.NPUGraph()
     pool = torch.npu.graph_pool_handle()
     with torch.npu.graph(graph, pool=pool):
-        graph_outputs = call_mtp_out(case, graph_cache, *graph_buffers)
+        graph_outputs = call_mtp_with_buffers(
+            case, graph_cache, *graph_buffers
+        )
     torch.npu.synchronize()
-    for returned, supplied in zip(graph_outputs[:5], graph_buffers):
+    for returned, supplied in zip(graph_outputs, graph_buffers):
         if returned.data_ptr() != supplied.data_ptr():
-            raise AssertionError("graph capture lost caller-owned MTP-LIDU buffers")
-    if graph_outputs[5].data_ptr() != graph_cache.data_ptr():
-        raise AssertionError("graph capture lost mutable cache alias")
+            raise AssertionError("graph capture lost caller-owned LIM buffers")
 
     # Capture may execute the op. Start replay and eager reference from exactly
     # the same state, then let both states evolve across all replays.
@@ -934,7 +924,7 @@ def run_fused_li_manage_scatter_chain_case(
     device: torch.device,
     seed: int,
 ) -> None:
-    """Validate the fixed-capacity 8192 LIDU -> SCATTER contract."""
+    """Validate the fixed-capacity 8192 LIM -> SCATTER contract."""
 
     batch_size = 4
     source_len = 20992
@@ -1006,7 +996,7 @@ def run_fused_li_manage_scatter_chain_case(
             raise AssertionError(f"{label}: SCATTER CKV payload mismatch")
         return [int(value) for value in counts_cpu.tolist()]
 
-    # Eager chain: the actual MTP-LIDU buffers are passed directly to SCATTER.
+    # Eager chain: the actual MTP LIM buffers are passed directly to SCATTER.
     eager_cache = case.initial_cache_cpu.to(device)
     eager_kpe = torch.zeros(
         hbm_blocks, BLOCK_SIZE, KPE_DIM, dtype=torch.bfloat16, device=device
@@ -1014,7 +1004,9 @@ def run_fused_li_manage_scatter_chain_case(
     eager_ckv = torch.zeros(
         hbm_blocks, BLOCK_SIZE, CKV_DIM, dtype=torch.bfloat16, device=device
     )
-    eager_outputs = call_mtp_out(case, eager_cache, *make_outputs(case))
+    eager_outputs = call_mtp_with_buffers(
+        case, eager_cache, *make_outputs(case)
+    )
     _run_scatter(
         eager_kpe,
         eager_ckv,
@@ -1039,7 +1031,7 @@ def run_fused_li_manage_scatter_chain_case(
         label="fused_li_manage_scatter_chain/eager",
     )
     if payload_counts != eager_counts:
-        raise AssertionError("LIDU and SCATTER eager copy counts differ")
+        raise AssertionError("LIM and SCATTER eager copy counts differ")
     if max(eager_counts) <= TOPK or max(eager_counts) > UNION_CAPACITY:
         raise AssertionError(
             "MTP SCATTER coverage must include a copy_count in (2048,8192]"
@@ -1061,7 +1053,9 @@ def run_fused_li_manage_scatter_chain_case(
     graph = torch.npu.NPUGraph()
     pool = torch.npu.graph_pool_handle()
     with torch.npu.graph(graph, pool=pool):
-        graph_outputs = call_mtp_out(case, graph_cache, *graph_buffers)
+        graph_outputs = call_mtp_with_buffers(
+            case, graph_cache, *graph_buffers
+        )
         _run_scatter(
             graph_kpe,
             graph_ckv,
@@ -1093,7 +1087,7 @@ def run_fused_li_manage_scatter_chain_case(
         label="fused_li_manage_scatter_chain/graph",
     )
     if graph_counts != eager_counts:
-        raise AssertionError("eager and graph LIDU->SCATTER counts differ")
+        raise AssertionError("eager and graph LIM->SCATTER counts differ")
 
     repeat_before = graph_cache.cpu()
     kpe_before = graph_kpe.cpu()
@@ -1134,7 +1128,7 @@ def run_fused_li_manage_scatter_chain_case(
     torch.npu.empty_cache()
 
 
-def _single_query_out(
+def _single_query_with_buffers(
     case: MtpCase,
     query: torch.Tensor,
     weights: torch.Tensor,
@@ -1143,19 +1137,20 @@ def _single_query_out(
     destination_slots: torch.Tensor,
     miss_counts: torch.Tensor,
 ):
-    return torch.ops.nanovllm_dsa.fused_li_manage_out.default(
+    torch.ops.nanovllm_dsa.fused_li_manage.default(
         query,
-        case.key,
         weights,
+        case.key,
+        case.block_table,
+        case.candidate_lens,
+        case.cache_tokens,
         case.req_pool_entries,
         cache_slots,
-        case.cache_tokens,
-        case.candidate_lens,
-        case.block_table,
         source_ids,
         destination_slots,
         miss_counts,
     )
+    return source_ids, destination_slots, miss_counts
 
 
 def _wall_ms(fn, warmup: int, iters: int) -> float:
@@ -1184,7 +1179,7 @@ def _fresh_state_ms(
         cache.copy_(initial)
         torch.npu.synchronize()
         start = perf_counter()
-        outputs = call_mtp_out(case, cache, *buffers)
+        outputs = call_mtp_with_buffers(case, cache, *buffers)
         torch.npu.synchronize()
         if iteration >= warmup:
             elapsed += (perf_counter() - start) * 1000.0
@@ -1257,12 +1252,12 @@ def run_performance_case(
     )
 
     def fused_step():
-        return call_mtp_out(case, fused_cache, *fused_buffers)
+        return call_mtp_with_buffers(case, fused_cache, *fused_buffers)
 
     def serial_step():
         result = None
         for query_idx in range(QUERY_COUNT):
-            result = _single_query_out(
+            result = _single_query_with_buffers(
                 case,
                 query_rows[query_idx],
                 weight_rows[query_idx],
@@ -1274,10 +1269,12 @@ def run_performance_case(
     # Report union copy reduction from an identical typical-miss state.
     union_cache = case.initial_cache_cpu.to(device)
     serial_count_cache = case.initial_cache_cpu.to(device)
-    union_result = call_mtp_out(case, union_cache, *make_outputs(case))
+    union_result = call_mtp_with_buffers(
+        case, union_cache, *make_outputs(case)
+    )
     per_query_misses: list[int] = []
     for query_idx in range(QUERY_COUNT):
-        result = _single_query_out(
+        result = _single_query_with_buffers(
             case,
             query_rows[query_idx],
             weight_rows[query_idx],
@@ -1327,7 +1324,7 @@ def run_performance_case(
         "FUSED_LI_MANAGE_MTP_PERF_RESULT "
         f"batch={batch_size} candidate_len={source_len} "
         f"cache_tokens={cache_tokens} fused_ms={fused_ms:.6f} "
-        f"four_serial_lidu_ms={serial_ms:.6f} speedup={speedup:.4f} "
+        f"four_serial_lim_ms={serial_ms:.6f} speedup={speedup:.4f} "
         f"warmup={warmup} iters={iters}",
         flush=True,
     )

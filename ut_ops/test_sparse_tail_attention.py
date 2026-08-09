@@ -61,19 +61,21 @@ def sparse_attention(
     key_rope: torch.Tensor,
     scale: float,
 ) -> torch.Tensor:
-    return torch.ops.nanovllm_dsa.sparse_tail_attention.default(
+    attention_out = torch.empty_like(query)
+    torch.ops.nanovllm_dsa.sparse_tail_attention.default(
+        query_rope,
         query,
-        key,
-        key,
-        sparse_slots,
-        cache_tokens,
-        block_table,
         actual_q,
         actual_kv,
-        query_rope,
+        cache_tokens,
+        sparse_slots,
+        block_table,
         key_rope,
+        key,
         scale,
+        attention_out,
     )
+    return attention_out
 
 
 def logical_rows(

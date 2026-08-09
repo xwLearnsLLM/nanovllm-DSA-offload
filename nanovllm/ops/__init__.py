@@ -37,7 +37,11 @@ if _CUSTOM_OPP_VENDOR.exists():
 
 try:
     importlib.import_module("torch_npu")
-    _C = importlib.import_module("nanovllm._C")
+    torch = importlib.import_module("torch")
+    # Importing the extension registers all bundled operators with
+    # torch.library.  Python callers use torch.ops below; pybind is no longer
+    # a second public operator surface.
+    importlib.import_module("nanovllm._C")
 except ImportError as exc:
     raise ImportError(
         "nanovllm Ascend ops are not built. Run "
@@ -46,22 +50,13 @@ except ImportError as exc:
     ) from exc
 
 
-moe_gating_top_k = _C.moe_gating_top_k
-batch_matmul_transpose = _C.batch_matmul_transpose
-matmul_allreduce_add_rmsnorm = _C.matmul_allreduce_add_rmsnorm
-
-
-def _missing_dsa_indexer_rope(*args, **kwargs):
-    raise RuntimeError(
-        "dsa_indexer_query_rope_inplace is not built into nanovllm._C. "
-        "Run `bash scripts/build_nanovllm_ops.sh` on the Ascend machine first."
-    )
-
-
-dsa_indexer_query_rope_inplace = getattr(
-    _C,
-    "dsa_indexer_query_rope_inplace",
-    _missing_dsa_indexer_rope,
+moe_gating_top_k = torch.ops.nanovllm_dsa.moe_gating_top_k.default
+batch_matmul_transpose = torch.ops.nanovllm_dsa.batch_matmul_transpose.default
+matmul_allreduce_add_rmsnorm = (
+    torch.ops.nanovllm_dsa.matmul_allreduce_add_rmsnorm.default
+)
+dsa_indexer_query_rope_inplace = (
+    torch.ops.nanovllm_dsa.dsa_indexer_query_rope_inplace.default
 )
 
 
@@ -98,7 +93,7 @@ def mla_preprocess(
     quant_mode="no_quant",
     enable_inner_out=False,
 ):
-    return _C.mla_preprocess(
+    return torch.ops.nanovllm_dsa.mla_preprocess.default(
         hidden_state,
         wdqkv,
         descale0,

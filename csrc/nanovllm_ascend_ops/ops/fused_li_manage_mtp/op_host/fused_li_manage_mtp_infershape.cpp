@@ -27,7 +27,7 @@ static ge::graphStatus InferShapeNanovllmFusedLiManageMtp(
     OPS_LOG_E_IF_NULL(context, cache, return ge::GRAPH_FAILED);
     OPS_ERR_IF(query->GetDimNum() != 3 || req->GetDimNum() != 1 ||
                    cache->GetDimNum() != 2,
-               OPS_LOG_E(context, "invalid MTP-LIDU input ranks."),
+               OPS_LOG_E(context, "invalid MTP LIM input ranks."),
                return ge::GRAPH_FAILED);
 
     gert::Shape *topkSlots = context->GetOutputShape(0);

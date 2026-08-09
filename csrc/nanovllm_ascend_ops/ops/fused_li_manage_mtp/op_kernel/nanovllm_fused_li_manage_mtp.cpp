@@ -15,7 +15,7 @@ using namespace AscendC;
     GET_TILING_DATA_WITH_STRUCT(tilingDataStruct, tiling_data_in, tiling);     \
     const tilingDataStruct *__restrict tiling_data = &tiling_data_in;
 
-#define INVOKE_MTP_LIDU(templateClass, ...)                                    \
+#define INVOKE_MTP_LIM(templateClass, ...)                                     \
     do {                                                                        \
         templateClass<LIType<__VA_ARGS__>> op;                                  \
         COPY_MTP_TILING_DATA(LIUMtpTilingData, tiling);                         \
@@ -44,9 +44,9 @@ __global__ __aicore__ void nanovllm_fused_li_manage_mtp(
     __gm__ uint8_t *user = GetUserWorkspace(workspace);
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     if constexpr (DT == LI_MTP_TPL_FP16) {
-        INVOKE_MTP_LIDU(LIMtpPreload, half);
+        INVOKE_MTP_LIM(LIMtpPreload, half);
     } else {
-        INVOKE_MTP_LIDU(LIMtpPreload, bfloat16_t);
+        INVOKE_MTP_LIM(LIMtpPreload, bfloat16_t);
     }
 #endif
 }

@@ -469,16 +469,16 @@ def run_case(
     def reset_fused_li_manage() -> None:
         cache_slots.copy_(initial_cache)
 
-    def run_fused_li_manage() -> tuple[torch.Tensor, ...]:
-        return torch.ops.nanovllm_dsa.fused_li_manage_out.default(
+    def run_fused_li_manage() -> None:
+        torch.ops.nanovllm_dsa.fused_li_manage.default(
             query,
-            key,
             weights,
+            key,
+            block_table,
+            candidate_lens,
+            cache_tokens,
             req_entries,
             cache_slots,
-            cache_tokens,
-            candidate_lens,
-            block_table,
             source_ids,
             destination_slots,
             miss_counts,

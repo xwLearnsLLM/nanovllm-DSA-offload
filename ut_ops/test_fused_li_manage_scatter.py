@@ -50,6 +50,9 @@ class Case:
     init_source_ids: torch.Tensor
     init_destination_slots: torch.Tensor
     init_counts: torch.Tensor
+    topk_src_ids: torch.Tensor
+    topk_dst_slots: torch.Tensor
+    miss_counts: torch.Tensor
     expected_initial_sources: list[torch.Tensor]
 
 
@@ -254,6 +257,13 @@ def make_case(heads: int, device: torch.device, seed: int) -> Case:
         init_source_ids=init_source_ids_cpu.to(device),
         init_destination_slots=init_destination_cpu.to(device),
         init_counts=torch.tensor(CACHE_TIERS, dtype=torch.int32, device=device),
+        topk_src_ids=torch.empty(
+            (batch, 1, TOPK), dtype=torch.int32, device=device
+        ),
+        topk_dst_slots=torch.empty(
+            (batch, 1, TOPK), dtype=torch.int32, device=device
+        ),
+        miss_counts=torch.empty((batch,), dtype=torch.int32, device=device),
         expected_initial_sources=expected_initial_sources,
     )
 
@@ -263,34 +273,38 @@ def call_scatter(
     source_ids: torch.Tensor,
     destination_slots: torch.Tensor,
     counts: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return torch.ops.nanovllm_dsa.scatter_copy.default(
+) -> None:
+    torch.ops.nanovllm_dsa.scatter_copy.default(
+        source_ids,
+        destination_slots,
+        counts,
+        case.hbm_block_table,
+        case.dram_block_table,
         case.hbm_kpe,
         case.hbm_ckv,
         case.dram_kpe,
         case.dram_ckv,
-        case.hbm_block_table,
-        case.dram_block_table,
-        source_ids,
-        destination_slots,
-        counts,
     )
 
 
 def call_fused_li_manage(case: Case):
-    return torch.ops.nanovllm_dsa.fused_li_manage.default(
+    torch.ops.nanovllm_dsa.fused_li_manage.default(
         case.query,
-        case.index_cache,
         case.weights,
+        case.index_cache,
+        case.index_block_table,
+        case.candidate_lens,
+        case.cache_tokens,
         case.req_entries,
         case.cache_slots,
-        case.cache_tokens,
-        case.candidate_lens,
-        case.index_block_table,
+        case.topk_src_ids,
+        case.topk_dst_slots,
+        case.miss_counts,
     )
+    return case.topk_src_ids, case.topk_dst_slots, case.miss_counts
 
 
-def call_fused_li_manage_out(
+def call_fused_li_manage_with_buffers(
     case: Case,
     *,
     query: torch.Tensor,
@@ -303,19 +317,20 @@ def call_fused_li_manage_out(
     destination_slots: torch.Tensor,
     miss_counts: torch.Tensor,
 ):
-    return torch.ops.nanovllm_dsa.fused_li_manage_out.default(
+    torch.ops.nanovllm_dsa.fused_li_manage.default(
         query,
-        case.index_cache,
         weights,
+        case.index_cache,
+        index_block_table,
+        candidate_lens,
+        cache_tokens,
         req_entries,
         case.cache_slots,
-        cache_tokens,
-        candidate_lens,
-        index_block_table,
         source_ids,
         destination_slots,
         miss_counts,
     )
+    return source_ids, destination_slots, miss_counts
 
 
 def validate_cache_data(case: Case, row: int, sources: torch.Tensor) -> None:
@@ -434,9 +449,7 @@ def run_case(case: Case, warmup: int, iters: int) -> None:
         f"max_c={max(CACHE_TIERS)} ok=1"
     )
 
-    source_ids, destination_slots, miss_counts, cache_alias = call_fused_li_manage(case)
-    if cache_alias.data_ptr() != case.cache_slots.data_ptr():
-        raise AssertionError("Fused LI Manage cache_slots output does not alias its mutable input")
+    source_ids, destination_slots, miss_counts = call_fused_li_manage(case)
     call_scatter(
         case,
         source_ids.view(len(CACHE_TIERS), TOPK),
@@ -480,7 +493,7 @@ def run_case(case: Case, warmup: int, iters: int) -> None:
     print(f"FUSED_LI_MANAGE_FULL_TOPK_INDEX_SLOTS_CHECK heads={case.heads} ok=1")
 
     # Identical query must be a zero-miss repeat and leave every pool row valid.
-    repeat_source, repeat_slots, repeat_counts, _ = call_fused_li_manage(case)
+    repeat_source, repeat_slots, repeat_counts = call_fused_li_manage(case)
     call_scatter(
         case,
         repeat_source.view(len(CACHE_TIERS), TOPK),
@@ -499,7 +512,7 @@ def run_case(case: Case, warmup: int, iters: int) -> None:
     print(f"FUSED_LI_MANAGE_SCATTER_ZERO_MISS_CHECK heads={case.heads} ok=1")
 
     for _ in range(warmup):
-        source, slots, counts, _ = call_fused_li_manage(case)
+        source, slots, counts = call_fused_li_manage(case)
         call_scatter(
             case,
             source.view(len(CACHE_TIERS), TOPK),
@@ -509,7 +522,7 @@ def run_case(case: Case, warmup: int, iters: int) -> None:
     torch.npu.synchronize()
     start = perf_counter()
     for _ in range(iters):
-        source, slots, counts, _ = call_fused_li_manage(case)
+        source, slots, counts = call_fused_li_manage(case)
         call_scatter(
             case,
             source.view(len(CACHE_TIERS), TOPK),
@@ -610,17 +623,23 @@ def run_local_bs24_case(
     block_table = block_table_cpu.to(device)
     index_cache = index_cpu.to(device)
 
-    source_ids, destination_slots, miss_counts, _ = (
-        torch.ops.nanovllm_dsa.fused_li_manage.default(
-            query,
-            index_cache,
-            weights,
-            req_entries,
-            cache_slots,
-            cache_tokens,
-            candidate_lens,
-            block_table,
-        )
+    source_ids = torch.empty(
+        (batch, 1, TOPK), dtype=torch.int32, device=device
+    )
+    destination_slots = torch.empty_like(source_ids)
+    miss_counts = torch.empty((batch,), dtype=torch.int32, device=device)
+    torch.ops.nanovllm_dsa.fused_li_manage.default(
+        query,
+        weights,
+        index_cache,
+        block_table,
+        candidate_lens,
+        cache_tokens,
+        req_entries,
+        cache_slots,
+        source_ids,
+        destination_slots,
+        miss_counts,
     )
     torch.npu.synchronize()
     counts_cpu = miss_counts.cpu()
@@ -687,18 +706,22 @@ def run_local_bs24_case(
                 f"bs24 row={row} full top-k slot set is incorrect."
             )
 
-    repeat_sources, repeat_slots, repeat_counts, _ = (
-        torch.ops.nanovllm_dsa.fused_li_manage.default(
-            query,
-            index_cache,
-            weights,
-            req_entries,
-            cache_slots,
-            cache_tokens,
-            candidate_lens,
-            block_table,
-        )
+    torch.ops.nanovllm_dsa.fused_li_manage.default(
+        query,
+        weights,
+        index_cache,
+        block_table,
+        candidate_lens,
+        cache_tokens,
+        req_entries,
+        cache_slots,
+        source_ids,
+        destination_slots,
+        miss_counts,
     )
+    repeat_sources = source_ids
+    repeat_slots = destination_slots
+    repeat_counts = miss_counts
     torch.npu.synchronize()
     if bool((repeat_counts.cpu() != 0).any()):
         raise AssertionError("bs24 identical-query repeat must have zero misses.")
@@ -752,7 +775,7 @@ def run_graph_case(case: Case, replays: int) -> None:
     miss_counts = torch.zeros((1,), dtype=torch.int32, device=case.device)
 
     def chain():
-        outputs = call_fused_li_manage_out(
+        outputs = call_fused_li_manage_with_buffers(
             case,
             query=query,
             weights=weights,
@@ -765,15 +788,15 @@ def run_graph_case(case: Case, replays: int) -> None:
             miss_counts=miss_counts,
         )
         torch.ops.nanovllm_dsa.scatter_copy.default(
+            outputs[0].view(1, TOPK),
+            outputs[1].view(1, TOPK),
+            outputs[2],
+            hbm_table,
+            dram_table,
             case.hbm_kpe,
             case.hbm_ckv,
             case.dram_kpe,
             case.dram_ckv,
-            hbm_table,
-            dram_table,
-            outputs[0].view(1, TOPK),
-            outputs[1].view(1, TOPK),
-            outputs[2],
         )
         return outputs
 
@@ -789,11 +812,10 @@ def run_graph_case(case: Case, replays: int) -> None:
     if any(
         output.data_ptr() != expected.data_ptr()
         for output, expected in zip(
-            graph_outputs[:3],
-            (source_ids, destination_slots, miss_counts),
+            graph_outputs, (source_ids, destination_slots, miss_counts)
         )
     ):
-        raise AssertionError("graph Fused LI Manage outputs do not alias persistent buffers")
+        raise AssertionError("graph did not reuse caller-owned output buffers")
     if int(graph_outputs[2].cpu()[0]) != 0:
         raise AssertionError("graph capture precondition must be zero miss")
 

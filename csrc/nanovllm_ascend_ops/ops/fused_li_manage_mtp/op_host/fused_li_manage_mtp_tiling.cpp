@@ -125,7 +125,7 @@ ge::graphStatus LIUMtpTiling::CheckShapes(LIUMtpTilingInfo &info) const
                    w.GetDimNum() != 2 || req.GetDimNum() != 1 ||
                    cache.GetDimNum() != 2 || cacheTokens.GetDimNum() != 1 ||
                    lens.GetDimNum() != 1 || blocks.GetDimNum() != 2,
-               OPS_LOG_E(info.opName, "invalid MTP-LIDU input ranks."),
+               OPS_LOG_E(info.opName, "invalid MTP LIM input ranks."),
                return ge::GRAPH_FAILED);
     info.tokenRows = static_cast<uint32_t>(q.GetDim(0));
     info.batchSize = static_cast<uint32_t>(req.GetDim(0));

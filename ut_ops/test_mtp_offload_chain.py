@@ -1,4 +1,4 @@
-"""End-to-end MTP3 LIDU -> SCATTER -> sparse-and-tail Attention UT."""
+"""End-to-end MTP3 LIM -> SCATTER -> sparse-and-tail Attention UT."""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ KNOWN_FUSED_ATTENTION_ATOL = 0.1
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Validate the real MTP-LIDU outputs through SCATTER and MTP3 "
+            "Validate the real MTP LIM outputs through SCATTER and MTP3 "
             "sparse-and-tail Attention on one NPU."
         )
     )
@@ -117,7 +117,7 @@ def initialize_hbm(
     hbm_blocks: int,
     generator: torch.Generator,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Materialize the pre-update LIDU token->slot state in HBM."""
+    """Materialize the pre-update LIM token-to-slot state in HBM."""
 
     initial_kpe = torch.zeros(
         hbm_blocks, BLOCK_SIZE, KPE_DIM, dtype=torch.bfloat16
@@ -135,7 +135,7 @@ def initialize_hbm(
         sources = torch.nonzero(state >= 0).flatten()
         if sources.numel() != cache_tokens:
             raise AssertionError(
-                f"request={request}: initial LIDU state does not contain C tokens"
+                f"request={request}: initial LIM state does not contain C tokens"
             )
         source_ids[request] = sources.to(torch.int32)
         destination_slots[request] = state[sources]
@@ -358,20 +358,20 @@ def call_attention_out(
 ) -> torch.Tensor:
     latent_cache = ckv.view(-1, BLOCK_SIZE, 1, CKV_DIM)
     rope_cache = kpe.view(-1, BLOCK_SIZE, 1, KPE_DIM)
-    return torch.ops.nanovllm_dsa.sparse_tail_attention_mtp_out.default(
+    torch.ops.nanovllm_dsa.sparse_tail_attention_mtp.default(
+        query_rope,
         query,
-        latent_cache,
-        latent_cache,
-        sparse_slots,
-        cache_tokens,
-        hbm_table,
         actual_q,
         actual_kv,
-        query_rope,
+        cache_tokens,
+        sparse_slots,
+        hbm_table,
         rope_cache,
+        latent_cache,
         scale,
         output,
     )
+    return output
 
 
 def run_chain(args: argparse.Namespace, device: torch.device) -> None:
@@ -462,25 +462,25 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
         lidu_buffers: tuple[torch.Tensor, ...],
         attention_output: torch.Tensor,
     ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
-        lidu_outputs = lidu_ut.call_mtp_out(
+        lidu_outputs = lidu_ut.call_mtp_with_buffers(
             case, cache_slots, *lidu_buffers
         )
-        kpe_alias, ckv_alias = torch.ops.nanovllm_dsa.scatter_copy.default(
+        torch.ops.nanovllm_dsa.scatter_copy.default(
+            lidu_outputs[2],
+            lidu_outputs[3],
+            lidu_outputs[4],
+            hbm_table,
+            dram_table,
             hbm_kpe,
             hbm_ckv,
             dram_kpe,
             dram_ckv,
-            hbm_table,
-            dram_table,
-            lidu_outputs[2],
-            lidu_outputs[3],
-            lidu_outputs[4],
         )
         attention = call_attention_out(
             query=query,
             query_rope=query_rope,
-            kpe=kpe_alias,
-            ckv=ckv_alias,
+            kpe=hbm_kpe,
+            ckv=hbm_ckv,
             sparse_slots=lidu_outputs[0],
             cache_tokens=case.cache_tokens,
             hbm_table=hbm_table,
@@ -498,36 +498,30 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
         lidu_buffers: tuple[torch.Tensor, ...],
         attention_output: torch.Tensor,
     ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
-        lidu_outputs = lidu_ut.call_mtp_out(
+        lidu_outputs = lidu_ut.call_mtp_with_buffers(
             case, cache_slots, *lidu_buffers
         )
-        attention = (
-            torch.ops.nanovllm_dsa.fused_copy_sfa_mtp_out.default(
-                query_rope,
-                query,
-                actual_q,
-                actual_kv,
-                case.cache_tokens,
-                lidu_outputs[0],
-                lidu_outputs[1],
-                lidu_outputs[2],
-                lidu_outputs[3],
-                lidu_outputs[4],
-                hbm_table,
-                dram_table,
-                hbm_kpe.view(-1, BLOCK_SIZE, 1, KPE_DIM),
-                hbm_ckv.view(-1, BLOCK_SIZE, 1, CKV_DIM),
-                dram_kpe,
-                dram_ckv,
-                scale,
-                attention_output,
-            )
+        torch.ops.nanovllm_dsa.fused_copy_sfa_mtp.default(
+            query_rope,
+            query,
+            actual_q,
+            actual_kv,
+            case.cache_tokens,
+            lidu_outputs[0],
+            lidu_outputs[1],
+            lidu_outputs[2],
+            lidu_outputs[3],
+            lidu_outputs[4],
+            hbm_table,
+            dram_table,
+            hbm_kpe.view(-1, BLOCK_SIZE, 1, KPE_DIM),
+            hbm_ckv.view(-1, BLOCK_SIZE, 1, CKV_DIM),
+            dram_kpe,
+            dram_ckv,
+            scale,
+            attention_output,
         )
-        if attention.data_ptr() != attention_output.data_ptr():
-            raise AssertionError(
-                "fused_copy_sfa_mtp_out did not return its caller-owned output"
-            )
-        return lidu_outputs, attention
+        return lidu_outputs, attention_output
 
     def validate_chain(
         *,
@@ -556,7 +550,7 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
             lidu_outputs=lidu_outputs,
         )
         if counts != payload_counts:
-            raise AssertionError(f"{label}: LIDU and SCATTER counts differ")
+            raise AssertionError(f"{label}: LIM and SCATTER counts differ")
         actual_kpe = hbm_kpe.cpu()
         actual_ckv = hbm_ckv.cpu()
         if not torch.equal(actual_kpe, expected_kpe):
@@ -677,7 +671,7 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
         label="mtp_offload_chain/split_fused",
     )
     if not torch.equal(fused_cache.cpu(), eager_cache.cpu()):
-        raise AssertionError("split and fused LIDU states differ")
+        raise AssertionError("split and fused LIM states differ")
     if not torch.equal(fused_kpe.cpu(), eager_kpe.cpu()) or not torch.equal(
         fused_ckv.cpu(), eager_ckv.cpu()
     ):
@@ -698,7 +692,7 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
         flush=True,
     )
 
-    # Warm up LIDU plus the caller-owned fused interface on disposable state.
+    # Warm up LIM plus the caller-owned fused interface on disposable state.
     warm_cache = case.initial_cache_cpu.to(device)
     warm_kpe = initial_kpe_cpu.to(device)
     warm_ckv = initial_ckv_cpu.to(device)
@@ -751,7 +745,7 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
         case, graph_outputs, fused_outputs, label="mtp_offload_chain/eager_graph"
     )
     if not torch.equal(graph_cache.cpu(), fused_cache.cpu()):
-        raise AssertionError("eager and graph LIDU states differ")
+        raise AssertionError("eager and graph LIM states differ")
     if not torch.equal(graph_kpe.cpu(), fused_kpe.cpu()) or not torch.equal(
         graph_ckv.cpu(), fused_ckv.cpu()
     ):
@@ -794,7 +788,7 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
     print(
         "MTP_OFFLOAD_CHAIN_GRAPH_CHECK "
         f"replays={args.graph_replays} first_nonzero_miss=1 "
-        "repeat_zero_miss=1 lidu_to_scatter_dependency=1 "
+        "repeat_zero_miss=1 lim_to_scatter_dependency=1 "
         "scatter_to_attention_dependency=1 out_buffer=1 "
         f"attention_max_abs={graph_max_abs:.6f} "
         f"repeat_attention_max_abs={repeat_attention_max_abs:.6f} "
@@ -831,7 +825,7 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
             generator=torch.Generator().manual_seed(args.seed + 8017),
         )
         perf_cache = perf_initial_cache_cpu.to(device)
-        perf_outputs = lidu_ut.call_mtp_out(
+        perf_outputs = lidu_ut.call_mtp_with_buffers(
             perf_case, perf_cache, *lidu_ut.make_outputs(perf_case)
         )
         torch.npu.synchronize()
@@ -852,22 +846,22 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
         fused_perf_out = torch.empty_like(eager_attention_buffer)
 
         def split_copy_attention() -> torch.Tensor:
-            kpe_alias, ckv_alias = torch.ops.nanovllm_dsa.scatter_copy.default(
+            torch.ops.nanovllm_dsa.scatter_copy.default(
+                perf_outputs[2],
+                perf_outputs[3],
+                perf_outputs[4],
+                hbm_table,
+                dram_table,
                 split_perf_kpe,
                 split_perf_ckv,
                 dram_kpe,
                 dram_ckv,
-                hbm_table,
-                dram_table,
-                perf_outputs[2],
-                perf_outputs[3],
-                perf_outputs[4],
             )
             return call_attention_out(
                 query=query,
                 query_rope=query_rope,
-                kpe=kpe_alias,
-                ckv=ckv_alias,
+                kpe=split_perf_kpe,
+                ckv=split_perf_ckv,
                 sparse_slots=perf_outputs[0],
                 cache_tokens=perf_case.cache_tokens,
                 hbm_table=hbm_table,
@@ -878,7 +872,7 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
             )
 
         def fused_copy_attention() -> torch.Tensor:
-            return torch.ops.nanovllm_dsa.fused_copy_sfa_mtp_out.default(
+            torch.ops.nanovllm_dsa.fused_copy_sfa_mtp.default(
                 query_rope,
                 query,
                 actual_q,
@@ -898,6 +892,7 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
                 scale,
                 fused_perf_out,
             )
+            return fused_perf_out
 
         def elapsed_ms(fn) -> float:
             for _ in range(args.warmup):

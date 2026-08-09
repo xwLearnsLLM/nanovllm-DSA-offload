@@ -84,15 +84,15 @@ def scatter(
     copy_counts: torch.Tensor,
 ) -> None:
     torch.ops.nanovllm_dsa.scatter_copy.default(
+        source_ids,
+        destination_slots,
+        copy_counts,
+        hbm_table,
+        dram_table,
         hbm_kpe,
         hbm_ckv,
         dram_kpe,
         dram_ckv,
-        hbm_table,
-        dram_table,
-        source_ids,
-        destination_slots,
-        copy_counts,
     )
 
 
@@ -264,7 +264,7 @@ def run_correctness_case(
 
     # Capture with zero copies, then replay the same fixed-shape graph after
     # refreshing only copy_counts.  This is the contract used when an earlier
-    # MTP-LIDU node writes a variable-length union miss list in the graph.
+    # MTP LIM writes a variable-length union miss list in the graph.
     graph_sources_cpu, graph_slots_cpu, graph_counts_cpu = make_metadata(
         batch_size,
         copy_cap,

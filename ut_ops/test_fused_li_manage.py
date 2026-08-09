@@ -243,16 +243,16 @@ def build_case(
     }
 
 
-def call_fused_li_manage(case: dict[str, torch.Tensor | int]) -> object:
-    return torch.ops.nanovllm_dsa.fused_li_manage_out.default(
+def call_fused_li_manage(case: dict[str, torch.Tensor | int]) -> None:
+    torch.ops.nanovllm_dsa.fused_li_manage.default(
         case["query"],
-        case["key"],
         case["weights"],
+        case["key"],
+        case["block_table"],
+        case["candidate_lens"],
+        case["cache_tokens"],
         case["req_entries"],
         case["cache_slots"],
-        case["cache_tokens"],
-        case["candidate_lens"],
-        case["block_table"],
         case["source_ids"],
         case["destination_slots"],
         case["miss_counts"],
@@ -426,24 +426,6 @@ def validate_outputs(
     return state_pool
 
 
-def validate_aliases(
-    outputs: object, case: dict[str, torch.Tensor | int]
-) -> None:
-    expected = (
-        case["source_ids"],
-        case["destination_slots"],
-        case["miss_counts"],
-        case["cache_slots"],
-    )
-    if not isinstance(outputs, (tuple, list)) or len(outputs) != len(expected):
-        raise AssertionError("Persistent-output aliases have an invalid structure.")
-    if any(
-        output.data_ptr() != expected_output.data_ptr()
-        for output, expected_output in zip(outputs, expected)
-    ):
-        raise AssertionError("Persistent-output aliases are incorrect.")
-
-
 def benchmark(
     runner: Callable[[], object],
     *,
@@ -516,9 +498,8 @@ def run_case(
         case["cache_slots"].copy_(case["initial_cache"])
 
     reset_state()
-    outputs = call_fused_li_manage(case)
+    call_fused_li_manage(case)
     torch.npu.synchronize()
-    validate_aliases(outputs, case)
     manage_state = validate_outputs(
         case,
         seq_len=seq_len,

@@ -79,26 +79,22 @@ def call_mtp(
     *,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    args = (
+    if out is None:
+        out = torch.empty_like(query)
+    torch.ops.nanovllm_dsa.sparse_tail_attention_mtp.default(
+        query_rope,
         query,
-        key,
-        key,
-        sparse_slots,
-        cache_tokens,
-        block_table,
         actual_q,
         actual_kv,
-        query_rope,
+        cache_tokens,
+        sparse_slots,
+        block_table,
         key_rope,
+        key,
         scale,
+        out,
     )
-    if out is None:
-        return torch.ops.nanovllm_dsa.sparse_tail_attention_mtp.default(
-            *args
-        )
-    return torch.ops.nanovllm_dsa.sparse_tail_attention_mtp_out.default(
-        *args, out
-    )
+    return out
 
 
 def call_single(
@@ -113,19 +109,21 @@ def call_single(
     key_rope: torch.Tensor,
     scale: float,
 ) -> torch.Tensor:
-    return torch.ops.nanovllm_dsa.sparse_tail_attention.default(
+    out = torch.empty_like(query)
+    torch.ops.nanovllm_dsa.sparse_tail_attention.default(
+        query_rope,
         query,
-        key,
-        key,
-        sparse_slots,
-        cache_tokens,
-        block_table,
         actual_q,
         actual_kv,
-        query_rope,
+        cache_tokens,
+        sparse_slots,
+        block_table,
         key_rope,
+        key,
         scale,
+        out,
     )
+    return out
 
 
 def make_sparse_slots(
@@ -178,21 +176,23 @@ def meta_check() -> None:
         dtype=query.dtype,
         device="meta",
     )
-    output = call_mtp(
-        query, key, sparse, cache_tokens, block_table, lengths, lengths,
-        q_rope, k_rope, 1.0,
-    )
     out_buffer = torch.empty_like(query)
-    out_result = call_mtp(
-        query, key, sparse, cache_tokens, block_table, lengths, lengths,
-        q_rope, k_rope, 1.0, out=out_buffer,
+    result = torch.ops.nanovllm_dsa.sparse_tail_attention_mtp.default(
+        q_rope,
+        query,
+        lengths,
+        lengths,
+        cache_tokens,
+        sparse,
+        block_table,
+        k_rope,
+        key,
+        1.0,
+        out_buffer,
     )
-    if (
-        output.shape != query.shape
-        or not torch._C._is_alias_of(out_result, out_buffer)
-    ):
-        raise AssertionError("MTP Attention Meta/Fake output contract is invalid")
-    print("MTP_SPARSE_TAIL_META_CHECK alloc=1 out=1 alias=1 ok=1")
+    if result is not None or out_buffer.shape != query.shape:
+        raise AssertionError("MTP Attention Meta/Fake buffer contract is invalid")
+    print("MTP_SPARSE_TAIL_META_CHECK caller_owned_output=1 return_none=1 ok=1")
 
 
 def run_semantic_check(
@@ -288,14 +288,14 @@ def run_semantic_check(
         query_rope, key_rope, scale,
     )
     output_buffer = torch.empty_like(query)
-    output_from_out = call_mtp(
+    output_from_buffer = call_mtp(
         query, key, sparse, cache_tokens, block_table, actual_q, actual_kv,
         query_rope, key_rope, scale, out=output_buffer,
     )
     torch.npu.synchronize()
-    if output_from_out.data_ptr() != output_buffer.data_ptr():
-        raise AssertionError("MTP Attention _out did not return its output buffer")
-    torch.testing.assert_close(output, output_from_out, rtol=0, atol=0)
+    if output_from_buffer.data_ptr() != output_buffer.data_ptr():
+        raise AssertionError("MTP Attention replaced its caller-owned buffer")
+    torch.testing.assert_close(output, output_from_buffer, rtol=0, atol=0)
 
     golden_rows: list[torch.Tensor] = []
     for request, (cache_count, tail_count) in enumerate(cases):
@@ -331,7 +331,7 @@ def run_semantic_check(
     print(
         "MTP_SPARSE_TAIL_SEMANTIC_CHECK "
         f"heads={heads} cases={list(cases)} max_abs={max_abs:.6f} "
-        "alloc_out_equal=1 causal_rows=4 ok=1"
+        "caller_owned_output_equal=1 causal_rows=4 ok=1"
     )
 
     graph_output = torch.empty_like(query)

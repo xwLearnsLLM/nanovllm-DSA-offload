@@ -32,8 +32,6 @@ from nanovllm.models.dsa_offload_ops import (
     initialize_lidu_row,
     fused_li_manage,
     fused_li_manage_mtp,
-    fused_li_manage_mtp_out,
-    fused_li_manage_out,
     scatter_copy,
     sparse_tail_attention,
     sparse_tail_attention_mtp,
@@ -452,14 +450,13 @@ class GlmMLAAttention(nn.Module):
                 rope_parameters=config.rope_parameters,
             )
             self.indexer = GlmDsaIndexer(config)
-        # Keep custom-op outputs alive at fixed addresses across graph replay.
-        self._use_persistent_fused_li_manage_outputs = self.uses_offload
+        # Caller-owned custom-op outputs stay alive at fixed graph addresses.
         self._use_sparse_tail_attention = self.uses_offload
         self._use_fused_copy_sfa = self.offload_mode == OFFLOAD_FUSE
-        self._fused_li_manage_graph_outputs: dict[
+        self._fused_li_manage_outputs: dict[
             int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]
         ] = {}
-        self._fused_li_manage_mtp_graph_outputs: dict[
+        self._fused_li_manage_mtp_outputs: dict[
             int,
             tuple[
                 torch.Tensor,
@@ -469,7 +466,7 @@ class GlmMLAAttention(nn.Module):
                 torch.Tensor,
             ],
         ] = {}
-        self._mtp_sparse_tail_graph_outputs: dict[int, torch.Tensor] = {}
+        self._sparse_tail_outputs: dict[tuple[int, ...], torch.Tensor] = {}
 
         self.ckv_cache = torch.tensor([])
         self.kpe_cache = torch.tensor([])
@@ -1151,60 +1148,51 @@ class GlmMLAAttention(nn.Module):
                     block_size=self.block_size,
                 )
 
-        lidu_args = (
+        buffers = self._fused_li_manage_outputs.get(batch_size)
+        if buffers is None:
+            options = dict(dtype=torch.int32, device=q_index.device)
+            buffers = (
+                torch.zeros((batch_size, 1, LIDU_TOPK), **options),
+                torch.zeros((batch_size, 1, LIDU_TOPK), **options),
+                torch.zeros((batch_size,), **options),
+            )
+            self._fused_li_manage_outputs[batch_size] = buffers
+        topk_src_ids, topk_dst_slots, miss_counts = buffers
+        fused_li_manage(
             q_index[:batch_size],
-            self.index_cache,
             weights[:batch_size],
+            self.index_cache,
+            context.index_block_tables[:batch_size],
+            context.candidate_lens[:batch_size],
+            context.lidu_cache_tokens[:batch_size],
             context.req_pool_entries[:batch_size],
             self.lidu_cache_slots,
-            context.lidu_cache_tokens[:batch_size],
-            context.candidate_lens[:batch_size],
-            context.index_block_tables[:batch_size],
+            topk_src_ids,
+            topk_dst_slots,
+            miss_counts,
         )
-        if context.full_decode_graph and self._use_persistent_fused_li_manage_outputs:
-            buffers = self._fused_li_manage_graph_outputs.get(batch_size)
-            if buffers is None:
-                options = dict(
-                    dtype=torch.int32,
-                    device=q_index.device,
-                )
-                buffers = (
-                    torch.zeros((batch_size, 1, LIDU_TOPK), **options),
-                    torch.zeros((batch_size, 1, LIDU_TOPK), **options),
-                    torch.zeros((batch_size,), **options),
-                )
-                self._fused_li_manage_graph_outputs[batch_size] = buffers
-            source_ids, destination_slots, miss_counts, _ = (
-                fused_li_manage_out(*lidu_args, *buffers)
-            )
-        else:
-            source_ids, destination_slots, miss_counts, _ = (
-                fused_li_manage(*lidu_args)
-            )
         if self._lidu_miss_count_collect_all:
             self._record_lidu_miss_counts(miss_counts, batch_size)
         use_fused_attention_scatter = (
             self._can_use_fused_copy_sfa()
         )
-        if use_fused_attention_scatter:
-            kpe_alias, ckv_alias = hbm_kpe, hbm_ckv
-        else:
-            kpe_alias, ckv_alias = scatter_copy(
+        if not use_fused_attention_scatter:
+            scatter_copy(
+                topk_src_ids.view(batch_size, -1),
+                topk_dst_slots.view(batch_size, -1),
+                miss_counts[:batch_size],
+                context.block_tables[:batch_size],
+                context.dram_block_tables[:batch_size],
                 hbm_kpe,
                 hbm_ckv,
                 dram_kpe,
                 dram_ckv,
-                context.block_tables[:batch_size],
-                context.dram_block_tables[:batch_size],
-                source_ids.view(batch_size, -1),
-                destination_slots.view(batch_size, -1),
-                miss_counts[:batch_size],
             )
         return (
-            kpe_alias,
-            ckv_alias,
-            destination_slots,
-            source_ids,
+            hbm_kpe,
+            hbm_ckv,
+            topk_dst_slots,
+            topk_src_ids,
             miss_counts,
         )
 
@@ -1270,76 +1258,68 @@ class GlmMLAAttention(nn.Module):
                     block_size=self.block_size,
                 )
 
-        lidu_args = (
+        buffers = self._fused_li_manage_mtp_outputs.get(batch_size)
+        if buffers is None:
+            options = dict(dtype=torch.int32, device=q_index.device)
+            buffers = (
+                torch.full(
+                    (batch_size * 4, 1, LIDU_TOPK), -1, **options
+                ),
+                torch.zeros(
+                    (batch_size * 4, 1, LIDU_TOPK), **options
+                ),
+                torch.zeros(
+                    (batch_size, LIDU_MTP_UNION_CAPACITY), **options
+                ),
+                torch.zeros(
+                    (batch_size, LIDU_MTP_UNION_CAPACITY), **options
+                ),
+                torch.zeros((batch_size,), **options),
+            )
+            self._fused_li_manage_mtp_outputs[batch_size] = buffers
+        (
+            topk_src_ids,
+            topk_dst_slots,
+            miss_src_ids,
+            miss_dst_slots,
+            miss_counts,
+        ) = buffers
+        fused_li_manage_mtp(
             q_index[: batch_size * 4],
-            self.index_cache,
             weights[: batch_size * 4],
+            self.index_cache,
+            context.index_block_tables[:batch_size],
+            context.candidate_lens[:batch_size],
+            context.lidu_cache_tokens[:batch_size],
             context.req_pool_entries[:batch_size],
             self.lidu_cache_slots,
-            context.lidu_cache_tokens[:batch_size],
-            context.candidate_lens[:batch_size],
-            context.index_block_tables[:batch_size],
+            topk_src_ids,
+            topk_dst_slots,
+            miss_src_ids,
+            miss_dst_slots,
+            miss_counts,
         )
-        if context.full_decode_graph:
-            buffers = self._fused_li_manage_mtp_graph_outputs.get(batch_size)
-            if buffers is None:
-                options = dict(dtype=torch.int32, device=q_index.device)
-                buffers = (
-                    torch.zeros(
-                        (batch_size * 4, 1, LIDU_TOPK), **options
-                    ),
-                    torch.full(
-                        (batch_size * 4, 1, LIDU_TOPK), -1, **options
-                    ),
-                    torch.zeros(
-                        (batch_size, LIDU_MTP_UNION_CAPACITY), **options
-                    ),
-                    torch.zeros(
-                        (batch_size, LIDU_MTP_UNION_CAPACITY), **options
-                    ),
-                    torch.zeros((batch_size,), **options),
-                )
-                self._fused_li_manage_mtp_graph_outputs[batch_size] = buffers
-            (
-                topk_slots,
-                topk_source_ids,
-                source_ids,
-                destination_slots,
-                miss_counts,
-                _,
-            ) = fused_li_manage_mtp_out(*lidu_args, *buffers)
-        else:
-            (
-                topk_slots,
-                topk_source_ids,
-                source_ids,
-                destination_slots,
-                miss_counts,
-                _,
-            ) = fused_li_manage_mtp(*lidu_args)
         if self._lidu_miss_count_collect_all:
             self._record_lidu_miss_counts(miss_counts, batch_size)
-        if self._can_use_fused_copy_sfa():
-            kpe_alias, ckv_alias = hbm_kpe, hbm_ckv
-        else:
-            kpe_alias, ckv_alias = scatter_copy(
+        if not self._can_use_fused_copy_sfa():
+            scatter_copy(
+                miss_src_ids,
+                miss_dst_slots,
+                miss_counts[:batch_size],
+                context.block_tables[:batch_size],
+                context.dram_block_tables[:batch_size],
                 hbm_kpe,
                 hbm_ckv,
                 dram_kpe,
                 dram_ckv,
-                context.block_tables[:batch_size],
-                context.dram_block_tables[:batch_size],
-                source_ids,
-                destination_slots,
-                miss_counts[:batch_size],
             )
         return (
-            kpe_alias,
-            ckv_alias,
-            topk_slots,
-            topk_source_ids,
-            source_ids,
-            destination_slots,
+            hbm_kpe,
+            hbm_ckv,
+            topk_dst_slots,
+            topk_src_ids,
+            miss_src_ids,
+            miss_dst_slots,
             miss_counts,
         )
 
@@ -1371,28 +1351,22 @@ class GlmMLAAttention(nn.Module):
         (
             kpe_cache,
             ckv_cache,
-            topk_slots,
-            topk_source_ids,
-            source_ids,
-            destination_slots,
+            topk_dst_slots,
+            topk_src_ids,
+            miss_src_ids,
+            miss_dst_slots,
             miss_counts,
         ) = self._lidu_update_mtp(q_index, weights, batch_size)
         use_fused_copy_attention = self._can_use_fused_copy_sfa()
-        attention_out = None
-        if context.full_decode_graph or use_fused_copy_attention:
-            attention_out = self._mtp_sparse_tail_graph_outputs.get(
-                batch_size
-            )
-            if (
-                attention_out is None
-                or tuple(attention_out.shape) != tuple(ql_nope.shape)
-                or attention_out.dtype != ql_nope.dtype
-                or attention_out.device != ql_nope.device
-            ):
-                attention_out = torch.empty_like(ql_nope)
-                self._mtp_sparse_tail_graph_outputs[batch_size] = (
-                    attention_out
-                )
+        output_key = tuple(ql_nope.shape)
+        attention_out = self._sparse_tail_outputs.get(output_key)
+        if (
+            attention_out is None
+            or attention_out.dtype != ql_nope.dtype
+            or attention_out.device != ql_nope.device
+        ):
+            attention_out = torch.empty_like(ql_nope)
+            self._sparse_tail_outputs[output_key] = attention_out
         hbm_ckv = ckv_cache.view(
             -1, self.block_size, 1, self.kv_lora_rank
         )
@@ -1405,16 +1379,16 @@ class GlmMLAAttention(nn.Module):
                     "Fused MTP copy+Attention requires DRAM block tables "
                     "and a caller-owned output buffer."
                 )
-            latent = fused_copy_sfa_mtp(
+            fused_copy_sfa_mtp(
                 q_pe,
                 ql_nope,
                 context.candidate_query_lens[:batch_size],
                 context.actual_seq_lengths_kv_tensor[:batch_size],
                 context.lidu_cache_tokens[:batch_size],
-                topk_slots,
-                topk_source_ids,
-                source_ids,
-                destination_slots,
+                topk_dst_slots,
+                topk_src_ids,
+                miss_src_ids,
+                miss_dst_slots,
                 miss_counts[:batch_size],
                 context.block_tables[:batch_size],
                 context.dram_block_tables[:batch_size],
@@ -1426,19 +1400,20 @@ class GlmMLAAttention(nn.Module):
                 attention_out,
             )
         else:
-            latent = sparse_tail_attention_mtp(
+            sparse_tail_attention_mtp(
+                q_pe,
                 ql_nope,
-                hbm_ckv,
-                topk_slots,
-                context.lidu_cache_tokens[:batch_size],
-                context.block_tables[:batch_size],
                 context.candidate_query_lens[:batch_size],
                 context.actual_seq_lengths_kv_tensor[:batch_size],
-                q_pe,
+                context.lidu_cache_tokens[:batch_size],
+                topk_dst_slots,
+                context.block_tables[:batch_size],
                 hbm_kpe,
+                hbm_ckv,
                 self.scale,
-                out=attention_out,
+                attention_out,
             )
+        latent = attention_out
         return torch_npu.npu_transpose_batchmatmul(
             latent.transpose(0, 1).contiguous(),
             self.w_uv,
@@ -1508,20 +1483,20 @@ class GlmMLAAttention(nn.Module):
             if q_index is None or weights is None:
                 raise RuntimeError("LIDU decode requires indexer outputs.")
             cache_aliases = self._lidu_update(q_index, weights, batch_size)
-        kpe_cache = ckv_cache = sparse_slots = None
-        source_ids = miss_counts = None
+        kpe_cache = ckv_cache = topk_dst_slots = None
+        topk_src_ids = miss_counts = None
         if cache_aliases is not None:
             (
                 kpe_cache,
                 ckv_cache,
-                sparse_slots,
-                source_ids,
+                topk_dst_slots,
+                topk_src_ids,
                 miss_counts,
             ) = cache_aliases
         if (
             self._use_sparse_tail_attention
             and not context.has_first_decode
-            and sparse_slots is not None
+            and topk_dst_slots is not None
         ):
             required = {
                 "candidate_query_lens": context.candidate_query_lens,
@@ -1545,47 +1520,57 @@ class GlmMLAAttention(nn.Module):
             hbm_kpe = kpe_cache.view(
                 -1, self.block_size, 1, self.qk_rope_head_dim
             )
+            output_key = tuple(ql_nope.shape)
+            attention_out = self._sparse_tail_outputs.get(output_key)
+            if (
+                attention_out is None
+                or attention_out.dtype != ql_nope.dtype
+                or attention_out.device != ql_nope.device
+            ):
+                attention_out = torch.empty_like(ql_nope)
+                self._sparse_tail_outputs[output_key] = attention_out
             if (
                 self._can_use_fused_copy_sfa()
-                and source_ids is not None
+                and topk_src_ids is not None
                 and miss_counts is not None
             ):
                 if context.dram_block_tables is None:
                     raise RuntimeError(
                         "Fused Attention+SCATTER requires DRAM block tables."
                     )
-                latent, _, _ = (
-                    fused_copy_sfa(
-                        ql_nope,
-                        latent_kv_cache,
-                        sparse_slots[:batch_size],
-                        context.lidu_cache_tokens[:batch_size],
-                        context.block_tables[:batch_size],
-                        context.candidate_query_lens[:batch_size],
-                        context.actual_seq_lengths_kv_tensor[:batch_size],
-                        q_pe,
-                        hbm_kpe,
-                        self.dram_kpe_cache.squeeze(2),
-                        self.dram_ckv_cache.squeeze(2),
-                        context.dram_block_tables[:batch_size],
-                        source_ids.view(batch_size, -1),
-                        miss_counts[:batch_size],
-                        self.scale,
-                    )
-                )
-            else:
-                latent = sparse_tail_attention(
+                fused_copy_sfa(
+                    q_pe,
                     ql_nope,
-                    latent_kv_cache,
-                    sparse_slots[:batch_size],
-                    context.lidu_cache_tokens[:batch_size],
-                    context.block_tables[:batch_size],
                     context.candidate_query_lens[:batch_size],
                     context.actual_seq_lengths_kv_tensor[:batch_size],
-                    q_pe,
+                    context.lidu_cache_tokens[:batch_size],
+                    topk_dst_slots[:batch_size],
+                    topk_src_ids.view(batch_size, -1),
+                    miss_counts[:batch_size],
+                    context.block_tables[:batch_size],
+                    context.dram_block_tables[:batch_size],
                     hbm_kpe,
+                    latent_kv_cache,
+                    self.dram_kpe_cache.squeeze(2),
+                    self.dram_ckv_cache.squeeze(2),
                     self.scale,
+                    attention_out,
                 )
+            else:
+                sparse_tail_attention(
+                    q_pe,
+                    ql_nope,
+                    context.candidate_query_lens[:batch_size],
+                    context.actual_seq_lengths_kv_tensor[:batch_size],
+                    context.lidu_cache_tokens[:batch_size],
+                    topk_dst_slots[:batch_size],
+                    context.block_tables[:batch_size],
+                    hbm_kpe,
+                    latent_kv_cache,
+                    self.scale,
+                    attention_out,
+                )
+            latent = attention_out
             latent_for_v_up = latent.transpose(0, 1).contiguous()
         else:
             latent = self._decode_forward_mla_v2(

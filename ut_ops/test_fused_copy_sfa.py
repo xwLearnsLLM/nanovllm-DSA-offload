@@ -43,6 +43,8 @@ class Case:
     serial_ckv: torch.Tensor
     fused_kpe: torch.Tensor
     fused_ckv: torch.Tensor
+    serial_out: torch.Tensor
+    fused_out: torch.Tensor
     scale: float
 
 
@@ -221,12 +223,19 @@ def make_case(args: argparse.Namespace) -> Case:
         serial_ckv=initial_ckv.clone(),
         fused_kpe=initial_kpe.clone(),
         fused_ckv=initial_ckv.clone(),
+        serial_out=torch.empty_like(query),
+        fused_out=torch.empty_like(query),
         scale=1.0 / math.sqrt(CKV_DIM + KPE_DIM),
     )
 
 
 def launch_serial(case: Case) -> torch.Tensor:
     torch.ops.nanovllm_dsa.scatter_copy.default(
+        case.source_token_ids,
+        case.sparse_slots.view(case.sparse_slots.size(0), SPARSE_COUNT),
+        case.copy_counts,
+        case.hbm_block_table,
+        case.dram_block_table,
         case.serial_kpe.view(
             case.serial_kpe.size(0), BLOCK_SIZE, KPE_DIM
         ),
@@ -235,53 +244,52 @@ def launch_serial(case: Case) -> torch.Tensor:
         ),
         case.dram_kpe,
         case.dram_ckv,
-        case.hbm_block_table,
-        case.dram_block_table,
-        case.source_token_ids,
-        case.sparse_slots.view(case.sparse_slots.size(0), SPARSE_COUNT),
-        case.copy_counts,
     )
-    return torch.ops.nanovllm_dsa.sparse_tail_attention.default(
+    torch.ops.nanovllm_dsa.sparse_tail_attention.default(
+        case.query_rope,
         case.query,
-        case.serial_ckv,
-        case.serial_ckv,
-        case.sparse_slots,
-        case.cache_tokens,
-        case.hbm_block_table,
         case.actual_q,
         case.actual_kv,
-        case.query_rope,
+        case.cache_tokens,
+        case.sparse_slots,
+        case.hbm_block_table,
         case.serial_kpe,
+        case.serial_ckv,
         case.scale,
+        case.serial_out,
     )
+    return case.serial_out
 
 
 def launch_fused(case: Case) -> torch.Tensor:
-    output, _, _ = (
-        torch.ops.nanovllm_dsa
-        .fused_copy_sfa.default(
-            case.query,
-            case.fused_ckv,
-            case.sparse_slots,
-            case.cache_tokens,
-            case.hbm_block_table,
-            case.actual_q,
-            case.actual_kv,
-            case.query_rope,
-            case.fused_kpe,
-            case.dram_kpe,
-            case.dram_ckv,
-            case.dram_block_table,
-            case.source_token_ids,
-            case.copy_counts,
-            case.scale,
-        )
+    torch.ops.nanovllm_dsa.fused_copy_sfa.default(
+        case.query_rope,
+        case.query,
+        case.actual_q,
+        case.actual_kv,
+        case.cache_tokens,
+        case.sparse_slots,
+        case.source_token_ids,
+        case.copy_counts,
+        case.hbm_block_table,
+        case.dram_block_table,
+        case.fused_kpe,
+        case.fused_ckv,
+        case.dram_kpe,
+        case.dram_ckv,
+        case.scale,
+        case.fused_out,
     )
-    return output
+    return case.fused_out
 
 
-def launch_scatter_only(case: Case) -> tuple[torch.Tensor, torch.Tensor]:
-    return torch.ops.nanovllm_dsa.scatter_copy.default(
+def launch_scatter_only(case: Case) -> None:
+    torch.ops.nanovllm_dsa.scatter_copy.default(
+        case.source_token_ids,
+        case.sparse_slots.view(case.sparse_slots.size(0), SPARSE_COUNT),
+        case.copy_counts,
+        case.hbm_block_table,
+        case.dram_block_table,
         case.serial_kpe.view(
             case.serial_kpe.size(0), BLOCK_SIZE, KPE_DIM
         ),
@@ -290,28 +298,24 @@ def launch_scatter_only(case: Case) -> tuple[torch.Tensor, torch.Tensor]:
         ),
         case.dram_kpe,
         case.dram_ckv,
-        case.hbm_block_table,
-        case.dram_block_table,
-        case.source_token_ids,
-        case.sparse_slots.view(case.sparse_slots.size(0), SPARSE_COUNT),
-        case.copy_counts,
     )
 
 
 def launch_sfa_only(case: Case) -> torch.Tensor:
-    return torch.ops.nanovllm_dsa.sparse_tail_attention.default(
+    torch.ops.nanovllm_dsa.sparse_tail_attention.default(
+        case.query_rope,
         case.query,
-        case.serial_ckv,
-        case.serial_ckv,
-        case.sparse_slots,
-        case.cache_tokens,
-        case.hbm_block_table,
         case.actual_q,
         case.actual_kv,
-        case.query_rope,
+        case.cache_tokens,
+        case.sparse_slots,
+        case.hbm_block_table,
         case.serial_kpe,
+        case.serial_ckv,
         case.scale,
+        case.serial_out,
     )
+    return case.serial_out
 
 
 def active_physical_token_indices(
