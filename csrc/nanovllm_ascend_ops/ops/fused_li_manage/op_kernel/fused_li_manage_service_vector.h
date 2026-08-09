@@ -1088,7 +1088,12 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
                    missMask.template ReinterpretCast<uint32_t>(), true,
                    BASE_TOPK, compactParams, tokenMissCount);
         PipeBarrier<PIPE_V>();
-        Select(topkPayloads, missMask, topkPayloads, invalidSource,
+        // C220 vsel has no int32 tensor overload. Reinterpret the int32
+        // payloads as float so vsel copies the same 32-bit lanes without a
+        // numeric conversion.
+        Select(topkPayloads.template ReinterpretCast<float>(), missMask,
+               topkPayloads.template ReinterpretCast<float>(),
+               invalidSource.template ReinterpretCast<float>(),
                AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE, BASE_TOPK);
         PipeBarrier<PIPE_V>();
         SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
