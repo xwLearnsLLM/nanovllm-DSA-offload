@@ -102,7 +102,8 @@ public:
         GlobalTensor<int32_t> missDestinationSlotsGm,
         GlobalTensor<int32_t> missCountGm,
         GlobalTensor<float> scoresGm,
-        GlobalTensor<int32_t> mtpTopkPayloadsGm);
+        GlobalTensor<int32_t> mtpTopkPayloadsGm,
+        GlobalTensor<float> mtpThresholdsGm);
     __aicore__ inline void InitPartialMetadata(uint32_t coreIdx);
     __aicore__ inline void FinalizePartialRequest(uint32_t bIdx, uint32_t cacheRowIdx,
                                                   uint32_t actualSeqLen,
@@ -128,6 +129,7 @@ protected:
     GlobalTensor<int32_t> mtpTopkSourceIdsGm;
     GlobalTensor<int32_t> mtpMissSourceIdsGm;
     GlobalTensor<int32_t> mtpMissDestinationSlotsGm;
+    GlobalTensor<float> mtpThresholdsGm;
 
 private:
     // queue
@@ -298,7 +300,8 @@ __aicore__ inline void LIVector<LIT>::InitMtpGlobalTensor(
     GlobalTensor<int32_t> missDestinationSlotsGm,
     GlobalTensor<int32_t> missCountGm,
     GlobalTensor<float> scoresGm,
-    GlobalTensor<int32_t> mtpTopkPayloadsGm)
+    GlobalTensor<int32_t> mtpTopkPayloadsGm,
+    GlobalTensor<float> mtpThresholdsGm)
 {
     this->mm1ResGm = mm1ResGm;
     this->weightsGm = weightsGm;
@@ -310,6 +313,7 @@ __aicore__ inline void LIVector<LIT>::InitMtpGlobalTensor(
     this->missCountGm = missCountGm;
     this->scoresGm = scoresGm;
     this->mtpTopkPayloadsGm = mtpTopkPayloadsGm;
+    this->mtpThresholdsGm = mtpThresholdsGm;
 }
 
 template <typename LIT>
@@ -888,6 +892,10 @@ __aicore__ inline void LIVector<LIT>::StoreMtpQueryTopK(const LICommon::RunInfo 
 {
     LocalTensor<float> valueLocal = outQueue_.AllocTensor<float>();
     LocalTensor<uint32_t> payloadLocal = valueLocal.template ReinterpretCast<uint32_t>();
+    SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
+    mtpThresholdsGm.SetValue(
+        info.queryRow,
+        globalTopkUb_.GetValue((BASE_TOPK - 1U) * VALUE_AND_INDEX_NUM));
     ExtractIndex(payloadLocal, globalTopkUb_.template ReinterpretCast<uint32_t>(), BASE_TOPK);
 
     uint64_t rowOffset = static_cast<uint64_t>(info.queryRow) * BASE_TOPK;
@@ -914,40 +922,71 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
     LocalTensor<int32_t> destinationSlots = slotStorage.template ReinterpretCast<int32_t>();
     LocalTensor<int32_t> topkPayloads = payloadBuf_.Get<int32_t>();
 
-    const uint32_t activeUnionWords =
-        Min(CeilDiv(info.actS2Size, 32U), MTP_UNION_BITSET_WORDS);
-    Duplicate(unionBits, 0U, activeUnionWords);
-    PipeBarrier<PIPE_V>();
-    SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
-
     const uint64_t cacheBase =
         static_cast<uint64_t>(info.cacheRowIdx) * cacheSlotsSize_;
+    const uint32_t activeUnionWords =
+        Min(CeilDiv(info.actS2Size, 32U), MTP_UNION_BITSET_WORDS);
     uint32_t missCount = 0;
     AscendC::DataCopyExtParams copyIn{1, BASE_TOPK * sizeof(int32_t), 0, 0, 0};
     AscendC::DataCopyPadExtParams<int32_t> intPad{false, 0, 0, 0};
-    for (uint32_t queryIdx = 0; queryIdx < MTP_QUERY_COUNT; ++queryIdx) {
-        uint64_t rowOffset =
-            static_cast<uint64_t>(info.bIdx * MTP_QUERY_COUNT + queryIdx) * BASE_TOPK;
-        DataCopyPad(topkPayloads, mtpTopkPayloadsGm[rowOffset], copyIn, intPad);
-        SetWaitFlag<HardEvent::MTE2_S>(HardEvent::MTE2_S);
-        for (uint32_t topkIdx = 0; topkIdx < BASE_TOPK; ++topkIdx) {
-            uint32_t payload =
-                static_cast<uint32_t>(topkPayloads.GetValue(topkIdx));
-            uint32_t token = payload & INDEX_MASK;
-            int32_t oldSlot = static_cast<int32_t>(payload >> INDEX_BITS);
-            if (token >= info.actS2Size) {
-                continue;
-            }
-            uint32_t wordIdx = token >> 5U;
-            uint32_t mask = 1U << (token & 31U);
-            uint32_t word = unionBits.GetValue(wordIdx);
-            if ((word & mask) != 0U) {
-                continue;
-            }
-            unionBits.SetValue(wordIdx, word | mask);
-            if (oldSlot == INVALID_SLOT14 ||
-                static_cast<uint32_t>(oldSlot) >= info.cacheTokenCount) {
-                missTokens.SetValue(missCount++, static_cast<int32_t>(token));
+
+    // Build the ordered unique miss union without walking all 4*2048 TopK
+    // entries on the scalar pipeline.  Vector instructions decode each row
+    // and compact only its misses; the scalar bitset work is therefore
+    // O(query misses), about 4*200 entries for the target workload.
+    Duplicate(unionBits, 0U, activeUnionWords);
+    PipeBarrier<PIPE_V>();
+    {
+        LocalTensor<int32_t> decodedSlots = destinationSlots;
+        LocalTensor<int32_t> decodeScratch = destinationSlots[BASE_TOPK];
+        LocalTensor<int32_t> rowMissTokens = destinationSlots[BASE_TOPK * 2U];
+        LocalTensor<uint8_t> missMask =
+            destinationSlots[BASE_TOPK * 3U].template ReinterpretCast<uint8_t>();
+        AscendC::GatherMaskParams compactParams;
+        compactParams.repeatTimes = 1;
+        compactParams.src0BlockStride = 1;
+        compactParams.src0RepeatStride = B32_VEC_REPEAT_STRIDE;
+        compactParams.src1RepeatStride = B32_VEC_REPEAT_STRIDE;
+
+        for (uint32_t queryIdx = 0; queryIdx < MTP_QUERY_COUNT; ++queryIdx) {
+            uint64_t rowOffset =
+                static_cast<uint64_t>(info.bIdx * MTP_QUERY_COUNT + queryIdx) * BASE_TOPK;
+            SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
+            DataCopyPad(topkPayloads, mtpTopkPayloadsGm[rowOffset], copyIn, intPad);
+            SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
+            DecodeSlotFromPayload(
+                decodedSlots.template ReinterpretCast<uint32_t>(),
+                topkPayloads.template ReinterpretCast<uint32_t>(),
+                decodeScratch, BASE_TOPK);
+            DecodeIndexFromPayload(
+                topkPayloads.template ReinterpretCast<uint32_t>(),
+                topkPayloads.template ReinterpretCast<uint32_t>(), BASE_TOPK);
+            CompareScalar(missMask, decodedSlots,
+                          LICommon::ConstInfo::INVALID_IDX,
+                          AscendC::CMPMODE::EQ, BASE_TOPK);
+            PipeBarrier<PIPE_V>();
+
+            uint64_t rowMissCount = 0;
+            GatherMask(rowMissTokens, topkPayloads,
+                       missMask.template ReinterpretCast<uint32_t>(), true,
+                       BASE_TOPK, compactParams, rowMissCount);
+            PipeBarrier<PIPE_V>();
+            SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
+            for (uint32_t rowMissIdx = 0;
+                 rowMissIdx < static_cast<uint32_t>(rowMissCount);
+                 ++rowMissIdx) {
+                uint32_t token =
+                    static_cast<uint32_t>(rowMissTokens.GetValue(rowMissIdx));
+                if (token >= info.actS2Size) {
+                    continue;
+                }
+                uint32_t wordIdx = token >> 5U;
+                uint32_t mask = 1U << (token & 31U);
+                uint32_t word = unionBits.GetValue(wordIdx);
+                if ((word & mask) == 0U) {
+                    unionBits.SetValue(wordIdx, word | mask);
+                    missTokens.SetValue(missCount++, static_cast<int32_t>(token));
+                }
             }
         }
     }
@@ -965,57 +1004,131 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
                             3.0e38f, SortedBasicBlock_);
     }
 
-    uint32_t candidateCursor = 0;
-    uint32_t fallbackCursor = 0;
     uint32_t updateCount = 0;
     LocalTensor<uint32_t> candidateBits =
         evictCandidateUb_.template ReinterpretCast<uint32_t>();
-    while (updateCount < missCount) {
-        uint32_t evictToken = 0;
-        int32_t evictSlot = LICommon::ConstInfo::INVALID_IDX;
-        bool found = false;
-        while (candidateCursor < candidateCap) {
-            uint32_t payload =
-                candidateBits.GetValue(candidateCursor * VALUE_AND_INDEX_NUM + 1U);
-            ++candidateCursor;
+    bool safeCandidatePrefix = (missCount == 0U);
+    if (missCount > 0U && missCount <= candidateCap) {
+        float minThreshold = mtpThresholdsGm.GetValue(info.bIdx * MTP_QUERY_COUNT);
+        bool thresholdsValid = (minThreshold == minThreshold);
+        for (uint32_t queryIdx = 1U; queryIdx < MTP_QUERY_COUNT; ++queryIdx) {
+            float threshold = mtpThresholdsGm.GetValue(
+                info.bIdx * MTP_QUERY_COUNT + queryIdx);
+            thresholdsValid = thresholdsValid && (threshold == threshold);
+            minThreshold = threshold < minThreshold ? threshold : minThreshold;
+        }
+        const float safeStopKey = -minThreshold;
+        SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
+        safeCandidatePrefix = thresholdsValid;
+        for (uint32_t candidateIdx = 0; candidateIdx < missCount; ++candidateIdx) {
+            float candidateKey = evictCandidateUb_.GetValue(
+                candidateIdx * VALUE_AND_INDEX_NUM);
+            uint32_t payload = candidateBits.GetValue(
+                candidateIdx * VALUE_AND_INDEX_NUM + 1U);
             uint32_t token = payload & INDEX_MASK;
             int32_t slot = static_cast<int32_t>(payload >> INDEX_BITS);
-            if (slot == INVALID_SLOT14 || token >= info.actS2Size ||
+            // Strict inequality keeps threshold ties on the exact path.
+            if (!(candidateKey > safeStopKey) || slot == INVALID_SLOT14 ||
+                token >= info.actS2Size ||
                 static_cast<uint32_t>(slot) >= info.cacheTokenCount) {
-                continue;
+                safeCandidatePrefix = false;
+                break;
             }
-            uint32_t unionWord = unionBits.GetValue(token >> 5U);
-            if ((unionWord & (1U << (token & 31U))) != 0U) {
-                continue;
-            }
-            evictToken = token;
-            evictSlot = slot;
-            found = true;
-            break;
         }
-        while (!found && fallbackCursor < info.actS2Size) {
-            uint32_t token = fallbackCursor++;
-            int32_t slot = cacheSlotsGm.GetValue(cacheBase + token);
-            if (slot < 0 || static_cast<uint32_t>(slot) >= info.cacheTokenCount) {
-                continue;
-            }
-            uint32_t unionWord = unionBits.GetValue(token >> 5U);
-            if ((unionWord & (1U << (token & 31U))) != 0U) {
-                continue;
-            }
-            evictToken = token;
-            evictSlot = slot;
-            found = true;
+    }
+
+    if (safeCandidatePrefix) {
+        // Every selected victim scores below all four TopK thresholds, so it
+        // cannot belong to their union.  The candidate order is unchanged
+        // from the exact path; only its 8192-entry membership scan is skipped.
+        for (; updateCount < missCount; ++updateCount) {
+            uint32_t payload = candidateBits.GetValue(
+                updateCount * VALUE_AND_INDEX_NUM + 1U);
+            uint32_t evictToken = payload & INDEX_MASK;
+            int32_t evictSlot = static_cast<int32_t>(payload >> INDEX_BITS);
+            uint32_t missToken =
+                static_cast<uint32_t>(missTokens.GetValue(updateCount));
+            cacheSlotsGm.SetValue(cacheBase + evictToken,
+                                  LICommon::ConstInfo::INVALID_IDX);
+            cacheSlotsGm.SetValue(cacheBase + missToken, evictSlot);
+            destinationSlots.SetValue(updateCount, evictSlot);
         }
-        if (!found) {
-            break;
+    } else {
+        // Ties or an unsafe candidate require the original exact membership
+        // path.  Reconstruct the complete union and retain the same candidate
+        // and fallback ordering as before the fast path.
+        Duplicate(unionBits, 0U, activeUnionWords);
+        PipeBarrier<PIPE_V>();
+        SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
+        for (uint32_t queryIdx = 0; queryIdx < MTP_QUERY_COUNT; ++queryIdx) {
+            uint64_t rowOffset =
+                static_cast<uint64_t>(info.bIdx * MTP_QUERY_COUNT + queryIdx) * BASE_TOPK;
+            DataCopyPad(topkPayloads, mtpTopkPayloadsGm[rowOffset], copyIn, intPad);
+            SetWaitFlag<HardEvent::MTE2_S>(HardEvent::MTE2_S);
+            for (uint32_t topkIdx = 0; topkIdx < BASE_TOPK; ++topkIdx) {
+                uint32_t token = static_cast<uint32_t>(
+                    topkPayloads.GetValue(topkIdx)) & INDEX_MASK;
+                if (token >= info.actS2Size) {
+                    continue;
+                }
+                uint32_t wordIdx = token >> 5U;
+                uint32_t mask = 1U << (token & 31U);
+                unionBits.SetValue(wordIdx,
+                                   unionBits.GetValue(wordIdx) | mask);
+            }
         }
 
-        uint32_t missToken = static_cast<uint32_t>(missTokens.GetValue(updateCount));
-        cacheSlotsGm.SetValue(cacheBase + evictToken, LICommon::ConstInfo::INVALID_IDX);
-        cacheSlotsGm.SetValue(cacheBase + missToken, evictSlot);
-        destinationSlots.SetValue(updateCount, evictSlot);
-        ++updateCount;
+        uint32_t candidateCursor = 0;
+        uint32_t fallbackCursor = 0;
+        while (updateCount < missCount) {
+            uint32_t evictToken = 0;
+            int32_t evictSlot = LICommon::ConstInfo::INVALID_IDX;
+            bool found = false;
+            while (candidateCursor < candidateCap) {
+                uint32_t payload = candidateBits.GetValue(
+                    candidateCursor * VALUE_AND_INDEX_NUM + 1U);
+                ++candidateCursor;
+                uint32_t token = payload & INDEX_MASK;
+                int32_t slot = static_cast<int32_t>(payload >> INDEX_BITS);
+                if (slot == INVALID_SLOT14 || token >= info.actS2Size ||
+                    static_cast<uint32_t>(slot) >= info.cacheTokenCount) {
+                    continue;
+                }
+                uint32_t unionWord = unionBits.GetValue(token >> 5U);
+                if ((unionWord & (1U << (token & 31U))) != 0U) {
+                    continue;
+                }
+                evictToken = token;
+                evictSlot = slot;
+                found = true;
+                break;
+            }
+            while (!found && fallbackCursor < info.actS2Size) {
+                uint32_t token = fallbackCursor++;
+                int32_t slot = cacheSlotsGm.GetValue(cacheBase + token);
+                if (slot < 0 || static_cast<uint32_t>(slot) >= info.cacheTokenCount) {
+                    continue;
+                }
+                uint32_t unionWord = unionBits.GetValue(token >> 5U);
+                if ((unionWord & (1U << (token & 31U))) != 0U) {
+                    continue;
+                }
+                evictToken = token;
+                evictSlot = slot;
+                found = true;
+            }
+            if (!found) {
+                break;
+            }
+
+            uint32_t missToken =
+                static_cast<uint32_t>(missTokens.GetValue(updateCount));
+            cacheSlotsGm.SetValue(cacheBase + evictToken,
+                                  LICommon::ConstInfo::INVALID_IDX);
+            cacheSlotsGm.SetValue(cacheBase + missToken, evictSlot);
+            destinationSlots.SetValue(updateCount, evictSlot);
+            ++updateCount;
+        }
     }
     PipeBarrier<PIPE_ALL>();
 

@@ -63,6 +63,7 @@ private:
     GlobalTensor<MM1_OUT_T> mm1ResGm;
     GlobalTensor<float> aggregateScoresGm;
     GlobalTensor<int32_t> internalTopkPayloadsGm;
+    GlobalTensor<float> internalThresholdsGm;
 
     uint32_t tmpBlockIdx = 0;
     uint32_t aiCoreIdx = 0;
@@ -137,6 +138,10 @@ __aicore__ inline void LIMtpPreload<LIT>::Init(
         constInfo.batchSize * scoreStride * sizeof(float);
     internalTopkPayloadsGm.SetGlobalBuffer(
         (__gm__ int32_t *)(workspace + topkOffset));
+    uint64_t thresholdOffset = topkOffset +
+        constInfo.batchSize * MAX_UNION_TOKENS * sizeof(int32_t);
+    internalThresholdsGm.SetGlobalBuffer(
+        (__gm__ float *)(workspace + thresholdOffset));
 
     reqPoolEntriesGm.SetGlobalBuffer((__gm__ int32_t *)reqPoolEntries,
                                      constInfo.batchSize);
@@ -162,7 +167,8 @@ __aicore__ inline void LIMtpPreload<LIT>::Init(
             mm1ResGm, weightsGm, cacheSlotsGm, topkSlotsGm,
             topkSourceIdsGm,
             missSourceIdsGm, missDestinationSlotsGm, missCountsGm,
-            aggregateScoresGm, internalTopkPayloadsGm);
+            aggregateScoresGm, internalTopkPayloadsGm,
+            internalThresholdsGm);
         vectorService.InitMtpBuffers(pipe);
     } else {
         matmulService.InitParams(constInfo);
