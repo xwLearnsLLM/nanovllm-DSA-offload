@@ -1489,8 +1489,13 @@ __aicore__ inline void SFAVectorService<SFAT>::MergeKv(const RunInfo &runInfo)
             static_cast<int64_t>(runInfo.s2Idx) *
             constInfo.s2BaseSize;
         if (virtualTileStart < runInfo.sparseTokenCount) {
+            // The staggered schedule assumes the compact miss-prefix layout
+            // used by single-query COPYSFA.  MTP uses per-topk aligned miss
+            // metadata, so preserve source order until it has a dedicated
+            // schedule; otherwise a reused merge buffer can pair a later
+            // source row with an earlier destination slot.
             const int64_t sourceTileStart =
-                missCount > 0
+                missCount > 0 && !SFAT::mtp3Mode
                     ? GetStaggeredSparseIndex(
                           virtualTileStart, runInfo)
                     : virtualTileStart;
