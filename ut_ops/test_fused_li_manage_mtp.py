@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import statistics
+from collections.abc import Callable
 from dataclasses import dataclass
-from time import perf_counter
 
 import torch
 import torch_npu  # type: ignore
@@ -60,10 +61,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--graph-replays", type=int, default=3)
     parser.add_argument(
-        "--perf-miss-count",
+        "--perf-query-miss-count",
         type=int,
-        default=300,
-        help="Exact unique union misses per request in the target benchmark.",
+        default=200,
+        help="Exact old-cache misses in each of the four TopK2048 rows.",
+    )
+    parser.add_argument(
+        "--perf-query-noise",
+        type=float,
+        default=0.25,
+        help=(
+            "Noise applied to four correlated queries. The resulting TopK union "
+            "should be about 3000-4000 tokens per request."
+        ),
     )
     parser.add_argument(
         "--skip-performance",
@@ -90,15 +100,17 @@ def _validate_cli(args: argparse.Namespace) -> None:
         raise ValueError(
             "--warmup/--graph-replays must be >=0 and --iters must be >0."
         )
-    if not 0 <= args.perf_miss_count <= UNION_CAPACITY:
-        raise ValueError("--perf-miss-count must be in [0,8192].")
+    if not 0 <= args.perf_query_miss_count <= TOPK:
+        raise ValueError("--perf-query-miss-count must be in [0,2048].")
+    if args.perf_query_noise <= 0:
+        raise ValueError("--perf-query-noise must be positive.")
     if (
         not args.skip_performance
         and args.cache_tokens == args.source_len
-        and args.perf_miss_count != 0
+        and args.perf_query_miss_count != 0
     ):
         raise ValueError(
-            "--perf-miss-count must be 0 when the full source is cached."
+            "--perf-query-miss-count must be 0 when the full source is cached."
         )
 
 
@@ -122,6 +134,32 @@ def _ordered_union(rows: list[torch.Tensor]) -> torch.Tensor:
                 seen.add(token)
                 ordered.append(token)
     return torch.tensor(ordered, dtype=torch.int64)
+
+
+def _call_native_li(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    weights: torch.Tensor,
+    block_table: torch.Tensor,
+    candidate_lens: torch.Tensor,
+    query_ends: torch.Tensor,
+) -> torch.Tensor:
+    result = torch_npu.npu_lightning_indexer(
+        query=query,
+        key=key,
+        weights=weights,
+        actual_seq_lengths_query=query_ends,
+        actual_seq_lengths_key=candidate_lens,
+        block_table=block_table,
+        layout_query="TND",
+        layout_key="PA_BSND",
+        sparse_count=TOPK,
+        sparse_mode=3,
+    )
+    topk = result[0] if isinstance(result, (tuple, list)) else result
+    if not isinstance(topk, torch.Tensor):
+        raise TypeError("native LightningIndexer did not return a Tensor")
+    return topk
 
 
 def _native_topk(
@@ -163,21 +201,14 @@ def _native_topk(
         dtype=torch.int32,
         device=query.device,
     )
-    result = torch_npu.npu_lightning_indexer(
-        query=active_query,
-        key=key,
-        weights=active_weights,
-        actual_seq_lengths_query=query_ends,
-        actual_seq_lengths_key=active_lens,
-        block_table=active_table,
-        layout_query="TND",
-        layout_key="PA_BSND",
-        sparse_count=TOPK,
-        sparse_mode=3,
+    topk = _call_native_li(
+        active_query,
+        key,
+        active_weights,
+        active_table,
+        active_lens,
+        query_ends,
     )
-    topk = result[0] if isinstance(result, (tuple, list)) else result
-    if not isinstance(topk, torch.Tensor):
-        raise TypeError("native LightningIndexer did not return a Tensor")
     expected_shape = (len(active_query_rows), 1, TOPK)
     if tuple(topk.shape) != expected_shape:
         raise AssertionError(
@@ -277,6 +308,130 @@ def _make_cache_state(
     return state.contiguous(), unions
 
 
+def _make_balanced_mtp_cache_state(
+    *,
+    topk_rows: list[torch.Tensor],
+    candidate_lens: tuple[int, ...],
+    cache_tokens: tuple[int, ...],
+    req_pool_entries: torch.Tensor,
+    source_capacity: int,
+    per_query_miss_count: int,
+    generator: torch.Generator,
+    pool_size: int,
+) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    """Build the MTP3 performance state without redefining miss as union miss.
+
+    Up to half of each query's misses are shared by all four queries. The rest
+    use exact pair-membership buckets on opposite query-pair edges. For the
+    target value 200 this gives exactly 200 misses in every TopK row and
+    300-400 unique union misses per request.
+    """
+
+    state = torch.full((pool_size, source_capacity), -777, dtype=torch.int32)
+    unions: list[torch.Tensor] = []
+    for request, (candidate_len, budget) in enumerate(
+        zip(candidate_lens, cache_tokens)
+    ):
+        pool_row = int(req_pool_entries[request])
+        state[pool_row].fill_(-1)
+        rows = topk_rows[request * QUERY_COUNT : (request + 1) * QUERY_COUNT]
+        union = _ordered_union(rows)
+        unions.append(union)
+        if budget == 0:
+            if per_query_miss_count:
+                raise ValueError("C=0 rows cannot have performance misses")
+            continue
+        if union.numel() > budget:
+            raise AssertionError(
+                f"request={request}: TopK union={union.numel()} exceeds C={budget}"
+            )
+        if budget == candidate_len and per_query_miss_count:
+            raise ValueError("fully cached rows cannot have performance misses")
+
+        membership = torch.zeros(candidate_len, dtype=torch.uint8)
+        for query_idx, row in enumerate(rows):
+            membership[row] |= 1 << query_idx
+        available_by_mask = {
+            mask: torch.nonzero(membership == mask).flatten().to(torch.int64)
+            for mask in range(1, 1 << QUERY_COUNT)
+        }
+        selected_parts: list[torch.Tensor] = []
+        common = available_by_mask[0b1111]
+        common_count = min(per_query_miss_count // 2, int(common.numel()))
+        selected_parts.append(common[:common_count])
+        pair_degree = per_query_miss_count - common_count
+        opposite_pair_masks = (
+            (0b0011, 0b1100),
+            (0b0101, 0b1010),
+            (0b1001, 0b0110),
+        )
+        capacities = [
+            min(
+                int(available_by_mask[left].numel()),
+                int(available_by_mask[right].numel()),
+            )
+            for left, right in opposite_pair_masks
+        ]
+        if sum(capacities) < pair_degree:
+            raise AssertionError(
+                f"request={request}: pair-overlap capacity={capacities} cannot "
+                f"supply degree={pair_degree}; adjust --perf-query-noise"
+            )
+        pair_counts = [min(pair_degree // 3, capacity) for capacity in capacities]
+        remaining = pair_degree - sum(pair_counts)
+        while remaining:
+            progressed = False
+            for idx, capacity in enumerate(capacities):
+                if pair_counts[idx] < capacity:
+                    pair_counts[idx] += 1
+                    remaining -= 1
+                    progressed = True
+                    if remaining == 0:
+                        break
+            if not progressed:
+                raise AssertionError("failed to distribute pair-overlap misses")
+        wanted_by_mask: dict[int, int] = {}
+        for (left, right), count in zip(opposite_pair_masks, pair_counts):
+            wanted_by_mask[left] = count
+            wanted_by_mask[right] = count
+        for mask, wanted in wanted_by_mask.items():
+            available = available_by_mask[mask]
+            selected_parts.append(available[:wanted])
+        selected_misses = torch.cat(selected_parts)
+        if torch.unique(selected_misses).numel() != selected_misses.numel():
+            raise AssertionError("balanced MTP miss construction produced duplicates")
+
+        per_query_counts = [
+            int(torch.isin(selected_misses, row).sum()) for row in rows
+        ]
+        if per_query_counts != [per_query_miss_count] * QUERY_COUNT:
+            raise AssertionError(
+                f"request={request}: constructed per-query misses="
+                f"{per_query_counts}, expected={per_query_miss_count}"
+            )
+
+        missing_mask = torch.zeros(candidate_len, dtype=torch.bool)
+        missing_mask[selected_misses] = True
+        hits = union[~missing_mask[union]]
+        union_mask = torch.zeros(candidate_len, dtype=torch.bool)
+        union_mask[union] = True
+        fillers = torch.arange(candidate_len, dtype=torch.int64)[~union_mask]
+        needed = budget - int(hits.numel())
+        if needed < 0 or fillers.numel() < needed:
+            raise AssertionError(
+                f"request={request}: cannot build C={budget} cache with "
+                f"{selected_misses.numel()} selected misses"
+            )
+        cached = torch.cat((hits, fillers[:needed]))
+        if cached.numel() != budget or torch.unique(cached).numel() != budget:
+            raise AssertionError("balanced initial cache must contain exactly C tokens")
+        state[pool_row, cached] = torch.randperm(
+            budget, generator=generator
+        ).to(torch.int32)
+
+    return state.contiguous(), unions
+
+
 def make_case(
     *,
     name: str,
@@ -288,6 +443,8 @@ def make_case(
     seed: int,
     source_capacity: int | None = None,
     exact_miss_counts: tuple[int, ...] | None = None,
+    correlated_query_noise: float | None = None,
+    balanced_query_miss_count: int | None = None,
 ) -> MtpCase:
     batch_size = len(candidate_lens)
     if not (
@@ -318,20 +475,43 @@ def make_case(
     candidate_cpu = torch.tensor(candidate_lens, dtype=torch.int32)
     cache_tokens_cpu = torch.tensor(cache_tokens, dtype=torch.int32)
 
-    query_cpu = torch.randn(
-        batch_size * QUERY_COUNT,
-        HEADS,
-        HEAD_DIM,
-        generator=generator,
-        dtype=torch.float32,
-    ).to(dtype)
-    # Positive weights match GLM indexer usage and avoid unstable cancellation.
-    weights_cpu = torch.rand(
-        batch_size * QUERY_COUNT,
-        HEADS,
-        generator=generator,
-        dtype=torch.float32,
-    ).to(dtype)
+    if correlated_query_noise is None:
+        query_cpu = torch.randn(
+            batch_size * QUERY_COUNT,
+            HEADS,
+            HEAD_DIM,
+            generator=generator,
+            dtype=torch.float32,
+        )
+        # Positive weights match GLM indexer usage and avoid unstable cancellation.
+        weights_cpu = torch.rand(
+            batch_size * QUERY_COUNT,
+            HEADS,
+            generator=generator,
+            dtype=torch.float32,
+        )
+    else:
+        if correlated_query_noise <= 0:
+            raise ValueError("correlated query noise must be positive")
+        base_query = torch.randn(
+            batch_size, 1, HEADS, HEAD_DIM, generator=generator
+        )
+        query_noise = torch.randn(
+            batch_size, QUERY_COUNT, HEADS, HEAD_DIM, generator=generator
+        )
+        query_cpu = (
+            base_query + correlated_query_noise * query_noise
+        ).reshape(batch_size * QUERY_COUNT, HEADS, HEAD_DIM)
+        # One request's four nearby decode positions use the same positive
+        # head weighting in this focused index-management benchmark.
+        base_weights = torch.rand(
+            batch_size, 1, HEADS, generator=generator, dtype=torch.float32
+        )
+        weights_cpu = base_weights.expand(-1, QUERY_COUNT, -1).reshape(
+            batch_size * QUERY_COUNT, HEADS
+        ).contiguous()
+    query_cpu = query_cpu.to(dtype)
+    weights_cpu = weights_cpu.to(dtype)
     torch.manual_seed(seed + 991)
     key = torch.randn(
         physical_blocks,
@@ -353,17 +533,33 @@ def make_case(
         candidate,
         cache_tokens_cpu,
     )
-    cache_cpu, union_rows = _make_cache_state(
-        topk_rows=topk_rows,
-        candidate_lens=candidate_lens,
-        cache_tokens=cache_tokens,
-        req_pool_entries=req_entries_cpu,
-        source_capacity=capacity,
-        miss_fractions=miss_fractions,
-        generator=generator,
-        pool_size=batch_size + 3,
-        exact_miss_counts=exact_miss_counts,
-    )
+    if balanced_query_miss_count is None:
+        cache_cpu, union_rows = _make_cache_state(
+            topk_rows=topk_rows,
+            candidate_lens=candidate_lens,
+            cache_tokens=cache_tokens,
+            req_pool_entries=req_entries_cpu,
+            source_capacity=capacity,
+            miss_fractions=miss_fractions,
+            generator=generator,
+            pool_size=batch_size + 3,
+            exact_miss_counts=exact_miss_counts,
+        )
+    else:
+        if exact_miss_counts is not None:
+            raise ValueError(
+                "balanced per-query misses and exact union misses are exclusive"
+            )
+        cache_cpu, union_rows = _make_balanced_mtp_cache_state(
+            topk_rows=topk_rows,
+            candidate_lens=candidate_lens,
+            cache_tokens=cache_tokens,
+            req_pool_entries=req_entries_cpu,
+            source_capacity=capacity,
+            per_query_miss_count=balanced_query_miss_count,
+            generator=generator,
+            pool_size=batch_size + 3,
+        )
     return MtpCase(
         name=name,
         device=device,
@@ -1185,38 +1381,65 @@ def _single_query_with_buffers(
     return source_ids, destination_slots, miss_counts
 
 
-def _wall_ms(fn, warmup: int, iters: int) -> float:
-    for _ in range(warmup):
-        fn()
-    torch.npu.synchronize()
-    start = perf_counter()
-    for _ in range(iters):
-        fn()
-    torch.npu.synchronize()
-    return (perf_counter() - start) * 1000.0 / iters
-
-
-def _fresh_state_ms(
-    case: MtpCase,
-    initial_cpu: torch.Tensor,
+def _event_us(
+    runner: Callable[[], object],
+    *,
     warmup: int,
     iters: int,
-) -> tuple[float, int]:
-    cache = initial_cpu.to(case.device)
-    initial = initial_cpu.to(case.device)
-    buffers = make_outputs(case)
-    elapsed = 0.0
-    last_misses = 0
-    for iteration in range(warmup + iters):
-        cache.copy_(initial)
-        torch.npu.synchronize()
-        start = perf_counter()
-        outputs = call_mtp_with_buffers(case, cache, *buffers)
-        torch.npu.synchronize()
-        if iteration >= warmup:
-            elapsed += (perf_counter() - start) * 1000.0
-        last_misses = int(outputs[4].sum().cpu())
-    return elapsed / iters, last_misses
+    reset: Callable[[], None] | None = None,
+) -> float:
+    """Measure only NPU work; mutable request-state reset is not timed."""
+
+    for _ in range(warmup):
+        if reset is not None:
+            reset()
+        runner()
+    torch.npu.synchronize()
+
+    samples_ms: list[float] = []
+    for _ in range(iters):
+        if reset is not None:
+            reset()
+            torch.npu.synchronize()
+        start = torch.npu.Event(enable_timing=True)
+        end = torch.npu.Event(enable_timing=True)
+        start.record()
+        runner()
+        end.record()
+        end.synchronize()
+        samples_ms.append(float(start.elapsed_time(end)))
+    return statistics.mean(samples_ms) * 1000.0
+
+
+def _assert_topk_sets(
+    actual: torch.Tensor,
+    expected_rows: list[torch.Tensor],
+    *,
+    label: str,
+) -> None:
+    actual_cpu = actual.reshape(-1, TOPK).cpu().to(torch.int64)
+    expected = torch.stack(expected_rows)
+    if not torch.equal(
+        torch.sort(actual_cpu, dim=1).values,
+        torch.sort(expected, dim=1).values,
+    ):
+        raise AssertionError(f"{label}: TopK sets differ from native golden")
+
+
+def _query_miss_counts(case: MtpCase) -> tuple[list[int], list[int]]:
+    per_query_totals = [0] * QUERY_COUNT
+    union_counts: list[int] = []
+    for request in range(case.batch_size):
+        pool_row = int(case.req_pool_entries_cpu[request])
+        before = case.initial_cache_cpu[pool_row]
+        rows = case.topk_cpu[
+            request * QUERY_COUNT : (request + 1) * QUERY_COUNT
+        ]
+        for query_idx, row in enumerate(rows):
+            per_query_totals[query_idx] += int((before[row] < 0).sum())
+        union = case.union_cpu[request]
+        union_counts.append(int((before[union] < 0).sum()))
+    return per_query_totals, union_counts
 
 
 def run_performance_case(
@@ -1228,7 +1451,8 @@ def run_performance_case(
     seed: int,
     warmup: int,
     iters: int,
-    perf_miss_count: int,
+    perf_query_miss_count: int,
+    perf_query_noise: float,
 ) -> None:
     case = make_case(
         name="performance",
@@ -1238,8 +1462,53 @@ def run_performance_case(
         cache_tokens=(cache_tokens,) * batch_size,
         miss_fractions=(0.0,) * batch_size,
         seed=seed + 6000,
-        exact_miss_counts=(perf_miss_count,) * batch_size,
+        correlated_query_noise=perf_query_noise,
+        balanced_query_miss_count=perf_query_miss_count,
     )
+
+    union_sizes = [int(row.numel()) for row in case.union_cpu]
+    union_mean = statistics.mean(union_sizes)
+    union_min = min(union_sizes)
+    union_max = max(union_sizes)
+    union_target_ok = 3000.0 <= union_mean <= 4000.0
+    print(
+        "FUSED_LI_MANAGE_MTP_WORKLOAD_CHECK "
+        f"batch={batch_size} candidate_len={source_len} "
+        f"query_noise={perf_query_noise:.4f} "
+        f"topk_union_min={union_min} topk_union_mean={union_mean:.2f} "
+        f"topk_union_max={union_max} target_range=[3000,4000] "
+        f"target_ok={int(union_target_ok)}",
+        flush=True,
+    )
+    if not union_target_ok:
+        raise AssertionError(
+            "MTP3 TopK union is outside the intended 3000-4000 range; "
+            "adjust --perf-query-noise and rerun."
+        )
+
+    per_query_totals, expected_union_counts = _query_miss_counts(case)
+    expected_query_total = batch_size * perf_query_miss_count
+    minimum_unique_per_request = (
+        2 * perf_query_miss_count - perf_query_miss_count // 2
+    )
+    maximum_unique_per_request = 2 * perf_query_miss_count
+    if per_query_totals != [expected_query_total] * QUERY_COUNT:
+        raise AssertionError(
+            f"performance workload per-query misses={per_query_totals}, "
+            f"expected={expected_query_total} for every query"
+        )
+    if any(
+        count < minimum_unique_per_request
+        or count > maximum_unique_per_request
+        for count in expected_union_counts
+    ):
+        raise AssertionError(
+            f"performance workload union misses={expected_union_counts}, "
+            f"expected range=[{minimum_unique_per_request},"
+            f"{maximum_unique_per_request}] per request"
+        )
+    unique_union_mean = statistics.mean(expected_union_counts)
+
     correctness_cache = case.initial_cache_cpu.to(device)
     correctness_outputs = call_mtp(case, correctness_cache)
     torch.npu.synchronize()
@@ -1250,161 +1519,173 @@ def run_performance_case(
         correctness_outputs,
         label="performance/correctness",
     )
+    if correctness_counts != expected_union_counts:
+        raise AssertionError(
+            f"MTP LIM miss_counts={correctness_counts}, "
+            f"expected={expected_union_counts}"
+        )
     print(
         "FUSED_LI_MANAGE_MTP_TARGET_BATCH_CHECK "
         f"batch={batch_size} candidate_len={source_len} "
         f"cache_tokens={cache_tokens} "
-        f"unique_misses_per_request={perf_miss_count} "
+        f"per_query_misses={perf_query_miss_count} "
+        f"unique_union_misses_min={min(expected_union_counts)} "
+        f"unique_union_misses_mean={unique_union_mean:.2f} "
+        f"unique_union_misses_max={max(expected_union_counts)} "
+        f"per_query_miss_totals={per_query_totals} "
         f"total_union_misses={sum(correctness_counts)} "
         "one_request_per_owner=1 ok=1",
         flush=True,
     )
 
-    total_unique_misses = 0
-    total_query_occurrences = 0
-    shared_unique_misses = 0
-    for request in range(case.batch_size):
-        pool_row = int(case.req_pool_entries_cpu[request])
-        candidate_len = int(case.candidate_lens_cpu[request])
-        before = case.initial_cache_cpu[pool_row]
-        union = case.union_cpu[request]
-        misses = union[before[union] < 0]
-        rows = case.topk_cpu[
-            request * QUERY_COUNT : (request + 1) * QUERY_COUNT
-        ]
-        occurrences = torch.bincount(
-            torch.cat(rows), minlength=candidate_len
-        )
-        total_unique_misses += int(misses.numel())
-        total_query_occurrences += int(occurrences[misses].sum())
-        shared_unique_misses += int((occurrences[misses] > 1).sum())
-    if perf_miss_count > 0 and (
-        total_query_occurrences <= total_unique_misses
-        or shared_unique_misses == 0
-    ):
-        raise AssertionError(
-            "target benchmark must include misses shared by multiple queries"
-        )
-    print(
-        "FUSED_LI_MANAGE_MTP_REPEATED_MISS_CHECK "
-        f"unique_union_misses={total_unique_misses} "
-        f"query_occurrences={total_query_occurrences} "
-        f"shared_unique_misses={shared_unique_misses} ok=1",
-        flush=True,
+    query_view = case.query.view(batch_size, QUERY_COUNT, HEADS, HEAD_DIM)
+    weights_view = case.weights.view(batch_size, QUERY_COUNT, HEADS)
+    single_query = query_view[:, 0].contiguous()
+    single_weights = weights_view[:, 0].contiguous()
+    single_query_ends = torch.arange(
+        1, batch_size + 1, dtype=torch.int32, device=device
     )
-    fused_cache = case.initial_cache_cpu.to(device)
-    serial_cache = case.initial_cache_cpu.to(device)
-    fused_buffers = make_outputs(case)
-    serial_buffers = tuple(
-        (
-            torch.empty(
-                (batch_size, 1, TOPK), dtype=torch.int32, device=device
-            ),
-            torch.empty(
-                (batch_size, 1, TOPK), dtype=torch.int32, device=device
-            ),
-            torch.empty((batch_size,), dtype=torch.int32, device=device),
-        )
-        for _ in range(QUERY_COUNT)
-    )
-    query_rows = tuple(
-        case.query.view(case.batch_size, QUERY_COUNT, HEADS, HEAD_DIM)[
-            :, query_idx
-        ].contiguous()
-        for query_idx in range(QUERY_COUNT)
-    )
-    weight_rows = tuple(
-        case.weights.view(case.batch_size, QUERY_COUNT, HEADS)[
-            :, query_idx
-        ].contiguous()
-        for query_idx in range(QUERY_COUNT)
+    mtp_query_ends = torch.arange(
+        QUERY_COUNT,
+        batch_size * QUERY_COUNT + 1,
+        QUERY_COUNT,
+        dtype=torch.int32,
+        device=device,
     )
 
-    def fused_step():
-        return call_mtp_with_buffers(case, fused_cache, *fused_buffers)
-
-    def serial_step():
-        result = None
-        for query_idx in range(QUERY_COUNT):
-            result = _single_query_with_buffers(
-                case,
-                query_rows[query_idx],
-                weight_rows[query_idx],
-                serial_cache,
-                *serial_buffers[query_idx],
-            )
-        return result
-
-    # Report union copy reduction from an identical typical-miss state.
-    union_cache = case.initial_cache_cpu.to(device)
-    serial_count_cache = case.initial_cache_cpu.to(device)
-    union_result = call_mtp_with_buffers(
-        case, union_cache, *make_outputs(case)
+    native_single = _call_native_li(
+        single_query,
+        case.key,
+        single_weights,
+        case.block_table,
+        case.candidate_lens,
+        single_query_ends,
     )
-    per_query_misses: list[int] = []
-    for query_idx in range(QUERY_COUNT):
-        result = _single_query_with_buffers(
-            case,
-            query_rows[query_idx],
-            weight_rows[query_idx],
-            serial_count_cache,
-            *serial_buffers[query_idx],
-        )
-        per_query_misses.append(int(result[2].sum().cpu()))
+    native_mtp = _call_native_li(
+        case.query,
+        case.key,
+        case.weights,
+        case.block_table,
+        case.candidate_lens,
+        mtp_query_ends,
+    )
     torch.npu.synchronize()
-    union_misses = int(union_result[4].sum().cpu())
-
-    fused_ms = _wall_ms(fused_step, warmup, iters)
-    serial_ms = _wall_ms(serial_step, warmup, iters)
-    speedup = serial_ms / fused_ms
-
-    level_specs = (
-        ("zero", (0.0,) * batch_size, (0,) * batch_size),
-        (
-            "typical",
-            (0.0,) * batch_size,
-            (perf_miss_count,) * batch_size,
-        ),
-        ("high", (1.0,) * batch_size, None),
+    _assert_topk_sets(
+        native_single,
+        [case.topk_cpu[request * QUERY_COUNT] for request in range(batch_size)],
+        label="official_li_single",
     )
-    for label, fractions, exact_counts in level_specs:
-        level_cpu, _ = _make_cache_state(
-            topk_rows=case.topk_cpu,
-            candidate_lens=(source_len,) * batch_size,
-            cache_tokens=(cache_tokens,) * batch_size,
-            req_pool_entries=case.req_pool_entries_cpu,
-            source_capacity=case.source_capacity,
-            miss_fractions=fractions,
-            generator=torch.Generator().manual_seed(seed + 7000),
-            pool_size=batch_size + 3,
-            exact_miss_counts=exact_counts,
+    _assert_topk_sets(native_mtp, case.topk_cpu, label="official_li_mtp3")
+
+    single_correctness_cache = case.initial_cache_cpu.to(device)
+    single_correctness_buffers = (
+        torch.empty((batch_size, 1, TOPK), dtype=torch.int32, device=device),
+        torch.empty((batch_size, 1, TOPK), dtype=torch.int32, device=device),
+        torch.empty((batch_size,), dtype=torch.int32, device=device),
+    )
+    single_result = _single_query_with_buffers(
+        case,
+        single_query,
+        single_weights,
+        single_correctness_cache,
+        *single_correctness_buffers,
+    )
+    torch.npu.synchronize()
+    single_counts = single_result[2].cpu().tolist()
+    if single_counts != [perf_query_miss_count] * batch_size:
+        raise AssertionError(
+            f"single LIM miss_counts={single_counts}, "
+            f"expected={perf_query_miss_count} per request"
         )
-        avg_ms, misses = _fresh_state_ms(
-            case, level_cpu, min(warmup, 3), min(iters, 10)
-        )
-        print(
-            "FUSED_LI_MANAGE_MTP_MISS_LEVEL_RESULT "
-            f"level={label} batch={batch_size} candidate_len={source_len} "
-            f"cache_tokens={cache_tokens} total_union_misses={misses} "
-            f"avg_ms={avg_ms:.6f}",
-            flush=True,
+    _assert_topk_sets(
+        single_result[0],
+        [case.topk_cpu[request * QUERY_COUNT] for request in range(batch_size)],
+        label="fused_lim_single",
+    )
+
+    single_initial = case.initial_cache_cpu.to(device)
+    single_cache = torch.empty_like(single_initial)
+    single_buffers = (
+        torch.empty((batch_size, 1, TOPK), dtype=torch.int32, device=device),
+        torch.empty((batch_size, 1, TOPK), dtype=torch.int32, device=device),
+        torch.empty((batch_size,), dtype=torch.int32, device=device),
+    )
+    mtp_initial = case.initial_cache_cpu.to(device)
+    mtp_cache = torch.empty_like(mtp_initial)
+    mtp_buffers = make_outputs(case)
+
+    def native_single_step() -> object:
+        return _call_native_li(
+            single_query,
+            case.key,
+            single_weights,
+            case.block_table,
+            case.candidate_lens,
+            single_query_ends,
         )
 
-    print(
-        "FUSED_LI_MANAGE_MTP_UNION_COMPARE "
-        f"per_query_misses={per_query_misses} "
-        f"sum_per_query_misses={sum(per_query_misses)} "
-        f"union_misses={union_misses}",
-        flush=True,
+    def fused_single_step() -> object:
+        return _single_query_with_buffers(
+            case,
+            single_query,
+            single_weights,
+            single_cache,
+            *single_buffers,
+        )
+
+    def native_mtp_step() -> object:
+        return _call_native_li(
+            case.query,
+            case.key,
+            case.weights,
+            case.block_table,
+            case.candidate_lens,
+            mtp_query_ends,
+        )
+
+    def fused_mtp_step() -> object:
+        return call_mtp_with_buffers(case, mtp_cache, *mtp_buffers)
+
+    official_li_single_us = _event_us(
+        native_single_step, warmup=warmup, iters=iters
+    )
+    fused_lim_single_us = _event_us(
+        fused_single_step,
+        warmup=warmup,
+        iters=iters,
+        reset=lambda: single_cache.copy_(single_initial),
+    )
+    official_li_mtp3_us = _event_us(
+        native_mtp_step, warmup=warmup, iters=iters
+    )
+    fused_lim_mtp3_us = _event_us(
+        fused_mtp_step,
+        warmup=warmup,
+        iters=iters,
+        reset=lambda: mtp_cache.copy_(mtp_initial),
+    )
+    management_single_us = fused_lim_single_us - official_li_single_us
+    management_mtp3_us = fused_lim_mtp3_us - official_li_mtp3_us
+    management_ratio = (
+        management_mtp3_us / management_single_us
+        if management_single_us > 0
+        else float("nan")
     )
     print(
-        "FUSED_LI_MANAGE_MTP_PERF_RESULT "
+        "FUSED_LI_MANAGE_MTP_MANAGEMENT_RESULT "
         f"batch={batch_size} candidate_len={source_len} "
         f"cache_tokens={cache_tokens} "
-        f"unique_misses_per_request={perf_miss_count} "
-        f"fused_ms={fused_ms:.6f} "
-        f"four_serial_lim_ms={serial_ms:.6f} speedup={speedup:.4f} "
-        f"warmup={warmup} iters={iters}",
+        f"per_query_misses={perf_query_miss_count} "
+        f"unique_union_misses_mean={unique_union_mean:.2f} "
+        f"topk_union_mean={union_mean:.2f} "
+        f"official_li_single_us={official_li_single_us:.3f} "
+        f"fused_lim_single_us={fused_lim_single_us:.3f} "
+        f"index_management_single_us={management_single_us:+.3f} "
+        f"official_li_mtp3_us={official_li_mtp3_us:.3f} "
+        f"fused_lim_mtp3_us={fused_lim_mtp3_us:.3f} "
+        f"index_management_mtp3_us={management_mtp3_us:+.3f} "
+        f"management_ratio={management_ratio:.4f} target_ratio=4.0000 "
+        f"timer=npu_event performance_assert=0 warmup={warmup} iters={iters}",
         flush=True,
     )
     del case
@@ -1469,7 +1750,8 @@ def main() -> None:
             seed=args.seed,
             warmup=args.warmup,
             iters=args.iters,
-            perf_miss_count=args.perf_miss_count,
+            perf_query_miss_count=args.perf_query_miss_count,
+            perf_query_noise=args.perf_query_noise,
         )
     print("FUSED_LI_MANAGE_MTP_UT_OK", flush=True)
 
