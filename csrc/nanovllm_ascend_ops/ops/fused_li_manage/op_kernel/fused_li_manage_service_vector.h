@@ -469,7 +469,9 @@ __aicore__ inline void LIVector<LIT>::WriteMtpAggregateScoreChunk(
     // q1..q3 write the previous chunk's aggregate from this same UB scratch.
     // Delay that write's completion until the scratch is actually reused so
     // MTE3 can overlap the intervening TopK merge and next MM/scale work.
-    SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
+    if (s2BaseIdx > 0) {
+        SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
+    }
     SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
     DataCopyPad(previousScore, scoresGm[gmOffset],
                 AscendC::DataCopyExtParams{
