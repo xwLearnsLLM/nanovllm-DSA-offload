@@ -60,8 +60,8 @@ def parse_args() -> argparse.Namespace:
         "--diagnose-attention",
         action="store_true",
         help=(
-            "Compare canonical HBM, staggered HBM, and staggered mixed-source "
-            "COPYSFA-MTP paths for tail=0 and the configured tail length."
+            "Compare zero-miss HBM, nonzero-miss HBM-only, and nonzero-miss "
+            "mixed-source COPYSFA-MTP paths for tail=0 and the configured tail."
         ),
     )
     parser.add_argument("--skip-performance", action="store_true")
@@ -756,7 +756,7 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
     if args.diagnose_attention:
         hbm_only_src_ids = torch.full_like(eager_outputs[1], -1)
         canonical_counts = torch.zeros_like(eager_outputs[4])
-        stagger_counts = torch.ones_like(eager_outputs[4])
+        nonzero_counts = torch.ones_like(eager_outputs[4])
         tail_cases = sorted({0, tail_tokens})
 
         def diagnostic_fused(
@@ -821,12 +821,14 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
                 miss_counts=canonical_counts,
                 actual_kv=diagnostic_actual_kv,
             )
-            stagger_output, stagger_kpe, stagger_ckv = diagnostic_fused(
-                kpe_seed=eager_kpe,
-                ckv_seed=eager_ckv,
-                topk_src_ids=hbm_only_src_ids,
-                miss_counts=stagger_counts,
-                actual_kv=diagnostic_actual_kv,
+            nonzero_hbm_output, nonzero_hbm_kpe, nonzero_hbm_ckv = (
+                diagnostic_fused(
+                    kpe_seed=eager_kpe,
+                    ckv_seed=eager_ckv,
+                    topk_src_ids=hbm_only_src_ids,
+                    miss_counts=nonzero_counts,
+                    actual_kv=diagnostic_actual_kv,
+                )
             )
             mixed_output, mixed_kpe, mixed_ckv = diagnostic_fused(
                 kpe_seed=initial_kpe_cpu.to(device),
@@ -841,10 +843,10 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
                 canonical_ckv, eager_ckv
             ):
                 raise AssertionError("canonical HBM-only diagnostic modified cache")
-            if not torch.equal(stagger_kpe, eager_kpe) or not torch.equal(
-                stagger_ckv, eager_ckv
+            if not torch.equal(nonzero_hbm_kpe, eager_kpe) or not torch.equal(
+                nonzero_hbm_ckv, eager_ckv
             ):
-                raise AssertionError("staggered HBM-only diagnostic modified cache")
+                raise AssertionError("nonzero HBM-only diagnostic modified cache")
             if not torch.equal(mixed_kpe, eager_kpe) or not torch.equal(
                 mixed_ckv, eager_ckv
             ):
@@ -853,16 +855,16 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
             comparisons = (
                 ("split_vs_canonical_hbm", split_output, canonical_output),
                 (
-                    "canonical_vs_stagger_hbm",
+                    "canonical_vs_nonzero_hbm",
                     canonical_output,
-                    stagger_output,
+                    nonzero_hbm_output,
                 ),
                 (
-                    "stagger_hbm_vs_stagger_mixed",
-                    stagger_output,
+                    "nonzero_hbm_vs_nonzero_mixed",
+                    nonzero_hbm_output,
                     mixed_output,
                 ),
-                ("split_vs_stagger_mixed", split_output, mixed_output),
+                ("split_vs_nonzero_mixed", split_output, mixed_output),
             )
             for pair, lhs, rhs in comparisons:
                 max_abs, query_max_abs = attention_diff_by_query(lhs, rhs)

@@ -1534,11 +1534,16 @@ __aicore__ inline void SFAVectorService<SFAT>::MergeKv(const RunInfo &runInfo)
             static_cast<int64_t>(runInfo.s2Idx) *
             constInfo.s2BaseSize;
         if (virtualTileStart < runInfo.sparseTokenCount) {
-            const int64_t sourceTileStart =
-                missCount > 0
-                    ? GetStaggeredSparseIndex(
-                          virtualTileStart, runInfo)
-                    : virtualTileStart;
+            int64_t sourceTileStart = virtualTileStart;
+            // MTP3 keeps the four top-k rows in canonical tile order.  The
+            // qlen=1 stagger is numerically benign, but it amplifies the
+            // qlen=4 source-aware accumulation difference.
+            if constexpr (!SFAT::mtp3Mode) {
+                if (missCount > 0) {
+                    sourceTileStart = GetStaggeredSparseIndex(
+                        virtualTileStart, runInfo);
+                }
+            }
             MergeSourceAwareSparseRange<SFAT::mtp3Mode>(
                 runInfo, rangeStart, rangeEnd, part,
                 missCount, sourceTileStart);
