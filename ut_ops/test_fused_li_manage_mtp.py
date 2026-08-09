@@ -760,13 +760,23 @@ def _compare_valid_outputs(
 ) -> None:
     left_topk = left[0].reshape(case.batch_size, QUERY_COUNT, TOPK).cpu()
     right_topk = right[0].reshape(case.batch_size, QUERY_COUNT, TOPK).cpu()
+    left_topk_sources = left[1].reshape(
+        case.batch_size, QUERY_COUNT, TOPK
+    ).cpu()
+    right_topk_sources = right[1].reshape(
+        case.batch_size, QUERY_COUNT, TOPK
+    ).cpu()
     for request in range(case.batch_size):
         if int(case.cache_tokens_cpu[request]) == 0:
             continue
         if not torch.equal(left_topk[request], right_topk[request]):
             raise AssertionError(f"{label}: request={request} topk_slots differ")
-    if not torch.equal(left[1].cpu(), right[1].cpu()):
-        raise AssertionError(f"{label}: topk_source_ids differ")
+        if not torch.equal(
+            left_topk_sources[request], right_topk_sources[request]
+        ):
+            raise AssertionError(
+                f"{label}: request={request} topk_source_ids differ"
+            )
     left_counts = left[4].cpu()
     right_counts = right[4].cpu()
     if not torch.equal(left_counts, right_counts):
