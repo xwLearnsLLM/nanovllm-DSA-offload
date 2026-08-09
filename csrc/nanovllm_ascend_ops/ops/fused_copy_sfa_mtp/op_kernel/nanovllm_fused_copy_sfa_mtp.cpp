@@ -1,6 +1,14 @@
 #include "kernel_operator.h"
 #define C_TEMPLATE 0
 #define V_TEMPLATE 1
+
+// OPC generates only this operator's tiling class.  The fused payload has the
+// complete production SFA payload as its prefix, so expose it under the type
+// name expected by the shared SFA implementation (the same pattern used by
+// the non-MTP fused_copy_sfa kernel).
+using NanovllmSparseTailAttentionTilingDataMla =
+    NanovllmFusedCopySfaMtpTilingData;
+
 #include "../sparse_tail_attention/nanovllm_sparse_tail_attention_kernel_mla.h"
 #include "fused_copy_sfa_mtp_scatter_stage.h"
 
@@ -43,7 +51,7 @@ __aicore__ inline void RunFusedMtp(
         scatter.Process();
 
         // Make every local MTE3 write visible before waking its paired AIC.
-        PipeSync<HardEvent::MTE3_S>();
+        SetWaitFlag<HardEvent::MTE3_S>(HardEvent::MTE3_S);
         if (!scatter.UsesOwnerSchedule()) {
             // General batch shapes distribute the union list over all AIVs.
             // The target B=24 path intentionally skips this global barrier:
