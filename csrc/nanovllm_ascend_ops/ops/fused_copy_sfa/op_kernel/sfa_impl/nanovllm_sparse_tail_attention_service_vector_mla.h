@@ -120,7 +120,7 @@ public:
         int64_t mte2Size, int64_t mte3Size,
         int64_t s2StartGmOffset, int64_t mergeMte3Idx,
         const RunInfo &runInfo, int64_t missRangeSize,
-        int64_t sourceRangeStart);
+        int64_t sourceRangeStart, bool hasActualMiss);
     __aicore__ inline void SetInfInBlk(const LocalTensor<T> &mmResUb, uint32_t dealRowCount, uint32_t columnCount,
                                        uint64_t startId, uint64_t endId);
     __aicore__ inline void SetMidInf(const LocalTensor<T> &mmResUb, uint32_t dealRowCount, uint32_t columnCount,
@@ -1198,12 +1198,12 @@ SFAVectorService<SFAT>::CopyOutSourceAwareResult(
     int64_t mte2Size, int64_t mte3Size,
     int64_t s2GmStartOffset, int64_t mergeMte3Idx,
     const RunInfo &runInfo, int64_t missRangeSize,
-    int64_t sourceRangeStart)
+    int64_t sourceRangeStart, bool hasActualMiss)
 {
     CopyOutMrgeResult(
         mte2Size, mte3Size, s2GmStartOffset,
         mergeMte3Idx, runInfo);
-    if (mte2Size <= mte3Size ||
+    if (!hasActualMiss || mte2Size <= mte3Size ||
         (!ALIGNED_MISS && mte3Size >= missRangeSize)) {
         return;
     }
@@ -1306,6 +1306,7 @@ __aicore__ inline void SFAVectorService<SFAT>::MergeKvRange(
     int64_t realS2Idx0 = -1;
     int64_t realS2Idx1 = -1;
     bool needWaitMte3ToMte2 = true;
+    bool flushHasActualMiss = false;
     SetFlag<AscendC::HardEvent::MTE3_MTE2>(0);
     SetFlag<AscendC::HardEvent::MTE3_MTE2>(1);
     for (int64_t s2GmOffsetArray = s2GmStartOffset;
@@ -1341,6 +1342,8 @@ __aicore__ inline void SFAVectorService<SFAT>::MergeKvRange(
                         ? sourceTokenIdsGm_.GetValue(missBase + sourceIndex1)
                         : topkGm_.GetValue(topkGmBaseOffset + sourceIndex1);
                 }
+                flushHasActualMiss = flushHasActualMiss ||
+                    source0FromDram || source1FromDram;
                 if (source0FromDram || source1FromDram) {
                     if (source0FromDram) {
                         CopyInDramKv(
@@ -1413,7 +1416,8 @@ __aicore__ inline void SFAVectorService<SFAT>::MergeKvRange(
                 CopyOutSourceAwareResult<ALIGNED_MISS>(
                     mte2Size, mte3Size, s2GmStartOffset,
                     mergeMte3Idx, runInfo, missRangeSize,
-                    sourceRangeStart);
+                    sourceRangeStart, flushHasActualMiss);
+                flushHasActualMiss = false;
             } else {
                 CopyOutMrgeResult(
                     mte2Size, mte3Size, s2GmStartOffset,
@@ -1535,8 +1539,7 @@ __aicore__ inline void SFAVectorService<SFAT>::MergeKv(const RunInfo &runInfo)
             constInfo.s2BaseSize;
         if (virtualTileStart < runInfo.sparseTokenCount) {
             int64_t sourceTileStart = virtualTileStart;
-            // The MTP3 translation unit requests canonical source tiles.  The
-            // qlen=1 kernel keeps its source-aware staggered schedule.
+            // MTP3 keeps canonical source tiles; qlen=1 retains staggering.
 #if !defined(NANOVLLM_SFA_CANONICAL_SOURCE_TILES)
             if (missCount > 0) {
                 sourceTileStart = GetStaggeredSparseIndex(
