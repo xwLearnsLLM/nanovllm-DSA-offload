@@ -9,7 +9,7 @@
 using NanovllmSparseTailAttentionTilingDataMla =
     NanovllmFusedCopySfaMtpTilingData;
 
-#include "../../fused_copy_sfa/op_kernel/sfa_impl/nanovllm_sparse_tail_attention_kernel_mla.h"
+#include "../fused_copy_sfa/sfa_impl/nanovllm_sparse_tail_attention_kernel_mla.h"
 
 using namespace AscendC;
 namespace {
