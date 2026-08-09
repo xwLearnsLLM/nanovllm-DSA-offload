@@ -1535,15 +1535,14 @@ __aicore__ inline void SFAVectorService<SFAT>::MergeKv(const RunInfo &runInfo)
             constInfo.s2BaseSize;
         if (virtualTileStart < runInfo.sparseTokenCount) {
             int64_t sourceTileStart = virtualTileStart;
-            // MTP3 keeps the four top-k rows in canonical tile order.  The
-            // qlen=1 stagger is numerically benign, but it amplifies the
-            // qlen=4 source-aware accumulation difference.
-            if constexpr (!SFAT::mtp3Mode) {
-                if (missCount > 0) {
-                    sourceTileStart = GetStaggeredSparseIndex(
-                        virtualTileStart, runInfo);
-                }
+            // The MTP3 translation unit requests canonical source tiles.  The
+            // qlen=1 kernel keeps its source-aware staggered schedule.
+#if !defined(NANOVLLM_SFA_CANONICAL_SOURCE_TILES)
+            if (missCount > 0) {
+                sourceTileStart = GetStaggeredSparseIndex(
+                    virtualTileStart, runInfo);
             }
+#endif
             MergeSourceAwareSparseRange<SFAT::mtp3Mode>(
                 runInfo, rangeStart, rangeEnd, part,
                 missCount, sourceTileStart);

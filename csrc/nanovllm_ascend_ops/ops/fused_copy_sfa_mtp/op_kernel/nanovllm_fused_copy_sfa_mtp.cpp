@@ -1,6 +1,7 @@
 #include "kernel_operator.h"
 #define C_TEMPLATE 0
 #define V_TEMPLATE 1
+#define NANOVLLM_SFA_CANONICAL_SOURCE_TILES 1
 
 // OPC generates only this operator's tiling class.  The fused payload has the
 // complete production SFA payload as its prefix, so expose it under the type

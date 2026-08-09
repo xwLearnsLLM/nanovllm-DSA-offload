@@ -151,8 +151,18 @@ rm -f \
   "${BIN_DIR}/${OP_NAME}.json" \
   "${BIN_DIR}/binary_info_config.json"
 
-cmake --build "${CANN_BUILD_DIR}" \
-  --target "${TARGET_NAME}" -j"${BUILD_JOBS}"
+BUILD_GENERATOR="$(sed -n 's/^CMAKE_GENERATOR:INTERNAL=//p' \
+  "${CANN_BUILD_DIR}/CMakeCache.txt" | head -n 1)"
+if [[ "${BUILD_GENERATOR}" == "Unix Makefiles" ]]; then
+  # -B forces the selected kernel's dependency closure to run again.  This is
+  # needed because OPC/CMake may otherwise reuse a binary after only a shared
+  # transitive device header changed.
+  cmake --build "${CANN_BUILD_DIR}" \
+    --target "${TARGET_NAME}" -j"${BUILD_JOBS}" -- -B
+else
+  cmake --build "${CANN_BUILD_DIR}" \
+    --target "${TARGET_NAME}" -j"${BUILD_JOBS}"
+fi
 cmake --build "${CANN_BUILD_DIR}" \
   --target "${CONFIG_TARGET}" -j"${BUILD_JOBS}"
 
