@@ -895,21 +895,29 @@ __aicore__ inline void LIVector<LIT>::WriteMissCount(uint32_t bIdx, int32_t miss
 template <typename LIT>
 __aicore__ inline void LIVector<LIT>::StoreMtpQueryTopK(const LICommon::RunInfo &info)
 {
-    LocalTensor<float> valueLocal = outQueue_.AllocTensor<float>();
-    LocalTensor<uint32_t> payloadLocal = valueLocal.template ReinterpretCast<uint32_t>();
+    LocalTensor<uint32_t> payloadLocal = payloadBuf_.Get<uint32_t>();
     SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
     mtpThresholdsGm.SetValue(
         info.queryRow,
         globalTopkUb_.GetValue((BASE_TOPK - 1U) * VALUE_AND_INDEX_NUM));
     ExtractIndex(payloadLocal, globalTopkUb_.template ReinterpretCast<uint32_t>(), BASE_TOPK);
 
-    uint64_t rowOffset = static_cast<uint64_t>(info.queryRow) * BASE_TOPK;
-    SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
-    DataCopyPad(mtpTopkPayloadsGm[rowOffset],
-                payloadLocal.template ReinterpretCast<int32_t>(),
-                {1, static_cast<uint16_t>(BASE_TOPK * sizeof(int32_t)), 0, 0});
-    SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
-    outQueue_.FreeTensor(valueLocal);
+    if (info.queryIdx + 1U < MTP_QUERY_COUNT) {
+        uint64_t rowOffset = static_cast<uint64_t>(info.queryRow) * BASE_TOPK;
+        SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
+        DataCopyPad(mtpTopkPayloadsGm[rowOffset],
+                    payloadLocal.template ReinterpretCast<int32_t>(),
+                    {1, static_cast<uint16_t>(BASE_TOPK * sizeof(int32_t)), 0, 0});
+        SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
+    } else {
+        // Finalization runs immediately after q3 and keeps this payload in UB.
+        // Do not round-trip the last row through the private GM workspace.
+        // The old payload copy also completed q3's pending aggregate-score
+        // write implicitly; retain only the dependency required by the
+        // eviction scan that will read those scores through MTE2.
+        PipeBarrier<PIPE_V>();
+        SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
+    }
 }
 
 template <typename LIT>
@@ -926,6 +934,9 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
     LocalTensor<int32_t> missTokens = missStorage.template ReinterpretCast<int32_t>();
     LocalTensor<int32_t> destinationSlots = slotStorage.template ReinterpretCast<int32_t>();
     LocalTensor<int32_t> topkPayloads = payloadBuf_.Get<int32_t>();
+    LocalTensor<int32_t> lastQueryPayload = destinationSlots[BASE_TOPK * 3U];
+    DataCopy(lastQueryPayload, topkPayloads, BASE_TOPK);
+    PipeBarrier<PIPE_V>();
 
     const uint64_t cacheBase =
         static_cast<uint64_t>(info.cacheRowIdx) * cacheSlotsSize_;
@@ -945,8 +956,6 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
         LocalTensor<int32_t> decodedSlots = destinationSlots;
         LocalTensor<int32_t> decodeScratch = destinationSlots[BASE_TOPK];
         LocalTensor<int32_t> rowMissTokens = destinationSlots[BASE_TOPK * 2U];
-        LocalTensor<uint8_t> missMask =
-            destinationSlots[BASE_TOPK * 3U].template ReinterpretCast<uint8_t>();
         AscendC::GatherMaskParams compactParams;
         compactParams.repeatTimes = 1;
         compactParams.src0BlockStride = 1;
@@ -956,9 +965,14 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
         for (uint32_t queryIdx = 0; queryIdx < MTP_QUERY_COUNT; ++queryIdx) {
             uint64_t rowOffset =
                 static_cast<uint64_t>(info.bIdx * MTP_QUERY_COUNT + queryIdx) * BASE_TOPK;
-            SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
-            DataCopyPad(topkPayloads, mtpTopkPayloadsGm[rowOffset], copyIn, intPad);
-            SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
+            if (queryIdx + 1U == MTP_QUERY_COUNT) {
+                DataCopy(topkPayloads, lastQueryPayload, BASE_TOPK);
+                PipeBarrier<PIPE_V>();
+            } else {
+                SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
+                DataCopyPad(topkPayloads, mtpTopkPayloadsGm[rowOffset], copyIn, intPad);
+                SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
+            }
             DecodeSlotFromPayload(
                 decodedSlots.template ReinterpretCast<uint32_t>(),
                 topkPayloads.template ReinterpretCast<uint32_t>(),
@@ -966,6 +980,8 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
             DecodeIndexFromPayload(
                 topkPayloads.template ReinterpretCast<uint32_t>(),
                 topkPayloads.template ReinterpretCast<uint32_t>(), BASE_TOPK);
+            LocalTensor<uint8_t> missMask =
+                decodeScratch.template ReinterpretCast<uint8_t>();
             CompareScalar(missMask, decodedSlots,
                           LICommon::ConstInfo::INVALID_IDX,
                           AscendC::CMPMODE::EQ, BASE_TOPK);
@@ -994,6 +1010,21 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
                 }
             }
         }
+    }
+
+    // destinationSlots may occupy the complete 8192-entry VECOUT buffer in
+    // high-miss cases.  Keep q3 entirely in UB for the typical path, but
+    // preserve it in the original private workspace before updates can reach
+    // its [6144,8192) scratch range.
+    const bool lastQueryPayloadInUb =
+        missCount <= MTP_UNION_CAPACITY - BASE_TOPK;
+    if (!lastQueryPayloadInUb) {
+        uint64_t lastRowOffset = static_cast<uint64_t>(
+            info.bIdx * MTP_QUERY_COUNT + MTP_QUERY_COUNT - 1U) * BASE_TOPK;
+        SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
+        DataCopyPad(mtpTopkPayloadsGm[lastRowOffset], lastQueryPayload,
+                    {1, static_cast<uint16_t>(BASE_TOPK * sizeof(int32_t)), 0, 0});
+        SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
     }
 
     uint32_t candidateCap = 0;
@@ -1068,8 +1099,14 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
         for (uint32_t queryIdx = 0; queryIdx < MTP_QUERY_COUNT; ++queryIdx) {
             uint64_t rowOffset =
                 static_cast<uint64_t>(info.bIdx * MTP_QUERY_COUNT + queryIdx) * BASE_TOPK;
-            DataCopyPad(topkPayloads, mtpTopkPayloadsGm[rowOffset], copyIn, intPad);
-            SetWaitFlag<HardEvent::MTE2_S>(HardEvent::MTE2_S);
+            if (queryIdx + 1U == MTP_QUERY_COUNT && lastQueryPayloadInUb) {
+                DataCopy(topkPayloads, lastQueryPayload, BASE_TOPK);
+                PipeBarrier<PIPE_V>();
+                SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
+            } else {
+                DataCopyPad(topkPayloads, mtpTopkPayloadsGm[rowOffset], copyIn, intPad);
+                SetWaitFlag<HardEvent::MTE2_S>(HardEvent::MTE2_S);
+            }
             for (uint32_t topkIdx = 0; topkIdx < BASE_TOPK; ++topkIdx) {
                 uint32_t token = static_cast<uint32_t>(
                     topkPayloads.GetValue(topkIdx)) & INDEX_MASK;
@@ -1214,8 +1251,13 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
     for (uint32_t queryIdx = 0; queryIdx < MTP_QUERY_COUNT; ++queryIdx) {
         uint64_t rowOffset =
             static_cast<uint64_t>(info.bIdx * MTP_QUERY_COUNT + queryIdx) * BASE_TOPK;
-        DataCopyPad(topkPayloads, mtpTopkPayloadsGm[rowOffset], copyIn, intPad);
-        SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
+        if (queryIdx + 1U == MTP_QUERY_COUNT && lastQueryPayloadInUb) {
+            DataCopy(topkPayloads, lastQueryPayload, BASE_TOPK);
+            PipeBarrier<PIPE_V>();
+        } else {
+            DataCopyPad(topkPayloads, mtpTopkPayloadsGm[rowOffset], copyIn, intPad);
+            SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
+        }
         DecodeSlotFromPayload(
             destinationSlots.template ReinterpretCast<uint32_t>(),
             topkPayloads.template ReinterpretCast<uint32_t>(), slotScratch,
