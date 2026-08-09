@@ -46,10 +46,11 @@ export CANN_INSTALL_PATH=/usr/local/Ascend/cann-8.5.1
 PYTHONPATH=$PWD:$PYTHONPATH PYTHONUNBUFFERED=1 SOC_VERSION=ascend910_9391 NANOVLLM_CANN_BUILD_JOBS=64 NANOVLLM_EXT_BUILD_JOBS=1 bash scripts/build_nanovllm_ops.sh
 ```
 
-完成过一次全量编译后，如果只修改了 `fused_li_manage_mtp` 算子的 AscendC kernel 或其依赖的 device header，可以复用原 build 目录，只重新编译并安装该 kernel：
+完成过一次全量编译后，如果只修改了 `fused_li_manage_mtp` 或 `fused_copy_sfa_mtp` 算子的 AscendC kernel 或其依赖的 device header，可以复用原 build 目录，只重新编译并安装对应 kernel：
 
 ```bash
 bash scripts/rebuild_nanovllm_cann_kernel.sh fused_li_manage_mtp
+bash scripts/rebuild_nanovllm_cann_kernel.sh fused_copy_sfa_mtp
 ```
 
 修改 host tiling、算子接口、op-api、PyTorch binding、CMake，或者 build 目录已被删除时，仍须使用上面的全量编译命令。

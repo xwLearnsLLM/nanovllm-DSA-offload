@@ -56,6 +56,14 @@ def parse_args() -> argparse.Namespace:
             "Attention path while retaining the CPU golden and cache checks."
         ),
     )
+    parser.add_argument(
+        "--diagnose-attention",
+        action="store_true",
+        help=(
+            "Compare canonical HBM, staggered HBM, and staggered mixed-source "
+            "COPYSFA-MTP paths for tail=0 and the configured tail length."
+        ),
+    )
     parser.add_argument("--skip-performance", action="store_true")
     parser.add_argument("--seed", type=int, default=7)
     return parser.parse_args()
@@ -374,10 +382,67 @@ def call_attention_out(
     return output
 
 
+def call_fused_attention_out(
+    *,
+    query: torch.Tensor,
+    query_rope: torch.Tensor,
+    actual_q: torch.Tensor,
+    actual_kv: torch.Tensor,
+    cache_tokens: torch.Tensor,
+    topk_dst_slots: torch.Tensor,
+    topk_src_ids: torch.Tensor,
+    miss_src_ids: torch.Tensor,
+    miss_dst_slots: torch.Tensor,
+    miss_counts: torch.Tensor,
+    hbm_table: torch.Tensor,
+    dram_table: torch.Tensor,
+    hbm_kpe: torch.Tensor,
+    hbm_ckv: torch.Tensor,
+    dram_kpe: torch.Tensor,
+    dram_ckv: torch.Tensor,
+    scale: float,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    torch.ops.nanovllm_dsa.fused_copy_sfa_mtp.default(
+        query_rope,
+        query,
+        actual_q,
+        actual_kv,
+        cache_tokens,
+        topk_dst_slots,
+        topk_src_ids,
+        miss_src_ids,
+        miss_dst_slots,
+        miss_counts,
+        hbm_table,
+        dram_table,
+        hbm_kpe.view(-1, BLOCK_SIZE, 1, KPE_DIM),
+        hbm_ckv.view(-1, BLOCK_SIZE, 1, CKV_DIM),
+        dram_kpe,
+        dram_ckv,
+        scale,
+        output,
+    )
+    return output
+
+
+def attention_diff_by_query(
+    lhs: torch.Tensor, rhs: torch.Tensor
+) -> tuple[float, list[float]]:
+    difference = (lhs.float() - rhs.float()).abs().reshape(
+        -1, QUERY_COUNT, lhs.shape[-2], lhs.shape[-1]
+    )
+    per_query = difference.amax(dim=(0, 2, 3)).cpu().tolist()
+    return float(difference.max().cpu()), [float(value) for value in per_query]
+
+
 def run_chain(args: argparse.Namespace, device: torch.device) -> None:
     batch_size = args.batch_size
     cache_tokens = args.cache_tokens
     tail_tokens = args.tail_tokens
+    allow_known_fused_diff = (
+        args.allow_fused_attention_diff or args.diagnose_attention
+    )
     final_kv_len = cache_tokens + tail_tokens + QUERY_COUNT
     hbm_capacity = math.ceil(final_kv_len / BLOCK_SIZE) * BLOCK_SIZE
     case = lidu_ut.make_case(
@@ -593,11 +658,7 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
             scale=scale,
         )
         actual = attention.float().cpu()
-        golden_atol = (
-            KNOWN_FUSED_ATTENTION_ATOL
-            if args.allow_fused_attention_diff
-            else 0.08
-        )
+        golden_atol = KNOWN_FUSED_ATTENTION_ATOL if allow_known_fused_diff else 0.08
         torch.testing.assert_close(actual, golden, rtol=0.08, atol=golden_atol)
         return counts, float((actual - golden).abs().max())
 
@@ -679,7 +740,7 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
     split_fused_max_abs = float(
         (fused_attention.float() - eager_attention.float()).abs().max().cpu()
     )
-    if not args.allow_fused_attention_diff:
+    if not allow_known_fused_diff:
         torch.testing.assert_close(fused_attention, eager_attention, rtol=0, atol=0)
     print(
         "FUSED_COPY_SFA_MTP_CHECK "
@@ -688,9 +749,134 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
         f"attention_max_abs={fused_max_abs:.6f} "
         f"split_fused_max_abs={split_fused_max_abs:.6f} "
         f"split_exact={int(split_fused_max_abs == 0.0)} "
-        f"known_diff_allowed={int(args.allow_fused_attention_diff)} ok=1",
+        f"known_diff_allowed={int(allow_known_fused_diff)} ok=1",
         flush=True,
     )
+
+    if args.diagnose_attention:
+        hbm_only_src_ids = torch.full_like(eager_outputs[1], -1)
+        canonical_counts = torch.zeros_like(eager_outputs[4])
+        stagger_counts = torch.ones_like(eager_outputs[4])
+        tail_cases = sorted({0, tail_tokens})
+
+        def diagnostic_fused(
+            *,
+            kpe_seed: torch.Tensor,
+            ckv_seed: torch.Tensor,
+            topk_src_ids: torch.Tensor,
+            miss_counts: torch.Tensor,
+            actual_kv: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            diagnostic_kpe = kpe_seed.clone()
+            diagnostic_ckv = ckv_seed.clone()
+            diagnostic_output = torch.empty_like(eager_attention_buffer)
+            call_fused_attention_out(
+                query=query,
+                query_rope=query_rope,
+                actual_q=actual_q,
+                actual_kv=actual_kv,
+                cache_tokens=case.cache_tokens,
+                topk_dst_slots=eager_outputs[0],
+                topk_src_ids=topk_src_ids,
+                miss_src_ids=eager_outputs[2],
+                miss_dst_slots=eager_outputs[3],
+                miss_counts=miss_counts,
+                hbm_table=hbm_table,
+                dram_table=dram_table,
+                hbm_kpe=diagnostic_kpe,
+                hbm_ckv=diagnostic_ckv,
+                dram_kpe=dram_kpe,
+                dram_ckv=dram_ckv,
+                scale=scale,
+                output=diagnostic_output,
+            )
+            return diagnostic_output, diagnostic_kpe, diagnostic_ckv
+
+        for diagnostic_tail in tail_cases:
+            diagnostic_actual_kv = torch.full(
+                (batch_size,),
+                cache_tokens + diagnostic_tail + QUERY_COUNT,
+                dtype=torch.int32,
+                device=device,
+            )
+            split_output = torch.empty_like(eager_attention_buffer)
+            call_attention_out(
+                query=query,
+                query_rope=query_rope,
+                kpe=eager_kpe,
+                ckv=eager_ckv,
+                sparse_slots=eager_outputs[0],
+                cache_tokens=case.cache_tokens,
+                hbm_table=hbm_table,
+                actual_q=actual_q,
+                actual_kv=diagnostic_actual_kv,
+                scale=scale,
+                output=split_output,
+            )
+
+            canonical_output, canonical_kpe, canonical_ckv = diagnostic_fused(
+                kpe_seed=eager_kpe,
+                ckv_seed=eager_ckv,
+                topk_src_ids=hbm_only_src_ids,
+                miss_counts=canonical_counts,
+                actual_kv=diagnostic_actual_kv,
+            )
+            stagger_output, stagger_kpe, stagger_ckv = diagnostic_fused(
+                kpe_seed=eager_kpe,
+                ckv_seed=eager_ckv,
+                topk_src_ids=hbm_only_src_ids,
+                miss_counts=stagger_counts,
+                actual_kv=diagnostic_actual_kv,
+            )
+            mixed_output, mixed_kpe, mixed_ckv = diagnostic_fused(
+                kpe_seed=initial_kpe_cpu.to(device),
+                ckv_seed=initial_ckv_cpu.to(device),
+                topk_src_ids=eager_outputs[1],
+                miss_counts=eager_outputs[4],
+                actual_kv=diagnostic_actual_kv,
+            )
+            torch.npu.synchronize()
+
+            if not torch.equal(canonical_kpe, eager_kpe) or not torch.equal(
+                canonical_ckv, eager_ckv
+            ):
+                raise AssertionError("canonical HBM-only diagnostic modified cache")
+            if not torch.equal(stagger_kpe, eager_kpe) or not torch.equal(
+                stagger_ckv, eager_ckv
+            ):
+                raise AssertionError("staggered HBM-only diagnostic modified cache")
+            if not torch.equal(mixed_kpe, eager_kpe) or not torch.equal(
+                mixed_ckv, eager_ckv
+            ):
+                raise AssertionError("mixed-source diagnostic cache copy differs")
+
+            comparisons = (
+                ("split_vs_canonical_hbm", split_output, canonical_output),
+                (
+                    "canonical_vs_stagger_hbm",
+                    canonical_output,
+                    stagger_output,
+                ),
+                (
+                    "stagger_hbm_vs_stagger_mixed",
+                    stagger_output,
+                    mixed_output,
+                ),
+                ("split_vs_stagger_mixed", split_output, mixed_output),
+            )
+            for pair, lhs, rhs in comparisons:
+                max_abs, query_max_abs = attention_diff_by_query(lhs, rhs)
+                formatted_query_max = ",".join(
+                    f"{value:.6f}" for value in query_max_abs
+                )
+                print(
+                    "FUSED_COPY_SFA_MTP_ATTENTION_DIAGNOSTIC "
+                    f"tail_tokens={diagnostic_tail} pair={pair} "
+                    f"max_abs={max_abs:.6f} "
+                    f"query_max_abs=[{formatted_query_max}] "
+                    "cache_exact=1",
+                    flush=True,
+                )
 
     # Warm up LIM plus the caller-owned fused interface on disposable state.
     warm_cache = case.initial_cache_cpu.to(device)
@@ -777,7 +963,7 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
     repeat_attention_max_abs = float(
         (repeat_attention.float() - repeat_attention_before.float()).abs().max()
     )
-    if args.allow_fused_attention_diff:
+    if allow_known_fused_diff:
         if repeat_attention_max_abs > KNOWN_FUSED_ATTENTION_ATOL:
             raise AssertionError(
                 "zero-miss full-chain replay Attention difference exceeds "
@@ -792,7 +978,7 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
         "scatter_to_attention_dependency=1 out_buffer=1 "
         f"attention_max_abs={graph_max_abs:.6f} "
         f"repeat_attention_max_abs={repeat_attention_max_abs:.6f} "
-        f"known_diff_allowed={int(args.allow_fused_attention_diff)} ok=1",
+        f"known_diff_allowed={int(allow_known_fused_diff)} ok=1",
         flush=True,
     )
 

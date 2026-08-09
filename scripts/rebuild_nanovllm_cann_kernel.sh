@@ -10,6 +10,7 @@ usage() {
   cat <<'EOF'
 Usage:
   bash scripts/rebuild_nanovllm_cann_kernel.sh fused_li_manage_mtp
+  bash scripts/rebuild_nanovllm_cann_kernel.sh fused_copy_sfa_mtp
 
 This incremental path requires one successful full build first. It is only
 for AscendC device-kernel/header changes; host tiling, schema, op-api, binding,
@@ -17,14 +18,27 @@ or CMake changes still require scripts/build_nanovllm_ops.sh.
 EOF
 }
 
-if [[ "${OP_NAME}" != "fused_li_manage_mtp" || $# -ne 1 ]]; then
+if (( $# != 1 )); then
   usage >&2
   exit 2
 fi
 
-KERNEL_NAME="nanovllm_fused_li_manage_mtp"
-OP_TYPE="NanovllmFusedLiManageMtp"
-DEPENDENCY_SOURCE_DIRS=("fused_li_manage")
+case "${OP_NAME}" in
+  fused_li_manage_mtp)
+    KERNEL_NAME="nanovllm_fused_li_manage_mtp"
+    OP_TYPE="NanovllmFusedLiManageMtp"
+    DEPENDENCY_SOURCE_DIRS=("fused_li_manage")
+    ;;
+  fused_copy_sfa_mtp)
+    KERNEL_NAME="nanovllm_fused_copy_sfa_mtp"
+    OP_TYPE="NanovllmFusedCopySfaMtp"
+    DEPENDENCY_SOURCE_DIRS=("fused_copy_sfa")
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac
 
 RAW_SOC_VERSION="${SOC_VERSION:-ascend910_9391}"
 case "${RAW_SOC_VERSION}" in
@@ -91,7 +105,7 @@ CONFIG_TARGET="ops_config_${CANN_SOC_VERSION}"
 TARGET_HELP="$(cmake --build "${CANN_BUILD_DIR}" --target help 2>/dev/null || true)"
 if ! grep -Fq "${TARGET_NAME}" <<<"${TARGET_HELP}"; then
   echo "[nanovllm incremental] ERROR: CMake target ${TARGET_NAME} is unavailable." >&2
-  grep -F "fused_li_manage_mtp" <<<"${TARGET_HELP}" >&2 || true
+  grep -F "${OP_NAME}" <<<"${TARGET_HELP}" >&2 || true
   echo "[nanovllm incremental] Run a full build before using the incremental path." >&2
   exit 1
 fi
@@ -126,10 +140,11 @@ done
 find "${GEN_DIR}" -maxdepth 1 -type f \
   -name "${TARGET_NAME}_*.done" -delete
 find "${CANN_BUILD_DIR}" -type f \
-  \( -name "${TARGET_NAME}_src_copy.done" \
-     -o -name "${OP_NAME}_${CANN_SOC_VERSION}_src_copy.done" \
-     -o -name "fused_li_manage_${CANN_SOC_VERSION}_src_copy.done" \) \
-  -delete
+  -name "${TARGET_NAME}_src_copy.done" -delete
+for source_dir_name in "${OP_NAME}" "${DEPENDENCY_SOURCE_DIRS[@]}"; do
+  find "${CANN_BUILD_DIR}" -type f \
+    -name "${source_dir_name}_${CANN_SOC_VERSION}_src_copy.done" -delete
+done
 rm -rf "${BIN_DIR:?}/${KERNEL_NAME}" "${BIN_DIR:?}/${OP_NAME}"
 rm -f \
   "${BIN_DIR}/${KERNEL_NAME}.json" \
