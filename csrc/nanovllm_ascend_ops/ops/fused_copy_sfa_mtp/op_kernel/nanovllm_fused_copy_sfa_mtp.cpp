@@ -17,6 +17,7 @@ using namespace FusedCopySfaMtpNs;
 
 namespace {
 constexpr uint32_t COPY_READY_FLAG = 15;
+constexpr uint32_t COPY_MTE3_DONE_EVENT = EVENT_ID0;
 
 template <typename T>
 __aicore__ inline void RunFusedMtp(
@@ -51,7 +52,8 @@ __aicore__ inline void RunFusedMtp(
         scatter.Process();
 
         // Make every local MTE3 write visible before waking its paired AIC.
-        SetWaitFlag<HardEvent::MTE3_S>(HardEvent::MTE3_S);
+        AscendC::SetFlag<HardEvent::MTE3_S>(COPY_MTE3_DONE_EVENT);
+        AscendC::WaitFlag<HardEvent::MTE3_S>(COPY_MTE3_DONE_EVENT);
         if (!scatter.UsesOwnerSchedule()) {
             // General batch shapes distribute the union list over all AIVs.
             // The target B=24 path intentionally skips this global barrier:
