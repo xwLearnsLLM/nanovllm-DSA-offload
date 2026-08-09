@@ -1174,8 +1174,6 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
             ++updateCount;
         }
     }
-    PipeBarrier<PIPE_ALL>();
-
     LocalTensor<int32_t> unionScratch =
         unionStorage.template ReinterpretCast<int32_t>();
     LocalTensor<int32_t> allPositions = unionScratch;
