@@ -13,6 +13,7 @@ inline void npu_fused_li_manage_mtp_out(
     const at::Tensor& candidate_lens,
     const at::Tensor& block_table,
     at::Tensor topk_slots,
+    at::Tensor topk_source_ids,
     at::Tensor miss_source_ids,
     at::Tensor miss_destination_slots,
     at::Tensor miss_counts) {
@@ -51,6 +52,8 @@ inline void npu_fused_li_manage_mtp_out(
                   topk_slots.size(0) == query.size(0) &&
                   topk_slots.size(1) == 1 && topk_slots.size(2) == kTopK,
               "MTP-LIDU topk_slots must be [4B, 1, 2048].");
+  TORCH_CHECK(topk_source_ids.sizes() == topk_slots.sizes(),
+              "MTP-LIDU topk_source_ids must match topk_slots.");
   TORCH_CHECK(miss_source_ids.dim() == 2 &&
                   miss_source_ids.size(0) == batch_size &&
                   miss_source_ids.size(1) == kUnionCapacity &&
@@ -69,6 +72,7 @@ inline void npu_fused_li_manage_mtp_out(
                   candidate_lens.scalar_type() == at::kInt &&
                   block_table.scalar_type() == at::kInt &&
                   topk_slots.scalar_type() == at::kInt &&
+                  topk_source_ids.scalar_type() == at::kInt &&
                   miss_source_ids.scalar_type() == at::kInt &&
                   miss_destination_slots.scalar_type() == at::kInt &&
                   miss_counts.scalar_type() == at::kInt,
@@ -77,7 +81,8 @@ inline void npu_fused_li_manage_mtp_out(
                   weights.is_contiguous() && req_pool_entries.is_contiguous() &&
                   cache_slots.is_contiguous() && cache_tokens.is_contiguous() &&
                   candidate_lens.is_contiguous() && block_table.is_contiguous() &&
-                  topk_slots.is_contiguous() && miss_source_ids.is_contiguous() &&
+                  topk_slots.is_contiguous() && topk_source_ids.is_contiguous() &&
+                  miss_source_ids.is_contiguous() &&
                   miss_destination_slots.is_contiguous() && miss_counts.is_contiguous(),
               "All MTP-LIDU tensors must be contiguous.");
   const auto device = query.device();
@@ -85,13 +90,15 @@ inline void npu_fused_li_manage_mtp_out(
                   req_pool_entries.device() == device &&
                   cache_slots.device() == device && cache_tokens.device() == device &&
                   candidate_lens.device() == device && block_table.device() == device &&
-                  topk_slots.device() == device && miss_source_ids.device() == device &&
+                  topk_slots.device() == device && topk_source_ids.device() == device &&
+                  miss_source_ids.device() == device &&
                   miss_destination_slots.device() == device && miss_counts.device() == device,
               "All MTP-LIDU tensors must be on the same NPU device.");
 
   auto keepalive = std::make_tuple(
       query, key, weights, req_pool_entries, cache_slots, cache_tokens,
-      candidate_lens, block_table, topk_slots, miss_source_ids,
+      candidate_lens, block_table, topk_slots, topk_source_ids,
+      miss_source_ids,
       miss_destination_slots, miss_counts);
   EXEC_NPU_CMD_ORDERED(
       aclnnNanovllmFusedLiManageMtp,
@@ -105,13 +112,14 @@ inline void npu_fused_li_manage_mtp_out(
       candidate_lens,
       block_table,
       topk_slots,
+      topk_source_ids,
       miss_source_ids,
       miss_destination_slots,
       miss_counts,
       cache_slots);
 }
 
-inline std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+inline std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 npu_fused_li_manage_mtp(
     const at::Tensor& query,
     const at::Tensor& key,
@@ -126,14 +134,16 @@ npu_fused_li_manage_mtp(
   const int64_t batch_size = req_pool_entries.size(0);
   auto options = query.options().dtype(at::kInt);
   auto topk_slots = at::empty({query.size(0), 1, kTopK}, options);
+  auto topk_source_ids = at::empty_like(topk_slots);
   auto miss_source_ids = at::empty({batch_size, kUnionCapacity}, options);
   auto miss_destination_slots = at::empty_like(miss_source_ids);
   auto miss_counts = at::empty({batch_size}, options);
   npu_fused_li_manage_mtp_out(
       query, key, weights, req_pool_entries, cache_slots, cache_tokens,
-      candidate_lens, block_table, topk_slots, miss_source_ids,
+      candidate_lens, block_table, topk_slots, topk_source_ids,
+      miss_source_ids,
       miss_destination_slots, miss_counts);
-  return std::make_tuple(topk_slots, miss_source_ids,
+  return std::make_tuple(topk_slots, topk_source_ids, miss_source_ids,
                          miss_destination_slots, miss_counts);
 }
 

@@ -90,6 +90,7 @@ private:
     static constexpr int TEMPLATE_MODE = SFAT::templateMode;
     static constexpr bool FLASH_DECODE = SFAT::flashDecode;
     static constexpr int STAGE_MODE = SFAT::stageMode;
+    static constexpr bool MTP3_MODE = SFAT::mtp3Mode;
     static constexpr SFA_LAYOUT LAYOUT_T = SFAT::layout;
     static constexpr SFA_LAYOUT KV_LAYOUT_T = SFAT::kvLayout;
 
@@ -316,32 +317,17 @@ __aicore__ inline void NanovllmSparseTailAttentionMla<SFAT>::GetActualSeqLen(uin
 {
     (void)s1Idx;
     tempLoopInfo.curActualSeqLenOri = GetActualSeqLenKV(bIdx);
-    tempLoopInfo.actS1Size = 1;
-
-    int32_t cacheTokenCount = cacheTokensGm.GetValue(bIdx);
-    if (cacheTokenCount == 0) {
-        tempLoopInfo.tailSlotStart = 0;
-        tempLoopInfo.tailTokenCount = static_cast<uint32_t>(tempLoopInfo.curActualSeqLenOri);
-        tempLoopInfo.sparseTokenCount = 0;
-    } else if (cacheTokenCount >= static_cast<int32_t>(SFA_OFFLOAD_SPARSE_COMPUTE_COUNT) &&
-               static_cast<uint64_t>(cacheTokenCount) <= tempLoopInfo.curActualSeqLenOri) {
-        tempLoopInfo.tailSlotStart = cacheTokenCount;
-        tempLoopInfo.tailTokenCount =
-            static_cast<uint32_t>(tempLoopInfo.curActualSeqLenOri - cacheTokenCount);
-        tempLoopInfo.sparseTokenCount = SFA_OFFLOAD_SPARSE_COMPUTE_COUNT;
-    } else {
-        tempLoopInfo.tailSlotStart = -1;
-        tempLoopInfo.tailTokenCount = 0;
-        tempLoopInfo.sparseTokenCount = 0;
-    }
+    tempLoopInfo.actS1Size = MTP3_MODE ? SFA_MTP3_QUERY_COUNT : 1;
 }
 
 template <typename SFAT>
 __aicore__ inline uint64_t NanovllmSparseTailAttentionMla<SFAT>::GetTopKRowOffset(uint32_t bIdx, uint32_t s1Idx,
                                                                            uint32_t n2Idx)
 {
-    (void)s1Idx;
     (void)n2Idx;
+    if constexpr (MTP3_MODE) {
+        return static_cast<uint64_t>(bIdx) * SFA_MTP3_QUERY_COUNT + s1Idx;
+    }
     return bIdx;
 }
 
@@ -349,9 +335,31 @@ template <typename SFAT>
 __aicore__ inline void NanovllmSparseTailAttentionMla<SFAT>::GetSparseActualSeqLen(uint32_t bIdx, uint32_t s1Idx,
                                                                             uint32_t n2Idx)
 {
-    (void)bIdx;
-    (void)s1Idx;
     (void)n2Idx;
+    uint64_t visibleKvLen = tempLoopInfo.curActualSeqLenOri;
+    if constexpr (MTP3_MODE) {
+        const uint32_t hiddenFutureRows = SFA_MTP3_QUERY_COUNT - 1U - s1Idx;
+        visibleKvLen = visibleKvLen > hiddenFutureRows
+            ? visibleKvLen - hiddenFutureRows
+            : 0;
+    }
+
+    int32_t cacheTokenCount = cacheTokensGm.GetValue(bIdx);
+    if (cacheTokenCount == 0) {
+        tempLoopInfo.tailSlotStart = 0;
+        tempLoopInfo.tailTokenCount = static_cast<uint32_t>(visibleKvLen);
+        tempLoopInfo.sparseTokenCount = 0;
+    } else if (cacheTokenCount >= static_cast<int32_t>(SFA_OFFLOAD_SPARSE_COMPUTE_COUNT) &&
+               static_cast<uint64_t>(cacheTokenCount) <= visibleKvLen) {
+        tempLoopInfo.tailSlotStart = cacheTokenCount;
+        tempLoopInfo.tailTokenCount =
+            static_cast<uint32_t>(visibleKvLen - cacheTokenCount);
+        tempLoopInfo.sparseTokenCount = SFA_OFFLOAD_SPARSE_COMPUTE_COUNT;
+    } else {
+        tempLoopInfo.tailSlotStart = -1;
+        tempLoopInfo.tailTokenCount = 0;
+        tempLoopInfo.sparseTokenCount = 0;
+    }
     tempLoopInfo.curActualSeqLen = tempLoopInfo.sparseTokenCount + tempLoopInfo.tailTokenCount;
 }
 
@@ -712,7 +720,9 @@ __aicore__ inline void NanovllmSparseTailAttentionMla<SFAT>::CalcParams(uint32_t
     }
     info.isLastS2Loop = s2LoopIdx == tempLoopInfo.s2LoopTimes - 1;
     info.bn2IdxInCurCore = tempLoopInfo.bn2IdxInCurCore - 1;
-    uint64_t actualSeqQPrefixSum = info.bIdx;
+    uint64_t actualSeqQPrefixSum = MTP3_MODE
+        ? static_cast<uint64_t>(info.bIdx) * SFA_MTP3_QUERY_COUNT
+        : info.bIdx;
     info.tndBIdxOffsetForQ = actualSeqQPrefixSum * constInfo.qHeadNum * headDim;
 
     uint64_t actualSeqKVPrefixSum;
@@ -949,7 +959,7 @@ NanovllmSparseTailAttentionMla<SFAT>::GetBalanceActualSeqLengths(GlobalTensor<in
 {
     (void)actualSeqLengths;
     (void)bIdx;
-    return 1;
+    return MTP3_MODE ? SFA_MTP3_QUERY_COUNT : 1;
 }
 
 template <typename SFAT>

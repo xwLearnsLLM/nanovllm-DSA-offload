@@ -456,6 +456,7 @@ class GlmMLAAttention(nn.Module):
                 torch.Tensor,
                 torch.Tensor,
                 torch.Tensor,
+                torch.Tensor,
             ],
         ] = {}
         self._mtp_sparse_tail_graph_outputs: dict[int, torch.Tensor] = {}
@@ -1277,6 +1278,9 @@ class GlmMLAAttention(nn.Module):
                     torch.zeros(
                         (batch_size * 4, 1, LIDU_TOPK), **options
                     ),
+                    torch.full(
+                        (batch_size * 4, 1, LIDU_TOPK), -1, **options
+                    ),
                     torch.zeros(
                         (batch_size, LIDU_MTP_UNION_CAPACITY), **options
                     ),
@@ -1288,6 +1292,7 @@ class GlmMLAAttention(nn.Module):
                 self._fused_li_manage_mtp_graph_outputs[batch_size] = buffers
             (
                 topk_slots,
+                topk_source_ids,
                 source_ids,
                 destination_slots,
                 miss_counts,
@@ -1296,6 +1301,7 @@ class GlmMLAAttention(nn.Module):
         else:
             (
                 topk_slots,
+                topk_source_ids,
                 source_ids,
                 destination_slots,
                 miss_counts,

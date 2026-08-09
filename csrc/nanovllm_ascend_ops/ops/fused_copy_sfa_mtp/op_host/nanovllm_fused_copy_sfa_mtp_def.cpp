@@ -32,9 +32,7 @@ public:
             .FormatList({ge::FORMAT_ND}).AutoContiguous();
         this->Input("dram_block_table").ParamType(REQUIRED).DataTypeList({ge::DT_INT32})
             .FormatList({ge::FORMAT_ND}).AutoContiguous();
-        this->Input("miss_source_ids").ParamType(REQUIRED).DataTypeList({ge::DT_INT32})
-            .FormatList({ge::FORMAT_ND}).AutoContiguous();
-        this->Input("miss_destination_slots").ParamType(REQUIRED).DataTypeList({ge::DT_INT32})
+        this->Input("topk_source_ids").ParamType(REQUIRED).DataTypeList({ge::DT_INT32})
             .FormatList({ge::FORMAT_ND}).AutoContiguous();
         this->Input("miss_counts").ParamType(REQUIRED).DataTypeList({ge::DT_INT32})
             .FormatList({ge::FORMAT_ND}).AutoContiguous();

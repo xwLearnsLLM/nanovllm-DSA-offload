@@ -3,7 +3,7 @@
 
 namespace vllm_ascend {
 
-// MTP3 union-SCATTER + causal sparse Attention in one AscendC launch.
+// MTP3 source-aware copy + causal sparse Attention in one AscendC launch.
 // HBM caches are mutated in place and the caller owns attention_out; no cache
 // aliases are exposed through the public torch.library schema.
 inline void npu_fused_copy_sfa_mtp_out(
@@ -13,8 +13,7 @@ inline void npu_fused_copy_sfa_mtp_out(
     const at::Tensor& actual_seq_lengths_kv,
     const at::Tensor& cache_tokens,
     const at::Tensor& topk_slots,
-    const at::Tensor& miss_source_ids,
-    const at::Tensor& miss_destination_slots,
+    const at::Tensor& topk_source_ids,
     const at::Tensor& miss_counts,
     const at::Tensor& hbm_block_table,
     const at::Tensor& dram_block_table,
@@ -27,7 +26,6 @@ inline void npu_fused_copy_sfa_mtp_out(
   constexpr int64_t kBlockSize = 128;
   constexpr int64_t kQueryCount = 4;
   constexpr int64_t kTopK = 2048;
-  constexpr int64_t kUnionCapacity = kQueryCount * kTopK;
   constexpr int64_t kCkvDim = 512;
   constexpr int64_t kKpeDim = 64;
 
@@ -50,12 +48,8 @@ inline void npu_fused_copy_sfa_mtp_out(
                   topk_slots.size(1) == 1 &&
                   topk_slots.size(2) == kTopK,
               "Fused MTP topk_slots must be [4B, 1, 2048].");
-  TORCH_CHECK(miss_source_ids.dim() == 2 &&
-                  miss_source_ids.size(0) == batch_size &&
-                  miss_source_ids.size(1) == kUnionCapacity &&
-                  miss_destination_slots.sizes() ==
-                      miss_source_ids.sizes(),
-              "Fused MTP miss source/destination buffers must be [B, 8192].");
+  TORCH_CHECK(topk_source_ids.sizes() == topk_slots.sizes(),
+              "Fused MTP topk_source_ids must match topk_slots.");
   TORCH_CHECK(miss_counts.dim() == 1 &&
                   miss_counts.size(0) == batch_size,
               "Fused MTP miss_counts must be [B].");
@@ -106,10 +100,10 @@ inline void npu_fused_copy_sfa_mtp_out(
                 "All fused MTP floating-point tensors must share one dtype.");
   }
   for (const at::Tensor* tensor :
-       std::array<const at::Tensor*, 9>{
+       std::array<const at::Tensor*, 8>{
            &actual_seq_lengths_query, &actual_seq_lengths_kv,
-           &cache_tokens, &topk_slots, &miss_source_ids,
-           &miss_destination_slots, &miss_counts, &hbm_block_table,
+           &cache_tokens, &topk_slots, &topk_source_ids,
+           &miss_counts, &hbm_block_table,
            &dram_block_table}) {
     TORCH_CHECK(tensor->scalar_type() == at::kInt,
                 "All fused MTP metadata tensors must be int32.");
@@ -117,10 +111,10 @@ inline void npu_fused_copy_sfa_mtp_out(
 
   const auto device = query.device();
   for (const at::Tensor* tensor :
-       std::array<const at::Tensor*, 16>{
+       std::array<const at::Tensor*, 15>{
            &query_rope, &query, &actual_seq_lengths_query,
            &actual_seq_lengths_kv, &cache_tokens, &topk_slots,
-           &miss_source_ids, &miss_destination_slots, &miss_counts,
+           &topk_source_ids, &miss_counts,
            &hbm_block_table, &dram_block_table, &hbm_k_rope,
            &hbm_kv_cache, &dram_k_rope, &dram_kv_cache,
            &attention_out}) {
@@ -139,7 +133,7 @@ inline void npu_fused_copy_sfa_mtp_out(
   auto keepalive = std::make_tuple(
       query_rope, query, actual_seq_lengths_query,
       actual_seq_lengths_kv, cache_tokens, topk_slots,
-      miss_source_ids, miss_destination_slots, miss_counts,
+      topk_source_ids, miss_counts,
       hbm_block_table, dram_block_table, hbm_k_rope,
       hbm_kv_cache, dram_k_rope, dram_kv_cache, attention_out);
   EXEC_NPU_CMD_ORDERED(
@@ -158,8 +152,7 @@ inline void npu_fused_copy_sfa_mtp_out(
       dram_k_rope,
       dram_kv_cache,
       dram_block_table,
-      miss_source_ids,
-      miss_destination_slots,
+      topk_source_ids,
       miss_counts,
       scale_value,
       kSparseBlockSize,

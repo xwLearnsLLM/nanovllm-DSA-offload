@@ -180,7 +180,7 @@ def expected_after_scatter(
 ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
     expected_kpe = initial_kpe.clone()
     expected_ckv = initial_ckv.clone()
-    counts = lidu_outputs[3].cpu()
+    counts = lidu_outputs[4].cpu()
     lidu_ut._apply_scatter_reference(
         expected_kpe,
         expected_ckv,
@@ -188,8 +188,8 @@ def expected_after_scatter(
         dram_ckv,
         hbm_table,
         dram_table,
-        lidu_outputs[1].cpu(),
         lidu_outputs[2].cpu(),
+        lidu_outputs[3].cpu(),
         counts,
     )
     return (
@@ -367,9 +367,9 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
             dram_ckv,
             hbm_table,
             dram_table,
-            lidu_outputs[1],
             lidu_outputs[2],
             lidu_outputs[3],
+            lidu_outputs[4],
         )
         attention = call_attention_out(
             query=query,
@@ -405,8 +405,7 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
                 case.cache_tokens,
                 lidu_outputs[0],
                 lidu_outputs[1],
-                lidu_outputs[2],
-                lidu_outputs[3],
+                lidu_outputs[4],
                 hbm_table,
                 dram_table,
                 hbm_kpe.view(-1, BLOCK_SIZE, 1, KPE_DIM),
@@ -679,7 +678,8 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
             perf_case, perf_cache, *lidu_ut.make_outputs(perf_case)
         )
         torch.npu.synchronize()
-        perf_counts = [int(value) for value in perf_outputs[3].cpu().tolist()]
+        perf_counts = [int(value) for value in perf_outputs[4].cpu().tolist()]
+        aligned_dram_reads = int((perf_outputs[1] >= 0).sum().cpu())
         expected_perf_counts = [args.perf_miss_count] * batch_size
         if perf_counts != expected_perf_counts:
             raise AssertionError(
@@ -702,9 +702,9 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
                 dram_ckv,
                 hbm_table,
                 dram_table,
-                perf_outputs[1],
                 perf_outputs[2],
                 perf_outputs[3],
+                perf_outputs[4],
             )
             return call_attention_out(
                 query=query,
@@ -729,8 +729,7 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
                 perf_case.cache_tokens,
                 perf_outputs[0],
                 perf_outputs[1],
-                perf_outputs[2],
-                perf_outputs[3],
+                perf_outputs[4],
                 hbm_table,
                 dram_table,
                 fused_perf_kpe.view(-1, BLOCK_SIZE, 1, KPE_DIM),
@@ -760,9 +759,10 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
             "FUSED_COPY_SFA_MTP_PERF_RESULT "
             f"batch={batch_size} miss_per_request={args.perf_miss_count} "
             f"total_misses={sum(perf_counts)} "
+            f"aligned_dram_reads={aligned_dram_reads} "
             f"split_ms={split_ms:.6f} fused_ms={fused_ms:.6f} "
             f"speedup={split_ms / fused_ms:.4f} "
-            "performance_assert=0 implementation=single_kernel_v1 "
+            "performance_assert=0 implementation=source_aware_v2 "
             f"warmup={args.warmup} iters={args.iters}",
             flush=True,
         )

@@ -74,10 +74,11 @@ public:
     // ================================Vector0==========================================
     __aicore__ inline void MergeKv(const RunInfo &runInfo);
     // Compile three lean ranges: original, staggered hit-only, and source-aware miss.
-    template <bool SOURCE_ORDER, bool HAS_MISS>
+    template <bool SOURCE_ORDER, bool HAS_MISS, bool ALIGNED_MISS = false>
     __aicore__ inline void MergeKvRange(const RunInfo &runInfo, int64_t s2GmStartOffset,
                                         int64_t s2GmLimit, uint32_t validSizePart,
                                         int64_t missRangeSize, int64_t sourceRangeStart);
+    template <bool ALIGNED_MISS = false>
     __aicore__ inline void MergeSourceAwareSparseRange(
         const RunInfo &runInfo, int64_t s2GmStartOffset,
         int64_t s2GmLimit, uint32_t validSizePart,
@@ -114,6 +115,7 @@ public:
         const RunInfo &runInfo);
     __aicore__ inline void CopyOutMrgeResult(int64_t mte2Size, int64_t mte3Size, int64_t s2StartGmOffset,
                                              int64_t mergeMte3Idx, const RunInfo &runInfo);
+    template <bool ALIGNED_MISS = false>
     __aicore__ inline void CopyOutSourceAwareResult(
         int64_t mte2Size, int64_t mte3Size,
         int64_t s2StartGmOffset, int64_t mergeMte3Idx,
@@ -849,14 +851,15 @@ SFAVectorService<SFAT>::GetSourceAwareMissCount(
         copyCountBatch_ = static_cast<int32_t>(runInfo.bIdx);
     }
     const int32_t missCount = cachedCopyCount_;
+    const int32_t maxCopyCount = SFAT::mtp3Mode
+        ? static_cast<int32_t>(copyCap_ * SFA_MTP3_QUERY_COUNT)
+        : static_cast<int32_t>(copyCap_);
     ASSERT_MSG(
         missCount >= 0 &&
-            missCount <= static_cast<int32_t>(runInfo.sparseTokenCount) &&
-            missCount <= static_cast<int32_t>(copyCap_),
+            missCount <= maxCopyCount,
         "copy_count exceeds the source-aware gather capacity.");
     if (missCount < 0 ||
-        missCount > static_cast<int32_t>(runInfo.sparseTokenCount) ||
-        missCount > static_cast<int32_t>(copyCap_)) {
+        missCount > maxCopyCount) {
         return 0;
     }
     return missCount;
@@ -1189,6 +1192,7 @@ __aicore__ inline void SFAVectorService<SFAT>::CopyOutMrgeResult(int64_t mte2Siz
 }
 
 template <typename SFAT>
+template <bool ALIGNED_MISS>
 __aicore__ inline void
 SFAVectorService<SFAT>::CopyOutSourceAwareResult(
     int64_t mte2Size, int64_t mte3Size,
@@ -1199,20 +1203,26 @@ SFAVectorService<SFAT>::CopyOutSourceAwareResult(
     CopyOutMrgeResult(
         mte2Size, mte3Size, s2GmStartOffset,
         mergeMte3Idx, runInfo);
-    if (mte2Size <= mte3Size || mte3Size >= missRangeSize) {
+    if (mte2Size <= mte3Size ||
+        (!ALIGNED_MISS && mte3Size >= missRangeSize)) {
         return;
     }
 
-    const int64_t missEnd =
-        mte2Size < missRangeSize ? mte2Size : missRangeSize;
-    // The source-aware sparse range is dense and ordered in source-index
-    // space. Only its miss prefix needs the second write to persistent HBM.
+    const int64_t missEnd = ALIGNED_MISS
+        ? mte2Size
+        : (mte2Size < missRangeSize ? mte2Size : missRangeSize);
     for (int64_t rangeOffset = mte3Size;
          rangeOffset < missEnd; ++rangeOffset) {
         const int64_t ubRow =
             mergeMte3Idx % 2 * 32 + rangeOffset - mte3Size;
         const int64_t sourceIndex =
             sourceRangeStart + rangeOffset;
+        if constexpr (ALIGNED_MISS) {
+            if (sourceTokenIdsGm_.GetValue(
+                    runInfo.topKBaseOffset + sourceIndex) < 0) {
+                continue;
+            }
+        }
         const int32_t destinationSlot =
             topkGm_.GetValue(
                 runInfo.topKBaseOffset + sourceIndex);
@@ -1223,7 +1233,7 @@ SFAVectorService<SFAT>::CopyOutSourceAwareResult(
 
 // b s1 k
 template <typename SFAT>
-template <bool SOURCE_ORDER, bool HAS_MISS>
+template <bool SOURCE_ORDER, bool HAS_MISS, bool ALIGNED_MISS>
 __aicore__ inline void SFAVectorService<SFAT>::MergeKvRange(
     const RunInfo &runInfo, int64_t s2GmStartOffset, int64_t s2GmLimit,
     uint32_t validSizePart, int64_t missRangeSize,
@@ -1240,7 +1250,7 @@ __aicore__ inline void SFAVectorService<SFAT>::MergeKvRange(
                 runInfo.gS1Idx / constInfo.gSize + 1;
         }
     }
-    if constexpr (HAS_MISS) {
+    if constexpr (HAS_MISS && !ALIGNED_MISS) {
         missBase =
             static_cast<int64_t>(runInfo.bIdx) * copyCap_;
     }
@@ -1267,27 +1277,24 @@ __aicore__ inline void SFAVectorService<SFAT>::MergeKvRange(
                 sourceRangeStart + rangeOffset;
             const int64_t sourceIndex1 = sourceIndex0 + 1;
             if constexpr (HAS_MISS) {
-                const bool source0FromDram =
-                    rangeOffset < missRangeSize;
-                const bool source1FromDram =
-                    rangeOffset + 1 < missRangeSize;
-                if (source0FromDram) {
-                    realS2Idx0 =
-                        sourceTokenIdsGm_.GetValue(
-                            missBase + sourceIndex0);
+                bool source0FromDram = false;
+                bool source1FromDram = false;
+                if constexpr (ALIGNED_MISS) {
+                    realS2Idx0 = sourceTokenIdsGm_.GetValue(
+                        topkGmBaseOffset + sourceIndex0);
+                    realS2Idx1 = sourceTokenIdsGm_.GetValue(
+                        topkGmBaseOffset + sourceIndex1);
+                    source0FromDram = realS2Idx0 >= 0;
+                    source1FromDram = realS2Idx1 >= 0;
                 } else {
-                    realS2Idx0 =
-                        topkGm_.GetValue(
-                            topkGmBaseOffset + sourceIndex0);
-                }
-                if (source1FromDram) {
-                    realS2Idx1 =
-                        sourceTokenIdsGm_.GetValue(
-                            missBase + sourceIndex1);
-                } else {
-                    realS2Idx1 =
-                        topkGm_.GetValue(
-                            topkGmBaseOffset + sourceIndex1);
+                    source0FromDram = rangeOffset < missRangeSize;
+                    source1FromDram = rangeOffset + 1 < missRangeSize;
+                    realS2Idx0 = source0FromDram
+                        ? sourceTokenIdsGm_.GetValue(missBase + sourceIndex0)
+                        : topkGm_.GetValue(topkGmBaseOffset + sourceIndex0);
+                    realS2Idx1 = source1FromDram
+                        ? sourceTokenIdsGm_.GetValue(missBase + sourceIndex1)
+                        : topkGm_.GetValue(topkGmBaseOffset + sourceIndex1);
                 }
                 if (source0FromDram || source1FromDram) {
                     if (source0FromDram) {
@@ -1358,7 +1365,7 @@ __aicore__ inline void SFAVectorService<SFAT>::MergeKvRange(
             s2GmOffsetArray + 2 * constInfo.sparseBlockSize >=
                 s2GmLimit) {
             if constexpr (SOURCE_ORDER && HAS_MISS) {
-                CopyOutSourceAwareResult(
+                CopyOutSourceAwareResult<ALIGNED_MISS>(
                     mte2Size, mte3Size, s2GmStartOffset,
                     mergeMte3Idx, runInfo, missRangeSize,
                     sourceRangeStart);
@@ -1379,6 +1386,7 @@ __aicore__ inline void SFAVectorService<SFAT>::MergeKvRange(
 }
 
 template <typename SFAT>
+template <bool ALIGNED_MISS>
 __aicore__ inline void
 SFAVectorService<SFAT>::MergeSourceAwareSparseRange(
     const RunInfo &runInfo, int64_t s2GmStartOffset,
@@ -1398,20 +1406,18 @@ SFAVectorService<SFAT>::MergeSourceAwareSparseRange(
         sourceTileStart + s2GmStartOffset;
     const int64_t rangeSize =
         s2GmLimit - s2GmStartOffset;
-    const int64_t missAfterRangeStart =
-        static_cast<int64_t>(missCount) - sourceRangeStart;
-    const int64_t missRangeSize =
-        missAfterRangeStart <= 0
-            ? 0
-            : (missAfterRangeStart < rangeSize
-                   ? missAfterRangeStart
-                   : rangeSize);
+    const int64_t missAfterRangeStart = ALIGNED_MISS
+        ? (missCount > 0 ? rangeSize : 0)
+        : static_cast<int64_t>(missCount) - sourceRangeStart;
+    const int64_t missRangeSize = missAfterRangeStart <= 0
+        ? 0
+        : (missAfterRangeStart < rangeSize ? missAfterRangeStart : rangeSize);
     if (missRangeSize == 0) {
         MergeKvRange<true, false>(
             runInfo, s2GmStartOffset, s2GmLimit,
             validSizePart, 0, sourceRangeStart);
     } else {
-        MergeKvRange<true, true>(
+        MergeKvRange<true, true, ALIGNED_MISS>(
             runInfo, s2GmStartOffset, s2GmLimit,
             validSizePart, missRangeSize, sourceRangeStart);
     }
@@ -1488,7 +1494,7 @@ __aicore__ inline void SFAVectorService<SFAT>::MergeKv(const RunInfo &runInfo)
                     ? GetStaggeredSparseIndex(
                           virtualTileStart, runInfo)
                     : virtualTileStart;
-            MergeSourceAwareSparseRange(
+            MergeSourceAwareSparseRange<SFAT::mtp3Mode>(
                 runInfo, rangeStart, rangeEnd, part,
                 missCount, sourceTileStart);
         } else {

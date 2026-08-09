@@ -66,6 +66,7 @@ ge::graphStatus LIUMtpTiling::GetTensors(LIUMtpTilingInfo &info) const
     LOAD_INPUT(candidateLens, MTP_CANDIDATE_LENS_INDEX);
     LOAD_INPUT(blockTable, MTP_BLOCK_TABLE_INDEX);
     LOAD_OUTPUT(topkSlots, MTP_TOPK_SLOTS_OUT);
+    LOAD_OUTPUT(topkSource, MTP_TOPK_SOURCE_OUT);
     LOAD_OUTPUT(missSource, MTP_MISS_SOURCE_OUT);
     LOAD_OUTPUT(missSlots, MTP_MISS_SLOTS_OUT);
     LOAD_OUTPUT(missCounts, MTP_MISS_COUNTS_OUT);
@@ -92,6 +93,7 @@ ge::graphStatus LIUMtpTiling::CheckDtypes(const LIUMtpTilingInfo &info) const
                    t.candidateLens.desc->GetDataType() != ge::DT_INT32 ||
                    t.blockTable.desc->GetDataType() != ge::DT_INT32 ||
                    t.topkSlots.desc->GetDataType() != ge::DT_INT32 ||
+                   t.topkSource.desc->GetDataType() != ge::DT_INT32 ||
                    t.missSource.desc->GetDataType() != ge::DT_INT32 ||
                    t.missSlots.desc->GetDataType() != ge::DT_INT32 ||
                    t.missCounts.desc->GetDataType() != ge::DT_INT32 ||
@@ -113,6 +115,7 @@ ge::graphStatus LIUMtpTiling::CheckShapes(LIUMtpTilingInfo &info) const
     const auto &lens = t.candidateLens.shape->GetStorageShape();
     const auto &blocks = t.blockTable.shape->GetStorageShape();
     const auto &topkSlots = t.topkSlots.shape->GetStorageShape();
+    const auto &topkSource = t.topkSource.shape->GetStorageShape();
     const auto &missSource = t.missSource.shape->GetStorageShape();
     const auto &missSlots = t.missSlots.shape->GetStorageShape();
     const auto &missCounts = t.missCounts.shape->GetStorageShape();
@@ -155,6 +158,13 @@ ge::graphStatus LIUMtpTiling::CheckShapes(LIUMtpTilingInfo &info) const
                    topkSlots.GetDim(0) != info.tokenRows ||
                    topkSlots.GetDim(1) != 1 || topkSlots.GetDim(2) != MTP_TOPK,
                OPS_LOG_E(info.opName, "topk_slots must be [4B,1,2048]."),
+               return ge::GRAPH_FAILED);
+    OPS_ERR_IF(topkSource.GetDimNum() != 3 ||
+                   topkSource.GetDim(0) != info.tokenRows ||
+                   topkSource.GetDim(1) != 1 ||
+                   topkSource.GetDim(2) != MTP_TOPK,
+               OPS_LOG_E(info.opName,
+                         "topk_source_ids must be [4B,1,2048]."),
                return ge::GRAPH_FAILED);
     OPS_ERR_IF(missSource.GetDimNum() != 2 || missSlots.GetDimNum() != 2 ||
                    missSource.GetDim(0) != info.batchSize ||

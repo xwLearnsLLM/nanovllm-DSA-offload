@@ -24,6 +24,7 @@ using namespace AscendC;
 constexpr SoftmaxConfig SFA_SOFTMAX_FLASHV2_CFG_WITHOUT_BRC = {false, 0, 0, SoftmaxMode::SOFTMAX_OUTPUT_WITHOUT_BRC};
 constexpr uint32_t SFA_OFFLOAD_SPARSE_INDICES_CAPACITY = 2048;
 constexpr uint32_t SFA_OFFLOAD_SPARSE_COMPUTE_COUNT = 2048;
+constexpr uint32_t SFA_MTP3_QUERY_COUNT = 4;
 
 enum class SFA_LAYOUT
 {
@@ -42,7 +43,8 @@ enum SFA_STAGE_MODE
 template <typename Q_T, typename KV_T, typename OUT_T, const bool FLASH_DECODE = false,
 	  SFA_LAYOUT LAYOUT_T = SFA_LAYOUT::BSND, SFA_LAYOUT KV_LAYOUT_T = SFA_LAYOUT::BSND,
           const int TEMPLATE_MODE = C_TEMPLATE, const int STAGE_MODE = SFA_STAGE_NORMAL,
-          const bool SOURCE_AWARE_GATHER = false, typename... Args>
+          const bool SOURCE_AWARE_GATHER = false,
+          const bool MTP3_MODE = false, typename... Args>
 struct SFAType {
     using queryType = Q_T;
     using kvType = KV_T;
@@ -53,6 +55,7 @@ struct SFAType {
     static constexpr int templateMode = TEMPLATE_MODE;
     static constexpr int stageMode = STAGE_MODE;
     static constexpr bool sourceAwareGather = SOURCE_AWARE_GATHER;
+    static constexpr bool mtp3Mode = MTP3_MODE;
     static constexpr bool pageAttention = (KV_LAYOUT_T == SFA_LAYOUT::PA_BSND);
 };
 

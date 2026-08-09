@@ -18,6 +18,7 @@ aclnnStatus aclnnNanovllmFusedLiManageMtpGetWorkspaceSize(
     const aclTensor *reqPoolEntries, const aclTensor *cacheSlots,
     const aclTensor *cacheTokens, const aclTensor *candidateLens,
     const aclTensor *blockTable, const aclTensor *topkSlotsOut,
+    const aclTensor *topkSourceIdsOut,
     const aclTensor *missSourceIdsOut,
     const aclTensor *missDestinationSlotsOut, const aclTensor *missCountsOut,
     const aclTensor *cacheSlotsOut, uint64_t *workspaceSize,

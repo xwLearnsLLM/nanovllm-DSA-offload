@@ -84,6 +84,7 @@ def fused_li_manage_mtp(
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
+    torch.Tensor,
 ]:
     """Run the fixed-width GLM MTP3 LIDU update.
 
@@ -115,10 +116,12 @@ def fused_li_manage_mtp_out(
     candidate_lens: torch.Tensor,
     block_table: torch.Tensor,
     topk_slots: torch.Tensor,
+    topk_source_ids: torch.Tensor,
     miss_source_ids: torch.Tensor,
     miss_destination_slots: torch.Tensor,
     miss_counts: torch.Tensor,
 ) -> tuple[
+    torch.Tensor,
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
@@ -137,6 +140,7 @@ def fused_li_manage_mtp_out(
         candidate_lens,
         block_table,
         topk_slots,
+        topk_source_ids,
         miss_source_ids,
         miss_destination_slots,
         miss_counts,
@@ -284,8 +288,7 @@ def fused_copy_sfa_mtp(
     actual_seq_lengths_kv: torch.Tensor,
     cache_tokens: torch.Tensor,
     topk_slots: torch.Tensor,
-    miss_source_ids: torch.Tensor,
-    miss_destination_slots: torch.Tensor,
+    topk_source_ids: torch.Tensor,
     miss_counts: torch.Tensor,
     hbm_block_table: torch.Tensor,
     dram_block_table: torch.Tensor,
@@ -296,7 +299,7 @@ def fused_copy_sfa_mtp(
     scale_value: float,
     attention_out: torch.Tensor,
 ) -> torch.Tensor:
-    """Copy MTP3 union misses and write sparse Attention to ``attention_out``.
+    """Gather MTP3 misses and write sparse Attention to ``attention_out``.
 
     The cache tensors are mutated in place.  They are intentionally not
     returned as alias outputs; the caller owns both cache storage and the
@@ -310,8 +313,7 @@ def fused_copy_sfa_mtp(
         actual_seq_lengths_kv,
         cache_tokens,
         topk_slots,
-        miss_source_ids,
-        miss_destination_slots,
+        topk_source_ids,
         miss_counts,
         hbm_block_table,
         dram_block_table,

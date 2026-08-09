@@ -7,7 +7,7 @@ namespace optiling {
 
 // Keep the production sparse Attention payload as an exact prefix.  The
 // kernel reinterprets that prefix as NanovllmSparseTailAttentionTilingDataMla
-// and consumes the final two fields only in its union-SCATTER pre-stage.
+// and consumes the suffix for source-aware DRAM gather metadata.
 BEGIN_TILING_DATA_DEF(NanovllmFusedCopySfaMtpTilingData)
 TILING_DATA_FIELD_DEF_STRUCT(NanovllmSparseTailAttentionBaseParamsMla, baseParams);
 TILING_DATA_FIELD_DEF_STRUCT(NanovllmSparseTailAttentionSplitKVParamsMla, splitKVParams);

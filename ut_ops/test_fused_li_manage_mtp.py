@@ -372,6 +372,7 @@ def call_mtp_out(
     case: MtpCase,
     cache_slots: torch.Tensor,
     topk_slots: torch.Tensor,
+    topk_source_ids: torch.Tensor,
     miss_source_ids: torch.Tensor,
     miss_destination_slots: torch.Tensor,
     miss_counts: torch.Tensor,
@@ -386,6 +387,7 @@ def call_mtp_out(
         case.candidate_lens,
         case.block_table,
         topk_slots,
+        topk_source_ids,
         miss_source_ids,
         miss_destination_slots,
         miss_counts,
@@ -399,6 +401,7 @@ def make_outputs(case: MtpCase) -> tuple[torch.Tensor, ...]:
         dtype=torch.int32,
         device=case.device,
     )
+    topk_source_ids = torch.full_like(topk_slots, -313)
     miss_sources = torch.full(
         (case.batch_size, UNION_CAPACITY),
         -313,
@@ -409,7 +412,13 @@ def make_outputs(case: MtpCase) -> tuple[torch.Tensor, ...]:
     miss_counts = torch.full(
         (case.batch_size,), -313, dtype=torch.int32, device=case.device
     )
-    return topk_slots, miss_sources, miss_destinations, miss_counts
+    return (
+        topk_slots,
+        topk_source_ids,
+        miss_sources,
+        miss_destinations,
+        miss_counts,
+    )
 
 
 def _swapped_from_cpu(cpu: torch.Tensor, device: torch.device) -> torch.Tensor:
@@ -472,9 +481,9 @@ def _run_scatter(
         dram_ckv,
         hbm_block_table,
         dram_block_table,
-        outputs[1],
         outputs[2],
         outputs[3],
+        outputs[4],
     )
 
 
@@ -520,6 +529,7 @@ def run_meta_check() -> None:
     )
     expected_shapes = (
         (batch_size * QUERY_COUNT, 1, TOPK),
+        (batch_size * QUERY_COUNT, 1, TOPK),
         (batch_size, UNION_CAPACITY),
         (batch_size, UNION_CAPACITY),
         (batch_size,),
@@ -536,6 +546,7 @@ def run_meta_check() -> None:
         torch.empty(expected_shapes[1], device=meta, dtype=torch.int32),
         torch.empty(expected_shapes[2], device=meta, dtype=torch.int32),
         torch.empty(expected_shapes[3], device=meta, dtype=torch.int32),
+        torch.empty(expected_shapes[4], device=meta, dtype=torch.int32),
     )
     out_outputs = torch.ops.nanovllm_dsa.fused_li_manage_mtp_out.default(
         query,
@@ -552,7 +563,7 @@ def run_meta_check() -> None:
         raise AssertionError("MTP-LIDU _out Meta output shapes are incorrect")
     if any(output.dtype != torch.int32 for output in out_outputs):
         raise AssertionError("MTP-LIDU _out Meta output dtypes are not int32")
-    for returned, supplied in zip(out_outputs[:4], out_buffers):
+    for returned, supplied in zip(out_outputs[:5], out_buffers):
         if not torch._C._is_alias_of(returned, supplied):
             raise AssertionError("MTP-LIDU _out Meta output lost its alias")
     if not torch._C._is_alias_of(out_outputs[-1], cache_slots):
@@ -572,11 +583,21 @@ def validate_result(
     *,
     label: str,
 ) -> list[int]:
-    topk_slots, miss_sources, miss_destinations, miss_counts, cache_alias = outputs
+    (
+        topk_slots,
+        topk_source_ids,
+        miss_sources,
+        miss_destinations,
+        miss_counts,
+        cache_alias,
+    ) = outputs
     if cache_alias.data_ptr() != cache_slots.data_ptr():
         raise AssertionError(f"{label}: cache output does not alias mutable pool")
     after_cpu = cache_slots.cpu()
     topk_slots_cpu = topk_slots.reshape(-1, TOPK).cpu().to(torch.int64)
+    topk_source_ids_cpu = (
+        topk_source_ids.reshape(-1, TOPK).cpu().to(torch.int64)
+    )
     sources_cpu = miss_sources.cpu().to(torch.int64)
     destinations_cpu = miss_destinations.cpu().to(torch.int64)
     counts_cpu = miss_counts.cpu().to(torch.int64)
@@ -642,6 +663,18 @@ def validate_result(
                     f"max={int(actual_slots.max())})"
                 )
             actual_tokens = slot_to_token[actual_slots]
+            expected_sources = torch.where(
+                before[actual_tokens] < 0,
+                actual_tokens,
+                torch.full_like(actual_tokens, -1),
+            )
+            if not torch.equal(
+                topk_source_ids_cpu[query_row], expected_sources
+            ):
+                raise AssertionError(
+                    f"{label}: request={request} query={query_idx} "
+                    "aligned source IDs differ"
+                )
             golden_tokens = case.topk_cpu[query_row]
             if not torch.equal(
                 torch.sort(actual_tokens).values,
@@ -732,18 +765,20 @@ def _compare_valid_outputs(
             continue
         if not torch.equal(left_topk[request], right_topk[request]):
             raise AssertionError(f"{label}: request={request} topk_slots differ")
-    left_counts = left[3].cpu()
-    right_counts = right[3].cpu()
+    if not torch.equal(left[1].cpu(), right[1].cpu()):
+        raise AssertionError(f"{label}: topk_source_ids differ")
+    left_counts = left[4].cpu()
+    right_counts = right[4].cpu()
     if not torch.equal(left_counts, right_counts):
         raise AssertionError(f"{label}: miss_counts differ")
     for request, count_value in enumerate(left_counts.tolist()):
         count = int(count_value)
         if not torch.equal(
-            left[1][request, :count].cpu(), right[1][request, :count].cpu()
+            left[2][request, :count].cpu(), right[2][request, :count].cpu()
         ):
             raise AssertionError(f"{label}: request={request} miss IDs differ")
         if not torch.equal(
-            left[2][request, :count].cpu(), right[2][request, :count].cpu()
+            left[3][request, :count].cpu(), right[3][request, :count].cpu()
         ):
             raise AssertionError(f"{label}: request={request} miss slots differ")
 
@@ -764,7 +799,7 @@ def run_semantic_case(case: MtpCase) -> None:
     validate_result(
         case, before, out_cache, out_outputs, label=f"{case.name}/out"
     )
-    for returned, supplied in zip(out_outputs[:4], out_buffers):
+    for returned, supplied in zip(out_outputs[:5], out_buffers):
         if returned.data_ptr() != supplied.data_ptr():
             raise AssertionError(f"{case.name}: _out did not preserve output buffer")
     _compare_valid_outputs(case, alloc_outputs, out_outputs, label=case.name)
@@ -821,10 +856,10 @@ def run_graph_case(device: torch.device, seed: int, replays: int) -> None:
     with torch.npu.graph(graph, pool=pool):
         graph_outputs = call_mtp_out(case, graph_cache, *graph_buffers)
     torch.npu.synchronize()
-    for returned, supplied in zip(graph_outputs[:4], graph_buffers):
+    for returned, supplied in zip(graph_outputs[:5], graph_buffers):
         if returned.data_ptr() != supplied.data_ptr():
             raise AssertionError("graph capture lost caller-owned MTP-LIDU buffers")
-    if graph_outputs[4].data_ptr() != graph_cache.data_ptr():
+    if graph_outputs[5].data_ptr() != graph_cache.data_ptr():
         raise AssertionError("graph capture lost mutable cache alias")
 
     # Capture may execute the op. Start replay and eager reference from exactly
@@ -937,7 +972,7 @@ def run_fused_li_manage_scatter_chain_case(
         *,
         label: str,
     ) -> list[int]:
-        counts_cpu = outputs[3].cpu()
+        counts_cpu = outputs[4].cpu()
         expected_kpe = torch.zeros(
             hbm_blocks, BLOCK_SIZE, KPE_DIM, dtype=torch.bfloat16
         )
@@ -951,8 +986,8 @@ def run_fused_li_manage_scatter_chain_case(
             dram_ckv_cpu,
             hbm_table_cpu,
             dram_table_cpu,
-            outputs[1].cpu(),
             outputs[2].cpu(),
+            outputs[3].cpu(),
             counts_cpu,
         )
         if not torch.equal(hbm_kpe.cpu(), expected_kpe):
@@ -1143,7 +1178,7 @@ def _fresh_state_ms(
         torch.npu.synchronize()
         if iteration >= warmup:
             elapsed += (perf_counter() - start) * 1000.0
-        last_misses = int(outputs[3].sum().cpu())
+        last_misses = int(outputs[4].sum().cpu())
     return elapsed / iters, last_misses
 
 
@@ -1241,7 +1276,7 @@ def run_performance_case(
         )
         per_query_misses.append(int(result[2].sum().cpu()))
     torch.npu.synchronize()
-    union_misses = int(union_result[3].sum().cpu())
+    union_misses = int(union_result[4].sum().cpu())
 
     fused_ms = _wall_ms(fused_step, warmup, iters)
     serial_ms = _wall_ms(serial_step, warmup, iters)

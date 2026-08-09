@@ -20,7 +20,8 @@ using namespace AscendC;
         templateClass<LIType<__VA_ARGS__>> op;                                  \
         COPY_MTP_TILING_DATA(LIUMtpTilingData, tiling);                         \
         op.Init(query, key, weights, reqPoolEntries, cacheSlots, cacheTokens,   \
-                candidateLens, blockTable, topkSlots, missSourceIds,            \
+                candidateLens, blockTable, topkSlots, topkSourceIds,            \
+                missSourceIds,                                                  \
                 missDestinationSlots, missCounts, user, tiling_data, &tPipe);   \
         op.Process();                                                            \
     } while (0)
@@ -31,6 +32,7 @@ __global__ __aicore__ void nanovllm_fused_li_manage_mtp(
     __gm__ uint8_t *reqPoolEntries, __gm__ uint8_t *cacheSlots,
     __gm__ uint8_t *cacheTokens, __gm__ uint8_t *candidateLens,
     __gm__ uint8_t *blockTable, __gm__ uint8_t *topkSlots,
+    __gm__ uint8_t *topkSourceIds,
     __gm__ uint8_t *missSourceIds, __gm__ uint8_t *missDestinationSlots,
     __gm__ uint8_t *missCounts, __gm__ uint8_t *cacheSlotsOut,
     __gm__ uint8_t *workspace, __gm__ uint8_t *tiling)

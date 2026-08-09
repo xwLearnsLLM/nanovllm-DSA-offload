@@ -30,10 +30,11 @@ constexpr uint32_t MTP_CANDIDATE_LENS_INDEX = 6;
 constexpr uint32_t MTP_BLOCK_TABLE_INDEX = 7;
 
 constexpr uint32_t MTP_TOPK_SLOTS_OUT = 0;
-constexpr uint32_t MTP_MISS_SOURCE_OUT = 1;
-constexpr uint32_t MTP_MISS_SLOTS_OUT = 2;
-constexpr uint32_t MTP_MISS_COUNTS_OUT = 3;
-constexpr uint32_t MTP_CACHE_SLOTS_OUT = 4;
+constexpr uint32_t MTP_TOPK_SOURCE_OUT = 1;
+constexpr uint32_t MTP_MISS_SOURCE_OUT = 2;
+constexpr uint32_t MTP_MISS_SLOTS_OUT = 3;
+constexpr uint32_t MTP_MISS_COUNTS_OUT = 4;
+constexpr uint32_t MTP_CACHE_SLOTS_OUT = 5;
 
 constexpr uint32_t MTP_QUERY_COUNT = 4;
 constexpr uint32_t MTP_HEADS = 32;
@@ -67,6 +68,7 @@ struct LIUMtpTensors {
     MtpRequiredTensor candidateLens;
     MtpRequiredTensor blockTable;
     MtpRequiredTensor topkSlots;
+    MtpRequiredTensor topkSource;
     MtpRequiredTensor missSource;
     MtpRequiredTensor missSlots;
     MtpRequiredTensor missCounts;

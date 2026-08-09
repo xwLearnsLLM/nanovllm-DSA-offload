@@ -36,6 +36,8 @@ public:
 
         this->Output("topk_slots").ParamType(REQUIRED)
             .DataTypeList({ge::DT_INT32}).FormatList({ge::FORMAT_ND});
+        this->Output("topk_source_ids").ParamType(REQUIRED)
+            .DataTypeList({ge::DT_INT32}).FormatList({ge::FORMAT_ND});
         this->Output("miss_source_ids").ParamType(REQUIRED)
             .DataTypeList({ge::DT_INT32}).FormatList({ge::FORMAT_ND});
         this->Output("miss_destination_slots").ParamType(REQUIRED)

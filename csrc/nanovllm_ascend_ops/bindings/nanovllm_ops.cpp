@@ -178,7 +178,8 @@ fused_li_manage_out_meta(
       source_ids, destination_slots, miss_counts, cache_slots);
 }
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+           at::Tensor>
 fused_li_manage_mtp_torch_op(
     const at::Tensor& query,
     const at::Tensor& key,
@@ -193,10 +194,11 @@ fused_li_manage_mtp_torch_op(
       candidate_lens, block_table);
   return std::make_tuple(
       std::get<0>(outputs), std::get<1>(outputs), std::get<2>(outputs),
-      std::get<3>(outputs), cache_slots);
+      std::get<3>(outputs), std::get<4>(outputs), cache_slots);
 }
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+           at::Tensor>
 fused_li_manage_mtp_meta(
     const at::Tensor& query,
     const at::Tensor& key,
@@ -213,15 +215,17 @@ fused_li_manage_mtp_meta(
   (void)block_table;
   auto options = query.options().dtype(at::kInt);
   auto topk_slots = at::empty({query.size(0), 1, 2048}, options);
+  auto topk_source_ids = at::empty_like(topk_slots);
   auto miss_source_ids = at::empty({req_pool_entries.size(0), 8192}, options);
   auto miss_destination_slots = at::empty_like(miss_source_ids);
   auto miss_counts = at::empty({req_pool_entries.size(0)}, options);
   return std::make_tuple(
-      topk_slots, miss_source_ids, miss_destination_slots, miss_counts,
-      cache_slots);
+      topk_slots, topk_source_ids, miss_source_ids, miss_destination_slots,
+      miss_counts, cache_slots);
 }
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+           at::Tensor>
 fused_li_manage_mtp_out_torch_op(
     const at::Tensor& query,
     const at::Tensor& key,
@@ -232,19 +236,22 @@ fused_li_manage_mtp_out_torch_op(
     const at::Tensor& candidate_lens,
     const at::Tensor& block_table,
     at::Tensor topk_slots,
+    at::Tensor topk_source_ids,
     at::Tensor miss_source_ids,
     at::Tensor miss_destination_slots,
     at::Tensor miss_counts) {
   vllm_ascend::npu_fused_li_manage_mtp_out(
       query, key, weights, req_pool_entries, cache_slots, cache_tokens,
-      candidate_lens, block_table, topk_slots, miss_source_ids,
+      candidate_lens, block_table, topk_slots, topk_source_ids,
+      miss_source_ids,
       miss_destination_slots, miss_counts);
   return std::make_tuple(
-      topk_slots, miss_source_ids, miss_destination_slots, miss_counts,
-      cache_slots);
+      topk_slots, topk_source_ids, miss_source_ids, miss_destination_slots,
+      miss_counts, cache_slots);
 }
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+           at::Tensor>
 fused_li_manage_mtp_out_meta(
     const at::Tensor& query,
     const at::Tensor& key,
@@ -255,6 +262,7 @@ fused_li_manage_mtp_out_meta(
     const at::Tensor& candidate_lens,
     const at::Tensor& block_table,
     at::Tensor topk_slots,
+    at::Tensor topk_source_ids,
     at::Tensor miss_source_ids,
     at::Tensor miss_destination_slots,
     at::Tensor miss_counts) {
@@ -266,8 +274,8 @@ fused_li_manage_mtp_out_meta(
   (void)candidate_lens;
   (void)block_table;
   return std::make_tuple(
-      topk_slots, miss_source_ids, miss_destination_slots, miss_counts,
-      cache_slots);
+      topk_slots, topk_source_ids, miss_source_ids, miss_destination_slots,
+      miss_counts, cache_slots);
 }
 
 std::tuple<at::Tensor, at::Tensor> scatter_copy_torch_op(
@@ -504,8 +512,7 @@ at::Tensor fused_copy_sfa_mtp_out_torch_op(
     const at::Tensor& actual_seq_lengths_kv,
     const at::Tensor& cache_tokens,
     const at::Tensor& topk_slots,
-    const at::Tensor& miss_source_ids,
-    const at::Tensor& miss_destination_slots,
+    const at::Tensor& topk_source_ids,
     const at::Tensor& miss_counts,
     const at::Tensor& hbm_block_table,
     const at::Tensor& dram_block_table,
@@ -517,8 +524,8 @@ at::Tensor fused_copy_sfa_mtp_out_torch_op(
     at::Tensor attention_out) {
   vllm_ascend::npu_fused_copy_sfa_mtp_out(
       query_rope, query, actual_seq_lengths_query,
-      actual_seq_lengths_kv, cache_tokens, topk_slots, miss_source_ids,
-      miss_destination_slots, miss_counts, hbm_block_table,
+      actual_seq_lengths_kv, cache_tokens, topk_slots, topk_source_ids,
+      miss_counts, hbm_block_table,
       dram_block_table, hbm_k_rope, hbm_kv_cache, dram_k_rope,
       dram_kv_cache, scale_value, attention_out);
   return attention_out;
@@ -531,8 +538,7 @@ at::Tensor fused_copy_sfa_mtp_out_meta(
     const at::Tensor& actual_seq_lengths_kv,
     const at::Tensor& cache_tokens,
     const at::Tensor& topk_slots,
-    const at::Tensor& miss_source_ids,
-    const at::Tensor& miss_destination_slots,
+    const at::Tensor& topk_source_ids,
     const at::Tensor& miss_counts,
     const at::Tensor& hbm_block_table,
     const at::Tensor& dram_block_table,
@@ -548,8 +554,7 @@ at::Tensor fused_copy_sfa_mtp_out_meta(
   (void)actual_seq_lengths_kv;
   (void)cache_tokens;
   (void)topk_slots;
-  (void)miss_source_ids;
-  (void)miss_destination_slots;
+  (void)topk_source_ids;
   (void)miss_counts;
   (void)hbm_block_table;
   (void)dram_block_table;
@@ -723,14 +728,16 @@ TORCH_LIBRARY(nanovllm_dsa, ops) {
       "fused_li_manage_mtp(Tensor query, Tensor key, Tensor weights,"
       " Tensor req_pool_entries, Tensor(a!) cache_slots,"
       " Tensor cache_tokens, Tensor candidate_lens, Tensor block_table)"
-      " -> (Tensor, Tensor, Tensor, Tensor, Tensor(a!))");
+      " -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor(a!))");
   ops.def(
       "fused_li_manage_mtp_out(Tensor query, Tensor key, Tensor weights,"
       " Tensor req_pool_entries, Tensor(a!) cache_slots,"
       " Tensor cache_tokens, Tensor candidate_lens, Tensor block_table,"
-      " Tensor(b!) topk_slots, Tensor(c!) miss_source_ids,"
-      " Tensor(d!) miss_destination_slots, Tensor(e!) miss_counts)"
-      " -> (Tensor(b!), Tensor(c!), Tensor(d!), Tensor(e!), Tensor(a!))");
+      " Tensor(b!) topk_slots, Tensor(c!) topk_source_ids,"
+      " Tensor(d!) miss_source_ids, Tensor(e!) miss_destination_slots,"
+      " Tensor(f!) miss_counts)"
+      " -> (Tensor(b!), Tensor(c!), Tensor(d!), Tensor(e!), Tensor(f!),"
+      " Tensor(a!))");
   ops.def(
       "scatter_copy(Tensor(a!) hbm_k_rope, Tensor(b!) hbm_kv_cache,"
       " Tensor dram_k_rope, Tensor dram_kv_cache, Tensor hbm_block_table,"
@@ -769,8 +776,8 @@ TORCH_LIBRARY(nanovllm_dsa, ops) {
       "Tensor query_rope, Tensor query,"
       " Tensor actual_seq_lengths_query, Tensor actual_seq_lengths_kv,"
       " Tensor cache_tokens, Tensor topk_slots,"
-      " Tensor miss_source_ids, Tensor miss_destination_slots,"
-      " Tensor miss_counts, Tensor hbm_block_table,"
+      " Tensor topk_source_ids, Tensor miss_counts,"
+      " Tensor hbm_block_table,"
       " Tensor dram_block_table, Tensor(a!) hbm_k_rope,"
       " Tensor(b!) hbm_kv_cache, Tensor dram_k_rope,"
       " Tensor dram_kv_cache, float scale_value,"

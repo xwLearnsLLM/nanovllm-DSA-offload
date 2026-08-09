@@ -97,6 +97,7 @@ public:
         GlobalTensor<MM1_OUT_T> mm1ResGm, GlobalTensor<K_T> weightsGm,
         GlobalTensor<int32_t> cacheSlotsGm,
         GlobalTensor<int32_t> topkSlotsGm,
+        GlobalTensor<int32_t> topkSourceIdsGm,
         GlobalTensor<int32_t> missSourceIdsGm,
         GlobalTensor<int32_t> missDestinationSlotsGm,
         GlobalTensor<int32_t> missCountGm,
@@ -121,6 +122,7 @@ protected:
     GlobalTensor<float> partialTopkGm;
     GlobalTensor<int32_t> partialMetaGm;
     GlobalTensor<int32_t> mtpTopkIndicesGm;
+    GlobalTensor<int32_t> mtpTopkSourceIdsGm;
     GlobalTensor<int32_t> mtpMissSourceIdsGm;
     GlobalTensor<int32_t> mtpMissDestinationSlotsGm;
 
@@ -288,6 +290,7 @@ __aicore__ inline void LIVector<LIT>::InitMtpGlobalTensor(
     GlobalTensor<MM1_OUT_T> mm1ResGm, GlobalTensor<K_T> weightsGm,
     GlobalTensor<int32_t> cacheSlotsGm,
     GlobalTensor<int32_t> topkSlotsGm,
+    GlobalTensor<int32_t> topkSourceIdsGm,
     GlobalTensor<int32_t> missSourceIdsGm,
     GlobalTensor<int32_t> missDestinationSlotsGm,
     GlobalTensor<int32_t> missCountGm,
@@ -298,6 +301,7 @@ __aicore__ inline void LIVector<LIT>::InitMtpGlobalTensor(
     this->weightsGm = weightsGm;
     this->cacheSlotsGm = cacheSlotsGm;
     this->topkSlotsGm = topkSlotsGm;
+    this->mtpTopkSourceIdsGm = topkSourceIdsGm;
     this->mtpMissSourceIdsGm = missSourceIdsGm;
     this->mtpMissDestinationSlotsGm = missDestinationSlotsGm;
     this->missCountGm = missCountGm;
@@ -1028,6 +1032,19 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
     // vector operation and is insufficient for this MTE2 reuse.
     SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
 
+    // Reuse the union bitset as this step's miss-membership table.  The
+    // aligned source rows let source-aware Attention decide in O(1) whether
+    // each selected token comes from DRAM; -1 denotes an HBM hit.
+    Duplicate(unionBits, 0U, MTP_UNION_BITSET_WORDS);
+    PipeBarrier<PIPE_V>();
+    SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
+    for (uint32_t missIdx = 0; missIdx < updateCount; ++missIdx) {
+        uint32_t token = static_cast<uint32_t>(missTokens.GetValue(missIdx));
+        uint32_t wordIdx = token >> 5U;
+        uint32_t mask = 1U << (token & 31U);
+        unionBits.SetValue(wordIdx, unionBits.GetValue(wordIdx) | mask);
+    }
+
     // Resolve all four top-k rows against the single final cache state.
     AscendC::DataCopyParams topkCopy{
         1, static_cast<uint16_t>(BASE_TOPK * sizeof(int32_t)), 0, 0};
@@ -1042,9 +1059,17 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
                                ? LICommon::ConstInfo::INVALID_IDX
                                : cacheSlotsGm.GetValue(cacheBase + static_cast<uint32_t>(token));
             destinationSlots.SetValue(topkIdx, slot);
+            bool isMiss = false;
+            if (token >= 0) {
+                uint32_t unsignedToken = static_cast<uint32_t>(token);
+                uint32_t word = unionBits.GetValue(unsignedToken >> 5U);
+                isMiss = (word & (1U << (unsignedToken & 31U))) != 0U;
+            }
+            topkIndices.SetValue(topkIdx, isMiss ? token : -1);
         }
         SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
         DataCopyPad(topkSlotsGm[rowOffset], destinationSlots, topkCopy);
+        DataCopyPad(mtpTopkSourceIdsGm[rowOffset], topkIndices, topkCopy);
         SetWaitFlag<HardEvent::MTE3_S>(HardEvent::MTE3_S);
     }
 

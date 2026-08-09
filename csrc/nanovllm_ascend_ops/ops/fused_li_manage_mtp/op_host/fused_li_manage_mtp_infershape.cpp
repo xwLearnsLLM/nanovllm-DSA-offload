@@ -31,11 +31,13 @@ static ge::graphStatus InferShapeNanovllmFusedLiManageMtp(
                return ge::GRAPH_FAILED);
 
     gert::Shape *topkSlots = context->GetOutputShape(0);
-    gert::Shape *missSource = context->GetOutputShape(1);
-    gert::Shape *missSlots = context->GetOutputShape(2);
-    gert::Shape *missCounts = context->GetOutputShape(3);
-    gert::Shape *cacheOut = context->GetOutputShape(4);
+    gert::Shape *topkSource = context->GetOutputShape(1);
+    gert::Shape *missSource = context->GetOutputShape(2);
+    gert::Shape *missSlots = context->GetOutputShape(3);
+    gert::Shape *missCounts = context->GetOutputShape(4);
+    gert::Shape *cacheOut = context->GetOutputShape(5);
     OPS_LOG_E_IF_NULL(context, topkSlots, return ge::GRAPH_FAILED);
+    OPS_LOG_E_IF_NULL(context, topkSource, return ge::GRAPH_FAILED);
     OPS_LOG_E_IF_NULL(context, missSource, return ge::GRAPH_FAILED);
     OPS_LOG_E_IF_NULL(context, missSlots, return ge::GRAPH_FAILED);
     OPS_LOG_E_IF_NULL(context, missCounts, return ge::GRAPH_FAILED);
@@ -45,6 +47,7 @@ static ge::graphStatus InferShapeNanovllmFusedLiManageMtp(
     topkSlots->SetDim(0, query->GetDim(0));
     topkSlots->SetDim(1, 1);
     topkSlots->SetDim(2, TOPK);
+    *topkSource = *topkSlots;
     missSource->SetDimNum(2);
     missSource->SetDim(0, req->GetDim(0));
     missSource->SetDim(1, UNION_CAPACITY);
@@ -62,7 +65,7 @@ static ge::graphStatus InferDataTypeNanovllmFusedLiManageMtp(
                OPS_LOG_E("NanovllmFusedLiManageMtp",
                          "InferDataTypeContext is nullptr."),
                return ge::GRAPH_FAILED);
-    for (uint32_t output = 0; output < 5; ++output) {
+    for (uint32_t output = 0; output < 6; ++output) {
         context->SetOutputDataType(output, ge::DT_INT32);
     }
     return ge::GRAPH_SUCCESS;

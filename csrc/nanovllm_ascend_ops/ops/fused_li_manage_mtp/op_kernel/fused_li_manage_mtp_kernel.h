@@ -31,7 +31,8 @@ public:
         __gm__ uint8_t *weights, __gm__ uint8_t *reqPoolEntries,
         __gm__ uint8_t *cacheSlots, __gm__ uint8_t *cacheTokens,
         __gm__ uint8_t *candidateLens, __gm__ uint8_t *blockTable,
-        __gm__ uint8_t *topkSlots, __gm__ uint8_t *missSourceIds,
+        __gm__ uint8_t *topkSlots, __gm__ uint8_t *topkSourceIds,
+        __gm__ uint8_t *missSourceIds,
         __gm__ uint8_t *missDestinationSlots, __gm__ uint8_t *missCounts,
         __gm__ uint8_t *workspace,
         const LIUMtpTilingData *__restrict tiling, TPipe *pipe);
@@ -55,6 +56,7 @@ private:
     GlobalTensor<uint32_t> candidateLensGm;
     GlobalTensor<int32_t> blockTableGm;
     GlobalTensor<int32_t> topkSlotsGm;
+    GlobalTensor<int32_t> topkSourceIdsGm;
     GlobalTensor<int32_t> missSourceIdsGm;
     GlobalTensor<int32_t> missDestinationSlotsGm;
     GlobalTensor<int32_t> missCountsGm;
@@ -99,6 +101,7 @@ __aicore__ inline void LIMtpPreload<LIT>::Init(
     __gm__ uint8_t *reqPoolEntries, __gm__ uint8_t *cacheSlots,
     __gm__ uint8_t *cacheTokens, __gm__ uint8_t *candidateLens,
     __gm__ uint8_t *blockTable, __gm__ uint8_t *topkSlots,
+    __gm__ uint8_t *topkSourceIds,
     __gm__ uint8_t *missSourceIds, __gm__ uint8_t *missDestinationSlots,
     __gm__ uint8_t *missCounts, __gm__ uint8_t *workspace,
     const LIUMtpTilingData *__restrict tiling, TPipe *pipe)
@@ -149,12 +152,14 @@ __aicore__ inline void LIMtpPreload<LIT>::Init(
                                  constInfo.cacheSlotsSize);
         weightsGm.SetGlobalBuffer((__gm__ K_T *)weights);
         topkSlotsGm.SetGlobalBuffer((__gm__ int32_t *)topkSlots);
+        topkSourceIdsGm.SetGlobalBuffer((__gm__ int32_t *)topkSourceIds);
         missSourceIdsGm.SetGlobalBuffer((__gm__ int32_t *)missSourceIds);
         missDestinationSlotsGm.SetGlobalBuffer(
             (__gm__ int32_t *)missDestinationSlots);
         missCountsGm.SetGlobalBuffer((__gm__ int32_t *)missCounts);
         vectorService.InitMtpGlobalTensor(
             mm1ResGm, weightsGm, cacheSlotsGm, topkSlotsGm,
+            topkSourceIdsGm,
             missSourceIdsGm, missDestinationSlotsGm, missCountsGm,
             aggregateScoresGm, internalTopkIndicesGm);
         vectorService.InitMtpBuffers(pipe);
