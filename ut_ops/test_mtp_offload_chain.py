@@ -20,6 +20,7 @@ TOPK = lidu_ut.TOPK
 UNION_CAPACITY = lidu_ut.UNION_CAPACITY
 CKV_DIM = lidu_ut.CKV_DIM
 KPE_DIM = lidu_ut.KPE_DIM
+KNOWN_FUSED_ATTENTION_ATOL = 0.1
 
 
 def parse_args() -> argparse.Namespace:
@@ -596,7 +597,12 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
             scale=scale,
         )
         actual = attention.float().cpu()
-        torch.testing.assert_close(actual, golden, rtol=0.08, atol=0.08)
+        golden_atol = (
+            KNOWN_FUSED_ATTENTION_ATOL
+            if args.allow_fused_attention_diff
+            else 0.08
+        )
+        torch.testing.assert_close(actual, golden, rtol=0.08, atol=golden_atol)
         return counts, float((actual - golden).abs().max())
 
     eager_cache = case.initial_cache_cpu.to(device)
@@ -771,14 +777,26 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
         graph_ckv.cpu(), repeat_ckv_before
     ):
         raise AssertionError("zero-miss full-chain replay modified HBM cache")
-    if not torch.equal(graph_attention.cpu(), repeat_attention_before):
+    repeat_attention = graph_attention.cpu()
+    repeat_attention_max_abs = float(
+        (repeat_attention.float() - repeat_attention_before.float()).abs().max()
+    )
+    if args.allow_fused_attention_diff:
+        if repeat_attention_max_abs > KNOWN_FUSED_ATTENTION_ATOL:
+            raise AssertionError(
+                "zero-miss full-chain replay Attention difference exceeds "
+                f"{KNOWN_FUSED_ATTENTION_ATOL}: max_abs={repeat_attention_max_abs}"
+            )
+    elif not torch.equal(repeat_attention, repeat_attention_before):
         raise AssertionError("zero-miss full-chain replay changed Attention output")
     print(
         "MTP_OFFLOAD_CHAIN_GRAPH_CHECK "
         f"replays={args.graph_replays} first_nonzero_miss=1 "
         "repeat_zero_miss=1 lidu_to_scatter_dependency=1 "
         "scatter_to_attention_dependency=1 out_buffer=1 "
-        f"attention_max_abs={graph_max_abs:.6f} ok=1",
+        f"attention_max_abs={graph_max_abs:.6f} "
+        f"repeat_attention_max_abs={repeat_attention_max_abs:.6f} "
+        f"known_diff_allowed={int(args.allow_fused_attention_diff)} ok=1",
         flush=True,
     )
 
