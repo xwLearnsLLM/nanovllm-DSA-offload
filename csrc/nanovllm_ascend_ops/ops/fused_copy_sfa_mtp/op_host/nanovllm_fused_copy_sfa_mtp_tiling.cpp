@@ -24,7 +24,9 @@ constexpr uint32_t DRAM_KEY_ROPE = 10;
 constexpr uint32_t DRAM_KV_CACHE = 11;
 constexpr uint32_t DRAM_BLOCK_TABLE = 12;
 constexpr uint32_t TOPK_SOURCE_IDS = 13;
-constexpr uint32_t MISS_COUNTS = 14;
+constexpr uint32_t MISS_SOURCE_IDS = 14;
+constexpr uint32_t MISS_DESTINATION_SLOTS = 15;
+constexpr uint32_t MISS_COUNTS = 16;
 
 constexpr int64_t BLOCK_SIZE = 128;
 constexpr int64_t CKV_DIM = 512;
@@ -67,6 +69,9 @@ ge::graphStatus CheckFusedInputs(
     const auto dramKv = context->GetInputShape(DRAM_KV_CACHE);
     const auto dramTable = context->GetInputShape(DRAM_BLOCK_TABLE);
     const auto sourceIds = context->GetInputShape(TOPK_SOURCE_IDS);
+    const auto missSourceIds = context->GetInputShape(MISS_SOURCE_IDS);
+    const auto missDestinationSlots =
+        context->GetInputShape(MISS_DESTINATION_SLOTS);
     const auto missCounts = context->GetInputShape(MISS_COUNTS);
     OPS_ERR_IF(query == nullptr || key == nullptr || value == nullptr ||
                    sparse == nullptr || cacheTokens == nullptr ||
@@ -74,7 +79,8 @@ ge::graphStatus CheckFusedInputs(
                    actualKv == nullptr || queryRope == nullptr ||
                    hbmRope == nullptr || dramRope == nullptr ||
                    dramKv == nullptr || dramTable == nullptr ||
-                   sourceIds == nullptr ||
+                   sourceIds == nullptr || missSourceIds == nullptr ||
+                   missDestinationSlots == nullptr ||
                    missCounts == nullptr,
                OPS_LOG_E(context->GetNodeName(),
                          "A required fused MTP input shape is missing."),
@@ -94,6 +100,9 @@ ge::graphStatus CheckFusedInputs(
     const gert::Shape dramCkv = dramKv->GetStorageShape();
     const gert::Shape dramBt = dramTable->GetStorageShape();
     const gert::Shape sources = sourceIds->GetStorageShape();
+    const gert::Shape compactSources = missSourceIds->GetStorageShape();
+    const gert::Shape compactDestinations =
+        missDestinationSlots->GetStorageShape();
     const gert::Shape counts = missCounts->GetStorageShape();
 
     OPS_ERR_IF(!IsShape(cache, {-1}) || cache.GetDim(0) <= 0,
@@ -127,9 +136,13 @@ ge::graphStatus CheckFusedInputs(
                    !IsShape(qLens, {batchSize}) ||
                    !IsShape(kvLens, {batchSize}) ||
                    !IsShape(sources, {batchSize * QUERY_COUNT, 1, SPARSE_COUNT}) ||
+                   !IsShape(compactSources,
+                            {batchSize, QUERY_COUNT * SPARSE_COUNT}) ||
+                   !IsShape(compactDestinations,
+                            {batchSize, QUERY_COUNT * SPARSE_COUNT}) ||
                    !IsShape(counts, {batchSize}),
                OPS_LOG_E(context->GetNodeName(),
-                         "MTP slots, lengths, tables, and aligned-source metadata have inconsistent shapes."),
+                         "MTP slots, lengths, tables, and miss metadata have inconsistent shapes."),
                return ge::GRAPH_FAILED);
 
     copyCap = static_cast<uint32_t>(sources.GetDim(2));
@@ -154,7 +167,8 @@ ge::graphStatus CheckFusedInputs(
     }
     for (uint32_t idx : {SPARSE_INDICES, CACHE_TOKENS, HBM_BLOCK_TABLE,
                          ACTUAL_SEQ_LENGTHS_QUERY, ACTUAL_SEQ_LENGTHS_KV,
-                         DRAM_BLOCK_TABLE, TOPK_SOURCE_IDS, MISS_COUNTS}) {
+                         DRAM_BLOCK_TABLE, TOPK_SOURCE_IDS, MISS_SOURCE_IDS,
+                         MISS_DESTINATION_SLOTS, MISS_COUNTS}) {
         const auto desc = context->GetInputDesc(idx);
         OPS_ERR_IF(desc == nullptr || desc->GetDataType() != ge::DT_INT32,
                    OPS_LOG_E(context->GetNodeName(),

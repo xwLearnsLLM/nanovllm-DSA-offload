@@ -513,6 +513,8 @@ at::Tensor fused_copy_sfa_mtp_out_torch_op(
     const at::Tensor& cache_tokens,
     const at::Tensor& topk_slots,
     const at::Tensor& topk_source_ids,
+    const at::Tensor& miss_source_ids,
+    const at::Tensor& miss_destination_slots,
     const at::Tensor& miss_counts,
     const at::Tensor& hbm_block_table,
     const at::Tensor& dram_block_table,
@@ -525,7 +527,7 @@ at::Tensor fused_copy_sfa_mtp_out_torch_op(
   vllm_ascend::npu_fused_copy_sfa_mtp_out(
       query_rope, query, actual_seq_lengths_query,
       actual_seq_lengths_kv, cache_tokens, topk_slots, topk_source_ids,
-      miss_counts, hbm_block_table,
+      miss_source_ids, miss_destination_slots, miss_counts, hbm_block_table,
       dram_block_table, hbm_k_rope, hbm_kv_cache, dram_k_rope,
       dram_kv_cache, scale_value, attention_out);
   return attention_out;
@@ -539,6 +541,8 @@ at::Tensor fused_copy_sfa_mtp_out_meta(
     const at::Tensor& cache_tokens,
     const at::Tensor& topk_slots,
     const at::Tensor& topk_source_ids,
+    const at::Tensor& miss_source_ids,
+    const at::Tensor& miss_destination_slots,
     const at::Tensor& miss_counts,
     const at::Tensor& hbm_block_table,
     const at::Tensor& dram_block_table,
@@ -555,6 +559,8 @@ at::Tensor fused_copy_sfa_mtp_out_meta(
   (void)cache_tokens;
   (void)topk_slots;
   (void)topk_source_ids;
+  (void)miss_source_ids;
+  (void)miss_destination_slots;
   (void)miss_counts;
   (void)hbm_block_table;
   (void)dram_block_table;
@@ -776,7 +782,8 @@ TORCH_LIBRARY(nanovllm_dsa, ops) {
       "Tensor query_rope, Tensor query,"
       " Tensor actual_seq_lengths_query, Tensor actual_seq_lengths_kv,"
       " Tensor cache_tokens, Tensor topk_slots,"
-      " Tensor topk_source_ids, Tensor miss_counts,"
+      " Tensor topk_source_ids, Tensor miss_source_ids,"
+      " Tensor miss_destination_slots, Tensor miss_counts,"
       " Tensor hbm_block_table,"
       " Tensor dram_block_table, Tensor(a!) hbm_k_rope,"
       " Tensor(b!) hbm_kv_cache, Tensor dram_k_rope,"

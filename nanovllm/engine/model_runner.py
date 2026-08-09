@@ -258,9 +258,9 @@ class ModelRunner:
             )
             attention = "dense MLA (all KV)"
             if self.offload_mode == OFFLOAD_FUSE:
-                attention = "LIDU + fused SCATTER/sparse-and-tail MLA"
+                attention = "LIM + COPYSFA sparse-and-tail MLA"
             elif self.uses_offload:
-                attention = "LIDU + SCATTER + sparse-and-tail MLA"
+                attention = "LIM + SCATTER + sparse-and-tail MLA"
             logger.info(
                 "GLM-5.1 W4A8: %s decode, attention=%s, max_model_len=%d, "
                 "EP%d (%d local experts/rank), ModelSlim version=%s "

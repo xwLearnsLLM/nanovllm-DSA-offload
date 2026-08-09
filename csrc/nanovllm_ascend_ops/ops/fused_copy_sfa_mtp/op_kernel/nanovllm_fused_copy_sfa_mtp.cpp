@@ -29,6 +29,8 @@ __aicore__ inline void RunFusedMtp(
     __gm__ uint8_t *dramKvCache,
     __gm__ uint8_t *dramBlockTable,
     __gm__ uint8_t *topkSourceIds,
+    __gm__ uint8_t *missSourceIds,
+    __gm__ uint8_t *missDestinationSlots,
     __gm__ uint8_t *missCounts,
     __gm__ uint8_t *attentionOut,
     __gm__ uint8_t *attentionWorkspace,
@@ -36,6 +38,10 @@ __aicore__ inline void RunFusedMtp(
     __gm__ uint8_t *tiling,
     TPipe *pipe)
 {
+    // Reserved for the future unique-union copy pipeline.  Source-aware v2
+    // still gathers from the aligned per-query source metadata.
+    (void)missSourceIds;
+    (void)missDestinationSlots;
     using MtpType = SFAType<
         T, T, T, false, SFA_LAYOUT::TND, SFA_LAYOUT::PA_BSND,
         V_TEMPLATE, SFA_STAGE_NORMAL, true, true>;
@@ -72,6 +78,8 @@ extern "C" __global__ __aicore__ void nanovllm_fused_copy_sfa_mtp(
     __gm__ uint8_t *dramKvCache,
     __gm__ uint8_t *dramBlockTable,
     __gm__ uint8_t *topkSourceIds,
+    __gm__ uint8_t *missSourceIds,
+    __gm__ uint8_t *missDestinationSlots,
     __gm__ uint8_t *missCounts,
     __gm__ uint8_t *attentionOut,
     __gm__ uint8_t *workspace,
@@ -92,7 +100,8 @@ extern "C" __global__ __aicore__ void nanovllm_fused_copy_sfa_mtp(
                 hbmBlockTable, actualSeqLengthsQuery,
                 actualSeqLengthsKv, queryRope, hbmKeyRope,
                 dramKeyRope, dramKvCache, dramBlockTable,
-                topkSourceIds, missCounts,
+                topkSourceIds, missSourceIds, missDestinationSlots,
+                missCounts,
                 attentionOut, attentionWorkspace, fusedTiling,
                 tiling, &pipe);
         } else {
@@ -101,7 +110,8 @@ extern "C" __global__ __aicore__ void nanovllm_fused_copy_sfa_mtp(
                 hbmBlockTable, actualSeqLengthsQuery,
                 actualSeqLengthsKv, queryRope, hbmKeyRope,
                 dramKeyRope, dramKvCache, dramBlockTable,
-                topkSourceIds, missCounts,
+                topkSourceIds, missSourceIds, missDestinationSlots,
+                missCounts,
                 attentionOut, attentionWorkspace, fusedTiling,
                 tiling, &pipe);
         }

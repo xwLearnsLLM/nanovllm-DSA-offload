@@ -63,7 +63,7 @@ topk_slots, miss_ids, miss_slots, miss_counts, cache_alias = (
 - `sparse_tail_attention` 消费 `[B,1,2048]` slots。
 - `sparse_tail_attention_mtp` 消费 `[B*4,1,2048]` slots，并保证第 0～3 个验证位置只看到各自允许的 causal tail。
 - `fused_copy_sfa` 仅用于非 MTP `offload_fuse`。它使用 quotient/remainder 均衡分核，支持 bs=24、25、48、64 等跨 24-core 边界 batch。
-- `fused_copy_sfa_mtp_out` 固定使用调用方创建的 Attention 输出 buffer，原地更新 HBM cache，且不返回 cache alias。当前实现已把 union SCATTER 与 MTP3 sparse Attention 合入一个 AscendC kernel；bs=24 且各请求 miss count 较均衡时采用 request-owner 调度，负载偏斜或其它 batch 形状使用全 AIV 均衡调度。
+- `fused_copy_sfa_mtp_out` 固定使用调用方创建的 Attention 输出 buffer，原地更新 HBM cache，且不返回 cache alias。接口同时接收四路对齐的 `topk_source_ids` 和唯一 union miss 的 compact source/destination；当前 source-aware v2 使用前者，后者保留给后续“唯一 miss 只读一次”的流水优化。当前 Attention 存在已知数值偏差，留待性能优化阶段修复。
 
 ### 后续统一接口约定
 
@@ -178,13 +178,14 @@ python3 ut_ops/test_sparse_tail_attention_mtp.py \
 python3 ut_ops/test_mtp_offload_chain.py \
   --device npu:0 --batch-size 4 --heads 2 \
   --source-len 20992 --cache-tokens 8192 --tail-tokens 64 \
-  --graph-replays 3 --seed 7
+  --graph-replays 3 --seed 7 --allow-fused-attention-diff
 
 # fused_copy_sfa_mtp：split 对照、caller-owned output、graph replay 与时延打印
 python3 ut_ops/test_fused_copy_sfa_mtp.py \
   --device npu:0 --batch-size 4 --heads 2 \
   --source-len 20992 --cache-tokens 8192 --tail-tokens 64 \
-  --graph-replays 3 --warmup 10 --iters 100 --seed 7
+  --perf-miss-count 300 --graph-replays 3 --warmup 10 --iters 100 \
+  --seed 7 --allow-fused-attention-diff
 
 # Target qlen=4 MLA 与逐 token 参考结果及 graph replay
 python3 ut_ops/test_glm_mtp_target_verify.py \

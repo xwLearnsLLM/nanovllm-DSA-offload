@@ -460,41 +460,22 @@ def test_glm_mtp_runtime_accepts_nonoffload_k3(tmp_path, enforce_eager):
 
 
 @pytest.mark.parametrize("enforce_eager", [True, False])
-def test_glm_mtp_runtime_accepts_lidu_split(tmp_path, enforce_eager):
+@pytest.mark.parametrize("offload_mode", ["offload_split", "offload_fuse"])
+def test_glm_mtp_runtime_accepts_offload(
+    tmp_path, enforce_eager, offload_mode
+):
     _write_mtp_config(tmp_path)
     config = _mtp_config(
         tmp_path,
-        offload_mode="offload_split",
+        offload_mode=offload_mode,
         enforce_eager=enforce_eager,
         kvcache_block_size=128,
         num_dram_kvcache_blocks=64,
     )
-    assert config.offload_mode == "offload_split"
+    assert config.offload_mode == offload_mode
     assert config.decode_graph_capture_sizes == (
         () if enforce_eager else (config.max_num_decode_seqs_per_step,)
     )
-
-
-@pytest.mark.parametrize(
-    ("overrides", "message"),
-    [
-        (
-            {
-                "offload_mode": "offload_fuse",
-                "kvcache_block_size": 128,
-                "num_dram_kvcache_blocks": 64,
-            },
-            "does not support offload_mode='offload_fuse'",
-        ),
-    ],
-)
-def test_glm_mtp_runtime_rejects_unsupported_offload(
-    tmp_path, overrides, message
-):
-    _write_mtp_config(tmp_path)
-    with pytest.raises(ValueError, match=message):
-        _mtp_config(tmp_path, **overrides)
-
 
 @pytest.mark.parametrize("k", [1, 2])
 @pytest.mark.parametrize("enforce_eager", [True, False])

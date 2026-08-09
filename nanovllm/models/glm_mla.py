@@ -38,6 +38,7 @@ from nanovllm.models.dsa_offload_ops import (
     sparse_tail_attention,
     sparse_tail_attention_mtp,
     fused_copy_sfa,
+    fused_copy_sfa_mtp,
 )
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.layernorm import RMSNorm
@@ -55,6 +56,15 @@ _NPU_MLA_ATTENTION_MASK_CACHE: dict[tuple[str, int], torch.Tensor] = {}
 _NPU_MLA_V2_WORKSPACE_CACHE: dict[tuple, torch.Tensor] = {}
 _LIDU_MISS_COUNT_SCRATCH_KEY = "lidu_miss_counts_by_layer"
 _LiduUpdateResult = tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]
+_MtpLiduUpdateResult = tuple[
+    torch.Tensor,
+    torch.Tensor,
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
@@ -1203,7 +1213,7 @@ class GlmMLAAttention(nn.Module):
         q_index: torch.Tensor,
         weights: torch.Tensor,
         batch_size: int,
-    ) -> _LiduUpdateResult:
+    ) -> _MtpLiduUpdateResult:
         """Update one request cache from the union of its four MTP queries."""
 
         context = get_context()
@@ -1309,22 +1319,27 @@ class GlmMLAAttention(nn.Module):
             ) = fused_li_manage_mtp(*lidu_args)
         if self._lidu_miss_count_collect_all:
             self._record_lidu_miss_counts(miss_counts, batch_size)
-        kpe_alias, ckv_alias = scatter_copy(
-            hbm_kpe,
-            hbm_ckv,
-            dram_kpe,
-            dram_ckv,
-            context.block_tables[:batch_size],
-            context.dram_block_tables[:batch_size],
-            source_ids,
-            destination_slots,
-            miss_counts[:batch_size],
-        )
+        if self._can_use_fused_copy_sfa():
+            kpe_alias, ckv_alias = hbm_kpe, hbm_ckv
+        else:
+            kpe_alias, ckv_alias = scatter_copy(
+                hbm_kpe,
+                hbm_ckv,
+                dram_kpe,
+                dram_ckv,
+                context.block_tables[:batch_size],
+                context.dram_block_tables[:batch_size],
+                source_ids,
+                destination_slots,
+                miss_counts[:batch_size],
+            )
         return (
             kpe_alias,
             ckv_alias,
             topk_slots,
+            topk_source_ids,
             source_ids,
+            destination_slots,
             miss_counts,
         )
 
@@ -1357,11 +1372,14 @@ class GlmMLAAttention(nn.Module):
             kpe_cache,
             ckv_cache,
             topk_slots,
-            _,
-            _,
+            topk_source_ids,
+            source_ids,
+            destination_slots,
+            miss_counts,
         ) = self._lidu_update_mtp(q_index, weights, batch_size)
+        use_fused_copy_attention = self._can_use_fused_copy_sfa()
         attention_out = None
-        if context.full_decode_graph:
+        if context.full_decode_graph or use_fused_copy_attention:
             attention_out = self._mtp_sparse_tail_graph_outputs.get(
                 batch_size
             )
@@ -1375,19 +1393,52 @@ class GlmMLAAttention(nn.Module):
                 self._mtp_sparse_tail_graph_outputs[batch_size] = (
                     attention_out
                 )
-        latent = sparse_tail_attention_mtp(
-            ql_nope,
-            ckv_cache.view(-1, self.block_size, 1, self.kv_lora_rank),
-            topk_slots,
-            context.lidu_cache_tokens[:batch_size],
-            context.block_tables[:batch_size],
-            context.candidate_query_lens[:batch_size],
-            context.actual_seq_lengths_kv_tensor[:batch_size],
-            q_pe,
-            kpe_cache.view(-1, self.block_size, 1, self.qk_rope_head_dim),
-            self.scale,
-            out=attention_out,
+        hbm_ckv = ckv_cache.view(
+            -1, self.block_size, 1, self.kv_lora_rank
         )
+        hbm_kpe = kpe_cache.view(
+            -1, self.block_size, 1, self.qk_rope_head_dim
+        )
+        if use_fused_copy_attention:
+            if context.dram_block_tables is None or attention_out is None:
+                raise RuntimeError(
+                    "Fused MTP copy+Attention requires DRAM block tables "
+                    "and a caller-owned output buffer."
+                )
+            latent = fused_copy_sfa_mtp(
+                q_pe,
+                ql_nope,
+                context.candidate_query_lens[:batch_size],
+                context.actual_seq_lengths_kv_tensor[:batch_size],
+                context.lidu_cache_tokens[:batch_size],
+                topk_slots,
+                topk_source_ids,
+                source_ids,
+                destination_slots,
+                miss_counts[:batch_size],
+                context.block_tables[:batch_size],
+                context.dram_block_tables[:batch_size],
+                hbm_kpe,
+                hbm_ckv,
+                self.dram_kpe_cache.squeeze(2),
+                self.dram_ckv_cache.squeeze(2),
+                self.scale,
+                attention_out,
+            )
+        else:
+            latent = sparse_tail_attention_mtp(
+                ql_nope,
+                hbm_ckv,
+                topk_slots,
+                context.lidu_cache_tokens[:batch_size],
+                context.block_tables[:batch_size],
+                context.candidate_query_lens[:batch_size],
+                context.actual_seq_lengths_kv_tensor[:batch_size],
+                q_pe,
+                hbm_kpe,
+                self.scale,
+                out=attention_out,
+            )
         return torch_npu.npu_transpose_batchmatmul(
             latent.transpose(0, 1).contiguous(),
             self.w_uv,

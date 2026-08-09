@@ -17,7 +17,7 @@
 | 0 | `offload_fuse` | 支持 | 支持 | `fused_li_manage → fused_copy_sfa`，支持 bs>24 |
 | 3 | `none` | 支持 | 支持 | MTP3 + Dense MLA |
 | 3 | `offload_split` | 支持 | 支持 | `fused_li_manage_mtp → scatter_copy → sparse_tail_attention_mtp` |
-| 3 | `offload_fuse` | 不支持 | 不支持 | 尚未实现 `fused_copy_sfa_mtp` |
+| 3 | `offload_fuse` | 支持（实验） | 支持（实验） | `fused_li_manage_mtp → fused_copy_sfa_mtp`，当前 Attention 数值偏差留待阶段2修复 |
 
 　
 
@@ -77,7 +77,7 @@ PYTHONPATH=$PWD:$PYTHONPATH PYTHONUNBUFFERED=1 NANOVLLM_OFFLOAD_MODE=offload_fus
 开MTP，bs=12，seqlen=40k
 
 ```bash
-PYTHONPATH=$PWD:$PYTHONPATH PYTHONUNBUFFERED=1 NANOVLLM_OFFLOAD_MODE=offload_split NANOVLLM_NUM_SPECULATIVE_TOKENS=3 NANOVLLM_HBM_NUM_BLOCKS=820 NANOVLLM_DRAM_NUM_BLOCKS=3900 NANOVLLM_PROMPT_LENGTHS=40000,40001,40002,40003,40004,40005,40006,40007,40008,40009,40010,40011 python3 example/test.py
+PYTHONPATH=$PWD:$PYTHONPATH PYTHONUNBUFFERED=1 NANOVLLM_OFFLOAD_MODE=offload_fuse NANOVLLM_NUM_SPECULATIVE_TOKENS=3 NANOVLLM_HBM_NUM_BLOCKS=820 NANOVLLM_DRAM_NUM_BLOCKS=3900 NANOVLLM_PROMPT_LENGTHS=40000,40001,40002,40003,40004,40005,40006,40007,40008,40009,40010,40011 python3 example/test.py
 ```
 
 不开MTP，bs=12，longbench/dureader最长的12条（序列长度17k左右）
@@ -89,7 +89,7 @@ PYTHONPATH=$PWD:$PYTHONPATH PYTHONUNBUFFERED=1 NANOVLLM_OFFLOAD_MODE=offload_fus
 开MTP，bs=12，longbench/dureader最长的12条（序列长度17k左右）
 
 ```bash
-PYTHONPATH=$PWD:$PYTHONPATH PYTHONUNBUFFERED=1 NANOVLLM_OFFLOAD_MODE=offload_split NANOVLLM_NUM_SPECULATIVE_TOKENS=3 NANOVLLM_HBM_NUM_BLOCKS=820 NANOVLLM_DRAM_NUM_BLOCKS=3900 python3 example/test_dureader.py --prompt_count 12
+PYTHONPATH=$PWD:$PYTHONPATH PYTHONUNBUFFERED=1 NANOVLLM_OFFLOAD_MODE=offload_fuse NANOVLLM_NUM_SPECULATIVE_TOKENS=3 NANOVLLM_HBM_NUM_BLOCKS=820 NANOVLLM_DRAM_NUM_BLOCKS=3900 python3 example/test_dureader.py --prompt_count 12
 ```
 
 　
