@@ -39,7 +39,7 @@ public:
     __aicore__ inline void Process();
 
 private:
-    static constexpr uint32_t MM_RESULT_SLOTS = 4;
+    static constexpr uint32_t WS_DOUBLE = 2;
     static constexpr uint32_t QUERY_COUNT = 4;
     static constexpr uint32_t MIN_SOURCE_TOKENS = 2048;
     static constexpr uint32_t MAX_UNION_TOKENS = 8192;
@@ -64,8 +64,6 @@ private:
     GlobalTensor<float> aggregateScoresGm;
     GlobalTensor<int32_t> internalTopkPayloadsGm;
     GlobalTensor<float> internalThresholdsGm;
-    GlobalTensor<float> partialTopkPairsGm;
-    GlobalTensor<float> partialSortedPairsGm;
 
     uint32_t tmpBlockIdx = 0;
     uint32_t aiCoreIdx = 0;
@@ -125,7 +123,7 @@ __aicore__ inline void LIMtpPreload<LIT>::Init(
     constInfo.qHeadNum = tiling->n1Size;
 
     uint64_t singleCoreMm1Bytes =
-        MM_RESULT_SLOTS * constInfo.qHeadNum * constInfo.s2BaseSize *
+        WS_DOUBLE * constInfo.qHeadNum * constInfo.s2BaseSize *
         sizeof(MM1_OUT_T);
     mm1ResGm.SetGlobalBuffer(
         (__gm__ MM1_OUT_T *)(workspace + aiCoreIdx * singleCoreMm1Bytes));
@@ -144,12 +142,6 @@ __aicore__ inline void LIMtpPreload<LIT>::Init(
         constInfo.batchSize * MAX_UNION_TOKENS * sizeof(int32_t);
     internalThresholdsGm.SetGlobalBuffer(
         (__gm__ float *)(workspace + thresholdOffset));
-    uint64_t partialTopkOffset = thresholdOffset +
-        constInfo.batchSize * QUERY_COUNT * sizeof(float);
-    partialTopkPairsGm.SetGlobalBuffer((__gm__ float *)(workspace + partialTopkOffset));
-    uint64_t partialSortedOffset = partialTopkOffset +
-        constInfo.batchSize * QUERY_COUNT * LIServiceVec::TOPK_PAIR_FLOATS * sizeof(float);
-    partialSortedPairsGm.SetGlobalBuffer((__gm__ float *)(workspace + partialSortedOffset));
 
     reqPoolEntriesGm.SetGlobalBuffer((__gm__ int32_t *)reqPoolEntries,
                                      constInfo.batchSize);
@@ -176,7 +168,7 @@ __aicore__ inline void LIMtpPreload<LIT>::Init(
             topkSourceIdsGm,
             missSourceIdsGm, missDestinationSlotsGm, missCountsGm,
             aggregateScoresGm, internalTopkPayloadsGm,
-            internalThresholdsGm, partialTopkPairsGm, partialSortedPairsGm);
+            internalThresholdsGm);
         vectorService.InitMtpBuffers(pipe);
     } else {
         matmulService.InitParams(constInfo);
@@ -243,21 +235,10 @@ __aicore__ inline void LIMtpPreload<LIT>::ProcessMain()
         }
 
         uint32_t chunkCount = CeilDiv(candidateLen, constInfo.s2BaseSize);
-        for (uint32_t chunkIdx = 0; chunkIdx < chunkCount; ++chunkIdx) {
-            RunInfo cubeInfo{};
-            cubeInfo.bIdx = bIdx;
-            cubeInfo.s2Idx = chunkIdx;
-            cubeInfo.actS2Size = candidateLen;
-            cubeInfo.actualSingleProcessSInnerSize =
-                Min(constInfo.s2BaseSize, candidateLen - chunkIdx * constInfo.s2BaseSize);
-            cubeInfo.actualSingleProcessSInnerSizeAlign = LICommon::Align(
-                cubeInfo.actualSingleProcessSInnerSize, ConstInfo::BUFFER_SIZE_BYTE_32B);
-            if ASCEND_IS_AIC {
-                matmulService.ComputeMm1Mtp4(cubeInfo);
-            }
-            for (uint32_t queryIdx = 0; queryIdx < QUERY_COUNT; ++queryIdx) {
+        for (uint32_t queryIdx = 0; queryIdx < QUERY_COUNT; ++queryIdx) {
+            for (uint32_t chunkIdx = 0; chunkIdx < chunkCount; ++chunkIdx) {
                 RunInfo runInfo{};
-                runInfo.loop = queryIdx;
+                runInfo.loop = loop++;
                 runInfo.bIdx = bIdx;
                 runInfo.queryRow = bIdx * QUERY_COUNT + queryIdx;
                 runInfo.queryIdx = queryIdx;
@@ -277,15 +258,7 @@ __aicore__ inline void LIMtpPreload<LIT>::ProcessMain()
                 runInfo.isLastS2InnerLoop = chunkIdx + 1U == chunkCount;
                 runInfo.isPartialSegment = false;
                 runInfo.partialSlot = 0U;
-                if ASCEND_IS_AIC {
-                    CrossCoreSetFlag<ConstInfo::FIA_SYNC_MODE2, PIPE_FIX>(constInfo.syncC1V1);
-                    CrossCoreWaitFlag(constInfo.syncV1C1);
-                } else {
-                    CrossCoreWaitFlag(constInfo.syncC1V1);
-                    vectorService.ProcessVecMtp(runInfo);
-                    CrossCoreSetFlag<ConstInfo::FIA_SYNC_MODE2, PIPE_MTE2>(constInfo.syncV1C1);
-                }
-                ++loop;
+                ProcessChunk(runInfo);
             }
         }
     }

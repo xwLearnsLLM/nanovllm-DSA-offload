@@ -206,10 +206,10 @@ ge::graphStatus LIUMtpTiling::DoTiling(LIUMtpTilingInfo *info)
     context_->SetBlockDim(blockDim);
     info->usedCoreNum = blockDim;
 
-    constexpr uint64_t MTP_MM_RESULT_SLOTS = 4;
+    constexpr uint64_t DOUBLE_BUFFER = 2;
     constexpr uint64_t SCORE_CHUNK = 512;
     uint64_t workspaceSize = platform.GetLibApiWorkSpaceSize();
-    workspaceSize += static_cast<uint64_t>(blockDim) * MTP_MM_RESULT_SLOTS *
+    workspaceSize += static_cast<uint64_t>(blockDim) * DOUBLE_BUFFER *
                      MTP_HEADS * SCORE_CHUNK * sizeof(float);
     uint64_t scoreStride =
         (static_cast<uint64_t>(info->sourceCapacity) + SCORE_CHUNK - 1U) /
@@ -220,12 +220,6 @@ ge::graphStatus LIUMtpTiling::DoTiling(LIUMtpTilingInfo *info)
                      MTP_TOPK * sizeof(int32_t);
     workspaceSize += static_cast<uint64_t>(info->batchSize) * MTP_QUERY_COUNT *
                      sizeof(float);
-    // Four persistent (score,payload) TopK rows allow chunk-first execution,
-    // which lets the Cube reuse each K chunk across all four MTP queries.
-    workspaceSize += static_cast<uint64_t>(info->batchSize) * MTP_QUERY_COUNT *
-                     MTP_TOPK * 2U * sizeof(float);
-    workspaceSize += static_cast<uint64_t>(info->batchSize) * MTP_QUERY_COUNT *
-                     MTP_TOPK * 2U * sizeof(float);
     context_->GetWorkspaceSizes(1)[0] = workspaceSize;
 
     tilingData_.set_bSize(info->batchSize);

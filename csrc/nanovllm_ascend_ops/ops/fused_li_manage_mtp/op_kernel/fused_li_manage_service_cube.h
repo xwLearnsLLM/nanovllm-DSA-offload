@@ -38,8 +38,6 @@ public:
     __aicore__ inline void AllocEventID();
     __aicore__ inline void FreeEventID();
     __aicore__ inline void ComputeMm1(const LICommon::RunInfo &runInfo);
-    // MTP4 shares one K GM->L1 transfer across the four query rows.
-    __aicore__ inline void ComputeMm1Mtp4(const LICommon::RunInfo &runInfo);
 
     static constexpr IsResetLoad3dConfig LOAD3DV2_CONFIG = {true, true}; // isSetFMatrix isSetPadding;
     static constexpr uint64_t KEY_BUF_NUM = 3;
@@ -68,8 +66,6 @@ public:
 protected:
     __aicore__ inline void Fixp(uint64_t s2GmOffset, uint64_t s2L0RealSize,
                                 const LICommon::RunInfo &runInfo);
-    __aicore__ inline void FixpMtp(uint64_t s2GmOffset, uint64_t s2L0RealSize,
-                                   const LICommon::RunInfo &runInfo, uint32_t queryIdx);
     __aicore__ inline void ComuteL0c(uint64_t s2L0RealSize);
     __aicore__ inline void LoadKeyToL0b(uint64_t s2L0Offset, uint64_t s2L1RealSize, uint64_t s2L0RealSize,
                                         const LICommon::RunInfo &runInfo);
@@ -104,51 +100,6 @@ template <typename LIT>
 __aicore__ inline void LIMatmul<LIT>::InitParams(const ConstInfo &constInfo)
 {
     constInfo_ = constInfo;
-}
-
-template <typename LIT>
-__aicore__ inline void LIMatmul<LIT>::ComputeMm1Mtp4(const LICommon::RunInfo &runInfo)
-{
-    constexpr uint32_t MTP_QUERY_COUNT = 4;
-    uint64_t s2GmBaseOffset = runInfo.s2Idx * constInfo_.s2BaseSize;
-    uint64_t s2ProcessSize = runInfo.actualSingleProcessSInnerSize;
-    for (uint64_t s2GmOffset = 0; s2GmOffset < s2ProcessSize; s2GmOffset += S2_BASIC_BLOCK) {
-        WaitFlag<HardEvent::MTE1_MTE2>(KEY_MTE1_MTE2_EVENT + keyL1BufIdx_ % KEY_BUF_NUM);
-        uint64_t s2L1RealSize =
-            s2GmOffset + S2_BASIC_BLOCK > s2ProcessSize ? s2ProcessSize - s2GmOffset : S2_BASIC_BLOCK;
-        KeyNd2NzForPA(s2L1RealSize, s2GmBaseOffset + s2GmOffset, runInfo);
-        SetFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
-        WaitFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
-
-        for (uint32_t queryIdx = 0; queryIdx < MTP_QUERY_COUNT; ++queryIdx) {
-            RunInfo queryInfo = runInfo;
-            queryInfo.queryIdx = queryIdx;
-            queryInfo.queryRow = runInfo.bIdx * MTP_QUERY_COUNT + queryIdx;
-            WaitFlag<HardEvent::MTE1_MTE2>(QUERY_MTE1_MTE2_EVENT);
-            QueryNd2Nz(queryInfo);
-            SetFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
-            WaitFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
-
-            for (uint64_t s2L1Offset = 0; s2L1Offset < s2L1RealSize; s2L1Offset += S2_BASIC_BLOCK_L0) {
-                uint64_t s2L0RealSize = s2L1Offset + S2_BASIC_BLOCK_L0 > s2L1RealSize
-                                             ? s2L1RealSize - s2L1Offset
-                                             : S2_BASIC_BLOCK_L0;
-                WaitFlag<HardEvent::M_MTE1>(M_MTE1_EVENT + l0BufIdx_ % L0_BUF_NUM);
-                LoadQueryToL0a();
-                LoadKeyToL0b(s2L1Offset, s2L1RealSize, s2L0RealSize, queryInfo);
-                SetFlag<HardEvent::MTE1_M>(MTE1_M_EVENT);
-                WaitFlag<HardEvent::MTE1_M>(MTE1_M_EVENT);
-                ComuteL0c(s2L0RealSize);
-                SetFlag<HardEvent::M_MTE1>(M_MTE1_EVENT + l0BufIdx_ % L0_BUF_NUM);
-                FixpMtp(s2GmOffset + s2L1Offset, s2L0RealSize, queryInfo, queryIdx);
-                ++l0BufIdx_;
-            }
-            SetFlag<HardEvent::MTE1_MTE2>(QUERY_MTE1_MTE2_EVENT);
-        }
-
-        SetFlag<HardEvent::MTE1_MTE2>(KEY_MTE1_MTE2_EVENT + keyL1BufIdx_ % KEY_BUF_NUM);
-        ++keyL1BufIdx_;
-    }
 }
 
 template <typename LIT>
@@ -361,25 +312,6 @@ __aicore__ inline void LIMatmul<LIT>::Fixp(uint64_t s2GmOffset, uint64_t s2L0Rea
 }
 
 template <typename LIT>
-__aicore__ inline void LIMatmul<LIT>::FixpMtp(uint64_t s2GmOffset, uint64_t s2L0RealSize,
-                                              const LICommon::RunInfo &runInfo, uint32_t queryIdx)
-{
-    AscendC::DataCopyCO12DstParams intriParams;
-    intriParams.mSize = constInfo_.qHeadNum;
-    intriParams.nSize = s2L0RealSize;
-    intriParams.dstStride = runInfo.actualSingleProcessSInnerSizeAlign;
-    intriParams.srcStride = constInfo_.qHeadNum;
-    intriParams.quantPre = QuantMode_t::NoQuant;
-    intriParams.nz2ndEn = true;
-    intriParams.unitFlag = 0b11;
-    intriParams.reluPre = 1;
-    AscendC::SetFixpipeNz2ndFlag(1, 1, 1);
-    uint64_t queryOffset = static_cast<uint64_t>(queryIdx) * constInfo_.qHeadNum * constInfo_.s2BaseSize;
-    AscendC::DataCopy(mm1ResGm_[queryOffset + s2GmOffset],
-                      cL0_[(l0BufIdx_ % L0_BUF_NUM) * L0C_BUFFER_OFFSET], intriParams);
-}
-
-template <typename LIT>
 __aicore__ inline void LIMatmul<LIT>::AllocEventID()
 {
     SetMMLayoutTransform(true);
@@ -408,3 +340,4 @@ __aicore__ inline void LIMatmul<LIT>::FreeEventID()
 }
 } // namespace LIKernel
 #endif
+

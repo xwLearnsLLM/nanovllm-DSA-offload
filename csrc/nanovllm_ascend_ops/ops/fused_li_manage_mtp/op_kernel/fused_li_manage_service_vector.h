@@ -106,9 +106,7 @@ public:
         GlobalTensor<int32_t> missCountGm,
         GlobalTensor<float> scoresGm,
         GlobalTensor<int32_t> mtpTopkPayloadsGm,
-        GlobalTensor<float> mtpThresholdsGm,
-        GlobalTensor<float> mtpPartialTopkPairsGm,
-        GlobalTensor<float> mtpPartialSortedPairsGm);
+        GlobalTensor<float> mtpThresholdsGm);
     __aicore__ inline void InitPartialMetadata(uint32_t coreIdx);
     __aicore__ inline void FinalizePartialRequest(uint32_t bIdx, uint32_t cacheRowIdx,
                                                   uint32_t actualSeqLen,
@@ -135,8 +133,6 @@ protected:
     GlobalTensor<int32_t> mtpMissSourceIdsGm;
     GlobalTensor<int32_t> mtpMissDestinationSlotsGm;
     GlobalTensor<float> mtpThresholdsGm;
-    GlobalTensor<float> mtpPartialTopkPairsGm;
-    GlobalTensor<float> mtpPartialSortedPairsGm;
 
 private:
     // queue
@@ -308,9 +304,7 @@ __aicore__ inline void LIVector<LIT>::InitMtpGlobalTensor(
     GlobalTensor<int32_t> missCountGm,
     GlobalTensor<float> scoresGm,
     GlobalTensor<int32_t> mtpTopkPayloadsGm,
-    GlobalTensor<float> mtpThresholdsGm,
-    GlobalTensor<float> mtpPartialTopkPairsGm,
-    GlobalTensor<float> mtpPartialSortedPairsGm)
+    GlobalTensor<float> mtpThresholdsGm)
 {
     this->mm1ResGm = mm1ResGm;
     this->weightsGm = weightsGm;
@@ -323,8 +317,6 @@ __aicore__ inline void LIVector<LIT>::InitMtpGlobalTensor(
     this->scoresGm = scoresGm;
     this->mtpTopkPayloadsGm = mtpTopkPayloadsGm;
     this->mtpThresholdsGm = mtpThresholdsGm;
-    this->mtpPartialTopkPairsGm = mtpPartialTopkPairsGm;
-    this->mtpPartialSortedPairsGm = mtpPartialSortedPairsGm;
 }
 
 template <typename LIT>
@@ -1331,25 +1323,10 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
 
     int32_t cuBaseS2Idx = info.s2Idx * s2BaseSize_;
     int32_t cuS2Len = info.actualSingleProcessSInnerSize;
-    int64_t mmGmOffset = static_cast<int64_t>(info.queryIdx) *
-                         (gSize_ * s2BaseSize_);
+    int64_t mmGmOffset = (info.loop % 2) * (gSize_ * s2BaseSize_);
     int64_t weightGmOffset = static_cast<int64_t>(info.queryRow) * gSize_;
     if (info.isFirstS2InnerLoop) {
         InitSortOutBuf(globalTopkUb_, TOPK_PAIR_FLOATS);
-    } else {
-        uint64_t partialOffset = static_cast<uint64_t>(info.queryRow) * TOPK_PAIR_FLOATS;
-        SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
-        DataCopyPad(globalTopkUb_, mtpPartialTopkPairsGm[partialOffset],
-                    AscendC::DataCopyExtParams{
-                        1, static_cast<uint32_t>(TOPK_PAIR_FLOATS * sizeof(float)), 0, 0, 0},
-                    AscendC::DataCopyPadExtParams<float>{false, 0, 0, 0.0f});
-        SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
-        SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
-        DataCopyPad(SortedBasicBlock_, mtpPartialSortedPairsGm[partialOffset],
-                    AscendC::DataCopyExtParams{
-                        1, static_cast<uint32_t>(TOPK_PAIR_FLOATS * sizeof(float)), 0, 0, 0},
-                    AscendC::DataCopyPadExtParams<float>{false, 0, 0, 0.0f});
-        SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
     }
 
     int32_t mmUbStride =
@@ -1420,7 +1397,8 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
                               s2BaseSize_);
                 PipeBarrier<PIPE_V>();
                 DataCopy(SortedBasicBlock_, tmpSortBuf,
-                         (cachedChunkIdx + 1U) * s2BaseSize_ * VALUE_AND_INDEX_NUM);
+                         (cachedChunkIdx + 1U) * s2BaseSize_ *
+                             VALUE_AND_INDEX_NUM);
             }
             PipeBarrier<PIPE_V>();
             SparseTopK(globalTopkUb_, SortedBasicBlock_, tmpSortBuf, BASE_TOPK,
@@ -1435,16 +1413,6 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
         if (info.queryIdx + 1U == MTP_QUERY_COUNT) {
             FinalizeMtpRequest(info);
         }
-    } else {
-        uint64_t partialOffset = static_cast<uint64_t>(info.queryRow) * TOPK_PAIR_FLOATS;
-        SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
-        LIServiceVec::CopyOut(mtpPartialTopkPairsGm[partialOffset], globalTopkUb_,
-                              TOPK_PAIR_FLOATS);
-        SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
-        SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
-        LIServiceVec::CopyOut(mtpPartialSortedPairsGm[partialOffset], SortedBasicBlock_,
-                              TOPK_PAIR_FLOATS);
-        SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
     }
 }
 
