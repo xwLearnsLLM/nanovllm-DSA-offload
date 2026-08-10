@@ -54,7 +54,7 @@ def require_glm_tokenizer_version(version: str) -> None:
     major_minor = tuple(int(value) for value in match.groups())
     if major_minor < _MIN_GLM_TOKENIZER_VERSION:
         raise RuntimeError(
-            "GLM-5.1 uses the Transformers v5 TokenizersBackend and the "
+            "GLM-5.1/5.2 uses the Transformers v5 TokenizersBackend and the "
             "list-form extra_special_tokens metadata, which requires "
             "Transformers >= 5.5 in this project. Installed version: "
             f"{version}. Run: python3 -m pip install --upgrade "
@@ -71,4 +71,3 @@ def load_glm_tokenizer(model_path: str, *, trust_remote_code: bool):
         model_path,
         trust_remote_code=trust_remote_code,
     )
-

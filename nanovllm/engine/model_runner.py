@@ -262,9 +262,10 @@ class ModelRunner:
             elif self.uses_offload:
                 attention = "LIM + SCATTER + sparse-and-tail MLA"
             logger.info(
-                "GLM-5.1 W4A8: %s decode, attention=%s, max_model_len=%d, "
+                "%s W4A8: %s decode, attention=%s, max_model_len=%d, "
                 "EP%d (%d local experts/rank), ModelSlim version=%s "
                 "group_size=%s; MTP K=%d.",
+                getattr(self.hf_config, "nanovllm_model_name", "GLM"),
                 (
                     "eager"
                     if self.config.enforce_eager

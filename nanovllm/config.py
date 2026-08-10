@@ -16,6 +16,21 @@ from nanovllm.engine.dsa_offload import (
 from nanovllm.engine.full_decode_graph import normalize_capture_sizes
 
 
+GLM_VERSION_51 = "5.1"
+GLM_VERSION_52 = "5.2"
+
+
+def glm52_indexer_types(num_hidden_layers: int) -> tuple[str, ...]:
+    """Return the official GLM-5.2 target-layer IndexShare schedule."""
+
+    return tuple(
+        "full"
+        if layer_idx < 3 or (layer_idx >= 6 and (layer_idx - 6) % 4 == 0)
+        else "shared"
+        for layer_idx in range(num_hidden_layers)
+    )
+
+
 def normalize_eos_token_ids(value: Any) -> tuple[int, ...]:
     if value is None:
         return ()
@@ -54,6 +69,8 @@ class Config:
     enforce_eager: bool = False
     decode_graph_capture_sizes: tuple[int, ...] | list[int] | None = None
     hf_config: Any = field(init=False)
+    glm_version: str = field(init=False)
+    glm_model_name: str = field(init=False)
     eos: tuple[int, ...] = field(init=False, default=(-1,))
     kvcache_block_size: int = 256
     num_hbm_kvcache_blocks: int = -1
@@ -91,6 +108,7 @@ class Config:
         if self.max_model_len <= 0:
             raise ValueError("max_model_len must be > 0.")
         self.hf_config = self._load_hf_config()
+        self._configure_glm_version()
         setattr(
             self.hf_config,
             "nanovllm_enable_expert_parallel",
@@ -116,6 +134,7 @@ class Config:
             )
 
         self._configure_glm_runtime()
+        self._validate_glm52_phase1_runtime()
         self._validate_mtp_runtime()
         self._validate_lidu_runtime(text_config)
         eos_token_id = getattr(text_config, "eos_token_id", None)
@@ -154,7 +173,7 @@ class Config:
 
         if getattr(self.hf_config, "model_type", "") != "glm_moe_dsa":
             raise ValueError(
-                "Built-in MTP currently supports GLM-5.1-W4A8 only."
+                "Built-in MTP currently supports GLM W4A8 only."
             )
         if int(getattr(self.hf_config, "num_nextn_predict_layers", 0)) != 1:
             raise ValueError(
@@ -163,7 +182,7 @@ class Config:
         mtp_layer_idx = int(getattr(self.hf_config, "num_hidden_layers", -1))
         if mtp_layer_idx != 78:
             raise ValueError(
-                "GLM-5.1 MTP expects 78 target layers and checkpoint layer "
+                "GLM MTP expects 78 target layers and checkpoint layer "
                 f"78, got num_hidden_layers={mtp_layer_idx}."
             )
 
@@ -202,6 +221,45 @@ class Config:
             raise ValueError(
                 "GLM MTP layer must be FLOAT/BF16 in the ModelSlim "
                 f"description; non-FLOAT entries include {non_float[:3]}."
+            )
+
+    def _configure_glm_version(self) -> None:
+        indexer_types = getattr(self.hf_config, "indexer_types", None)
+        if indexer_types is None:
+            self.glm_version = GLM_VERSION_51
+            self.glm_model_name = "GLM-5.1"
+        else:
+            num_layers = int(getattr(self.hf_config, "num_hidden_layers", 0))
+            actual = tuple(str(value) for value in indexer_types)
+            expected = glm52_indexer_types(num_layers)
+            if num_layers != 78 or actual != expected:
+                raise ValueError(
+                    "GLM-5.2 requires the official 21-full/57-shared "
+                    "IndexShare schedule."
+                )
+            self.glm_version = GLM_VERSION_52
+            self.glm_model_name = "GLM-5.2"
+
+        setattr(self.hf_config, "nanovllm_glm_version", self.glm_version)
+        setattr(self.hf_config, "nanovllm_model_name", self.glm_model_name)
+
+    def _validate_glm52_phase1_runtime(self) -> None:
+        if self.glm_version != GLM_VERSION_52:
+            return
+        if self.offload_mode != OFFLOAD_NONE:
+            raise ValueError(
+                "GLM-5.2 phase 1 supports offload_mode='none' only; "
+                "IndexShare offload is implemented in the next phase."
+            )
+        if self.num_speculative_tokens:
+            raise ValueError(
+                "GLM-5.2 phase 1 supports num_speculative_tokens=0 only; "
+                "the quantized MTP layer is implemented in a later phase."
+            )
+        if not self.enforce_eager:
+            raise ValueError(
+                "GLM-5.2 phase 1 is eager-only; set enforce_eager=True / "
+                "NANOVLLM_ENFORCE_EAGER=1."
             )
 
     def _configure_decode_graph(self) -> None:
@@ -261,7 +319,7 @@ class Config:
             "torch.bfloat16",
         ):
             raise ValueError(
-                "GLM-5.1-W4A8 requires BF16 runtime dtype, got "
+                "GLM W4A8 requires BF16 runtime dtype, got "
                 f"{dtype!r}."
             )
         description_path = os.path.join(
@@ -269,7 +327,7 @@ class Config:
         )
         if not os.path.isfile(description_path):
             raise ValueError(
-                "GLM-5.1-W4A8 requires quant_model_description.json "
+                "GLM W4A8 requires quant_model_description.json "
                 "from the ModelSlim checkpoint."
             )
         with open(description_path, "r", encoding="utf-8") as file:
@@ -286,17 +344,17 @@ class Config:
         }
         if metadata["version"] != "1.0.0":
             raise ValueError(
-                "GLM-5.1 support requires ModelSlim quant version 1.0.0 "
+                "GLM W4A8 support requires ModelSlim quant version 1.0.0 "
                 f"only, got {metadata['version']!r}."
             )
         if metadata["model_quant_type"] != "W8A8_DYNAMIC":
             raise ValueError(
-                "GLM-5.1 support expects model_quant_type="
+                "GLM W4A8 support expects model_quant_type="
                 f"'W8A8_DYNAMIC', got {metadata['model_quant_type']!r}."
             )
         if metadata["group_size"] != 0:
             raise ValueError(
-                "GLM-5.1 support expects per-channel W4A8 "
+                "GLM W4A8 support expects per-channel W4A8 "
                 f"(group_size=0), got {metadata['group_size']!r}."
             )
         setattr(self.hf_config, "nanovllm_quant_metadata", metadata)
@@ -304,7 +362,7 @@ class Config:
     def _configure_glm_runtime(self) -> None:
         if not self.enable_expert_parallel:
             raise ValueError(
-                "GLM-5.1-W4A8 requires expert parallel; set "
+                "GLM W4A8 requires expert parallel; set "
                 "enable_expert_parallel=True / "
                 "NANOVLLM_ENABLE_EXPERT_PARALLEL=1."
             )
@@ -390,7 +448,7 @@ class Config:
             return GlmMoeDsaConfig.from_pretrained(self.model)
 
         raise ValueError(
-            "nano-vllm-ascend supports GLM-5.1-W4A8 only. The model config "
+            "nano-vllm-ascend supports GLM-5.1/5.2 W4A8 only. The model config "
             "must use model_type='glm_moe_dsa' or architecture "
             "'GlmMoeDsaForCausalLM'."
         )

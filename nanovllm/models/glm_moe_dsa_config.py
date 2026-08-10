@@ -7,7 +7,7 @@ from transformers import PretrainedConfig
 
 
 class GlmMoeDsaConfig(PretrainedConfig):
-    """Minimal local config for the GLM-5.1 DSA architecture."""
+    """Minimal local config for the GLM-5.1/5.2 DSA architecture."""
 
     model_type = "glm_moe_dsa"
 

@@ -1,4 +1,4 @@
-"""Deterministic GLM-5.1 W4A8 short-prompt smoke test."""
+"""Deterministic GLM-5.1/5.2 W4A8 short-prompt smoke test."""
 
 from _example_utils import (
     decode_step_limits,

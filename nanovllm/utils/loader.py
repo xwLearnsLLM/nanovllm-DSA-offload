@@ -156,7 +156,7 @@ def load_model(
                 ):
                     if torch.count_nonzero(tensor).item() != 0:
                         raise ValueError(
-                            "GLM-5.1 supports symmetric W4A8 only, but "
+                            "GLM W4A8 supports symmetric weights only, but "
                             f"{weight_name!r} contains a non-zero offset."
                         )
                     continue

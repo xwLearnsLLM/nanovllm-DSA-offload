@@ -7,6 +7,7 @@ from safetensors.torch import save_file
 
 from nanovllm.config import (
     Config,
+    glm52_indexer_types,
     merge_eos_token_ids,
     normalize_eos_token_ids,
 )
@@ -106,6 +107,25 @@ def _write_glm_config(path, **overrides):
     )
 
 
+def _write_glm52_config(path, **overrides):
+    raw = {
+        "head_dim": 192,
+        "max_position_embeddings": 1_048_576,
+        "rope_parameters": {
+            "rope_theta": 8_000_000,
+            "rope_type": "default",
+        },
+        "index_share_for_mtp_iteration": True,
+        "index_skip_topk_offset": 3,
+        "index_topk_freq": 4,
+        "index_topk_pattern": None,
+        "indexer_types": list(glm52_indexer_types(78)),
+        "mlp_layer_types": ["dense"] * 3 + ["sparse"] * 75,
+    }
+    raw.update(overrides)
+    _write_glm_config(path, **raw)
+
+
 def _make_config(path, **overrides):
     kwargs = dict(
         max_model_len=2048,
@@ -130,6 +150,8 @@ def test_glm_config_is_loaded(tmp_path):
     )
     config = _make_config(tmp_path)
 
+    assert config.glm_version == "5.1"
+    assert config.glm_model_name == "GLM-5.1"
     assert config.hf_config.__class__.__name__ == "GlmMoeDsaConfig"
     assert config.hf_config.rope_parameters["rope_theta"] == 1_000_000
     assert config.hf_config.rope_parameters["rope_type"] == "default"
@@ -139,6 +161,76 @@ def test_glm_config_is_loaded(tmp_path):
         config.hf_config.nanovllm_original_max_position_embeddings
         == 202752
     )
+
+
+def test_glm52_mtp0_nonoffload_eager_config_is_loaded(tmp_path):
+    _write_glm52_config(tmp_path)
+
+    config = _make_config(
+        tmp_path,
+        offload_mode="none",
+        num_dram_kvcache_blocks=-1,
+        enforce_eager=True,
+        num_speculative_tokens=0,
+        max_model_len=65536,
+    )
+
+    assert config.glm_version == "5.2"
+    assert config.glm_model_name == "GLM-5.2"
+    assert config.hf_config.nanovllm_glm_version == "5.2"
+    assert config.hf_config.nanovllm_model_name == "GLM-5.2"
+    assert config.hf_config.indexer_types.count("full") == 21
+    assert config.hf_config.indexer_types.count("shared") == 57
+    assert config.hf_config.rope_parameters["rope_theta"] == 8_000_000
+    assert config.hf_config.max_position_embeddings == 65536
+    assert (
+        config.hf_config.nanovllm_original_max_position_embeddings
+        == 1_048_576
+    )
+
+
+def test_glm52_phase1_rejects_offload(tmp_path):
+    _write_glm52_config(tmp_path)
+
+    with pytest.raises(ValueError, match="offload_mode='none' only"):
+        _make_config(tmp_path, offload_mode="offload_split")
+
+
+def test_glm52_phase1_rejects_mtp3(tmp_path):
+    _write_glm52_config(tmp_path)
+
+    with pytest.raises(ValueError, match="num_speculative_tokens=0 only"):
+        _make_config(
+            tmp_path,
+            offload_mode="none",
+            num_dram_kvcache_blocks=-1,
+            num_speculative_tokens=3,
+        )
+
+
+def test_glm52_phase1_rejects_full_decode_graph(tmp_path):
+    _write_glm52_config(tmp_path)
+
+    with pytest.raises(ValueError, match="phase 1 is eager-only"):
+        _make_config(
+            tmp_path,
+            offload_mode="none",
+            num_dram_kvcache_blocks=-1,
+            enforce_eager=False,
+        )
+
+
+def test_glm52_rejects_non_official_index_share_schedule(tmp_path):
+    schedule = list(glm52_indexer_types(78))
+    schedule[3] = "full"
+    _write_glm52_config(tmp_path, indexer_types=schedule)
+
+    with pytest.raises(ValueError, match="21-full/57-shared"):
+        _make_config(
+            tmp_path,
+            offload_mode="none",
+            num_dram_kvcache_blocks=-1,
+        )
 
 
 def test_glm_rejects_non_bf16_runtime(tmp_path):

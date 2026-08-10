@@ -1,12 +1,14 @@
-# nano-vLLM Ascend：GLM-5.1 W4A8
+# nano-vLLM Ascend：GLM-5.1 / GLM-5.2 W4A8
 
-本仓库只维护 `GLM-5.1-w4a8`。运行时要求 BF16、Expert Parallel、128-token KV block，以及 ModelSlim 1.0.0 per-channel W4A8 checkpoint。Routed experts 保持原生 W4A8；Attention、dense/shared MLP 的 W8A8 权重在加载时反量化为 BF16。
+运行时要求 BF16、Expert Parallel、128-token KV block，以及 ModelSlim 1.0.0 per-channel W4A8 checkpoint。Routed experts 保持原生 W4A8；Attention、dense/shared MLP 的 W8A8 权重在加载时反量化为 BF16。
+
+`main-glm52` 第一阶段支持 `GLM-5.2-w4a8 + MTP0 + offload_mode=none + eager`，目标上下文为 20K～64K。GLM-5.2 的 IndexShare offload、MTP3 和图模式将在后续阶段逐步加入；当前若误开会明确报错。
 
 　
 
 ## 支持范围
 
-### MTP
+### GLM-5.1 MTP
 
 `NANOVLLM_NUM_SPECULATIVE_TOKENS` 只接受 `0` 或 `3`。图模式只针对后续稳定 decode。Prefill、首次 decode、卸载缓存初始化和首次 lazy capture 允许走 eager；稳定且 batch size 与 capture size 完全一致后才 replay。
 

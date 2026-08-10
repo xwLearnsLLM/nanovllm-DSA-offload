@@ -1,4 +1,4 @@
-# Ascend worker environment for GLM-5.1-w4a8.
+# Ascend worker environment for GLM-5.1/5.2-w4a8.
 # torch/torch-npu wheels are platform-specific; install them from the Ascend
 # wheel source that matches your machine.
 
