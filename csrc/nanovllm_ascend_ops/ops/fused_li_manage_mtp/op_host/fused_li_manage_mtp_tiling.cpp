@@ -224,6 +224,8 @@ ge::graphStatus LIUMtpTiling::DoTiling(LIUMtpTilingInfo *info)
     // which lets the Cube reuse each K chunk across all four MTP queries.
     workspaceSize += static_cast<uint64_t>(info->batchSize) * MTP_QUERY_COUNT *
                      MTP_TOPK * 2U * sizeof(float);
+    workspaceSize += static_cast<uint64_t>(info->batchSize) * MTP_QUERY_COUNT *
+                     MTP_TOPK * 2U * sizeof(float);
     context_->GetWorkspaceSizes(1)[0] = workspaceSize;
 
     tilingData_.set_bSize(info->batchSize);

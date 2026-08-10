@@ -107,7 +107,8 @@ public:
         GlobalTensor<float> scoresGm,
         GlobalTensor<int32_t> mtpTopkPayloadsGm,
         GlobalTensor<float> mtpThresholdsGm,
-        GlobalTensor<float> mtpPartialTopkPairsGm);
+        GlobalTensor<float> mtpPartialTopkPairsGm,
+        GlobalTensor<float> mtpPartialSortedPairsGm);
     __aicore__ inline void InitPartialMetadata(uint32_t coreIdx);
     __aicore__ inline void FinalizePartialRequest(uint32_t bIdx, uint32_t cacheRowIdx,
                                                   uint32_t actualSeqLen,
@@ -135,6 +136,7 @@ protected:
     GlobalTensor<int32_t> mtpMissDestinationSlotsGm;
     GlobalTensor<float> mtpThresholdsGm;
     GlobalTensor<float> mtpPartialTopkPairsGm;
+    GlobalTensor<float> mtpPartialSortedPairsGm;
 
 private:
     // queue
@@ -307,7 +309,8 @@ __aicore__ inline void LIVector<LIT>::InitMtpGlobalTensor(
     GlobalTensor<float> scoresGm,
     GlobalTensor<int32_t> mtpTopkPayloadsGm,
     GlobalTensor<float> mtpThresholdsGm,
-    GlobalTensor<float> mtpPartialTopkPairsGm)
+    GlobalTensor<float> mtpPartialTopkPairsGm,
+    GlobalTensor<float> mtpPartialSortedPairsGm)
 {
     this->mm1ResGm = mm1ResGm;
     this->weightsGm = weightsGm;
@@ -321,6 +324,7 @@ __aicore__ inline void LIVector<LIT>::InitMtpGlobalTensor(
     this->mtpTopkPayloadsGm = mtpTopkPayloadsGm;
     this->mtpThresholdsGm = mtpThresholdsGm;
     this->mtpPartialTopkPairsGm = mtpPartialTopkPairsGm;
+    this->mtpPartialSortedPairsGm = mtpPartialSortedPairsGm;
 }
 
 template <typename LIT>
@@ -1340,6 +1344,12 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
                         1, static_cast<uint32_t>(TOPK_PAIR_FLOATS * sizeof(float)), 0, 0, 0},
                     AscendC::DataCopyPadExtParams<float>{false, 0, 0, 0.0f});
         SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
+        SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
+        DataCopyPad(SortedBasicBlock_, mtpPartialSortedPairsGm[partialOffset],
+                    AscendC::DataCopyExtParams{
+                        1, static_cast<uint32_t>(TOPK_PAIR_FLOATS * sizeof(float)), 0, 0, 0},
+                    AscendC::DataCopyPadExtParams<float>{false, 0, 0, 0.0f});
+        SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
     }
 
     int32_t mmUbStride =
@@ -1392,20 +1402,30 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
                                 sortScoreUb, s2BaseSize_);
 
     LocalTensor<float> tmpSortBuf = outQueue_.AllocTensor<float>();
+    uint32_t cachedChunkIdx = info.segmentChunkIdx % PAYLOAD_BUF_SLOTS;
     Sort<float, true>(
-        SortedBasicBlock_,
+        SortedBasicBlock_[cachedChunkIdx * s2BaseSize_ * VALUE_AND_INDEX_NUM],
         reduceOutBuff, payloadUb.template ReinterpretCast<uint32_t>(),
         tmpSortBuf, s2BaseSize_ / 32);
     PipeBarrier<PIPE_V>();
-    // Chunk-first MTP execution interleaves q0..q3, so UB cannot retain a
-    // query-private four-chunk batch. Merge each sorted chunk immediately;
-    // globalTopkUb_ is restored from that query's workspace row above.
-    if (info.isFirstS2InnerLoop) {
-        DataCopy(globalTopkUb_, SortedBasicBlock_,
-                 s2BaseSize_ * VALUE_AND_INDEX_NUM);
-    } else {
-        SparseTopK(globalTopkUb_, SortedBasicBlock_, tmpSortBuf, BASE_TOPK,
-                   s2BaseSize_);
+    if (cachedChunkIdx == 3U || info.isLastS2InnerLoop) {
+        if (info.segmentChunkIdx < PAYLOAD_BUF_SLOTS) {
+            MrgBasicBlock(globalTopkUb_, SortedBasicBlock_,
+                          static_cast<int64_t>(cachedChunkIdx + 1U),
+                          s2BaseSize_);
+        } else {
+            if (cachedChunkIdx > 0U) {
+                MrgBasicBlock(tmpSortBuf, SortedBasicBlock_,
+                              static_cast<int64_t>(cachedChunkIdx + 1U),
+                              s2BaseSize_);
+                PipeBarrier<PIPE_V>();
+                DataCopy(SortedBasicBlock_, tmpSortBuf,
+                         (cachedChunkIdx + 1U) * s2BaseSize_ * VALUE_AND_INDEX_NUM);
+            }
+            PipeBarrier<PIPE_V>();
+            SparseTopK(globalTopkUb_, SortedBasicBlock_, tmpSortBuf, BASE_TOPK,
+                       s2BaseSize_ * (cachedChunkIdx + 1U));
+        }
     }
     PipeBarrier<PIPE_V>();
     outQueue_.FreeTensor(tmpSortBuf);
@@ -1419,6 +1439,10 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
         uint64_t partialOffset = static_cast<uint64_t>(info.queryRow) * TOPK_PAIR_FLOATS;
         SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
         LIServiceVec::CopyOut(mtpPartialTopkPairsGm[partialOffset], globalTopkUb_,
+                              TOPK_PAIR_FLOATS);
+        SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
+        SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
+        LIServiceVec::CopyOut(mtpPartialSortedPairsGm[partialOffset], SortedBasicBlock_,
                               TOPK_PAIR_FLOATS);
         SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
     }
