@@ -93,6 +93,29 @@ def scatter_copy(
     )
 
 
+def kvcache_offload_copy(
+    hbm_kv_cache: torch.Tensor,
+    dram_kv_cache: torch.Tensor,
+    hbm_block_table: torch.Tensor,
+    dram_block_table: torch.Tensor,
+    copy_counts: torch.Tensor,
+) -> torch.Tensor:
+    """Offload selected complete INT8 KVCache blocks from HBM to DRAM.
+
+    For batch row ``b``, the first ``copy_counts[b]`` columns pair an HBM
+    physical block with a DRAM physical block.  The returned tensor aliases
+    the mutated ``dram_kv_cache`` input.
+    """
+
+    return torch.ops.nanovllm_dsa.kvcache_offload_copy.default(
+        hbm_kv_cache,
+        dram_kv_cache,
+        hbm_block_table,
+        dram_block_table,
+        copy_counts,
+    )
+
+
 def sparse_tail_attention(
     query: torch.Tensor,
     latent_kv_cache: torch.Tensor,

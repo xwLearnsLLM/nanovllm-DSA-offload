@@ -240,6 +240,7 @@ op_add_subdirectory(OP_LIST OP_DIR_LIST)
 # to include the kernels in binary_info_config.json.
 set(fused_li_manage_kernel_aliases nanovllm_fused_li_manage)
 set(kvcache_scatter_copy_kernel_aliases nanovllm_kvcache_scatter_copy)
+set(kvcache_offload_copy_kernel_aliases nanovllm_kvcache_offload_copy)
 set(sparse_tail_attention_kernel_aliases nanovllm_sparse_tail_attention)
 set(fused_copy_sfa_kernel_aliases nanovllm_fused_copy_sfa)
 

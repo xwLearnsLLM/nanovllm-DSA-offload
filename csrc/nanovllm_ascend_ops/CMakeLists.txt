@@ -106,6 +106,7 @@ target_include_directories(_C BEFORE PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/cann_ops
   ${CMAKE_CURRENT_SOURCE_DIR}/ops/fused_li_manage
   ${CMAKE_CURRENT_SOURCE_DIR}/ops/kvcache_scatter_copy
+  ${CMAKE_CURRENT_SOURCE_DIR}/ops/kvcache_offload_copy
   ${CMAKE_CURRENT_SOURCE_DIR}/ops/sparse_tail_attention
   ${CMAKE_CURRENT_SOURCE_DIR}/ops/fused_copy_sfa
   ${CMAKE_CURRENT_SOURCE_DIR}/ops/matmul_allreduce_add_rmsnorm

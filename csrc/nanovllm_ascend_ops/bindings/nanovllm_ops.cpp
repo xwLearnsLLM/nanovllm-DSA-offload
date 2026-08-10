@@ -61,6 +61,7 @@ extern void mla_preprocess_impl(
 #include "ops/batch_matmul_transpose/batch_matmul_transpose_torch_adpt.h"
 #include "ops/fused_li_manage/fused_li_manage_torch_adpt.h"
 #include "ops/kvcache_scatter_copy/kvcache_scatter_copy_torch_adpt.h"
+#include "ops/kvcache_offload_copy/kvcache_offload_copy_torch_adpt.h"
 #include "ops/sparse_tail_attention/sparse_tail_attention_torch_adpt.h"
 #include "ops/fused_copy_sfa/fused_copy_sfa_torch_adpt.h"
 #include "ops/matmul_allreduce_add_rmsnorm/matmul_allreduce_add_rmsnorm_torch_adpt.h"
@@ -210,6 +211,31 @@ std::tuple<at::Tensor, at::Tensor> scatter_copy_meta(
   (void)destination_slots;
   (void)copy_counts;
   return std::make_tuple(hbm_k_rope, hbm_kv_cache);
+}
+
+at::Tensor kvcache_offload_copy_torch_op(
+    const at::Tensor& hbm_kv_cache,
+    at::Tensor dram_kv_cache,
+    const at::Tensor& hbm_block_table,
+    const at::Tensor& dram_block_table,
+    const at::Tensor& copy_counts) {
+  vllm_ascend::npu_kvcache_offload_copy(
+      hbm_kv_cache, dram_kv_cache, hbm_block_table,
+      dram_block_table, copy_counts);
+  return dram_kv_cache;
+}
+
+at::Tensor kvcache_offload_copy_meta(
+    const at::Tensor& hbm_kv_cache,
+    at::Tensor dram_kv_cache,
+    const at::Tensor& hbm_block_table,
+    const at::Tensor& dram_block_table,
+    const at::Tensor& copy_counts) {
+  (void)hbm_kv_cache;
+  (void)hbm_block_table;
+  (void)dram_block_table;
+  (void)copy_counts;
+  return dram_kv_cache;
 }
 
 at::Tensor sparse_tail_attention_torch_op(
@@ -477,6 +503,10 @@ TORCH_LIBRARY(nanovllm_dsa, ops) {
       " Tensor destination_slots, Tensor copy_counts)"
       " -> (Tensor(a!), Tensor(b!))");
   ops.def(
+      "kvcache_offload_copy(Tensor hbm_kv_cache,"
+      " Tensor(a!) dram_kv_cache, Tensor hbm_block_table,"
+      " Tensor dram_block_table, Tensor copy_counts) -> Tensor(a!)");
+  ops.def(
       "sparse_tail_attention(Tensor query, Tensor key, Tensor value,"
       " Tensor sparse_slots, Tensor cache_tokens, Tensor block_table,"
       " Tensor actual_seq_lengths_query, Tensor actual_seq_lengths_kv,"
@@ -497,6 +527,7 @@ TORCH_LIBRARY_IMPL(nanovllm_dsa, PrivateUse1, ops) {
   ops.impl("fused_li_manage", &fused_li_manage_torch_op);
   ops.impl("fused_li_manage_out", &fused_li_manage_out_torch_op);
   ops.impl("scatter_copy", &scatter_copy_torch_op);
+  ops.impl("kvcache_offload_copy", &kvcache_offload_copy_torch_op);
   ops.impl("sparse_tail_attention", &sparse_tail_attention_torch_op);
   ops.impl("fused_copy_sfa", &fused_copy_sfa_torch_op);
 }
@@ -505,6 +536,7 @@ TORCH_LIBRARY_IMPL(nanovllm_dsa, Meta, ops) {
   ops.impl("fused_li_manage", &fused_li_manage_meta);
   ops.impl("fused_li_manage_out", &fused_li_manage_out_meta);
   ops.impl("scatter_copy", &scatter_copy_meta);
+  ops.impl("kvcache_offload_copy", &kvcache_offload_copy_meta);
   ops.impl("sparse_tail_attention", &sparse_tail_attention_meta);
   ops.impl("fused_copy_sfa", &fused_copy_sfa_meta);
 }

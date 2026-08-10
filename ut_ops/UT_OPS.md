@@ -39,6 +39,18 @@ python3 ut_ops/test_fused_li_manage_perf.py --device npu:0 --heads 32 --batch-si
 python3 ut_ops/test_scatter_copy.py --device npu:0 --batch-size 24 --source-len 20992 --hbm-slots 6144 --copy-min 0 --copy-max 300 --copy-cap 2048 --warmup 10 --iters 100 --seed 7
 ```
 
+独立 INT8 `kvcache_offload_copy`，使用普通 HBM source、真实 swapped-memory DRAM destination、动态 block 数和 poison guard 校验：
+
+```bash
+python3 ut_ops/test_kvcache_offload_copy.py --device npu:0 --batch-size 24 --copy-cap 32 --copy-min 0 --copy-max 16 --block-size 128 --cache-dim 512 --warmup 10 --iters 100 --seed 7
+```
+
+额外用非 32-byte 对齐且跨 32 KiB tile 的 block 覆盖 `DataCopyPad` 尾块路径：
+
+```bash
+python3 ut_ops/test_kvcache_offload_copy.py --device npu:0 --batch-size 2 --copy-cap 3 --copy-min 0 --copy-max 2 --block-size 127 --cache-dim 513 --warmup 1 --iters 3 --seed 17
+```
+
 独立 `sparse_tail_attention`：
 
 ```bash
