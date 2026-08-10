@@ -1334,7 +1334,11 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
         InitSortOutBuf(globalTopkUb_, TOPK_PAIR_FLOATS);
     } else {
         uint64_t partialOffset = static_cast<uint64_t>(info.queryRow) * TOPK_PAIR_FLOATS;
-        DataCopy(globalTopkUb_, mtpPartialTopkPairsGm[partialOffset], TOPK_PAIR_FLOATS);
+        SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
+        DataCopyPad(globalTopkUb_, mtpPartialTopkPairsGm[partialOffset],
+                    AscendC::DataCopyExtParams{
+                        1, static_cast<uint32_t>(TOPK_PAIR_FLOATS * sizeof(float)), 0, 0, 0},
+                    AscendC::DataCopyPadExtParams<float>{false, 0, 0, 0.0f});
         SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
     }
 
@@ -1414,7 +1418,8 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
     } else {
         uint64_t partialOffset = static_cast<uint64_t>(info.queryRow) * TOPK_PAIR_FLOATS;
         SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
-        DataCopy(mtpPartialTopkPairsGm[partialOffset], globalTopkUb_, TOPK_PAIR_FLOATS);
+        LIServiceVec::CopyOut(mtpPartialTopkPairsGm[partialOffset], globalTopkUb_,
+                              TOPK_PAIR_FLOATS);
         SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
     }
 }
