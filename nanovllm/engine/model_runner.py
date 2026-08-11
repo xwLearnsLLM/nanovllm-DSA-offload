@@ -572,7 +572,13 @@ class ModelRunner:
             if getattr(module, "uses_offload", False):
                 ckv_cache = torch.empty(layer_shapes[0], dtype=cache_dtype, device=self.device)
                 kpe_cache = torch.empty(layer_shapes[1], dtype=cache_dtype, device=self.device)
-                index_cache = torch.empty(layer_shapes[2], dtype=cache_dtype, device=self.device)
+                # GLM-5.2 IndexShare: only owner (full) layers need an index
+                # key cache.  Shared layers consume the owner's selection
+                # metadata and never access index_cache at runtime.
+                if getattr(module, "is_index_share_owner", True):
+                    index_cache = torch.empty(layer_shapes[2], dtype=cache_dtype, device=self.device)
+                else:
+                    index_cache = torch.empty(0, dtype=cache_dtype, device=self.device)
                 dram_ckv_cache = torch_npu.empty_with_swapped_memory(layer_shapes[3], dtype=cache_dtype, device=self.device)
                 dram_kpe_cache = torch_npu.empty_with_swapped_memory(layer_shapes[4], dtype=cache_dtype, device=self.device)
                 lidu_cache_slots = torch.full(
@@ -583,7 +589,8 @@ class ModelRunner:
                 )
                 ckv_cache.zero_()
                 kpe_cache.zero_()
-                index_cache.zero_()
+                if index_cache.numel() > 0:
+                    index_cache.zero_()
                 module.assign_dsa_cache(
                     ckv_cache,
                     kpe_cache,

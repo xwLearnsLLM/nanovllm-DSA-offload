@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
 
 if TYPE_CHECKING:
@@ -309,3 +310,156 @@ class PoolEntryManager:
             return
         self.used_entries.remove(entry)
         self.free_entries.append(entry)
+
+
+@dataclass(frozen=True)
+class IndexShareGroup:
+    """One target-layer IndexShare group.
+
+    The owner (``full``) layer runs the LightningIndexer and owns the
+    group's persistent mapping state.  Member layers (including the owner)
+    each keep their own KV payload but consume the owner's selection
+    metadata.
+    """
+
+    group_id: int
+    owner_layer_idx: int
+    member_layer_idxs: tuple[int, ...]
+
+
+class IndexShareGroupManager:
+    """Target-layer IndexShare group topology.
+
+    GLM-5.1 degrades to ``num_hidden_layers`` single-layer groups: every
+    layer is its own owner, preserving the original per-layer LIM behaviour.
+
+    GLM-5.2 uses the official 21-full/57-shared schedule derived from
+    ``indexer_types``.  Each ``full`` layer starts a new group; subsequent
+    ``shared`` layers attach to the most recent ``full`` layer.
+    """
+
+    def __init__(
+        self,
+        num_hidden_layers: int,
+        indexer_types: tuple[str, ...] | list[str] | None = None,
+    ) -> None:
+        self.num_hidden_layers = int(num_hidden_layers)
+        if indexer_types is None:
+            self._groups: tuple[IndexShareGroup, ...] = tuple(
+                IndexShareGroup(
+                    group_id=layer_idx,
+                    owner_layer_idx=layer_idx,
+                    member_layer_idxs=(layer_idx,),
+                )
+                for layer_idx in range(self.num_hidden_layers)
+            )
+        else:
+            self._groups = self._build_groups_from_indexer_types(
+                tuple(str(t) for t in indexer_types),
+            )
+
+        self._layer_to_group: dict[int, int] = {}
+        self._layer_to_owner: dict[int, int] = {}
+        for group in self._groups:
+            for layer_idx in group.member_layer_idxs:
+                if layer_idx in self._layer_to_group:
+                    raise ValueError(
+                        f"Layer {layer_idx} appears in multiple IndexShare "
+                        "groups."
+                    )
+                self._layer_to_group[layer_idx] = group.group_id
+                self._layer_to_owner[layer_idx] = group.owner_layer_idx
+
+    def _build_groups_from_indexer_types(
+        self,
+        types: tuple[str, ...],
+    ) -> tuple[IndexShareGroup, ...]:
+        if len(types) != self.num_hidden_layers:
+            raise ValueError(
+                "indexer_types length must match num_hidden_layers: "
+                f"got {len(types)}, expected {self.num_hidden_layers}."
+            )
+        groups: list[IndexShareGroup] = []
+        current_owner: int | None = None
+        current_members: list[int] = []
+        for layer_idx, layer_type in enumerate(types):
+            if layer_type == "full":
+                if current_owner is not None:
+                    groups.append(
+                        IndexShareGroup(
+                            group_id=len(groups),
+                            owner_layer_idx=current_owner,
+                            member_layer_idxs=tuple(current_members),
+                        )
+                    )
+                current_owner = layer_idx
+                current_members = [layer_idx]
+            elif layer_type == "shared":
+                if current_owner is None:
+                    raise ValueError(
+                        f"Shared layer {layer_idx} has no preceding full "
+                        "layer in indexer_types."
+                    )
+                current_members.append(layer_idx)
+            else:
+                raise ValueError(
+                    f"Unknown indexer_type {layer_type!r} at layer "
+                    f"{layer_idx}; expected 'full' or 'shared'."
+                )
+        if current_owner is not None:
+            groups.append(
+                IndexShareGroup(
+                    group_id=len(groups),
+                    owner_layer_idx=current_owner,
+                    member_layer_idxs=tuple(current_members),
+                )
+            )
+        if not groups:
+            raise ValueError("indexer_types produced no IndexShare groups.")
+        return tuple(groups)
+
+    @property
+    def num_groups(self) -> int:
+        return len(self._groups)
+
+    @property
+    def owner_layer_idxs(self) -> tuple[int, ...]:
+        return tuple(group.owner_layer_idx for group in self._groups)
+
+    @property
+    def shared_layer_idxs(self) -> tuple[int, ...]:
+        return tuple(
+            layer_idx
+            for layer_idx in range(self.num_hidden_layers)
+            if not self.is_owner(layer_idx)
+        )
+
+    def group_of(self, layer_idx: int) -> int:
+        return self._layer_to_group[int(layer_idx)]
+
+    def owner_of(self, layer_idx: int) -> int:
+        return self._layer_to_owner[int(layer_idx)]
+
+    def is_owner(self, layer_idx: int) -> bool:
+        return self._layer_to_owner[int(layer_idx)] == int(layer_idx)
+
+    def is_shared(self, layer_idx: int) -> bool:
+        return not self.is_owner(int(layer_idx))
+
+    def group(self, group_id: int) -> IndexShareGroup:
+        return self._groups[int(group_id)]
+
+    def groups(self) -> tuple[IndexShareGroup, ...]:
+        return self._groups
+
+    def validate_layer(self, layer_idx: int) -> None:
+        if layer_idx not in self._layer_to_group:
+            raise IndexError(
+                f"Layer {layer_idx} is not in any IndexShare group."
+            )
+
+    def __repr__(self) -> str:
+        return (
+            f"IndexShareGroupManager(num_hidden_layers={self.num_hidden_layers}, "
+            f"num_groups={self.num_groups})"
+        )

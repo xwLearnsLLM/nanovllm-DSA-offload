@@ -4,7 +4,7 @@
 
 - [x] 从 `main@7c096e0` 创建独立分支 `main-glm52`。
 - [x] 完成 GLM-5.2 模型识别、官方 IndexShare 拓扑校验和第一阶段能力门禁（`7b2effb`）。
-- [ ] 在昇腾上验收 `MTP0 + none + eager`：短序列、21K、接近 64K。
+- [x] 在昇腾上验收 `MTP0 + none + eager`：短序列、21K、接近 64K。
 - [ ] 完成 MTP0 的 target-layer IndexShare：先 `offload_split + eager`，再 `offload_fuse + eager`。
 - [ ] 完成 MTP0 的 stable full-decode-only graph。
 - [ ] 适配 GLM-5.2 的量化 MTP layer，打通 `MTP3 + none` 的 eager 和 graph。
@@ -23,8 +23,11 @@
   - `NANOVLLM_ENFORCE_EAGER=1`
 - 其余 GLM-5.2 组合会明确报错，不会静默回退到错误路径。
 - 当前提交只改了 Python，不需要重新编译 Ascend 自定义算子。
-- 本地 CPU 验证已经覆盖模型识别、IndexShare schedule、能力门禁、原有 MTP 和 chunk prefill 回归。昇腾整网验收尚未完成，因此 checklist 中仍保留为未完成。
-- 下一步不是继续写 offload，而是先等待用户验证当前提交。当前阶段验收通过后，再开始 MTP0 的 IndexShare offload。
+- 本地 CPU 验证已经覆盖模型识别、IndexShare schedule、能力门禁、原有 MTP 和 chunk prefill 回归。
+- 阶段 0 昇腾整网验收已完成（短序列、21K、64K 均通过，token IDs 与 `main` 分支 baseline 对齐），见下方阶段 0 记录。
+- 阶段 1（IndexShare group 元数据层）代码已完成，CPU 测试通过；等待用户确认后进入阶段 2。
+- 阶段 1 建立了 `IndexShareGroupManager` 数据模型，GLM-5.1 退化为 78 个单层 group，GLM-5.2 为 21 个 group（21 full + 57 shared）。shared layer 不创建 Indexer 权重和 index key cache。
+- 当前 GLM-5.2 运行时限制不变（none + eager + MTP0）；阶段 2 将解除 offload 限制。
 
 相关文档：[`README.md`](README.md)、[`README_ops.md`](README_ops.md)、[`TODO.md`](TODO.md)。
 
@@ -164,7 +167,7 @@ shared layer:
 
 ### 阶段 0：验收当前 nonoffload eager bring-up
 
-代码状态：已完成，commit `7b2effb`；昇腾验收待完成。
+代码状态：已完成，commit `7b2effb`；昇腾验收已完成。
 
 验收内容：
 
@@ -370,3 +373,54 @@ CPU/UT：
 profile/性能：
 结论与下一步：
 ```
+
+---
+
+## 进度记录
+
+### 阶段 0：nonoffload eager bring-up
+
+```text
+日期：2025-08-11
+阶段：0（验收 nonoffload eager bring-up）
+commit：7b2effb
+代码状态：已完成，仅改 Python，无需重编算子
+CPU/UT：本地 CPU 覆盖模型识别、IndexShare schedule、能力门禁、原有 MTP 和 chunk prefill 回归
+昇腾整网：通过
+  - 短序列 smoke（bsz=3，prompt≤21）：输出语义正确（"北京"、"14"、英文句），日志显示 GLM-5.2 / MTP K=0 / none / eager
+  - 21K（prompt=21000，prefill_chunk_size=1024，21 个 prefill chunk）：输出 "Hawthorn Bridge" 正确，decode mean TPOT=0.1641s
+  - 64K（prompt=64000，prefill_chunk_size=1024，63 个 prefill chunk）：输出 "Hawthorn Bridge" 正确，decode mean TPOT=0.1551s
+  - token IDs baseline 对齐：64K 在 main-glm52 与 main（GLM-5.1 代码路径）上 token_ids 完全一致
+    [39, 672, 339, 1512, 19836, 154827, 39, 672, 339, 1512, 19836, 154842, 39, 672, 339, 1512, 19836]
+profile/性能：
+  - 21K：prefill TPS=1747 tok/s，decode mean TPOT=0.1641s，decode TPS=6.10 tok/s
+  - 64K：prefill TPS=2351 tok/s，decode mean TPOT=0.1551s，decode TPS=6.45 tok/s
+结论与下一步：阶段 0 验收通过，进入阶段 1（建立 IndexShare group 元数据层）
+```
+
+### 阶段 1：建立 IndexShare group 元数据层
+
+```text
+日期：2025-08-10
+阶段：1（建立 IndexShare group 元数据层）
+commit：8164dbe
+代码状态：已完成，仅改 Python，无需重编算子
+CPU/UT：30 项新测试全部通过（tests/test_glm_index_share.py）
+  - GLM-5.2 group 拓扑：21 groups、21 full/57 shared、layer->owner 映射、group membership
+  - GLM-5.1 退化：78 单层 group、全部 owner、无 shared
+  - 错误处理：长度不匹配、未知类型、shared 无前导 full、空 types
+  - Config 集成：GLM-5.1/5.2 均构建 IndexShareGroupManager 并存储到 hf_config
+  - 权重映射：offload 模式下 shared layer indexer 权重跳过、owner 正常加载
+  - Scheduler 生命周期：deallocate/preempt/abort/pool reuse/batch reorder 不受影响
+  - GLM-5.1 回归：全部原有测试不变（budget 相关旧测试失败为预存问题，见注意事项 17）
+昇腾整网：无需整网验收（阶段 1 只建立数据模型，不改变运行时行为）
+profile/性能：不适用
+结论与下一步：阶段 1 代码完成，等待用户确认后进入阶段 2（MTP0 + offload_split + eager）
+```
+
+实现内容：
+- `IndexShareGroup`（frozen dataclass）和 `IndexShareGroupManager`（`dsa_offload.py`）
+- `Config._configure_glm_version` 构建 group manager 并存储到 `hf_config.nanovllm_index_share_groups`
+- `GlmMLAAttention` 新增 `is_index_share_owner`，shared layer 跳过 indexer/indexer_rotary_emb 创建
+- `ModelRunner._allocate_mla_cache` 跳过 shared layer 的 `index_cache` 分配
+- `GlmMoeDsaForCausalLM.weight_name_mapping` 跳过 shared layer 的 indexer 权重加载

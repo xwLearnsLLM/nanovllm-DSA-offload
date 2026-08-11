@@ -7,6 +7,7 @@ from typing import Any
 
 from nanovllm.engine.dsa_offload import (
     DSA_SELECTION_TOPK_TOKENS,
+    IndexShareGroupManager,
     LIDU_OFFLOAD_MODES,
     LIDU_MAX_SOURCE_TOKENS,
     OFFLOAD_NONE,
@@ -242,6 +243,21 @@ class Config:
 
         setattr(self.hf_config, "nanovllm_glm_version", self.glm_version)
         setattr(self.hf_config, "nanovllm_model_name", self.glm_model_name)
+        num_layers = int(getattr(self.hf_config, "num_hidden_layers", 0))
+        raw_indexer_types = getattr(self.hf_config, "indexer_types", None)
+        index_share_groups = IndexShareGroupManager(
+            num_hidden_layers=num_layers,
+            indexer_types=(
+                tuple(str(t) for t in raw_indexer_types)
+                if raw_indexer_types is not None
+                else None
+            ),
+        )
+        setattr(
+            self.hf_config,
+            "nanovllm_index_share_groups",
+            index_share_groups,
+        )
 
     def _validate_glm52_phase1_runtime(self) -> None:
         if self.glm_version != GLM_VERSION_52:

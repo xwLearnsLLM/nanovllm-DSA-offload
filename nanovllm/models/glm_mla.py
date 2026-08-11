@@ -393,6 +393,19 @@ class GlmMLAAttention(nn.Module):
         self.uses_offload = (
             self.offload_mode != OFFLOAD_NONE and not self.is_mtp_layer
         )
+        # GLM-5.2 IndexShare: only ``full`` (owner) layers create an indexer
+        # and index key cache.  ``shared`` layers consume the owner's
+        # selection metadata.  GLM-5.1 has no indexer_types, so every
+        # layer is its own owner and the original behaviour is preserved.
+        index_share_groups = getattr(
+            config, "nanovllm_index_share_groups", None
+        )
+        if index_share_groups is not None and not self.is_mtp_layer:
+            self.is_index_share_owner = index_share_groups.is_owner(
+                self.layer_idx
+            )
+        else:
+            self.is_index_share_owner = True
         miss_count_layers = parse_lidu_miss_count_layers(
             os.environ.get("NANOVLLM_LIDU_MISS_COUNT_ON_LAYERS"),
             self.num_hidden_layers,
@@ -443,7 +456,7 @@ class GlmMLAAttention(nn.Module):
         )
         self.indexer_rotary_emb = None
         self.indexer = None
-        if self.uses_offload:
+        if self.uses_offload and self.is_index_share_owner:
             self.indexer_rotary_emb = GlmRotaryEmbedding(
                 self.qk_rope_head_dim,
                 max_position_embeddings=int(config.max_position_embeddings),

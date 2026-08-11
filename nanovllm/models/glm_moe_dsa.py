@@ -33,6 +33,9 @@ _EXPERT_WEIGHT_RE = re.compile(
     r"(?P<expert>\d+)\.(?P<projection>gate_proj|up_proj|down_proj)\."
     r"(?P<field>weight|weight_scale|weight_offset|scale_bias)$"
 )
+_INDEXER_WEIGHT_RE = re.compile(
+    r"^model\.layers\.(?P<layer>\d+)\.self_attn\.indexer\."
+)
 ACL_FORMAT_FRACTAL_NZ = 29
 
 
@@ -994,13 +997,25 @@ class GlmMoeDsaForCausalLM(nn.Module):
         return f"mtp.mtp_block.{suffix}"
 
     def weight_name_mapping(self, weight_name: str) -> str | WeightTarget | None:
-        if (
-            getattr(
-                self.config, "nanovllm_offload_mode", OFFLOAD_NONE
-            ) == OFFLOAD_NONE
-            and ".self_attn.indexer." in weight_name
-        ):
-            return None
+        if ".self_attn.indexer." in weight_name:
+            if (
+                getattr(
+                    self.config, "nanovllm_offload_mode", OFFLOAD_NONE
+                ) == OFFLOAD_NONE
+            ):
+                return None
+            # GLM-5.2 IndexShare: shared layers don't carry indexer weights.
+            # Only owner (full) layers load and create an indexer.
+            index_share_groups = getattr(
+                self.config, "nanovllm_index_share_groups", None
+            )
+            if index_share_groups is not None:
+                indexer_match = _INDEXER_WEIGHT_RE.match(weight_name)
+                if indexer_match is not None:
+                    layer_idx = int(indexer_match.group("layer"))
+                    if layer_idx < int(self.config.num_hidden_layers):
+                        if not index_share_groups.is_owner(layer_idx):
+                            return None
         if self.mtp is not None and (
             weight_name == "rot.weight"
             or weight_name.startswith(
