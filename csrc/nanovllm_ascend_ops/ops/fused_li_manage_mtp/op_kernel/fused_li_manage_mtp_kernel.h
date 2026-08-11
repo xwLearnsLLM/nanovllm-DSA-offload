@@ -41,6 +41,8 @@ public:
 private:
     static constexpr uint32_t WS_DOUBLE = 2;
     static constexpr uint32_t QUERY_COUNT = 4;
+    static constexpr uint32_t QUERY_PAIR_SIZE = 2;
+    static constexpr uint32_t AGGREGATE_GROUP_CHUNKS = 4;
     static constexpr uint32_t MIN_SOURCE_TOKENS = 2048;
     static constexpr uint32_t MAX_UNION_TOKENS = 8192;
 
@@ -235,30 +237,49 @@ __aicore__ inline void LIMtpPreload<LIT>::ProcessMain()
         }
 
         uint32_t chunkCount = CeilDiv(candidateLen, constInfo.s2BaseSize);
-        for (uint32_t queryIdx = 0; queryIdx < QUERY_COUNT; ++queryIdx) {
-            for (uint32_t chunkIdx = 0; chunkIdx < chunkCount; ++chunkIdx) {
-                RunInfo runInfo{};
-                runInfo.loop = loop++;
-                runInfo.bIdx = bIdx;
-                runInfo.queryRow = bIdx * QUERY_COUNT + queryIdx;
-                runInfo.queryIdx = queryIdx;
-                runInfo.s2Idx = chunkIdx;
-                runInfo.segmentChunkIdx = chunkIdx;
-                runInfo.actS2Size = candidateLen;
-                runInfo.cacheTokenCount =
-                    static_cast<uint32_t>(cacheTokenCount);
-                runInfo.cacheRowIdx = static_cast<uint32_t>(poolEntry);
-                uint32_t chunkStart = chunkIdx * constInfo.s2BaseSize;
-                runInfo.actualSingleProcessSInnerSize =
-                    Min(constInfo.s2BaseSize, candidateLen - chunkStart);
-                runInfo.actualSingleProcessSInnerSizeAlign = LICommon::Align(
-                    runInfo.actualSingleProcessSInnerSize,
-                    ConstInfo::BUFFER_SIZE_BYTE_32B);
-                runInfo.isFirstS2InnerLoop = chunkIdx == 0U;
-                runInfo.isLastS2InnerLoop = chunkIdx + 1U == chunkCount;
-                runInfo.isPartialSegment = false;
-                runInfo.partialSlot = 0U;
-                ProcessChunk(runInfo);
+        // Process two queries at a time in four-chunk groups.  The even row's
+        // aggregate stays in payload UB until the paired odd row consumes it,
+        // while the two rows keep independent persistent TopK state.
+        for (uint32_t pairStart = 0; pairStart < QUERY_COUNT;
+             pairStart += QUERY_PAIR_SIZE) {
+            for (uint32_t groupStart = 0; groupStart < chunkCount;
+                 groupStart += AGGREGATE_GROUP_CHUNKS) {
+                uint32_t groupEnd = Min(
+                    groupStart + AGGREGATE_GROUP_CHUNKS, chunkCount);
+                for (uint32_t queryIdx = pairStart;
+                     queryIdx < pairStart + QUERY_PAIR_SIZE; ++queryIdx) {
+                    for (uint32_t chunkIdx = groupStart;
+                         chunkIdx < groupEnd; ++chunkIdx) {
+                        RunInfo runInfo{};
+                        runInfo.loop = loop++;
+                        runInfo.bIdx = bIdx;
+                        runInfo.queryRow =
+                            bIdx * QUERY_COUNT + queryIdx;
+                        runInfo.queryIdx = queryIdx;
+                        runInfo.s2Idx = chunkIdx;
+                        runInfo.segmentChunkIdx = chunkIdx;
+                        runInfo.actS2Size = candidateLen;
+                        runInfo.cacheTokenCount =
+                            static_cast<uint32_t>(cacheTokenCount);
+                        runInfo.cacheRowIdx =
+                            static_cast<uint32_t>(poolEntry);
+                        uint32_t chunkStart =
+                            chunkIdx * constInfo.s2BaseSize;
+                        runInfo.actualSingleProcessSInnerSize = Min(
+                            constInfo.s2BaseSize,
+                            candidateLen - chunkStart);
+                        runInfo.actualSingleProcessSInnerSizeAlign =
+                            LICommon::Align(
+                                runInfo.actualSingleProcessSInnerSize,
+                                ConstInfo::BUFFER_SIZE_BYTE_32B);
+                        runInfo.isFirstS2InnerLoop = chunkIdx == 0U;
+                        runInfo.isLastS2InnerLoop =
+                            chunkIdx + 1U == chunkCount;
+                        runInfo.isPartialSegment = false;
+                        runInfo.partialSlot = 0U;
+                        ProcessChunk(runInfo);
+                    }
+                }
             }
         }
     }
