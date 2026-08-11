@@ -741,12 +741,18 @@ class GlmMLAAttention(nn.Module):
     ) -> None:
         num_full_blocks = int(seq.num_prefill_full_blocks)
         num_sparse_blocks = int(seq.num_sparse_blocks)
+        # Reset the shared cache_slots_pool mapping.  In the original
+        # per-layer code every layer resets its own row.  With IndexShare
+        # the row is group-owned, so only the owner needs to reset it;
+        # GLM-5.1 (no indexer_types) has every layer as its own owner,
+        # preserving the original behaviour exactly.
+        if self.is_index_share_owner:
+            pool_entry = int(seq.offload_pool_entry)
+            self.lidu_cache_slots[pool_entry].fill_(-1)
         if num_sparse_blocks >= num_full_blocks:
             # Short request: all KV stays in HBM.  Only the owner sets up
             # the identity mapping in the shared cache_slots_pool.
             if self.is_index_share_owner:
-                pool_entry = int(seq.offload_pool_entry)
-                self.lidu_cache_slots[pool_entry].fill_(-1)
                 if (
                     int(seq.lidu_cache_tokens) > 0
                     and num_full_blocks > 0
