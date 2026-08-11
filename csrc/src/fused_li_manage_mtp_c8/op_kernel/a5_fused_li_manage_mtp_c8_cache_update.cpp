@@ -288,7 +288,11 @@ private:
             const uint32_t chunkLen = MinU32(
                 CACHE_CHUNK, candidateLen - chunkBase);
             DataCopyExtParams copy{
-                1, chunkLen * sizeof(int32_t), 0, 0, 0};
+                1,
+                static_cast<uint32_t>(chunkLen * sizeof(int32_t)),
+                0,
+                0,
+                0};
             DataCopyPad<int32_t, PaddingMode::Normal>(
                 cacheChunk,
                 cacheSlotsPoolGm_[cacheBase + chunkBase],
@@ -333,7 +337,11 @@ private:
 
         if (missCount > 0) {
             DataCopyExtParams copy{
-                1, missCount * sizeof(int32_t), 0, 0, 0};
+                1,
+                static_cast<uint32_t>(missCount * sizeof(int32_t)),
+                0,
+                0,
+                0};
             const uint64_t missBase =
                 static_cast<uint64_t>(batch) * UNION_CAPACITY;
             SetFlag<HardEvent::S_MTE3>(EVENT_ID1);
