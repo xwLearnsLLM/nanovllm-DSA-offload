@@ -159,7 +159,6 @@ private:
     LocalTensor<float> globalTopkUb_;
     LocalTensor<float> evictCandidateUb_;
     LocalTensor<float> SortedBasicBlock_;
-    LocalTensor<float> mtpEvictCandidateUb_;
     LocalTensor<int32_t> partialMetaLocal_;
 
     static constexpr int32_t s2BaseSize_ = S2_BASE_SIZE;
@@ -274,10 +273,6 @@ __aicore__ inline void LIVector<LIT>::InitMtpBuffers(TPipe *pipe)
     // Only MTP needs the fourth-query aggregate-score scratch. Keep it out
     // of the single-query LIM UB footprint.
     pipe->InitBuffer(aggregateScoreBuf_, S2_BASE_SIZE * sizeof(float));
-    // q0/q2 and q1/q3 occupy the two 2048-pair TopK regions.  The final
-    // 512-pair block in the shared sort scratch remains disjoint from the
-    // four chunk-sort blocks and holds q3's persistent victim prefix.
-    mtpEvictCandidateUb_ = SortedBasicBlock_[SORT_TMP_FLOATS];
 }
 
 template <typename LIT>
@@ -469,31 +464,42 @@ __aicore__ inline void LIVector<LIT>::WriteMtpAggregateScoreChunk(
                         static_cast<uint32_t>(s2BaseIdx);
     LocalTensor<float> previousScore = aggregateScoreBuf_.Get<float>();
     if (queryIdx == 0U) {
+        if (s2BaseIdx > 0) {
+            SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
+        }
         DataCopy(previousScore, scoreLocal, alignedLen);
         PipeBarrier<PIPE_V>();
+        SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
+        LIServiceVec::CopyOut(scoresGm[gmOffset], previousScore, alignedLen);
         return;
     }
 
-    if (queryIdx == 2U) {
-        SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
-        DataCopyPad(previousScore, scoresGm[gmOffset],
-                    AscendC::DataCopyExtParams{
-                        1, static_cast<uint32_t>(alignedLen * sizeof(float)),
-                        0, 0, 0},
-                    AscendC::DataCopyPadExtParams<float>{
-                        false, 0, 0, 0.0f});
-        SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
+    // Do not borrow globalTopkIndice_ here.  FinishPayload relies on that
+    // buffer remaining the exact 0..511 progression across all four MTP
+    // queries; using it as async GM scratch corrupts query 1+ payloads on
+    // Ascend910_93 even when it is rewritten before the next chunk.
+    // q1..q2 write the previous chunk's aggregate from this same UB scratch.
+    // Delay that write's completion until the scratch is actually reused so
+    // MTE3 can overlap the intervening TopK merge and next MM/scale work.
+    if (queryIdx + 1U != MTP_QUERY_COUNT && s2BaseIdx > 0) {
+        SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
     }
-
-    // q1/q3 enter with the paired even query's aggregate preloaded from the
-    // payload UB slot. q2 is the only phase that reads the q0/q1 aggregate
-    // from GM. Thus the full candidate row crosses GM only once each way.
+    SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
+    DataCopyPad(previousScore, scoresGm[gmOffset],
+                AscendC::DataCopyExtParams{
+                    1, static_cast<uint32_t>(alignedLen * sizeof(float)), 0, 0, 0},
+                AscendC::DataCopyPadExtParams<float>{false, 0, 0, 0.0f});
+    SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
     Max(previousScore, previousScore, scoreLocal, alignedLen);
     PipeBarrier<PIPE_V>();
-    if (queryIdx == 1U) {
-        SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
-        LIServiceVec::CopyOut(scoresGm[gmOffset], previousScore, alignedLen);
+    if (queryIdx + 1U == MTP_QUERY_COUNT) {
+        // q3 produces the final max(q0..q3) score.  Its consumer now builds
+        // the eviction candidate prefix directly from this UB tensor, so a
+        // final GM write would only be read back by the old finalize scan.
+        return;
     }
+    SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
+    LIServiceVec::CopyOut(scoresGm[gmOffset], previousScore, alignedLen);
 }
 
 template <typename LIT>
@@ -504,7 +510,7 @@ __aicore__ inline void LIVector<LIT>::CollectMtpEvictCandidateChunk(
     uint32_t cachedChunkIdx)
 {
     if (info.isFirstS2InnerLoop) {
-        InitSortOutBuf(mtpEvictCandidateUb_,
+        InitSortOutBuf(evictCandidateUb_,
                        MTP_EVICT_PRELOAD_CAP * VALUE_AND_INDEX_NUM);
     }
 
@@ -526,8 +532,8 @@ __aicore__ inline void LIVector<LIT>::CollectMtpEvictCandidateChunk(
         payloadLocal.template ReinterpretCast<uint32_t>(),
         tmpSortBuf, s2BaseSize_ / BLOCK_BYTES);
     PipeBarrier<PIPE_V>();
-    MergeSort(mtpEvictCandidateUb_, s2BaseSize_, chunkPairLocal,
-              s2BaseSize_, tmpSortBuf);
+    MergeEvictCandidateChunk(chunkPairLocal, MTP_EVICT_PRELOAD_CAP,
+                             tmpSortBuf);
     PipeBarrier<PIPE_V>();
 }
 
@@ -948,16 +954,13 @@ __aicore__ inline void LIVector<LIT>::WriteMissCount(uint32_t bIdx, int32_t miss
 template <typename LIT>
 __aicore__ inline void LIVector<LIT>::StoreMtpQueryTopK(const LICommon::RunInfo &info)
 {
-    LocalTensor<float> queryTopkUb =
-        (info.queryIdx & 1U) == 0U ? globalTopkUb_ : evictCandidateUb_;
     LocalTensor<float> valueLocal = outQueue_.AllocTensor<float>();
     LocalTensor<uint32_t> payloadLocal = valueLocal.template ReinterpretCast<uint32_t>();
     SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
     mtpThresholdsGm.SetValue(
         info.queryRow,
-        queryTopkUb.GetValue((BASE_TOPK - 1U) * VALUE_AND_INDEX_NUM));
-    ExtractIndex(payloadLocal,
-                 queryTopkUb.template ReinterpretCast<uint32_t>(), BASE_TOPK);
+        globalTopkUb_.GetValue((BASE_TOPK - 1U) * VALUE_AND_INDEX_NUM));
+    ExtractIndex(payloadLocal, globalTopkUb_.template ReinterpretCast<uint32_t>(), BASE_TOPK);
 
     uint64_t rowOffset = static_cast<uint64_t>(info.queryRow) * BASE_TOPK;
     SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
@@ -1066,7 +1069,7 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
 
     uint32_t updateCount = 0;
     LocalTensor<uint32_t> candidateBits =
-        mtpEvictCandidateUb_.template ReinterpretCast<uint32_t>();
+        evictCandidateUb_.template ReinterpretCast<uint32_t>();
     bool safeCandidatePrefix = (missCount == 0U);
     if (missCount > 0U && missCount <= candidateCap) {
         float minThreshold = mtpThresholdsGm.GetValue(info.bIdx * MTP_QUERY_COUNT);
@@ -1372,11 +1375,8 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
     int32_t cuS2Len = info.actualSingleProcessSInnerSize;
     int64_t mmGmOffset = (info.loop % 2) * (gSize_ * s2BaseSize_);
     int64_t weightGmOffset = static_cast<int64_t>(info.queryRow) * gSize_;
-    uint32_t cachedChunkIdx = info.segmentChunkIdx % PAYLOAD_BUF_SLOTS;
-    LocalTensor<float> queryTopkUb =
-        (info.queryIdx & 1U) == 0U ? globalTopkUb_ : evictCandidateUb_;
     if (info.isFirstS2InnerLoop) {
-        InitSortOutBuf(queryTopkUb, TOPK_PAIR_FLOATS);
+        InitSortOutBuf(globalTopkUb_, TOPK_PAIR_FLOATS);
     }
 
     int32_t mmUbStride =
@@ -1385,21 +1385,6 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
     int64_t payloadBufIdx = info.s2Idx % PAYLOAD_BUF_SLOTS;
     LocalTensor<int32_t> payloadUb =
         payloadBuf_.Get<int32_t>()[payloadBufIdx * s2BaseSize_];
-    if ((info.queryIdx & 1U) != 0U) {
-        if (info.queryIdx == 1U && cachedChunkIdx > 0U) {
-            // q1's previous aggregate GM write still reads the shared UB
-            // scratch. Complete it before loading the next q0 aggregate.
-            SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
-        }
-        DataCopy(aggregateScoreBuf_.Get<float>(),
-                 payloadUb.template ReinterpretCast<float>(), s2BaseSize_);
-        PipeBarrier<PIPE_V>();
-        SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
-    } else if (info.queryIdx == 0U && info.s2Idx > 0U &&
-               cachedChunkIdx == 0U) {
-        // The preceding q1 group may still be writing from aggregateScoreBuf_.
-        SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
-    }
     StartPayloadCopy(payloadUb, info.cacheRowIdx, cuBaseS2Idx, cuS2Len,
                      s2BaseSize_);
     LocalTensor<float> reduceOutBuff = reduceOutBuf_.Get<float>();
@@ -1444,6 +1429,7 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
                                 sortScoreUb, s2BaseSize_);
 
     LocalTensor<float> tmpSortBuf = outQueue_.AllocTensor<float>();
+    uint32_t cachedChunkIdx = info.segmentChunkIdx % PAYLOAD_BUF_SLOTS;
     if (info.queryIdx + 1U == MTP_QUERY_COUNT) {
         CollectMtpEvictCandidateChunk(info, payloadUb, tmpSortBuf,
                                       cachedChunkIdx);
@@ -1453,16 +1439,9 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
         reduceOutBuff, payloadUb.template ReinterpretCast<uint32_t>(),
         tmpSortBuf, s2BaseSize_ / 32);
     PipeBarrier<PIPE_V>();
-    if ((info.queryIdx & 1U) == 0U) {
-        // The paired odd query consumes this final even-query aggregate before
-        // reusing the same payload slot for cache metadata.
-        DataCopy(payloadUb.template ReinterpretCast<float>(),
-                 aggregateScoreBuf_.Get<float>(), s2BaseSize_);
-        PipeBarrier<PIPE_V>();
-    }
     if (cachedChunkIdx == 3U || info.isLastS2InnerLoop) {
         if (info.segmentChunkIdx < PAYLOAD_BUF_SLOTS) {
-            MrgBasicBlock(queryTopkUb, SortedBasicBlock_,
+            MrgBasicBlock(globalTopkUb_, SortedBasicBlock_,
                           static_cast<int64_t>(cachedChunkIdx + 1U),
                           s2BaseSize_);
         } else {
@@ -1476,7 +1455,7 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
                              VALUE_AND_INDEX_NUM);
             }
             PipeBarrier<PIPE_V>();
-            SparseTopK(queryTopkUb, SortedBasicBlock_, tmpSortBuf, BASE_TOPK,
+            SparseTopK(globalTopkUb_, SortedBasicBlock_, tmpSortBuf, BASE_TOPK,
                        s2BaseSize_ * (cachedChunkIdx + 1U));
         }
     }
