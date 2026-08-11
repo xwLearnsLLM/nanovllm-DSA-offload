@@ -29,6 +29,7 @@ setup(
                 str(CSRC / "npu_fused_li_manage.cpp"),
                 str(CSRC / "npu_fused_li_manage_mtp.cpp"),
                 str(CSRC / "npu_fused_li_manage_c8.cpp"),
+                str(CSRC / "npu_fused_li_manage_mtp_c8.cpp"),
                 str(CSRC / "npu_kvcache_scatter_copy.cpp"),
                 str(CSRC / "npu_kvcache_scatter_copy_c8.cpp"),
                 str(CSRC / "npu_sparse_tail_attention.cpp"),

@@ -48,6 +48,42 @@ TORCH_LIBRARY(nanovllm_dsa, m) {
       "Tensor(c!) destination_slots, Tensor(d!) miss_counts) "
       "-> (Tensor(b!), Tensor(c!), Tensor(d!), Tensor(a!))");
   m.def(
+      "_fused_li_manage_mtp_c8_cache_update("
+      "Tensor topk_indices, Tensor actual_seq_lengths_query, "
+      "Tensor req_pool_entries, Tensor(a!) cache_slots_pool, "
+      "Tensor cache_tokens, Tensor candidate_lens) "
+      "-> (Tensor, Tensor, Tensor, Tensor, Tensor(a!))");
+  m.def(
+      "_fused_li_manage_mtp_c8_cache_update_out("
+      "Tensor topk_indices, Tensor actual_seq_lengths_query, "
+      "Tensor req_pool_entries, Tensor(a!) cache_slots_pool, "
+      "Tensor cache_tokens, Tensor candidate_lens, "
+      "Tensor(b!) topk_destination_slots, "
+      "Tensor(c!) miss_source_ids, "
+      "Tensor(d!) miss_destination_slots, "
+      "Tensor(e!) miss_counts) "
+      "-> (Tensor(b!), Tensor(c!), Tensor(d!), Tensor(e!), Tensor(a!))");
+  m.def(
+      "fused_li_manage_mtp_c8("
+      "Tensor query, Tensor key, Tensor weights, "
+      "Tensor query_dequant_scale, Tensor key_dequant_scale, "
+      "Tensor actual_seq_lengths_query, Tensor req_pool_entries, "
+      "Tensor(a!) cache_slots_pool, Tensor cache_tokens, "
+      "Tensor candidate_lens, Tensor block_table) "
+      "-> (Tensor, Tensor, Tensor, Tensor, Tensor(a!))");
+  m.def(
+      "fused_li_manage_mtp_c8_out("
+      "Tensor query, Tensor key, Tensor weights, "
+      "Tensor query_dequant_scale, Tensor key_dequant_scale, "
+      "Tensor actual_seq_lengths_query, Tensor req_pool_entries, "
+      "Tensor(a!) cache_slots_pool, Tensor cache_tokens, "
+      "Tensor candidate_lens, Tensor block_table, "
+      "Tensor(b!) topk_destination_slots, "
+      "Tensor(c!) miss_source_ids, "
+      "Tensor(d!) miss_destination_slots, "
+      "Tensor(e!) miss_counts) "
+      "-> (Tensor(b!), Tensor(c!), Tensor(d!), Tensor(e!), Tensor(a!))");
+  m.def(
       "kvcache_scatter_copy(Tensor(a!) hbm_kpe, Tensor(b!) hbm_ckv, "
       "Tensor dram_kpe, Tensor dram_ckv, Tensor hbm_block_table, "
       "Tensor dram_block_table, Tensor source_token_ids, "

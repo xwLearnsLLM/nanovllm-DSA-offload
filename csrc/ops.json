@@ -60,6 +60,26 @@
         "attr": []
     },
     {
+        "op": "A5FusedLiManageMtpC8CacheUpdate",
+        "language": "cpp",
+        "input_desc": [
+            {"name": "topk_indices", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "actual_seq_lengths_query", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "req_pool_entries", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "cache_slots_pool", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "cache_tokens", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "candidate_lens", "param_type": "required", "format": ["ND"], "type": ["int32"]}
+        ],
+        "output_desc": [
+            {"name": "topk_destination_slots", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "miss_source_ids", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "miss_destination_slots", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "miss_counts", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "cache_slots_alias", "param_type": "required", "format": ["ND"], "type": ["int32"]}
+        ],
+        "attr": []
+    },
+    {
         "op": "A5KvcacheScatterCopy",
         "language": "cpp",
         "input_desc": [

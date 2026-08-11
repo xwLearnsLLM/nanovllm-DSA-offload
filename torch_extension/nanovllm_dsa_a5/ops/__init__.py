@@ -4,6 +4,10 @@ from .fused_li_manage_c8 import (
     fused_li_manage_c8_out,
 )
 from .fused_li_manage_mtp import fused_li_manage_mtp
+from .fused_li_manage_mtp_c8 import (
+    fused_li_manage_mtp_c8,
+    fused_li_manage_mtp_c8_out,
+)
 from .kvcache_scatter_copy import kvcache_scatter_copy
 from .kvcache_scatter_copy_c8 import kvcache_scatter_copy_c8, kvcache_scatter_copy_c8_out
 from .fused_copy_sparse_tail_attention import (
@@ -17,6 +21,8 @@ __all__ = [
     "fused_li_manage",
     "fused_li_manage_out",
     "fused_li_manage_mtp",
+    "fused_li_manage_mtp_c8",
+    "fused_li_manage_mtp_c8_out",
     "fused_li_manage_c8",
     "fused_li_manage_c8_out",
     "kvcache_scatter_copy",
