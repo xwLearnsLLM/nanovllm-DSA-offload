@@ -345,16 +345,25 @@ def test_glm52_config_accepts_offload_fuse_in_stage3(tmp_path):
     assert config.glm_version == GLM_VERSION_52
 
 
-@pytest.mark.parametrize("offload_mode", ["offload_split", "offload_fuse"])
-def test_glm52_config_rejects_graph_with_offload_in_stage3(
-    tmp_path,
-    offload_mode,
-):
+def test_glm52_config_accepts_split_graph_in_stage4(tmp_path):
     _write_glm52_config(tmp_path)
-    with pytest.raises(ValueError, match="offload graph is implemented in stage 4"):
+    config = _make_config(
+        tmp_path,
+        offload_mode="offload_split",
+        enforce_eager=False,
+        max_num_decode_seqs_per_step=1,
+    )
+
+    assert config.offload_mode == "offload_split"
+    assert config.decode_graph_capture_sizes == (1,)
+
+
+def test_glm52_config_rejects_fuse_graph_until_later_stage(tmp_path):
+    _write_glm52_config(tmp_path)
+    with pytest.raises(ValueError, match="offload_fuse graph"):
         _make_config(
             tmp_path,
-            offload_mode=offload_mode,
+            offload_mode="offload_fuse",
             enforce_eager=False,
         )
 
@@ -706,16 +715,6 @@ def test_glm52_offload_split_config_builds_index_share_groups(tmp_path):
     assert groups.num_groups == 21
     assert len(groups.owner_layer_idxs) == 21
     assert len(groups.shared_layer_idxs) == 57
-
-
-def test_glm52_offload_split_enforces_eager(tmp_path):
-    _write_glm52_config(tmp_path)
-    with pytest.raises(ValueError, match="stage 4"):
-        _make_config(
-            tmp_path,
-            offload_mode="offload_split",
-            enforce_eager=False,
-        )
 
 
 def test_glm52_offload_split_rejects_mtp3(tmp_path):

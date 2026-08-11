@@ -210,13 +210,27 @@ def test_glm52_phase1_rejects_mtp3(tmp_path):
         )
 
 
-def test_glm52_phase1_rejects_full_decode_graph(tmp_path):
+def test_glm52_stage4_accepts_split_full_decode_graph(tmp_path):
     _write_glm52_config(tmp_path)
 
-    with pytest.raises(ValueError, match="offload graph is implemented in stage 4"):
+    config = _make_config(
+        tmp_path,
+        offload_mode="offload_split",
+        enforce_eager=False,
+        max_num_decode_seqs_per_step=1,
+    )
+
+    assert config.offload_mode == "offload_split"
+    assert config.decode_graph_capture_sizes == (1,)
+
+
+def test_glm52_stage4_rejects_fuse_full_decode_graph(tmp_path):
+    _write_glm52_config(tmp_path)
+
+    with pytest.raises(ValueError, match="offload_fuse graph"):
         _make_config(
             tmp_path,
-            offload_mode="offload_split",
+            offload_mode="offload_fuse",
             enforce_eager=False,
         )
 
