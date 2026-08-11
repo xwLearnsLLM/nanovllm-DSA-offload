@@ -179,6 +179,11 @@ private:
     __aicore__ inline void WriteMtpAggregateScoreChunk(
         uint32_t bIdx, uint32_t queryIdx, int32_t s2BaseIdx,
         const LocalTensor<float> &scoreLocal, int32_t alignedLen);
+    __aicore__ inline void CollectMtpEvictCandidateChunk(
+        const LICommon::RunInfo &info,
+        const LocalTensor<int32_t> &payloadLocal,
+        LocalTensor<float> &tmpSortBuf,
+        uint32_t cachedChunkIdx);
     __aicore__ inline void StoreMtpQueryTopK(const LICommon::RunInfo &info);
     __aicore__ inline void FinalizeMtpRequest(const LICommon::RunInfo &info);
     __aicore__ inline void WritePartialTopK(uint32_t coreIdx, uint32_t partialSlot, uint32_t bIdx);
@@ -466,10 +471,10 @@ __aicore__ inline void LIVector<LIT>::WriteMtpAggregateScoreChunk(
     // buffer remaining the exact 0..511 progression across all four MTP
     // queries; using it as async GM scratch corrupts query 1+ payloads on
     // Ascend910_93 even when it is rewritten before the next chunk.
-    // q1..q3 write the previous chunk's aggregate from this same UB scratch.
+    // q1..q2 write the previous chunk's aggregate from this same UB scratch.
     // Delay that write's completion until the scratch is actually reused so
     // MTE3 can overlap the intervening TopK merge and next MM/scale work.
-    if (s2BaseIdx > 0) {
+    if (queryIdx + 1U != MTP_QUERY_COUNT && s2BaseIdx > 0) {
         SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
     }
     SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
@@ -480,8 +485,48 @@ __aicore__ inline void LIVector<LIT>::WriteMtpAggregateScoreChunk(
     SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
     Max(previousScore, previousScore, scoreLocal, alignedLen);
     PipeBarrier<PIPE_V>();
+    if (queryIdx + 1U == MTP_QUERY_COUNT) {
+        // q3 produces the final max(q0..q3) score.  Its consumer now builds
+        // the eviction candidate prefix directly from this UB tensor, so a
+        // final GM write would only be read back by the old finalize scan.
+        return;
+    }
     SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
     LIServiceVec::CopyOut(scoresGm[gmOffset], previousScore, alignedLen);
+}
+
+template <typename LIT>
+__aicore__ inline void LIVector<LIT>::CollectMtpEvictCandidateChunk(
+    const LICommon::RunInfo &info,
+    const LocalTensor<int32_t> &payloadLocal,
+    LocalTensor<float> &tmpSortBuf,
+    uint32_t cachedChunkIdx)
+{
+    if (info.isFirstS2InnerLoop) {
+        InitSortOutBuf(evictCandidateUb_, EVICT_PAIR_FLOATS);
+    }
+
+    // q3 leaves the final max(q0..q3) score in aggregateScoreBuf_.  Reuse the
+    // cache-slot payload already fetched for this score chunk, sort cached
+    // entries by -aggregate_score, and retain the global lowest 2048 entries.
+    // SortedBasicBlock_'s current ping-pong slot is free until the q3 TopK
+    // sort below overwrites it.
+    LocalTensor<float> aggregateScore = aggregateScoreBuf_.Get<float>();
+    LocalTensor<float> keyLocal = reduceOutBuf_.Get<float>()[s2BaseSize_];
+    LocalTensor<float> chunkPairLocal =
+        SortedBasicBlock_[cachedChunkIdx * CHUNK_PAIR_FLOATS];
+    BuildEvictCandidateKeyFromPayload(
+        keyLocal, aggregateScore,
+        payloadLocal.template ReinterpretCast<uint32_t>(),
+        tmpSortBuf, s2BaseSize_);
+    SortByKeyWithPayload512(
+        chunkPairLocal, keyLocal,
+        payloadLocal.template ReinterpretCast<uint32_t>(),
+        tmpSortBuf, s2BaseSize_ / BLOCK_BYTES);
+    PipeBarrier<PIPE_V>();
+    MergeEvictCandidateChunk(chunkPairLocal, EVICT_CANDIDATE_CAP,
+                             tmpSortBuf);
+    PipeBarrier<PIPE_V>();
 }
 
 template <typename LIT>
@@ -1008,13 +1053,9 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
     if (missCount > 0U) {
         candidateCap = CeilDiv(missCount, S2_BASE_SIZE) * S2_BASE_SIZE;
         candidateCap = Min(candidateCap, EVICT_CANDIDATE_CAP);
-        // A very high threshold stops the score-guided scan after it has a
-        // full candidate prefix plus the configured extra chunks.  ScoresGm
-        // contains max(q0..q3), so low aggregate-score cache entries win.
-        uint32_t guidedCount = Min(missCount, candidateCap);
-        FindEvictCandidates(info.bIdx, info.cacheRowIdx, info.actS2Size,
-                            info.actS2Size, guidedCount, candidateCap,
-                            3.0e38f, SortedBasicBlock_);
+        // q3 incrementally retained the global lowest-score cached entries in
+        // evictCandidateUb_.  Finalization only selects the prefix required by
+        // this request; it no longer scans aggregateScoresGm end to end.
     }
 
     uint32_t updateCount = 0;
@@ -1380,6 +1421,10 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
 
     LocalTensor<float> tmpSortBuf = outQueue_.AllocTensor<float>();
     uint32_t cachedChunkIdx = info.segmentChunkIdx % PAYLOAD_BUF_SLOTS;
+    if (info.queryIdx + 1U == MTP_QUERY_COUNT) {
+        CollectMtpEvictCandidateChunk(info, payloadUb, tmpSortBuf,
+                                      cachedChunkIdx);
+    }
     Sort<float, true>(
         SortedBasicBlock_[cachedChunkIdx * s2BaseSize_ * VALUE_AND_INDEX_NUM],
         reduceOutBuff, payloadUb.template ReinterpretCast<uint32_t>(),
