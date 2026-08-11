@@ -52,12 +52,6 @@ constexpr uint32_t MTP_UNION_CAPACITY = MTP_QUERY_COUNT * BASE_TOPK;
 // MTP LIM intentionally remains on the validated 18-bit source format.
 constexpr uint32_t MTP_SOURCE_CAPACITY = 1U << 18;
 constexpr uint32_t MTP_UNION_BITSET_WORDS = MTP_SOURCE_CAPACITY / 32U;
-constexpr uint32_t MTP_UNION_HASH_CAPACITY = 1024;
-constexpr uint32_t MTP_UNION_HASH_MAX_ITEMS =
-    MTP_UNION_HASH_CAPACITY / 2U;
-static_assert((MTP_UNION_HASH_CAPACITY &
-               (MTP_UNION_HASH_CAPACITY - 1U)) == 0U,
-              "MTP union hash capacity must be a power of two");
 constexpr uint32_t MTP_MISS_SLOT_MAP_CAPACITY = 2048;
 constexpr uint32_t MTP_MISS_SLOT_MAP_MAX_ITEMS =
     MTP_MISS_SLOT_MAP_CAPACITY / 2U;
@@ -980,10 +974,10 @@ __aicore__ inline void LIVector<LIT>::StoreMtpQueryTopK(const LICommon::RunInfo 
 template <typename LIT>
 __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo &info)
 {
-    // Two VECIN buffers hold the adaptive membership set and ordered union
-    // misses.  Typical requests use a compact hash; large requests reuse the
-    // same storage as a 2^18-token bitmap.  The VECOUT buffer first stages
-    // destination slots, then materializes the four sparse-slot rows.
+    // Two VECIN buffers hold the membership bitset and ordered union misses.
+    // The bitset has 2^18-token capacity, but only its active candidate prefix
+    // is touched. The VECOUT buffer first stages destination slots, then is
+    // reused to materialize the four per-query sparse-slot rows.
     LocalTensor<float> unionStorage = inQueue_.AllocTensor<float>();
     LocalTensor<float> missStorage = inQueue_.AllocTensor<float>();
     LocalTensor<float> slotStorage = outQueue_.AllocTensor<float>();
@@ -1001,13 +995,11 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
     AscendC::DataCopyPadExtParams<int32_t> intPad{false, 0, 0, 0};
 
     // Build the ordered unique miss union without walking all 4*2048 TopK
-    // entries on the scalar pipeline.  The target workload stays in a small
-    // open-addressed UB hash.  If an atypical request grows beyond its 50%
-    // load limit, materialize the source-domain bitmap once and continue on
-    // the original exact path.
-    Duplicate(unionBits, 0xffffffffU, MTP_UNION_HASH_CAPACITY);
+    // entries on the scalar pipeline.  Vector instructions decode each row
+    // and compact only its misses; the scalar bitset work is therefore
+    // O(query misses), about 4*200 entries for the target workload.
+    Duplicate(unionBits, 0U, activeUnionWords);
     PipeBarrier<PIPE_V>();
-    bool useUnionHash = true;
     {
         LocalTensor<uint32_t> rawSlots =
             destinationSlots.template ReinterpretCast<uint32_t>();
@@ -1054,55 +1046,6 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
                 if (token >= info.actS2Size) {
                     continue;
                 }
-
-                if (useUnionHash) {
-                    const uint32_t hashMask =
-                        MTP_UNION_HASH_CAPACITY - 1U;
-                    uint32_t hashIdx =
-                        (token * 0x9e3779b1U) & hashMask;
-                    bool handled = false;
-                    for (uint32_t probe = 0;
-                         probe < MTP_UNION_HASH_CAPACITY; ++probe) {
-                        uint32_t entry = unionBits.GetValue(hashIdx);
-                        if (entry == token) {
-                            handled = true;
-                            break;
-                        }
-                        if (entry == 0xffffffffU) {
-                            if (missCount < MTP_UNION_HASH_MAX_ITEMS) {
-                                unionBits.SetValue(hashIdx, token);
-                                missTokens.SetValue(
-                                    missCount++, static_cast<int32_t>(token));
-                                handled = true;
-                            }
-                            break;
-                        }
-                        hashIdx = (hashIdx + 1U) & hashMask;
-                    }
-                    if (handled) {
-                        continue;
-                    }
-
-                    // Preserve the ordered prefix while switching the same UB
-                    // storage from hash entries to source-domain membership
-                    // bits.  This transition happens only for >512 unique
-                    // union misses.
-                    Duplicate(unionBits, 0U, activeUnionWords);
-                    PipeBarrier<PIPE_V>();
-                    SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
-                    for (uint32_t missIdx = 0; missIdx < missCount;
-                         ++missIdx) {
-                        uint32_t previousToken = static_cast<uint32_t>(
-                            missTokens.GetValue(missIdx));
-                        uint32_t previousWord = previousToken >> 5U;
-                        unionBits.SetValue(
-                            previousWord,
-                            unionBits.GetValue(previousWord) |
-                                (1U << (previousToken & 31U)));
-                    }
-                    useUnionHash = false;
-                }
-
                 uint32_t wordIdx = token >> 5U;
                 uint32_t mask = 1U << (token & 31U);
                 uint32_t word = unionBits.GetValue(wordIdx);
