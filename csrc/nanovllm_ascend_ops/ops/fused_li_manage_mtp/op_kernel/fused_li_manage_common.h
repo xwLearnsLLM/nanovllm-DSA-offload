@@ -15,6 +15,10 @@
 #ifndef FUSED_LI_MANAGE_COMMON_H
 #define FUSED_LI_MANAGE_COMMON_H
 
+#ifndef NANOVLLM_MTP_CHUNK_MAJOR
+#define NANOVLLM_MTP_CHUNK_MAJOR 1
+#endif
+
 namespace LICommon {
 template <typename T>
 struct LIType {
@@ -90,4 +94,3 @@ __aicore__ inline T CeilDiv(T num, T rnd)
 } // namespace LICommon
 
 #endif // FUSED_LI_MANAGE_COMMON_H
-

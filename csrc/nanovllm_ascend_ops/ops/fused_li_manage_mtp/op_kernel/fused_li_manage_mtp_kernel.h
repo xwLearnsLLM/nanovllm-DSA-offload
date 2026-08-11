@@ -177,7 +177,7 @@ __aicore__ inline void LIMtpPreload<LIT>::Init(
         blockTableGm.SetGlobalBuffer((__gm__ int32_t *)blockTable);
         matmulService.InitMm1GlobalTensor(blockTableGm, keyGm, queryGm,
                                          mm1ResGm);
-        matmulService.InitBuffers(pipe);
+        matmulService.InitMtpBuffers(pipe);
     }
 }
 
@@ -235,8 +235,16 @@ __aicore__ inline void LIMtpPreload<LIT>::ProcessMain()
         }
 
         uint32_t chunkCount = CeilDiv(candidateLen, constInfo.s2BaseSize);
+#if NANOVLLM_MTP_CHUNK_MAJOR
+        // True chunk-major order lets AIV retain max(q0..q3) for the current
+        // source chunk in UB. AIC and AIV execute this shared loop, so the
+        // existing cross-core handshake count and ownership stay unchanged.
+        for (uint32_t chunkIdx = 0; chunkIdx < chunkCount; ++chunkIdx) {
+            for (uint32_t queryIdx = 0; queryIdx < QUERY_COUNT; ++queryIdx) {
+#else
         for (uint32_t queryIdx = 0; queryIdx < QUERY_COUNT; ++queryIdx) {
             for (uint32_t chunkIdx = 0; chunkIdx < chunkCount; ++chunkIdx) {
+#endif
                 RunInfo runInfo{};
                 runInfo.loop = loop++;
                 runInfo.bIdx = bIdx;
