@@ -804,7 +804,6 @@ class GlmMoeDsaDecoderLayer(nn.Module):
         context = get_context()
         fuse_o_proj_norm = (
             not context.is_prefill
-            and not context.is_spec_decode
             and self.self_attn.can_fuse_o_proj_add_rms_norm()
         )
         hidden_states = self.self_attn(
