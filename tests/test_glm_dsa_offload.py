@@ -189,11 +189,13 @@ def test_glm52_mtp0_nonoffload_eager_config_is_loaded(tmp_path):
     )
 
 
-def test_glm52_phase1_rejects_offload(tmp_path):
+def test_glm52_stage3_accepts_offload_fuse(tmp_path):
     _write_glm52_config(tmp_path)
 
-    with pytest.raises(ValueError, match="offload_fuse is implemented in stage 3"):
-        _make_config(tmp_path, offload_mode="offload_fuse")
+    config = _make_config(tmp_path, offload_mode="offload_fuse")
+
+    assert config.offload_mode == "offload_fuse"
+    assert config.glm_version == "5.2"
 
 
 def test_glm52_phase1_rejects_mtp3(tmp_path):

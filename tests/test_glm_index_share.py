@@ -334,18 +334,27 @@ def test_glm52_config_accepts_offload_split_in_stage2(tmp_path):
     assert config.glm_version == GLM_VERSION_52
 
 
-def test_glm52_config_rejects_offload_fuse_in_stage2(tmp_path):
+def test_glm52_config_accepts_offload_fuse_in_stage3(tmp_path):
     _write_glm52_config(tmp_path)
-    with pytest.raises(ValueError, match="offload_fuse is implemented in stage 3"):
-        _make_config(tmp_path, offload_mode="offload_fuse")
+    config = _make_config(
+        tmp_path,
+        offload_mode="offload_fuse",
+        max_model_len=4096,
+    )
+    assert config.offload_mode == "offload_fuse"
+    assert config.glm_version == GLM_VERSION_52
 
 
-def test_glm52_config_rejects_graph_with_offload_in_stage2(tmp_path):
+@pytest.mark.parametrize("offload_mode", ["offload_split", "offload_fuse"])
+def test_glm52_config_rejects_graph_with_offload_in_stage3(
+    tmp_path,
+    offload_mode,
+):
     _write_glm52_config(tmp_path)
     with pytest.raises(ValueError, match="offload graph is implemented in stage 4"):
         _make_config(
             tmp_path,
-            offload_mode="offload_split",
+            offload_mode=offload_mode,
             enforce_eager=False,
         )
 

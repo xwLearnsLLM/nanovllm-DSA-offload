@@ -17,18 +17,11 @@
 - 工作分支：`main-glm52`
 - 分支基线：`main@7c096e0`
 - 第一阶段功能提交：`7b2effb feat: add GLM-5.2 nonoffload eager bring-up`
-- 当前 GLM-5.2 只允许：
-  - `NANOVLLM_NUM_SPECULATIVE_TOKENS=0`
-  - `NANOVLLM_OFFLOAD_MODE=none`
-  - `NANOVLLM_ENFORCE_EAGER=1`
-- 其余 GLM-5.2 组合会明确报错，不会静默回退到错误路径。
-- 当前提交只改了 Python，不需要重新编译 Ascend 自定义算子。
-- 本地 CPU 验证已经覆盖模型识别、IndexShare schedule、能力门禁、原有 MTP 和 chunk prefill 回归。
-- 阶段 0 昇腾整网验收已完成（短序列、21K、64K 均通过，token IDs 与 `main` 分支 baseline 对齐），见下方阶段 0 记录。
-- 阶段 1（IndexShare group 元数据层）代码已完成，CPU 测试通过。
-- 阶段 2（MTP0 + offload_split + eager）代码已完成，CPU 测试通过；等待昇腾整网验收。
-- 阶段 2 实现了 group-owned `lidu_cache_slots`、shared layer 的 `_lidu_update_shared` 路径、`initialize_lidu_row_shared` 和 `finalize_prefill_offload` 的 owner-only 映射。
-- 当前 GLM-5.2 允许：`offload_mode=none/offload_split`、`MTP0`、`eager`；`offload_fuse`、MTP3 和 graph 仍明确报错。
+- 阶段 0、阶段 1 和阶段 2 均已完成并通过当前范围内的验收；阶段 2 的实现提交为 `15f1a7f`，后续修复为 `f9f4123` 和 `7c77e81`。
+- 阶段 2 昇腾整网已覆盖 21K、40K 和 64K 的 `MTP0 + offload_split + eager`。21K 和 64K 与 `none` 的 token IDs 完全一致；40K 在后续 greedy token 上存在稀疏 top-2048 + dense-tail Attention 的预期近似分叉。
+- 40K eager profile 确认每个 stable decode step 为 21 次 LIM、78 次 SCATTER、78 次 SFA；同一 IndexShare group 内的 miss metadata 一致，KV payload 仍按层独立。
+- 当前开始阶段 3：GLM-5.2 允许 `offload_mode=none/offload_split/offload_fuse`、`MTP0`、eager；MTP3 和 graph 仍明确报错。
+- 当前阶段只改 Python 调度与能力门禁，不需要重新编译 Ascend 自定义算子。
 
 相关文档：[`README.md`](README.md)、[`README_ops.md`](README_ops.md)、[`TODO.md`](TODO.md)。
 
@@ -429,27 +422,21 @@ profile/性能：不适用
 ### 阶段 2：MTP0 + offload_split + eager
 
 ```text
-日期：2025-08-10
+日期：2026-08-11
 阶段：2（MTP0 + offload_split + eager）
-commit：dd62586
+commit：15f1a7f；后续修复 f9f4123、7c77e81
 代码状态：已完成，仅改 Python，无需重编算子
-CPU/UT：新增 9 项测试，全部通过或正确跳过（scatter_copy 需昇腾环境）
+CPU/UT：新增 IndexShare/offload_split 测试全部通过；scatter_copy 相关 CPU 用例正确跳过
   - GLM-5.2 offload_split config 构建和门禁（允许 split、拒绝 fuse/graph/mtp3）
   - initialize_lidu_row_shared：owner 映射提取、zero-cache noop、未填充映射检测
   - scheduler offload_split 生命周期（allocate/deallocate/preempt/abort）
   - GLM-5.1 回归不变
-昇腾整网：待验收
-  验收命令：
-    NANOVLLM_OFFLOAD_MODE=offload_split NANOVLLM_NUM_SPECULATIVE_TOKENS=0
-    NANOVLLM_ENFORCE_EAGER=1 NANOVLLM_HBM_NUM_BLOCKS=800
-    NANOVLLM_DRAM_NUM_BLOCKS=3900 NANOVLLM_PROMPT_LENGTHS=21000
-  验收项：
-    - temperature=0 下与 offload_mode=none 的 token IDs 对齐
-    - 20K、约 40K、接近 64K 均能运行
-    - eager profile 中应为 21 次 LIM、78 次 SCATTER、78 次 SFA
-    - 每个 group 内 full/shared layer 的 miss metadata 一致，KV payload 各层独立
-profile/性能：待昇腾验收
-结论与下一步：阶段 2 代码完成，等待昇腾整网验收后进入阶段 3（offload_fuse + eager）
+昇腾整网：通过
+  - 21K：修复首次 decode 后，split 与 none 的 token IDs 完全一致
+  - 40K：两者共同前缀稳定，后续 greedy token 出现 top-2048 稀疏 Attention 的预期近似分叉；LIDU miss metadata 在 group 内一致，step 3 后稳定为 0
+  - 64K：split 与 none 的 token IDs 完全一致
+profile/性能：40K profile 为 21 次 LIM、78 次 SCATTER、78 次 SFA；语义验证完成后不以 bsz=1 时延作为性能结论
+结论与下一步：阶段 2 验收通过，进入阶段 3（MTP0 + offload_fuse + eager）
 ```
 
 实现内容：
