@@ -32,6 +32,13 @@ constexpr uint32_t S2_BASE_SIZE = 512;
 constexpr uint32_t GROUP_INNER = 16;
 constexpr uint32_t PAYLOAD_BUF_SLOTS = 4;
 constexpr uint32_t EVICT_CANDIDATE_CAP = BASE_TOPK;
+// The target MTP workload has about 300-400 unique union misses.  Preloading
+// one 512-entry block keeps q3's per-chunk merge at 512+512; atypical larger
+// miss sets retain exact semantics through FinalizeMtpRequest's GM fallback.
+constexpr uint32_t MTP_EVICT_PRELOAD_CAP = S2_BASE_SIZE;
+static_assert(MTP_EVICT_PRELOAD_CAP % S2_BASE_SIZE == 0U &&
+                  MTP_EVICT_PRELOAD_CAP <= EVICT_CANDIDATE_CAP,
+              "MTP eviction preload must fit the shared candidate buffer");
 constexpr uint32_t SORT_TMP_FLOATS = 512 * 8;
 constexpr uint32_t CHUNK_PAIR_FLOATS = 512 * VALUE_AND_INDEX_NUM;
 constexpr uint32_t TOPK_PAIR_FLOATS = BASE_TOPK * VALUE_AND_INDEX_NUM;
@@ -503,12 +510,13 @@ __aicore__ inline void LIVector<LIT>::CollectMtpEvictCandidateChunk(
     uint32_t cachedChunkIdx)
 {
     if (info.isFirstS2InnerLoop) {
-        InitSortOutBuf(evictCandidateUb_, EVICT_PAIR_FLOATS);
+        InitSortOutBuf(evictCandidateUb_,
+                       MTP_EVICT_PRELOAD_CAP * VALUE_AND_INDEX_NUM);
     }
 
     // q3 leaves the final max(q0..q3) score in aggregateScoreBuf_.  Reuse the
     // cache-slot payload already fetched for this score chunk, sort cached
-    // entries by -aggregate_score, and retain the global lowest 2048 entries.
+    // entries by -aggregate_score, and retain the global lowest 512 entries.
     // SortedBasicBlock_'s current ping-pong slot is free until the q3 TopK
     // sort below overwrites it.
     LocalTensor<float> aggregateScore = aggregateScoreBuf_.Get<float>();
@@ -524,7 +532,7 @@ __aicore__ inline void LIVector<LIT>::CollectMtpEvictCandidateChunk(
         payloadLocal.template ReinterpretCast<uint32_t>(),
         tmpSortBuf, s2BaseSize_ / BLOCK_BYTES);
     PipeBarrier<PIPE_V>();
-    MergeEvictCandidateChunk(chunkPairLocal, EVICT_CANDIDATE_CAP,
+    MergeEvictCandidateChunk(chunkPairLocal, MTP_EVICT_PRELOAD_CAP,
                              tmpSortBuf);
     PipeBarrier<PIPE_V>();
 }
@@ -1052,10 +1060,11 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
     uint32_t candidateCap = 0;
     if (missCount > 0U) {
         candidateCap = CeilDiv(missCount, S2_BASE_SIZE) * S2_BASE_SIZE;
-        candidateCap = Min(candidateCap, EVICT_CANDIDATE_CAP);
+        candidateCap = Min(candidateCap, MTP_EVICT_PRELOAD_CAP);
         // q3 incrementally retained the global lowest-score cached entries in
-        // evictCandidateUb_.  Finalization only selects the prefix required by
-        // this request; it no longer scans aggregateScoresGm end to end.
+        // evictCandidateUb_.  Finalization consumes at most that 512-entry
+        // prefix; atypical larger miss sets continue through the exact GM
+        // fallback without scanning aggregateScoresGm end to end.
     }
 
     uint32_t updateCount = 0;
