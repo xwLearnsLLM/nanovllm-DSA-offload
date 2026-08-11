@@ -1596,9 +1596,11 @@ class GlmMLAAttention(nn.Module):
                 topk_src_ids,
                 miss_counts,
             ) = cache_aliases
+        # First decode stays eager for cache initialization, but it must still
+        # consume the LIM-selected KV through SFA.  Falling back to dense MLA
+        # here would treat the sparse HBM arena as a dense sequence.
         if (
             self._use_sparse_tail_attention
-            and not context.has_first_decode
             and topk_dst_slots is not None
         ):
             required = {
