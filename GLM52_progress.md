@@ -20,8 +20,8 @@
 - 阶段 0、阶段 1 和阶段 2 均已完成并通过当前范围内的验收；阶段 2 的实现提交为 `15f1a7f`，后续修复为 `f9f4123` 和 `7c77e81`。
 - 阶段 2 昇腾整网已覆盖 21K、40K 和 64K 的 `MTP0 + offload_split + eager`。21K 和 64K 与 `none` 的 token IDs 完全一致；40K 在后续 greedy token 上存在稀疏 top-2048 + dense-tail Attention 的预期近似分叉。
 - 40K eager profile 确认每个 stable decode step 为 21 次 LIM、78 次 SCATTER、78 次 SFA；同一 IndexShare group 内的 miss metadata 一致，KV payload 仍按层独立。
-- 当前开始阶段 3：GLM-5.2 允许 `offload_mode=none/offload_split/offload_fuse`、`MTP0`、eager；MTP3 和 graph 仍明确报错。
-- 当前阶段只改 Python 调度与能力门禁，不需要重新编译 Ascend 自定义算子。
+- 阶段 3（MTP0 + offload_fuse + eager）已完成并通过验收；GLM-5.2 允许 `offload_mode=none/offload_split/offload_fuse`、`MTP0`、eager。MTP3 和 graph 仍明确报错。
+- 阶段 3 只改 Python 调度与能力门禁，不需要重新编译 Ascend 自定义算子；下一阶段为 MTP0 full-decode-only graph。
 
 相关文档：[`README.md`](README.md)、[`README_ops.md`](README_ops.md)、[`TODO.md`](TODO.md)。
 
@@ -447,3 +447,17 @@ profile/性能：40K profile 为 21 次 LIM、78 次 SCATTER、78 次 SFA；语�
 - `GlmMLAAttention.finalize_prefill_offload`：仅 owner 操作 `cache_slots_pool` 映射，所有层各自持久化 DRAM KV
 - `ModelRunner._allocate_mla_cache`：group-owned `lidu_cache_slots`（同 group 的层共享同一 tensor）
 - `ModelRunner._setup_index_share_owners`：为每个 shared layer 设置 owner 引用
+
+### 阶段 3：MTP0 + offload_fuse + eager
+
+```text
+日期：2026-08-11
+阶段：3（MTP0 + offload_fuse + eager）
+commit：390cf22
+代码状态：已完成，仅改 Python，无需重编算子
+CPU/UT：GLM-5.2 fuse eager 配置允许；split/fuse 的 graph 门禁仍正确拒绝；IndexShare 与 DSA offload 回归通过（历史预算断言单独排除）
+昇腾整网：通过
+  - 20K：清理 profile/miss-count 诊断环境变量后，offload_fuse 与 offload_split 的 token IDs 完全一致
+profile/性能：稳定 decode 为 21 次 LIM、78 次 COPYSFA
+结论与下一步：阶段 3 验收通过；后续进入阶段 4（MTP0 full-decode-only graph），先实现 offload_split graph
+```
