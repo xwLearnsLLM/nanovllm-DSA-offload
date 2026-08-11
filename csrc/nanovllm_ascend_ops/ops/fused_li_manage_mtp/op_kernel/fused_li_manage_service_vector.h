@@ -1542,7 +1542,7 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
         // This preserves the old single four-way merge for the first chunks
         // instead of merging each one against an all-invalid TopK state.
         Sort<float, true>(
-            queryTopkUb_[info.segmentChunkIdx * CHUNK_PAIR_FLOATS],
+            queryTopkUb[info.segmentChunkIdx * CHUNK_PAIR_FLOATS],
             reduceOutBuff, payloadUb.template ReinterpretCast<uint32_t>(),
             tmpSortBuf, s2BaseSize_ / 32);
         PipeBarrier<PIPE_V>();
