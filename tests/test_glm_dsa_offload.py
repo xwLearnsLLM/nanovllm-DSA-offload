@@ -192,14 +192,14 @@ def test_glm52_mtp0_nonoffload_eager_config_is_loaded(tmp_path):
 def test_glm52_phase1_rejects_offload(tmp_path):
     _write_glm52_config(tmp_path)
 
-    with pytest.raises(ValueError, match="offload_mode='none' only"):
-        _make_config(tmp_path, offload_mode="offload_split")
+    with pytest.raises(ValueError, match="offload_fuse is implemented in stage 3"):
+        _make_config(tmp_path, offload_mode="offload_fuse")
 
 
 def test_glm52_phase1_rejects_mtp3(tmp_path):
     _write_glm52_config(tmp_path)
 
-    with pytest.raises(ValueError, match="num_speculative_tokens=0 only"):
+    with pytest.raises(ValueError, match="quantized MTP layer"):
         _make_config(
             tmp_path,
             offload_mode="none",
@@ -211,11 +211,10 @@ def test_glm52_phase1_rejects_mtp3(tmp_path):
 def test_glm52_phase1_rejects_full_decode_graph(tmp_path):
     _write_glm52_config(tmp_path)
 
-    with pytest.raises(ValueError, match="phase 1 is eager-only"):
+    with pytest.raises(ValueError, match="offload graph is implemented in stage 4"):
         _make_config(
             tmp_path,
-            offload_mode="none",
-            num_dram_kvcache_blocks=-1,
+            offload_mode="offload_split",
             enforce_eager=False,
         )
 

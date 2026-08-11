@@ -358,3 +358,54 @@ def initialize_lidu_row(
         dram_ckv,
     )
     return hbm_kpe, hbm_ckv
+
+
+@torch.inference_mode()
+def initialize_lidu_row_shared(
+    *,
+    cache_slots_row: torch.Tensor,
+    cache_tokens: int,
+    hbm_kpe: torch.Tensor,
+    hbm_ckv: torch.Tensor,
+    dram_kpe: torch.Tensor,
+    dram_ckv: torch.Tensor,
+    hbm_block_table: torch.Tensor,
+    dram_block_table: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Copy DRAM KV to HBM for a shared IndexShare layer.
+
+    The owner (full) layer has already run :func:`initialize_lidu_row`
+    and filled ``cache_slots_row`` with the source-to-destination mapping.
+    This function extracts that mapping and copies this layer's own DRAM
+    KV payload to the same HBM destination slots.
+    """
+
+    cache_tokens = int(cache_tokens)
+    if cache_tokens <= 0:
+        return hbm_kpe, hbm_ckv
+
+    valid_mask = cache_slots_row >= 0
+    source_ids = torch.nonzero(valid_mask, as_tuple=True)[0].to(torch.int32)
+    destination_slots = cache_slots_row[source_ids.long()].to(torch.int32)
+
+    if source_ids.numel() != cache_tokens:
+        raise RuntimeError(
+            "Shared layer LIDU initialization found "
+            f"{source_ids.numel()} cached tokens, expected {cache_tokens}."
+        )
+
+    copy_counts = torch.tensor(
+        [cache_tokens], dtype=torch.int32, device=source_ids.device
+    )
+    scatter_copy(
+        source_ids.unsqueeze(0),
+        destination_slots.unsqueeze(0),
+        copy_counts,
+        hbm_block_table.unsqueeze(0),
+        dram_block_table.unsqueeze(0),
+        hbm_kpe,
+        hbm_ckv,
+        dram_kpe,
+        dram_ckv,
+    )
+    return hbm_kpe, hbm_ckv

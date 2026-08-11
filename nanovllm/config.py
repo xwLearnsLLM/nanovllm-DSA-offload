@@ -10,6 +10,7 @@ from nanovllm.engine.dsa_offload import (
     IndexShareGroupManager,
     LIDU_OFFLOAD_MODES,
     LIDU_MAX_SOURCE_TOKENS,
+    OFFLOAD_FUSE,
     OFFLOAD_NONE,
     normalize_offload_mode,
     validate_lidu_cache_token_budgets,
@@ -262,20 +263,23 @@ class Config:
     def _validate_glm52_phase1_runtime(self) -> None:
         if self.glm_version != GLM_VERSION_52:
             return
-        if self.offload_mode != OFFLOAD_NONE:
+        if self.offload_mode == OFFLOAD_FUSE:
             raise ValueError(
-                "GLM-5.2 phase 1 supports offload_mode='none' only; "
-                "IndexShare offload is implemented in the next phase."
+                "GLM-5.2 IndexShare offload_fuse is implemented in stage 3; "
+                "use offload_split for now."
             )
         if self.num_speculative_tokens:
             raise ValueError(
-                "GLM-5.2 phase 1 supports num_speculative_tokens=0 only; "
-                "the quantized MTP layer is implemented in a later phase."
+                "GLM-5.2 quantized MTP layer is implemented in a later phase; "
+                "set num_speculative_tokens=0."
             )
-        if not self.enforce_eager:
+        if (
+            self.offload_mode != OFFLOAD_NONE
+            and not self.enforce_eager
+        ):
             raise ValueError(
-                "GLM-5.2 phase 1 is eager-only; set enforce_eager=True / "
-                "NANOVLLM_ENFORCE_EAGER=1."
+                "GLM-5.2 IndexShare offload graph is implemented in stage 4; "
+                "set enforce_eager=True / NANOVLLM_ENFORCE_EAGER=1."
             )
 
     def _configure_decode_graph(self) -> None:

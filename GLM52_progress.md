@@ -25,9 +25,10 @@
 - 当前提交只改了 Python，不需要重新编译 Ascend 自定义算子。
 - 本地 CPU 验证已经覆盖模型识别、IndexShare schedule、能力门禁、原有 MTP 和 chunk prefill 回归。
 - 阶段 0 昇腾整网验收已完成（短序列、21K、64K 均通过，token IDs 与 `main` 分支 baseline 对齐），见下方阶段 0 记录。
-- 阶段 1（IndexShare group 元数据层）代码已完成，CPU 测试通过；等待用户确认后进入阶段 2。
-- 阶段 1 建立了 `IndexShareGroupManager` 数据模型，GLM-5.1 退化为 78 个单层 group，GLM-5.2 为 21 个 group（21 full + 57 shared）。shared layer 不创建 Indexer 权重和 index key cache。
-- 当前 GLM-5.2 运行时限制不变（none + eager + MTP0）；阶段 2 将解除 offload 限制。
+- 阶段 1（IndexShare group 元数据层）代码已完成，CPU 测试通过。
+- 阶段 2（MTP0 + offload_split + eager）代码已完成，CPU 测试通过；等待昇腾整网验收。
+- 阶段 2 实现了 group-owned `lidu_cache_slots`、shared layer 的 `_lidu_update_shared` 路径、`initialize_lidu_row_shared` 和 `finalize_prefill_offload` 的 owner-only 映射。
+- 当前 GLM-5.2 允许：`offload_mode=none/offload_split`、`MTP0`、`eager`；`offload_fuse`、MTP3 和 graph 仍明确报错。
 
 相关文档：[`README.md`](README.md)、[`README_ops.md`](README_ops.md)、[`TODO.md`](TODO.md)。
 
@@ -424,3 +425,38 @@ profile/性能：不适用
 - `GlmMLAAttention` 新增 `is_index_share_owner`，shared layer 跳过 indexer/indexer_rotary_emb 创建
 - `ModelRunner._allocate_mla_cache` 跳过 shared layer 的 `index_cache` 分配
 - `GlmMoeDsaForCausalLM.weight_name_mapping` 跳过 shared layer 的 indexer 权重加载
+
+### 阶段 2：MTP0 + offload_split + eager
+
+```text
+日期：2025-08-10
+阶段：2（MTP0 + offload_split + eager）
+commit：dd62586
+代码状态：已完成，仅改 Python，无需重编算子
+CPU/UT：新增 9 项测试，全部通过或正确跳过（scatter_copy 需昇腾环境）
+  - GLM-5.2 offload_split config 构建和门禁（允许 split、拒绝 fuse/graph/mtp3）
+  - initialize_lidu_row_shared：owner 映射提取、zero-cache noop、未填充映射检测
+  - scheduler offload_split 生命周期（allocate/deallocate/preempt/abort）
+  - GLM-5.1 回归不变
+昇腾整网：待验收
+  验收命令：
+    NANOVLLM_OFFLOAD_MODE=offload_split NANOVLLM_NUM_SPECULATIVE_TOKENS=0
+    NANOVLLM_ENFORCE_EAGER=1 NANOVLLM_HBM_NUM_BLOCKS=800
+    NANOVLLM_DRAM_NUM_BLOCKS=3900 NANOVLLM_PROMPT_LENGTHS=21000
+  验收项：
+    - temperature=0 下与 offload_mode=none 的 token IDs 对齐
+    - 20K、约 40K、接近 64K 均能运行
+    - eager profile 中应为 21 次 LIM、78 次 SCATTER、78 次 SFA
+    - 每个 group 内 full/shared layer 的 miss metadata 一致，KV payload 各层独立
+profile/性能：待昇腾验收
+结论与下一步：阶段 2 代码完成，等待昇腾整网验收后进入阶段 3（offload_fuse + eager）
+```
+
+实现内容：
+- `Config._validate_glm52_phase1_runtime` 放宽：允许 `offload_split + MTP0 + eager`，仍拒绝 `offload_fuse`/MTP3/graph
+- `dsa_offload_ops.py` 新增 `initialize_lidu_row_shared`：shared layer 从 owner 填充的 `cache_slots_row` 提取映射，调用 `scatter_copy` 拷贝本层 KV
+- `GlmMLAAttention` 新增 `_index_share_owner` 引用和 `_lidu_update_shared` 方法：shared layer 跳过 LIM，读取 owner 的 `topk_src_ids/topk_dst_slots/miss_counts`，用本层 KV 执行 SCATTER
+- `GlmMLAAttention.forward` prefill/decode 路径：shared layer 跳过 indexer 调用
+- `GlmMLAAttention.finalize_prefill_offload`：仅 owner 操作 `cache_slots_pool` 映射，所有层各自持久化 DRAM KV
+- `ModelRunner._allocate_mla_cache`：group-owned `lidu_cache_slots`（同 group 的层共享同一 tensor）
+- `ModelRunner._setup_index_share_owners`：为每个 shared layer 设置 owner 引用

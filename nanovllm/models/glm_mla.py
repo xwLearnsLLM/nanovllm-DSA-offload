@@ -30,6 +30,7 @@ from nanovllm.models.dsa_offload_ops import (
     LIDU_MTP_UNION_CAPACITY,
     LIDU_TOPK,
     initialize_lidu_row,
+    initialize_lidu_row_shared,
     fused_li_manage,
     fused_li_manage_mtp,
     scatter_copy,
@@ -463,6 +464,10 @@ class GlmMLAAttention(nn.Module):
                 rope_parameters=config.rope_parameters,
             )
             self.indexer = GlmDsaIndexer(config)
+        # Reference to the owner GlmMLAAttention for IndexShare shared
+        # layers.  Set by ModelRunner after all layers are created.
+        # None for owner layers and GLM-5.1 (every layer is its own owner).
+        self._index_share_owner: "GlmMLAAttention | None" = None
         # Caller-owned custom-op outputs stay alive at fixed graph addresses.
         self._use_sparse_tail_attention = self.uses_offload
         self._use_fused_copy_sfa = self.offload_mode == OFFLOAD_FUSE
@@ -736,28 +741,28 @@ class GlmMLAAttention(nn.Module):
     ) -> None:
         num_full_blocks = int(seq.num_prefill_full_blocks)
         num_sparse_blocks = int(seq.num_sparse_blocks)
-        pool_entry = int(seq.offload_pool_entry)
-        self.lidu_cache_slots[pool_entry].fill_(-1)
-
         if num_sparse_blocks >= num_full_blocks:
-            # Dense/short requests keep every full prefill block in HBM, so their
-            # decode path stays aligned with baseline and no DRAM copy is needed.
-            if (
-                int(seq.lidu_cache_tokens) > 0
-                and num_full_blocks > 0
-            ):
-                source_tokens = num_full_blocks * self.block_size
-                self.lidu_cache_slots[pool_entry, :source_tokens].copy_(
-                    torch.arange(
-                        source_tokens,
-                        dtype=torch.int32,
-                        device=self.lidu_cache_slots.device,
+            # Short request: all KV stays in HBM.  Only the owner sets up
+            # the identity mapping in the shared cache_slots_pool.
+            if self.is_index_share_owner:
+                pool_entry = int(seq.offload_pool_entry)
+                self.lidu_cache_slots[pool_entry].fill_(-1)
+                if (
+                    int(seq.lidu_cache_tokens) > 0
+                    and num_full_blocks > 0
+                ):
+                    source_tokens = num_full_blocks * self.block_size
+                    self.lidu_cache_slots[pool_entry, :source_tokens].copy_(
+                        torch.arange(
+                            source_tokens,
+                            dtype=torch.int32,
+                            device=self.lidu_cache_slots.device,
+                        )
                     )
-                )
             return
 
-        # Long requests keep only the first prefix block plus suffix blocks in HBM.
-        # Persist the full prefill KV to DRAM for future Tx>0 promote copies.
+        # Long request: persist this layer's full prefill KV to DRAM.
+        # All layers (owner and shared) do this independently.
         for logical_block in range(num_full_blocks):
             hbm_block = int(old_hbm_block_table[logical_block])
             dram_block = int(seq.dram_block_table[logical_block])
@@ -1209,6 +1214,78 @@ class GlmMLAAttention(nn.Module):
             miss_counts,
         )
 
+    def _lidu_update_shared(
+        self,
+        batch_size: int,
+    ) -> _LiduUpdateResult:
+        """Run SCATTER for a shared layer using the owner's LIM output.
+
+        Shared layers skip the indexer and ``fused_li_manage`` call.
+        They read the owner's ``topk_src_ids/topk_dst_slots/miss_counts``
+        and use them with this layer's own KV cache for SCATTER+SFA.
+        """
+
+        context = get_context()
+        owner = self._index_share_owner
+        if owner is None:
+            raise RuntimeError(
+                "IndexShare shared layer has no owner reference."
+            )
+        buffers = owner._fused_li_manage_outputs.get(batch_size)
+        if buffers is None:
+            raise RuntimeError(
+                "Shared layer decode ran before its owner's LIM update "
+                f"for batch_size={batch_size}."
+            )
+        topk_src_ids, topk_dst_slots, miss_counts = buffers
+
+        hbm_kpe = self.kpe_cache.squeeze(2)
+        hbm_ckv = self.ckv_cache.squeeze(2)
+        dram_kpe = self.dram_kpe_cache.squeeze(2)
+        dram_ckv = self.dram_ckv_cache.squeeze(2)
+
+        init_rows = context.lidu_init_rows
+        if init_rows is not None and init_rows.numel() > 0:
+            if context.full_decode_graph:
+                raise RuntimeError("LIDU initialization must remain eager.")
+            for row in init_rows.detach().cpu().tolist():
+                row = int(row)
+                pool_entry = int(context.req_pool_entries[row].item())
+                cache_tokens = int(context.lidu_cache_tokens[row].item())
+                hbm_kpe, hbm_ckv = initialize_lidu_row_shared(
+                    cache_slots_row=self.lidu_cache_slots[pool_entry],
+                    cache_tokens=cache_tokens,
+                    hbm_kpe=hbm_kpe,
+                    hbm_ckv=hbm_ckv,
+                    dram_kpe=dram_kpe,
+                    dram_ckv=dram_ckv,
+                    hbm_block_table=context.block_tables[row],
+                    dram_block_table=context.dram_block_tables[row],
+                )
+
+        use_fused_attention_scatter = self._can_use_fused_copy_sfa()
+        if not use_fused_attention_scatter:
+            scatter_copy(
+                topk_src_ids.view(batch_size, -1),
+                topk_dst_slots.view(batch_size, -1),
+                miss_counts[:batch_size],
+                context.block_tables[:batch_size],
+                context.dram_block_tables[:batch_size],
+                hbm_kpe,
+                hbm_ckv,
+                dram_kpe,
+                dram_ckv,
+            )
+        if self._lidu_miss_count_collect_all:
+            self._record_lidu_miss_counts(miss_counts, batch_size)
+        return (
+            hbm_kpe,
+            hbm_ckv,
+            topk_dst_slots,
+            topk_src_ids,
+            miss_counts,
+        )
+
     def _lidu_update_mtp(
         self,
         q_index: torch.Tensor,
@@ -1493,9 +1570,16 @@ class GlmMLAAttention(nn.Module):
         batch_size = int(ql_nope.shape[0])
         assert context.actual_seq_lengths_kv is not None
         if context.needs_dsa_update and not dsa_updated:
-            if q_index is None or weights is None:
-                raise RuntimeError("LIDU decode requires indexer outputs.")
-            cache_aliases = self._lidu_update(q_index, weights, batch_size)
+            if self.is_index_share_owner:
+                if q_index is None or weights is None:
+                    raise RuntimeError(
+                        "LIDU decode requires indexer outputs."
+                    )
+                cache_aliases = self._lidu_update(
+                    q_index, weights, batch_size
+                )
+            else:
+                cache_aliases = self._lidu_update_shared(batch_size)
         kpe_cache = ckv_cache = topk_dst_slots = None
         topk_src_ids = miss_counts = None
         if cache_aliases is not None:
@@ -1632,7 +1716,7 @@ class GlmMLAAttention(nn.Module):
             q_index = index_k = weights = None
             dsa_updated = False
             cache_aliases = None
-            if needs_decode_dsa_update:
+            if needs_decode_dsa_update and self.is_index_share_owner:
                 if context.full_decode_graph:
                     cache_aliases = self._run_dsa_pipeline_with_qc_full_graph(
                         hidden_states,
@@ -1684,7 +1768,7 @@ class GlmMLAAttention(nn.Module):
         k_pe = _rope_interleaved_to_neox(k_pe)
 
         q_index = index_k = weights = None
-        if context.needs_dsa_update:
+        if context.needs_dsa_update and self.is_index_share_owner:
             q_index, index_k, weights = self._run_indexer(
                 hidden_states,
                 q_c,

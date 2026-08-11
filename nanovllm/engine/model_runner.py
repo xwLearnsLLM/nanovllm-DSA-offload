@@ -185,6 +185,7 @@ class ModelRunner:
         self._mtp_decode_cu_seqlens: dict[int, torch.Tensor] = {}
         torch.npu.empty_cache()
         self._allocate_mla_cache()
+        self._setup_index_share_owners()
         self.decode_graph_manager = None
         if not config.enforce_eager:
             text_config = getattr(config.hf_config, "text_config", config.hf_config)
@@ -566,6 +567,21 @@ class ModelRunner:
             dram_ckv_shape[1:],
             dram_kpe_shape[1:],
         )
+        index_share_groups = getattr(
+            self.hf_config, "nanovllm_index_share_groups", None
+        )
+        # GLM-5.2 IndexShare: one cache_slots_pool per group, shared by all
+        # member layers.  GLM-5.1 (no indexer_types) gives every layer its
+        # own pool, preserving the original per-layer behaviour.
+        group_lidu_slots: dict[int, torch.Tensor] = {}
+        if index_share_groups is not None:
+            for group in index_share_groups.groups():
+                group_lidu_slots[group.group_id] = torch.full(
+                    lidu_slots_shape,
+                    -1,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
         for module in self.model.modules():
             if not hasattr(module, "assign_mla_cache"):
                 continue
@@ -581,12 +597,16 @@ class ModelRunner:
                     index_cache = torch.empty(0, dtype=cache_dtype, device=self.device)
                 dram_ckv_cache = torch_npu.empty_with_swapped_memory(layer_shapes[3], dtype=cache_dtype, device=self.device)
                 dram_kpe_cache = torch_npu.empty_with_swapped_memory(layer_shapes[4], dtype=cache_dtype, device=self.device)
-                lidu_cache_slots = torch.full(
-                    lidu_slots_shape,
-                    -1,
-                    dtype=torch.int32,
-                    device=self.device,
-                )
+                if index_share_groups is not None:
+                    gid = index_share_groups.group_of(module.layer_idx)
+                    lidu_cache_slots = group_lidu_slots[gid]
+                else:
+                    lidu_cache_slots = torch.full(
+                        lidu_slots_shape,
+                        -1,
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
                 ckv_cache.zero_()
                 kpe_cache.zero_()
                 if index_cache.numel() > 0:
@@ -626,6 +646,38 @@ class ModelRunner:
                     tuple(dense_ckv.shape),
                     tuple(dense_kpe.shape),
                 )
+
+    def _setup_index_share_owners(self) -> None:
+        """Wire shared layers to their owner's LIM output buffers.
+
+        After cache allocation, each shared (non-owner) target layer gets
+        a direct reference to its group's owner ``GlmMLAAttention``.
+        This lets the shared layer read the owner's
+        ``_fused_li_manage_outputs`` without duplicating the LIM call.
+        """
+
+        index_share_groups = getattr(
+            self.hf_config, "nanovllm_index_share_groups", None
+        )
+        if index_share_groups is None:
+            return
+        target_layers = self.model.model.layers
+        for group in index_share_groups.groups():
+            owner_attn = target_layers[group.owner_layer_idx].self_attn
+            for member_idx in group.member_layer_idxs:
+                if member_idx == group.owner_layer_idx:
+                    continue
+                target_layers[member_idx].self_attn._index_share_owner = (
+                    owner_attn
+                )
+        if self.rank == 0 and index_share_groups.num_groups != index_share_groups.num_hidden_layers:
+            logger.info(
+                "IndexShare: %d groups, %d owner layers, %d shared layers; "
+                "shared layers reference their owner's LIM output.",
+                index_share_groups.num_groups,
+                len(index_share_groups.owner_layer_idxs),
+                len(index_share_groups.shared_layer_idxs),
+            )
 
     def prepare_block_tables(self, seqs: list[Sequence], table_name: str = "hbm_block_table"):
         static_max_block_cols = (self.config.max_model_len + self.config.kvcache_block_size - 1) // self.config.kvcache_block_size

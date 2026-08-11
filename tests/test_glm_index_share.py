@@ -323,10 +323,31 @@ def test_glm51_config_builds_degenerate_index_share_groups(tmp_path):
     assert config.glm_version == GLM_VERSION_51
 
 
-def test_glm52_config_with_offload_still_rejected_in_phase1(tmp_path):
+def test_glm52_config_accepts_offload_split_in_stage2(tmp_path):
     _write_glm52_config(tmp_path)
-    with pytest.raises(ValueError, match="offload_mode='none' only"):
-        _make_config(tmp_path, offload_mode="offload_split")
+    config = _make_config(
+        tmp_path,
+        offload_mode="offload_split",
+        max_model_len=4096,
+    )
+    assert config.offload_mode == "offload_split"
+    assert config.glm_version == GLM_VERSION_52
+
+
+def test_glm52_config_rejects_offload_fuse_in_stage2(tmp_path):
+    _write_glm52_config(tmp_path)
+    with pytest.raises(ValueError, match="offload_fuse is implemented in stage 3"):
+        _make_config(tmp_path, offload_mode="offload_fuse")
+
+
+def test_glm52_config_rejects_graph_with_offload_in_stage2(tmp_path):
+    _write_glm52_config(tmp_path)
+    with pytest.raises(ValueError, match="offload graph is implemented in stage 4"):
+        _make_config(
+            tmp_path,
+            offload_mode="offload_split",
+            enforce_eager=False,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -658,3 +679,190 @@ def test_group_manager_handles_small_model():
     assert mgr.shared_layer_idxs == (1, 2, 4, 5)
     assert mgr.group(0).member_layer_idxs == (0, 1, 2)
     assert mgr.group(1).member_layer_idxs == (3, 4, 5)
+
+
+# ---------------------------------------------------------------------------
+# Stage 2: offload_split + MTP0 + eager
+# ---------------------------------------------------------------------------
+
+
+def test_glm52_offload_split_config_builds_index_share_groups(tmp_path):
+    _write_glm52_config(tmp_path)
+    config = _make_config(
+        tmp_path,
+        offload_mode="offload_split",
+        max_model_len=4096,
+    )
+    groups = config.hf_config.nanovllm_index_share_groups
+    assert groups.num_groups == 21
+    assert len(groups.owner_layer_idxs) == 21
+    assert len(groups.shared_layer_idxs) == 57
+
+
+def test_glm52_offload_split_enforces_eager(tmp_path):
+    _write_glm52_config(tmp_path)
+    with pytest.raises(ValueError, match="stage 4"):
+        _make_config(
+            tmp_path,
+            offload_mode="offload_split",
+            enforce_eager=False,
+        )
+
+
+def test_glm52_offload_split_rejects_mtp3(tmp_path):
+    _write_glm52_config(tmp_path)
+    with pytest.raises(ValueError, match="quantized MTP layer"):
+        _make_config(
+            tmp_path,
+            offload_mode="offload_split",
+            num_speculative_tokens=3,
+        )
+
+
+def test_glm52_offload_none_still_allowed(tmp_path):
+    _write_glm52_config(tmp_path)
+    config = _make_config(
+        tmp_path,
+        offload_mode="none",
+        num_dram_kvcache_blocks=-1,
+        enforce_eager=True,
+    )
+    assert config.offload_mode == "none"
+    assert config.glm_version == GLM_VERSION_52
+
+
+def test_initialize_lidu_row_shared_extracts_owner_mapping():
+    """Shared layer init reads cache_slots_row filled by the owner."""
+
+    import torch
+    from nanovllm.models.dsa_offload_ops import (
+        initialize_lidu_row_shared,
+        LIDU_TOPK,
+    )
+
+    # scatter_copy is a custom Ascend operator not available on CPU.
+    if not hasattr(torch.ops, "nanovllm_dsa") or not hasattr(
+        torch.ops.nanovllm_dsa, "scatter_copy"
+    ):
+        pytest.skip("scatter_copy operator is not registered on this machine.")
+
+    cache_tokens = LIDU_TOPK
+    source_capacity = 4096
+    cache_slots_row = torch.full(
+        (source_capacity,), -1, dtype=torch.int32
+    )
+    # Simulate owner's mapping: source_ids within [0, source_capacity) -> slots [0, 1, 2, ...]
+    source_ids = torch.tensor(
+        [(i * 2) % source_capacity for i in range(cache_tokens)],
+        dtype=torch.int32,
+    )
+    dest_slots = torch.arange(cache_tokens, dtype=torch.int32)
+    cache_slots_row[source_ids.long()] = dest_slots
+
+    # Create small dummy KV caches for scatter_copy
+    block_size = 128
+    hbm_kpe = torch.zeros(64, block_size, 64, dtype=torch.bfloat16)
+    hbm_ckv = torch.zeros(64, block_size, 512, dtype=torch.bfloat16)
+    dram_kpe = torch.ones(64, block_size, 64, dtype=torch.bfloat16)
+    dram_ckv = torch.ones(64, block_size, 512, dtype=torch.bfloat16)
+    hbm_bt = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
+    dram_bt = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
+
+    hbm_kpe_out, hbm_ckv_out = initialize_lidu_row_shared(
+        cache_slots_row=cache_slots_row,
+        cache_tokens=cache_tokens,
+        hbm_kpe=hbm_kpe,
+        hbm_ckv=hbm_ckv,
+        dram_kpe=dram_kpe,
+        dram_ckv=dram_ckv,
+        hbm_block_table=hbm_bt,
+        dram_block_table=dram_bt,
+    )
+
+    # scatter_copy should have written DRAM data (all ones) to HBM at the
+    # destination slots.  Verify at least one position was written.
+    assert hbm_ckv_out.sum() > 0
+    assert hbm_kpe_out.sum() > 0
+
+
+def test_initialize_lidu_row_shared_noop_for_zero_cache():
+    import torch
+    from nanovllm.models.dsa_offload_ops import initialize_lidu_row_shared
+
+    hbm_kpe = torch.zeros(4, 128, 64, dtype=torch.bfloat16)
+    hbm_ckv = torch.zeros(4, 128, 512, dtype=torch.bfloat16)
+    cache_slots_row = torch.full((1024,), -1, dtype=torch.int32)
+
+    result = initialize_lidu_row_shared(
+        cache_slots_row=cache_slots_row,
+        cache_tokens=0,
+        hbm_kpe=hbm_kpe,
+        hbm_ckv=hbm_ckv,
+        dram_kpe=hbm_kpe.clone(),
+        dram_ckv=hbm_ckv.clone(),
+        hbm_block_table=torch.tensor([0], dtype=torch.int32),
+        dram_block_table=torch.tensor([0], dtype=torch.int32),
+    )
+    # No copy should have occurred
+    assert torch.equal(result[0], hbm_kpe)
+    assert torch.equal(result[1], hbm_ckv)
+
+
+def test_initialize_lidu_row_shared_detects_unfilled_mapping():
+    import torch
+    from nanovllm.models.dsa_offload_ops import initialize_lidu_row_shared
+
+    cache_slots_row = torch.full((1024,), -1, dtype=torch.int32)
+    # Don't fill any mapping; expect error when cache_tokens > 0
+
+    with pytest.raises(RuntimeError, match="found 0 cached tokens"):
+        initialize_lidu_row_shared(
+            cache_slots_row=cache_slots_row,
+            cache_tokens=2048,
+            hbm_kpe=torch.zeros(4, 128, 64, dtype=torch.bfloat16),
+            hbm_ckv=torch.zeros(4, 128, 512, dtype=torch.bfloat16),
+            dram_kpe=torch.zeros(4, 128, 64, dtype=torch.bfloat16),
+            dram_ckv=torch.zeros(4, 128, 512, dtype=torch.bfloat16),
+            hbm_block_table=torch.tensor([0], dtype=torch.int32),
+            dram_block_table=torch.tensor([0], dtype=torch.int32),
+        )
+
+
+def test_scheduler_offload_split_lifecycle_with_index_share():
+    """Scheduler allocate/deallocate/preempt/abort work with offload_split
+    and IndexShare groups present."""
+
+    mgr = IndexShareGroupManager(78, tuple(glm52_indexer_types(78)))
+    assert mgr.num_groups == 21
+
+    scheduler_config = _make_scheduler_config(
+        offload_mode="offload_split",
+        max_model_len=8224,
+        num_hbm_kvcache_blocks=96,
+        num_dram_kvcache_blocks=128,
+    )
+    scheduler = Scheduler(scheduler_config)
+
+    seq = Sequence(
+        list(range(8200)),
+        SamplingParams(temperature=0.0, max_tokens=8),
+        block_size=128,
+    )
+    scheduler._prepare_prefill_metadata(seq)
+    scheduler._allocate_prefill(seq)
+    assert seq.offload_pool_entry >= 0
+    assert seq.index_block_table
+    assert seq.dram_block_table
+
+    # Preempt recycles all resources
+    scheduler.preempt(seq)
+    assert seq.offload_pool_entry == -1
+    assert not seq.index_block_table
+    assert not seq.dram_block_table
+
+    # Abort after re-allocate
+    scheduler._prepare_prefill_metadata(seq)
+    scheduler._allocate_prefill(seq)
+    scheduler.running.append(seq)
+    scheduler.abort_seq_group(seq.request_id)
+    assert seq.finish_reason is FinishReason.ABORTED
