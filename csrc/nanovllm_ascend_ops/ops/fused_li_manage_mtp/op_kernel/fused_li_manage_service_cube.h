@@ -65,14 +65,13 @@ public:
     static constexpr uint64_t L0C_BUFFER_OFFSET = M_BASIC_BLOCK_L0 * S2_BASIC_BLOCK_L0;
 
 protected:
-    __aicore__ inline uint32_t GetQueryEvent(uint32_t querySlot) const;
     __aicore__ inline void Fixp(uint64_t s2GmOffset, uint64_t s2L0RealSize,
                                 const LICommon::RunInfo &runInfo);
     __aicore__ inline void ComuteL0c(uint64_t s2L0RealSize);
     __aicore__ inline void LoadKeyToL0b(uint64_t s2L0Offset, uint64_t s2L1RealSize, uint64_t s2L0RealSize,
                                         const LICommon::RunInfo &runInfo);
     __aicore__ inline void LoadQueryToL0a(uint32_t querySlot);
-    __aicore__ inline void QueryNd2Nz(const LICommon::RunInfo &runInfo,
+    __aicore__ inline void QueryNd2Nz(uint32_t queryRow,
                                       uint32_t querySlot);
     __aicore__ inline void KeyNd2NzForPA(uint64_t s2L1RealSize, uint64_t s2GmOffset, const LICommon::RunInfo &runInfo);
     GlobalTensor<int32_t> blkTableGm_;
@@ -154,19 +153,6 @@ __aicore__ inline void LIMatmul<LIT>::InitMtpBuffers(TPipe *pipe)
 }
 
 template <typename LIT>
-__aicore__ inline uint32_t LIMatmul<LIT>::GetQueryEvent(
-    uint32_t querySlot) const
-{
-    if (querySlotCount_ == 1U) {
-        return QUERY_MTE1_MTE2_EVENT;
-    }
-    // MTE1_MTE2 event IDs 2..4 belong to the triple-buffered key path.
-    // Use the remaining disjoint IDs 0, 1, 5 and 6 for q0..q3.
-    return querySlot < 2U ? EVENT_ID0 + querySlot
-                          : EVENT_ID5 + querySlot - 2U;
-}
-
-template <typename LIT>
 __aicore__ inline void
 LIMatmul<LIT>::InitMm1GlobalTensor(const GlobalTensor<int32_t> &blkTableGm, const GlobalTensor<K_T> &keyGm,
                                    const GlobalTensor<Q_T> &queryGm, const GlobalTensor<float> &mm1ResGm)
@@ -192,9 +178,15 @@ __aicore__ inline void LIMatmul<LIT>::ComputeMm1(const LICommon::RunInfo &runInf
 
         SetFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
         WaitFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
-        if (runInfo.isFirstS2InnerLoop && s2GmOffset == 0) {
-            WaitFlag<HardEvent::MTE1_MTE2>(GetQueryEvent(querySlot));
-            QueryNd2Nz(runInfo, querySlot);
+        if (runInfo.isFirstS2InnerLoop && s2GmOffset == 0 &&
+            (querySlotCount_ == 1U || querySlot == 0U)) {
+            // The chunk-major path owns the complete four-query L1 region for
+            // one request. q0 loads all four contiguous query rows once;
+            // q1..q3 reuse their slots without acquiring another event.
+            WaitFlag<HardEvent::MTE1_MTE2>(QUERY_MTE1_MTE2_EVENT);
+            for (uint32_t slot = 0; slot < querySlotCount_; ++slot) {
+                QueryNd2Nz(runInfo.queryRow + slot, slot);
+            }
             SetFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
             WaitFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
         }
@@ -211,8 +203,11 @@ __aicore__ inline void LIMatmul<LIT>::ComputeMm1(const LICommon::RunInfo &runInf
             Fixp(s2GmOffset + s2L1Offset, s2L0RealSize, runInfo);
             l0BufIdx_++;
         }
-        if (s2GmOffset + S2_BASIC_BLOCK >= s2ProcessSize && runInfo.isLastS2InnerLoop) {
-            SetFlag<HardEvent::MTE1_MTE2>(GetQueryEvent(querySlot));
+        if (s2GmOffset + S2_BASIC_BLOCK >= s2ProcessSize &&
+            runInfo.isLastS2InnerLoop &&
+            (querySlotCount_ == 1U || querySlot + 1U == querySlotCount_)) {
+            // q3 is the final consumer of the four-query L1 region.
+            SetFlag<HardEvent::MTE1_MTE2>(QUERY_MTE1_MTE2_EVENT);
         }
 
         SetFlag<HardEvent::MTE1_MTE2>(KEY_MTE1_MTE2_EVENT + keyL1BufIdx_ % KEY_BUF_NUM);
@@ -262,7 +257,7 @@ __aicore__ inline void LIMatmul<LIT>::KeyNd2NzForPA(uint64_t s2L1RealSize, uint6
 
 template <typename LIT>
 __aicore__ inline void LIMatmul<LIT>::QueryNd2Nz(
-    const LICommon::RunInfo &runInfo, uint32_t querySlot)
+    uint32_t queryRow, uint32_t querySlot)
 {
     Nd2NzParams nd2nzPara;
     nd2nzPara.ndNum = 1;
@@ -275,7 +270,7 @@ __aicore__ inline void LIMatmul<LIT>::QueryNd2Nz(
     nd2nzPara.dstNzMatrixStride = 0;
     DataCopy(
         queryL1_[static_cast<uint64_t>(querySlot) * QUERY_BUFFER_OFFSET],
-        queryGm_[static_cast<uint64_t>(runInfo.queryRow) *
+        queryGm_[static_cast<uint64_t>(queryRow) *
                  constInfo_.qHeadNum * constInfo_.headDim],
         nd2nzPara);
 }
@@ -374,9 +369,7 @@ __aicore__ inline void LIMatmul<LIT>::AllocEventID()
     SetFlag<HardEvent::MTE1_MTE2>(KEY_MTE1_MTE2_EVENT + 1);
     SetFlag<HardEvent::MTE1_MTE2>(KEY_MTE1_MTE2_EVENT + 2);
 
-    for (uint32_t querySlot = 0; querySlot < querySlotCount_; ++querySlot) {
-        SetFlag<HardEvent::MTE1_MTE2>(GetQueryEvent(querySlot));
-    }
+    SetFlag<HardEvent::MTE1_MTE2>(QUERY_MTE1_MTE2_EVENT);
 
     SetFlag<HardEvent::M_MTE1>(M_MTE1_EVENT + 0);
     SetFlag<HardEvent::M_MTE1>(M_MTE1_EVENT + 1);
@@ -390,9 +383,7 @@ __aicore__ inline void LIMatmul<LIT>::FreeEventID()
     WaitFlag<HardEvent::MTE1_MTE2>(KEY_MTE1_MTE2_EVENT + 1);
     WaitFlag<HardEvent::MTE1_MTE2>(KEY_MTE1_MTE2_EVENT + 2);
 
-    for (uint32_t querySlot = 0; querySlot < querySlotCount_; ++querySlot) {
-        WaitFlag<HardEvent::MTE1_MTE2>(GetQueryEvent(querySlot));
-    }
+    WaitFlag<HardEvent::MTE1_MTE2>(QUERY_MTE1_MTE2_EVENT);
 
     WaitFlag<HardEvent::M_MTE1>(M_MTE1_EVENT + 0);
     WaitFlag<HardEvent::M_MTE1>(M_MTE1_EVENT + 1);
