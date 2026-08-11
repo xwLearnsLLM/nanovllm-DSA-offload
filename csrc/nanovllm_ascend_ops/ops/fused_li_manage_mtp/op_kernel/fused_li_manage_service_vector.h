@@ -65,7 +65,11 @@ constexpr uint32_t MTP_EVICT_PAIR_FLOATS =
     MTP_EVICT_PRELOAD_CAP * VALUE_AND_INDEX_NUM;
 constexpr uint32_t MTP_SORT_BUFFER_FLOATS =
     MTP_TOPK_STATE_FLOATS + MTP_EVICT_PAIR_FLOATS + CHUNK_PAIR_FLOATS;
-constexpr uint32_t MTP_PAYLOAD_BUF_SLOTS = 1;
+// Keep the validated four-call reuse distance for payload UB. In chunk-major
+// order q0..q3 of one source chunk use different slots; the next chunk reuses
+// them only after four complete vector calls, avoiding an MTE2 overwrite of a
+// payload that Sort may still consume on PIPE_V.
+constexpr uint32_t MTP_PAYLOAD_BUF_SLOTS = PAYLOAD_BUF_SLOTS;
 // MTP LIM intentionally remains on the validated 18-bit source format.
 constexpr uint32_t MTP_SOURCE_CAPACITY = 1U << 18;
 constexpr uint32_t MTP_UNION_BITSET_WORDS = MTP_SOURCE_CAPACITY / 32U;
@@ -1477,7 +1481,7 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
         (s2BaseSize_ - info.actualSingleProcessSInnerSizeAlign) /
         B32_BLOCK_ALIGN_NUM;
 #if NANOVLLM_MTP_CHUNK_MAJOR
-    int64_t payloadBufIdx = 0;
+    int64_t payloadBufIdx = info.loop % MTP_PAYLOAD_BUF_SLOTS;
 #else
     int64_t payloadBufIdx = info.s2Idx % PAYLOAD_BUF_SLOTS;
 #endif
