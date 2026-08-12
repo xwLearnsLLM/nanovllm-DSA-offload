@@ -48,12 +48,6 @@ constexpr uint32_t SORT_BUFFER_FLOATS = TOPK_PAIR_FLOATS + EVICT_PAIR_FLOATS + S
 constexpr uint32_t PARTIAL_SLOTS_PER_CORE = 2;
 constexpr uint32_t PARTIAL_META_INTS_PER_CORE = 8;
 constexpr uint32_t MTP_QUERY_COUNT = 4;
-constexpr uint32_t MTP_CHUNK_GROUP_SIZE = PAYLOAD_BUF_SLOTS;
-constexpr uint32_t MTP_TOPK_STATES_FLOATS = MTP_QUERY_COUNT * TOPK_PAIR_FLOATS;
-constexpr uint32_t MTP_SORT_BUFFER_FLOATS =
-    MTP_TOPK_STATES_FLOATS + EVICT_PAIR_FLOATS + SORTED_SCRATCH_FLOATS;
-constexpr uint32_t MTP_AGGREGATE_FLOATS =
-    MTP_CHUNK_GROUP_SIZE * S2_BASE_SIZE;
 constexpr uint32_t MTP_UNION_CAPACITY = MTP_QUERY_COUNT * BASE_TOPK;
 // MTP LIM intentionally remains on the validated 18-bit source format.
 constexpr uint32_t MTP_SOURCE_CAPACITY = 1U << 18;
@@ -275,34 +269,10 @@ __aicore__ inline void LIVector<LIT>::InitMtpBuffers(TPipe *pipe)
     if ((GetBlockIdx() & 1U) != 0U) {
         return;
     }
-    // Four query TopK states remain live while a four-chunk aggregate group
-    // crosses q0..q3.  A single VECIN slot keeps the total UB footprint below
-    // 192 KiB; finalization reuses the now-published TopK state area for its
-    // union scratch instead of requiring a second VECIN slot.
-    uint32_t outNeedBufSize = TOPK_PAIR_FLOATS * 2 * sizeof(float);
-    uint32_t reduceCacheSize =
-        REDUCE_BANK_CONFLICT_OFFSETS + GROUP_INNER * S2_BASE_SIZE * sizeof(float);
-    outNeedBufSize = reduceCacheSize > outNeedBufSize ? reduceCacheSize : outNeedBufSize;
-
-    pipe->InitBuffer(inQueue_, 1,
-                     GROUP_INNER * S2_BASE_SIZE * sizeof(float) + S2_BASE_SIZE * sizeof(float));
-    pipe->InitBuffer(outQueue_, 1, outNeedBufSize);
-    pipe->InitBuffer(sortOutBuf_, MTP_SORT_BUFFER_FLOATS * sizeof(float));
-    pipe->InitBuffer(indexBuf_, S2_BASE_SIZE * sizeof(int32_t));
-    pipe->InitBuffer(payloadBuf_, S2_BASE_SIZE * PAYLOAD_BUF_SLOTS * sizeof(int32_t));
-    pipe->InitBuffer(reduceOutBuf_, S2_BASE_SIZE * 2 * sizeof(float));
-    pipe->InitBuffer(brcBuf_, GROUP_INNER * 8 * sizeof(float));
-    pipe->InitBuffer(partialMetaBuf_, PARTIAL_META_INTS_PER_CORE * sizeof(int32_t));
-    pipe->InitBuffer(aggregateScoreBuf_, MTP_AGGREGATE_FLOATS * sizeof(float));
-
-    globalTopkIndice_ = indexBuf_.Get<int32_t>();
-    globalTopkUb_ = sortOutBuf_.Get<float>();
-    evictCandidateUb_ = globalTopkUb_[MTP_TOPK_STATES_FLOATS];
-    SortedBasicBlock_ = evictCandidateUb_[EVICT_PAIR_FLOATS];
-    partialMetaLocal_ = partialMetaBuf_.Get<int32_t>();
-
-    ArithProgression<int32_t>(globalTopkIndice_, 0, 1, S2_BASE_SIZE);
-    PipeBarrier<PIPE_V>();
+    InitBuffers(pipe);
+    // Only MTP needs the fourth-query aggregate-score scratch. Keep it out
+    // of the single-query LIM UB footprint.
+    pipe->InitBuffer(aggregateScoreBuf_, S2_BASE_SIZE * sizeof(float));
 }
 
 template <typename LIT>
@@ -492,26 +462,42 @@ __aicore__ inline void LIVector<LIT>::WriteMtpAggregateScoreChunk(
 {
     uint64_t gmOffset = static_cast<uint64_t>(bIdx) * scoreStride_ +
                         static_cast<uint32_t>(s2BaseIdx);
-    uint32_t aggregateSlot =
-        (static_cast<uint32_t>(s2BaseIdx) / S2_BASE_SIZE) % MTP_CHUNK_GROUP_SIZE;
-    LocalTensor<float> previousScore =
-        aggregateScoreBuf_.Get<float>()[aggregateSlot * S2_BASE_SIZE];
+    LocalTensor<float> previousScore = aggregateScoreBuf_.Get<float>();
     if (queryIdx == 0U) {
-        if (static_cast<uint32_t>(s2BaseIdx) >=
-            MTP_CHUNK_GROUP_SIZE * S2_BASE_SIZE) {
+        if (s2BaseIdx > 0) {
             SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
         }
         DataCopy(previousScore, scoreLocal, alignedLen);
         PipeBarrier<PIPE_V>();
+        SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
+        LIServiceVec::CopyOut(scoresGm[gmOffset], previousScore, alignedLen);
         return;
     }
+
+    // Do not borrow globalTopkIndice_ here.  FinishPayload relies on that
+    // buffer remaining the exact 0..511 progression across all four MTP
+    // queries; using it as async GM scratch corrupts query 1+ payloads on
+    // Ascend910_93 even when it is rewritten before the next chunk.
+    // q1..q2 write the previous chunk's aggregate from this same UB scratch.
+    // Delay that write's completion until the scratch is actually reused so
+    // MTE3 can overlap the intervening TopK merge and next MM/scale work.
+    if (queryIdx + 1U != MTP_QUERY_COUNT && s2BaseIdx > 0) {
+        SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
+    }
+    SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
+    DataCopyPad(previousScore, scoresGm[gmOffset],
+                AscendC::DataCopyExtParams{
+                    1, static_cast<uint32_t>(alignedLen * sizeof(float)), 0, 0, 0},
+                AscendC::DataCopyPadExtParams<float>{false, 0, 0, 0.0f});
+    SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
     Max(previousScore, previousScore, scoreLocal, alignedLen);
     PipeBarrier<PIPE_V>();
-    if (queryIdx + 1U != MTP_QUERY_COUNT) {
+    if (queryIdx + 1U == MTP_QUERY_COUNT) {
+        // q3 produces the final max(q0..q3) score.  Its consumer now builds
+        // the eviction candidate prefix directly from this UB tensor, so a
+        // final GM write would only be read back by the old finalize scan.
         return;
     }
-    // q3 completes max(q0..q3).  Publish the aggregate exactly once; the UB
-    // copy remains available to the eviction-candidate fast path below.
     SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
     LIServiceVec::CopyOut(scoresGm[gmOffset], previousScore, alignedLen);
 }
@@ -533,8 +519,7 @@ __aicore__ inline void LIVector<LIT>::CollectMtpEvictCandidateChunk(
     // entries by -aggregate_score, and retain the global lowest 512 entries.
     // SortedBasicBlock_'s current ping-pong slot is free until the q3 TopK
     // sort below overwrites it.
-    LocalTensor<float> aggregateScore =
-        aggregateScoreBuf_.Get<float>()[cachedChunkIdx * S2_BASE_SIZE];
+    LocalTensor<float> aggregateScore = aggregateScoreBuf_.Get<float>();
     LocalTensor<float> keyLocal = reduceOutBuf_.Get<float>()[s2BaseSize_];
     LocalTensor<float> chunkPairLocal =
         SortedBasicBlock_[cachedChunkIdx * CHUNK_PAIR_FLOATS];
@@ -969,15 +954,13 @@ __aicore__ inline void LIVector<LIT>::WriteMissCount(uint32_t bIdx, int32_t miss
 template <typename LIT>
 __aicore__ inline void LIVector<LIT>::StoreMtpQueryTopK(const LICommon::RunInfo &info)
 {
-    LocalTensor<float> queryTopkUb =
-        globalTopkUb_[info.queryIdx * TOPK_PAIR_FLOATS];
     LocalTensor<float> valueLocal = outQueue_.AllocTensor<float>();
     LocalTensor<uint32_t> payloadLocal = valueLocal.template ReinterpretCast<uint32_t>();
     SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
     mtpThresholdsGm.SetValue(
         info.queryRow,
-        queryTopkUb.GetValue((BASE_TOPK - 1U) * VALUE_AND_INDEX_NUM));
-    ExtractIndex(payloadLocal, queryTopkUb.template ReinterpretCast<uint32_t>(), BASE_TOPK);
+        globalTopkUb_.GetValue((BASE_TOPK - 1U) * VALUE_AND_INDEX_NUM));
+    ExtractIndex(payloadLocal, globalTopkUb_.template ReinterpretCast<uint32_t>(), BASE_TOPK);
 
     uint64_t rowOffset = static_cast<uint64_t>(info.queryRow) * BASE_TOPK;
     SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
@@ -991,10 +974,11 @@ __aicore__ inline void LIVector<LIT>::StoreMtpQueryTopK(const LICommon::RunInfo 
 template <typename LIT>
 __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo &info)
 {
-    // All four TopK states have been published, so their 64-KiB UB region can
-    // now hold the union scratch.  The single VECIN buffer holds ordered
-    // misses, and VECOUT stages destination slots and sparse-slot rows.
-    LocalTensor<float> unionStorage = globalTopkUb_;
+    // Two VECIN buffers hold the membership bitset and ordered union misses.
+    // The bitset has 2^18-token capacity, but only its active candidate prefix
+    // is touched. The VECOUT buffer first stages destination slots, then is
+    // reused to materialize the four per-query sparse-slot rows.
+    LocalTensor<float> unionStorage = inQueue_.AllocTensor<float>();
     LocalTensor<float> missStorage = inQueue_.AllocTensor<float>();
     LocalTensor<float> slotStorage = outQueue_.AllocTensor<float>();
     LocalTensor<uint32_t> unionBits = unionStorage.template ReinterpretCast<uint32_t>();
@@ -1377,6 +1361,7 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
 
     outQueue_.FreeTensor(slotStorage);
     inQueue_.FreeTensor(missStorage);
+    inQueue_.FreeTensor(unionStorage);
 }
 
 template <typename LIT>
@@ -1390,28 +1375,16 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
     int32_t cuS2Len = info.actualSingleProcessSInnerSize;
     int64_t mmGmOffset = (info.loop % 2) * (gSize_ * s2BaseSize_);
     int64_t weightGmOffset = static_cast<int64_t>(info.queryRow) * gSize_;
-    LocalTensor<float> queryTopkUb =
-        globalTopkUb_[info.queryIdx * TOPK_PAIR_FLOATS];
     if (info.isFirstS2InnerLoop) {
-        InitSortOutBuf(queryTopkUb, TOPK_PAIR_FLOATS);
+        InitSortOutBuf(globalTopkUb_, TOPK_PAIR_FLOATS);
     }
 
     int32_t mmUbStride =
         (s2BaseSize_ - info.actualSingleProcessSInnerSizeAlign) /
         B32_BLOCK_ALIGN_NUM;
-    // Rotate by execution order, not source chunk.  The final chunk group can
-    // contain fewer than four chunks; s2Idx-based rotation would then make
-    // consecutive q0..q3 calls overwrite the same payload while PIPE_V may
-    // still consume it.  Four execution slots preserve the validated reuse
-    // distance for both full and partial groups.
-    int64_t payloadBufIdx = info.loop % PAYLOAD_BUF_SLOTS;
+    int64_t payloadBufIdx = info.s2Idx % PAYLOAD_BUF_SLOTS;
     LocalTensor<int32_t> payloadUb =
         payloadBuf_.Get<int32_t>()[payloadBufIdx * s2BaseSize_];
-    // A full 512-token chunk does not take StartPayloadCopy's padding path,
-    // so it otherwise has no V->MTE2 dependency before reusing this slot.
-    // Make the ownership transfer explicit instead of relying on four calls
-    // of pipeline latency to finish the preceding Sort payload read.
-    SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
     StartPayloadCopy(payloadUb, info.cacheRowIdx, cuBaseS2Idx, cuS2Len,
                      s2BaseSize_);
     LocalTensor<float> reduceOutBuff = reduceOutBuf_.Get<float>();
@@ -1468,7 +1441,7 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
     PipeBarrier<PIPE_V>();
     if (cachedChunkIdx == 3U || info.isLastS2InnerLoop) {
         if (info.segmentChunkIdx < PAYLOAD_BUF_SLOTS) {
-            MrgBasicBlock(queryTopkUb, SortedBasicBlock_,
+            MrgBasicBlock(globalTopkUb_, SortedBasicBlock_,
                           static_cast<int64_t>(cachedChunkIdx + 1U),
                           s2BaseSize_);
         } else {
@@ -1482,7 +1455,7 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
                              VALUE_AND_INDEX_NUM);
             }
             PipeBarrier<PIPE_V>();
-            SparseTopK(queryTopkUb, SortedBasicBlock_, tmpSortBuf, BASE_TOPK,
+            SparseTopK(globalTopkUb_, SortedBasicBlock_, tmpSortBuf, BASE_TOPK,
                        s2BaseSize_ * (cachedChunkIdx + 1U));
         }
     }

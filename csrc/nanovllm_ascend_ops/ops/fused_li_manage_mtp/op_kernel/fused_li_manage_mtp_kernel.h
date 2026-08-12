@@ -41,7 +41,6 @@ public:
 private:
     static constexpr uint32_t WS_DOUBLE = 2;
     static constexpr uint32_t QUERY_COUNT = 4;
-    static constexpr uint32_t CHUNK_GROUP_SIZE = LIKernel::MTP_CHUNK_GROUP_SIZE;
     static constexpr uint32_t MIN_SOURCE_TOKENS = 2048;
     static constexpr uint32_t MAX_UNION_TOKENS = 8192;
 
@@ -236,36 +235,30 @@ __aicore__ inline void LIMtpPreload<LIT>::ProcessMain()
         }
 
         uint32_t chunkCount = CeilDiv(candidateLen, constInfo.s2BaseSize);
-        for (uint32_t chunkGroup = 0; chunkGroup < chunkCount;
-             chunkGroup += CHUNK_GROUP_SIZE) {
-            uint32_t groupEnd = Min(chunkGroup + CHUNK_GROUP_SIZE, chunkCount);
-            for (uint32_t queryIdx = 0; queryIdx < QUERY_COUNT; ++queryIdx) {
-                for (uint32_t chunkIdx = chunkGroup; chunkIdx < groupEnd; ++chunkIdx) {
-                    RunInfo runInfo{};
-                    runInfo.loop = loop++;
-                    runInfo.bIdx = bIdx;
-                    runInfo.queryRow = bIdx * QUERY_COUNT + queryIdx;
-                    runInfo.queryIdx = queryIdx;
-                    runInfo.s2Idx = chunkIdx;
-                    runInfo.segmentChunkIdx = chunkIdx;
-                    runInfo.actS2Size = candidateLen;
-                    runInfo.cacheTokenCount =
-                        static_cast<uint32_t>(cacheTokenCount);
-                    runInfo.cacheRowIdx = static_cast<uint32_t>(poolEntry);
-                    uint32_t chunkStart = chunkIdx * constInfo.s2BaseSize;
-                    runInfo.actualSingleProcessSInnerSize =
-                        Min(constInfo.s2BaseSize, candidateLen - chunkStart);
-                    runInfo.actualSingleProcessSInnerSizeAlign = LICommon::Align(
-                        runInfo.actualSingleProcessSInnerSize,
-                        ConstInfo::BUFFER_SIZE_BYTE_32B);
-                    runInfo.isFirstS2InnerLoop = chunkIdx == 0U;
-                    runInfo.isLastS2InnerLoop = chunkIdx + 1U == chunkCount;
-                    runInfo.reloadQuery = chunkIdx == chunkGroup;
-                    runInfo.releaseQuery = chunkIdx + 1U == groupEnd;
-                    runInfo.isPartialSegment = false;
-                    runInfo.partialSlot = 0U;
-                    ProcessChunk(runInfo);
-                }
+        for (uint32_t queryIdx = 0; queryIdx < QUERY_COUNT; ++queryIdx) {
+            for (uint32_t chunkIdx = 0; chunkIdx < chunkCount; ++chunkIdx) {
+                RunInfo runInfo{};
+                runInfo.loop = loop++;
+                runInfo.bIdx = bIdx;
+                runInfo.queryRow = bIdx * QUERY_COUNT + queryIdx;
+                runInfo.queryIdx = queryIdx;
+                runInfo.s2Idx = chunkIdx;
+                runInfo.segmentChunkIdx = chunkIdx;
+                runInfo.actS2Size = candidateLen;
+                runInfo.cacheTokenCount =
+                    static_cast<uint32_t>(cacheTokenCount);
+                runInfo.cacheRowIdx = static_cast<uint32_t>(poolEntry);
+                uint32_t chunkStart = chunkIdx * constInfo.s2BaseSize;
+                runInfo.actualSingleProcessSInnerSize =
+                    Min(constInfo.s2BaseSize, candidateLen - chunkStart);
+                runInfo.actualSingleProcessSInnerSizeAlign = LICommon::Align(
+                    runInfo.actualSingleProcessSInnerSize,
+                    ConstInfo::BUFFER_SIZE_BYTE_32B);
+                runInfo.isFirstS2InnerLoop = chunkIdx == 0U;
+                runInfo.isLastS2InnerLoop = chunkIdx + 1U == chunkCount;
+                runInfo.isPartialSegment = false;
+                runInfo.partialSlot = 0U;
+                ProcessChunk(runInfo);
             }
         }
     }
