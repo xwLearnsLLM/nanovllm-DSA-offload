@@ -554,6 +554,15 @@ class GlmMLAAttention(nn.Module):
         self.ckv_cache = ckv_cache
         self.kpe_cache = kpe_cache
 
+    def assign_mtp_index_cache(self, index_cache: torch.Tensor) -> None:
+        """Attach the MTP layer's independent persistent IndexCache."""
+
+        if not self.uses_mtp_index_share or self.indexer is None:
+            raise RuntimeError(
+                "MTP IndexCache was assigned while MTP IndexShare is disabled."
+            )
+        self.index_cache = index_cache
+
     def post_load_prepare(self) -> None:
         if self.wd_qkv is None:
             q_weight = self.q_a_proj.weight.detach().cpu()
@@ -1788,7 +1797,10 @@ class GlmMLAAttention(nn.Module):
         k_pe = _rope_interleaved_to_neox(k_pe)
 
         q_index = index_k = weights = None
-        if context.needs_dsa_update and self.is_index_share_owner:
+        if (
+            (context.needs_dsa_update or context.mtp_index_cache_write)
+            and self.is_index_share_owner
+        ):
             q_index, index_k, weights = self._run_indexer(
                 hidden_states,
                 q_c,

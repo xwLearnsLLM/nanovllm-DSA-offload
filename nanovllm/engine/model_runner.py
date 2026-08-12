@@ -154,6 +154,12 @@ class ModelRunner:
         self.uses_separate_mtp_cache = bool(
             self.uses_offload and self.num_speculative_tokens
         )
+        self.uses_mtp_index_share = bool(
+            self.num_speculative_tokens
+            and getattr(
+                self.hf_config, "index_share_for_mtp_iteration", False
+            )
+        )
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
@@ -518,6 +524,21 @@ class ModelRunner:
                 ckv_cache.zero_()
                 kpe_cache.zero_()
                 module.assign_mla_cache(ckv_cache, kpe_cache)
+                if (
+                    self.uses_mtp_index_share
+                    and getattr(module, "uses_mtp_index_share", False)
+                ):
+                    index_cache = torch.zeros(
+                        (
+                            ckv_shape[1],
+                            self.block_size,
+                            1,
+                            int(text_config.index_head_dim),
+                        ),
+                        dtype=cache_dtype,
+                        device=self.device,
+                    )
+                    module.assign_mtp_index_cache(index_cache)
             return
 
         index_dim = int(text_config.index_head_dim)
@@ -645,6 +666,18 @@ class ModelRunner:
             dense_ckv.zero_()
             dense_kpe.zero_()
             module.assign_mla_cache(dense_ckv, dense_kpe)
+            if getattr(module, "uses_mtp_index_share", False):
+                mtp_index_cache = torch.zeros(
+                    (
+                        mtp_blocks,
+                        self.block_size,
+                        1,
+                        index_dim,
+                    ),
+                    dtype=cache_dtype,
+                    device=self.device,
+                )
+                module.assign_mtp_index_cache(mtp_index_cache)
             if self.rank == 0:
                 logger.info(
                     "MTP dense MLA cache: blocks=%d, CKV=%s, KPE=%s",
@@ -858,14 +891,19 @@ class ModelRunner:
     def _set_mtp_prefill_context(self, seqs: list[Sequence]) -> None:
         """Point the MTP layer at its independent dense cache during prefill."""
 
-        if not self.uses_separate_mtp_cache:
+        if not (self.uses_separate_mtp_cache or self.uses_mtp_index_share):
             return
         target_context = get_context()
         if target_context.cu_seqlens_q is None:
             raise RuntimeError("MTP prefill is missing target query lengths.")
         slots: list[int] = []
         for seq in seqs:
-            if not seq.mtp_block_table:
+            block_table = (
+                seq.mtp_block_table
+                if self.uses_separate_mtp_cache
+                else seq.hbm_block_table
+            )
+            if not block_table:
                 raise RuntimeError("MTP prefill has no dense MTP block table.")
             if self.config.prefill_chunk_size:
                 start = seq.num_prefill_tokens_processed
@@ -873,7 +911,7 @@ class ModelRunner:
             else:
                 start, end = 0, len(seq)
             slots.extend(
-                seq.mtp_block_table[position // self.block_size]
+                block_table[position // self.block_size]
                 * self.block_size
                 + position % self.block_size
                 for position in range(start, end)
@@ -886,8 +924,19 @@ class ModelRunner:
             cu_seqlens_q=target_context.cu_seqlens_q,
             flat_slot_mapping=flat_slots,
             flat_slot_mapping_i32=flat_slots.to(torch.int32),
+            flat_index_slot_mapping=(
+                flat_slots if self.uses_mtp_index_share else None
+            ),
             actual_seq_lengths_kv=target_context.actual_seq_lengths_kv,
-            block_tables=self.prepare_block_tables(seqs, "mtp_block_table"),
+            block_tables=self.prepare_block_tables(
+                seqs,
+                (
+                    "mtp_block_table"
+                    if self.uses_separate_mtp_cache
+                    else "hbm_block_table"
+                ),
+            ),
+            mtp_index_cache_write=self.uses_mtp_index_share,
         )
 
     def prepare_decode(

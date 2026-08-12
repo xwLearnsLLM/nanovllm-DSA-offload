@@ -25,6 +25,7 @@ class Context:
     candidate_query_lens: torch.Tensor | None = None
     lidu_cache_tokens: torch.Tensor | None = None
     needs_dsa_update: bool = False
+    mtp_index_cache_write: bool = False
     lidu_init_rows: torch.Tensor | None = None
     lidu_all_rows_ready: bool = False
     has_first_decode: bool = False
@@ -59,6 +60,7 @@ def set_context(
     candidate_query_lens=None,
     lidu_cache_tokens=None,
     needs_dsa_update=False,
+    mtp_index_cache_write=False,
     lidu_init_rows=None,
     lidu_all_rows_ready=False,
     has_first_decode=False,
@@ -84,6 +86,7 @@ def set_context(
         candidate_query_lens=candidate_query_lens,
         lidu_cache_tokens=lidu_cache_tokens,
         needs_dsa_update=bool(needs_dsa_update),
+        mtp_index_cache_write=bool(mtp_index_cache_write),
         lidu_init_rows=lidu_init_rows,
         lidu_all_rows_ready=bool(lidu_all_rows_ready),
         has_first_decode=bool(has_first_decode),
