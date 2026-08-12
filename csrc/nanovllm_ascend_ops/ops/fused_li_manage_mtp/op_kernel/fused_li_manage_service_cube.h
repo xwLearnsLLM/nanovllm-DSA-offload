@@ -62,6 +62,8 @@ public:
     static constexpr uint64_t QUERY_L0_BUFFER_OFFSET = M_BASIC_BLOCK_L0 * D_BASIC_BLOCK_L0;
     static constexpr uint64_t KEY_L0_BUFFER_OFFSET = S2_BASIC_BLOCK_L0 * D_BASIC_BLOCK_L0;
     static constexpr uint64_t L0C_BUFFER_OFFSET = M_BASIC_BLOCK_L0 * S2_BASIC_BLOCK_L0;
+    static constexpr uint64_t MTP_QUERY_COUNT = 4;
+    static constexpr uint64_t MTP_QUERY_ROWS = MTP_QUERY_COUNT * 32;
 
 protected:
     __aicore__ inline void Fixp(uint64_t s2GmOffset, uint64_t s2L0RealSize,
@@ -69,7 +71,7 @@ protected:
     __aicore__ inline void ComuteL0c(uint64_t s2L0RealSize);
     __aicore__ inline void LoadKeyToL0b(uint64_t s2L0Offset, uint64_t s2L1RealSize, uint64_t s2L0RealSize,
                                         const LICommon::RunInfo &runInfo);
-    __aicore__ inline void LoadQueryToL0a();
+    __aicore__ inline void LoadQueryToL0a(const LICommon::RunInfo &runInfo);
     __aicore__ inline void QueryNd2Nz(const LICommon::RunInfo &runInfo);
     __aicore__ inline void KeyNd2NzForPA(uint64_t s2L1RealSize, uint64_t s2GmOffset, const LICommon::RunInfo &runInfo);
     GlobalTensor<int32_t> blkTableGm_;
@@ -105,7 +107,9 @@ __aicore__ inline void LIMatmul<LIT>::InitParams(const ConstInfo &constInfo)
 template <typename LIT>
 __aicore__ inline void LIMatmul<LIT>::InitBuffers(TPipe *pipe)
 {
-    pipe->InitBuffer(bufQL1_, QUERY_BUFFER_OFFSET * sizeof(Q_T));
+    // Keep all four query rows for one request resident while preserving the
+    // original query-major execution and M=32 Cube path.
+    pipe->InitBuffer(bufQL1_, MTP_QUERY_ROWS * D_BASIC_BLOCK * sizeof(Q_T));
     queryL1_ = bufQL1_.Get<Q_T>();
     pipe->InitBuffer(bufKeyL1_, KEY_BUF_NUM * S2_BASIC_BLOCK * D_BASIC_BLOCK * sizeof(K_T));
     keyL1_ = bufKeyL1_.Get<K_T>();
@@ -143,7 +147,8 @@ __aicore__ inline void LIMatmul<LIT>::ComputeMm1(const LICommon::RunInfo &runInf
 
         SetFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
         WaitFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
-        if (runInfo.isFirstS2InnerLoop && s2GmOffset == 0) {
+        if (runInfo.isFirstS2InnerLoop && s2GmOffset == 0 &&
+            runInfo.queryIdx == 0U) {
             WaitFlag<HardEvent::MTE1_MTE2>(QUERY_MTE1_MTE2_EVENT);
             QueryNd2Nz(runInfo);
             SetFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
@@ -153,7 +158,7 @@ __aicore__ inline void LIMatmul<LIT>::ComputeMm1(const LICommon::RunInfo &runInf
             uint64_t s2L0RealSize =
                 s2L1Offset + S2_BASIC_BLOCK_L0 > s2L1RealSize ? s2L1RealSize - s2L1Offset : S2_BASIC_BLOCK_L0;
             WaitFlag<HardEvent::M_MTE1>(M_MTE1_EVENT + l0BufIdx_ % L0_BUF_NUM);
-            LoadQueryToL0a();
+            LoadQueryToL0a(runInfo);
             LoadKeyToL0b(s2L1Offset, s2L1RealSize, s2L0RealSize, runInfo);
             SetFlag<HardEvent::MTE1_M>(MTE1_M_EVENT);
             WaitFlag<HardEvent::MTE1_M>(MTE1_M_EVENT);
@@ -162,7 +167,9 @@ __aicore__ inline void LIMatmul<LIT>::ComputeMm1(const LICommon::RunInfo &runInf
             Fixp(s2GmOffset + s2L1Offset, s2L0RealSize, runInfo);
             l0BufIdx_++;
         }
-        if (s2GmOffset + S2_BASIC_BLOCK >= s2ProcessSize && runInfo.isLastS2InnerLoop) {
+        if (s2GmOffset + S2_BASIC_BLOCK >= s2ProcessSize &&
+            runInfo.isLastS2InnerLoop &&
+            runInfo.queryIdx + 1U == MTP_QUERY_COUNT) {
             SetFlag<HardEvent::MTE1_MTE2>(QUERY_MTE1_MTE2_EVENT);
         }
 
@@ -223,12 +230,18 @@ __aicore__ inline void LIMatmul<LIT>::QueryNd2Nz(const LICommon::RunInfo &runInf
     nd2nzPara.dstNzNStride = 1;
     nd2nzPara.srcNdMatrixStride = 0;
     nd2nzPara.dstNzMatrixStride = 0;
-    DataCopy(queryL1_, queryGm_[static_cast<uint64_t>(runInfo.queryRow) * constInfo_.qHeadNum * constInfo_.headDim],
-             nd2nzPara);
+    uint64_t firstQueryRow = static_cast<uint64_t>(runInfo.bIdx) * MTP_QUERY_COUNT;
+    uint64_t queryElements = constInfo_.qHeadNum * constInfo_.headDim;
+    for (uint32_t queryIdx = 0; queryIdx < MTP_QUERY_COUNT; ++queryIdx) {
+        DataCopy(queryL1_[static_cast<uint64_t>(queryIdx) * queryElements],
+                 queryGm_[(firstQueryRow + queryIdx) * queryElements],
+                 nd2nzPara);
+    }
 }
 
 template <typename LIT>
-__aicore__ inline void LIMatmul<LIT>::LoadQueryToL0a()
+__aicore__ inline void LIMatmul<LIT>::LoadQueryToL0a(
+    const LICommon::RunInfo &runInfo)
 {
     LoadData3DParamsV2<Q_T> loadData3DParams;
     loadData3DParams.l1H = CeilDiv(constInfo_.qHeadNum, static_cast<uint64_t>(BLOCK_CUBE));
@@ -255,8 +268,11 @@ __aicore__ inline void LIMatmul<LIT>::LoadQueryToL0a()
     loadData3DParams.enTranspose = 0;
     loadData3DParams.fMatrixCtrl = 0;
 
-    LoadData<Q_T, LOAD3DV2_CONFIG>(queryL0_[(l0BufIdx_ % L0_BUF_NUM) * QUERY_L0_BUFFER_OFFSET], queryL1_,
-                                   loadData3DParams);
+    uint64_t queryL1Offset = static_cast<uint64_t>(runInfo.queryIdx) *
+                             constInfo_.qHeadNum * constInfo_.headDim;
+    LoadData<Q_T, LOAD3DV2_CONFIG>(
+        queryL0_[(l0BufIdx_ % L0_BUF_NUM) * QUERY_L0_BUFFER_OFFSET],
+        queryL1_[queryL1Offset], loadData3DParams);
 }
 
 template <typename LIT>
@@ -340,4 +356,3 @@ __aicore__ inline void LIMatmul<LIT>::FreeEventID()
 }
 } // namespace LIKernel
 #endif
-
