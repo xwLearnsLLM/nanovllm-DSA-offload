@@ -222,21 +222,17 @@ template <typename LIT>
 __aicore__ inline void LIMatmul<LIT>::QueryNd2Nz(const LICommon::RunInfo &runInfo)
 {
     Nd2NzParams nd2nzPara;
-    nd2nzPara.ndNum = 1;
+    nd2nzPara.ndNum = MTP_QUERY_COUNT;
     nd2nzPara.nValue = constInfo_.qHeadNum;
     nd2nzPara.dValue = constInfo_.headDim;
     nd2nzPara.srcDValue = constInfo_.headDim;
     nd2nzPara.dstNzC0Stride = CeilAlign(constInfo_.qHeadNum, static_cast<uint64_t>(BLOCK_CUBE));
     nd2nzPara.dstNzNStride = 1;
-    nd2nzPara.srcNdMatrixStride = 0;
-    nd2nzPara.dstNzMatrixStride = 0;
-    uint64_t firstQueryRow = static_cast<uint64_t>(runInfo.bIdx) * MTP_QUERY_COUNT;
     uint64_t queryElements = constInfo_.qHeadNum * constInfo_.headDim;
-    for (uint32_t queryIdx = 0; queryIdx < MTP_QUERY_COUNT; ++queryIdx) {
-        DataCopy(queryL1_[static_cast<uint64_t>(queryIdx) * queryElements],
-                 queryGm_[(firstQueryRow + queryIdx) * queryElements],
-                 nd2nzPara);
-    }
+    nd2nzPara.srcNdMatrixStride = queryElements;
+    nd2nzPara.dstNzMatrixStride = queryElements;
+    uint64_t firstQueryRow = static_cast<uint64_t>(runInfo.bIdx) * MTP_QUERY_COUNT;
+    DataCopy(queryL1_, queryGm_[firstQueryRow * queryElements], nd2nzPara);
 }
 
 template <typename LIT>
