@@ -1908,7 +1908,19 @@ class ModelRunner:
                 mtp_index_share,
             )
         else:
-            if self.config.glm_version == "5.2":
+            if self.uses_offload:
+                # The MTP3 offload operators consume the complete B*4
+                # verification batch so LIM can protect its four-query union.
+                (
+                    target_tokens,
+                    accepted_counts,
+                    next_token_ids,
+                    selected_hidden_states,
+                    selected_positions,
+                ) = self._mtp_target_forward(
+                    input_ids, positions, draft_token_ids
+                )
+            elif self.config.glm_version == "5.2":
                 (
                     target_tokens,
                     accepted_counts,

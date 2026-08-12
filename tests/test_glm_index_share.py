@@ -720,9 +720,9 @@ def test_glm52_offload_split_config_builds_index_share_groups(tmp_path):
     assert len(groups.shared_layer_idxs) == 57
 
 
-def test_glm52_offload_split_rejects_mtp3(tmp_path):
+def test_glm52_offload_split_mtp3_requires_mtp_checkpoint(tmp_path):
     _write_glm52_config(tmp_path)
-    with pytest.raises(ValueError, match="MTP offload"):
+    with pytest.raises(ValueError, match="num_nextn_predict_layers"):
         _make_config(
             tmp_path,
             offload_mode="offload_split",

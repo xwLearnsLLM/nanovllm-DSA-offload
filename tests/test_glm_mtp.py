@@ -564,13 +564,37 @@ def test_glm52_mtp_runtime_accepts_quantized_nonoffload_eager(tmp_path):
     assert config.hf_config.nanovllm_mtp_uses_w4a8_experts is True
 
 
-def test_glm52_mtp_runtime_rejects_offload(tmp_path):
+def test_glm52_mtp_runtime_accepts_split_offload_eager(tmp_path):
     _write_glm52_mtp_config(tmp_path)
 
-    with pytest.raises(ValueError, match="MTP offload"):
+    config = _mtp_config(
+        tmp_path,
+        offload_mode="offload_split",
+        kvcache_block_size=128,
+        num_dram_kvcache_blocks=64,
+    )
+
+    assert config.offload_mode == "offload_split"
+
+
+@pytest.mark.parametrize(
+    ("offload_mode", "enforce_eager", "message"),
+    [
+        ("offload_fuse", True, "offload_split only"),
+        ("offload_split", False, "graph mode"),
+    ],
+)
+def test_glm52_mtp_runtime_rejects_unimplemented_offload_modes(
+    tmp_path, offload_mode, enforce_eager, message
+):
+    _write_glm52_mtp_config(tmp_path)
+
+    with pytest.raises(ValueError, match=message):
         _mtp_config(
             tmp_path,
-            offload_mode="offload_split",
+            offload_mode=offload_mode,
+            enforce_eager=enforce_eager,
+            kvcache_block_size=128,
             num_dram_kvcache_blocks=64,
         )
 

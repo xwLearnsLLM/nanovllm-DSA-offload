@@ -1413,11 +1413,18 @@ class GlmMLAAttention(nn.Module):
 
     def _lidu_update_mtp(
         self,
-        q_index: torch.Tensor,
-        weights: torch.Tensor,
+        q_index: torch.Tensor | None,
+        weights: torch.Tensor | None,
         batch_size: int,
     ) -> _MtpLiduUpdateResult:
         """Update one request cache from the union of its four MTP queries."""
+
+        if not self.is_index_share_owner:
+            return self._lidu_update_mtp_shared(batch_size)
+        if q_index is None or weights is None:
+            raise RuntimeError(
+                "MTP-LIDU owner layer requires indexer outputs."
+            )
 
         context = get_context()
         required = {
@@ -1538,12 +1545,85 @@ class GlmMLAAttention(nn.Module):
             miss_counts,
         )
 
+    def _lidu_update_mtp_shared(
+        self,
+        batch_size: int,
+    ) -> _MtpLiduUpdateResult:
+        """Consume the owner MTP-LIM union with this layer's own KV cache."""
+
+        context = get_context()
+        owner = self._index_share_owner
+        if owner is None:
+            raise RuntimeError(
+                "MTP IndexShare shared layer has no owner reference."
+            )
+        buffers = owner._fused_li_manage_mtp_outputs.get(batch_size)
+        if buffers is None:
+            raise RuntimeError(
+                "MTP IndexShare shared layer ran before its owner LIM "
+                f"update for batch_size={batch_size}."
+            )
+        (
+            topk_src_ids,
+            topk_dst_slots,
+            miss_src_ids,
+            miss_dst_slots,
+            miss_counts,
+        ) = buffers
+        hbm_kpe = self.kpe_cache.squeeze(2)
+        hbm_ckv = self.ckv_cache.squeeze(2)
+        dram_kpe = self.dram_kpe_cache.squeeze(2)
+        dram_ckv = self.dram_ckv_cache.squeeze(2)
+
+        init_rows = context.lidu_init_rows
+        if init_rows is not None and init_rows.numel() > 0:
+            if context.full_decode_graph:
+                raise RuntimeError("MTP-LIDU initialization must remain eager.")
+            for row in init_rows.detach().cpu().tolist():
+                row = int(row)
+                pool_entry = int(context.req_pool_entries[row].item())
+                cache_tokens = int(context.lidu_cache_tokens[row].item())
+                hbm_kpe, hbm_ckv = initialize_lidu_row_shared(
+                    cache_slots_row=self.lidu_cache_slots[pool_entry],
+                    cache_tokens=cache_tokens,
+                    hbm_kpe=hbm_kpe,
+                    hbm_ckv=hbm_ckv,
+                    dram_kpe=dram_kpe,
+                    dram_ckv=dram_ckv,
+                    hbm_block_table=context.block_tables[row],
+                    dram_block_table=context.dram_block_tables[row],
+                )
+
+        if not self._can_use_fused_copy_sfa():
+            scatter_copy(
+                miss_src_ids,
+                miss_dst_slots,
+                miss_counts[:batch_size],
+                context.block_tables[:batch_size],
+                context.dram_block_tables[:batch_size],
+                hbm_kpe,
+                hbm_ckv,
+                dram_kpe,
+                dram_ckv,
+            )
+        if self._lidu_miss_count_collect_all:
+            self._record_lidu_miss_counts(miss_counts, batch_size)
+        return (
+            hbm_kpe,
+            hbm_ckv,
+            topk_dst_slots,
+            topk_src_ids,
+            miss_src_ids,
+            miss_dst_slots,
+            miss_counts,
+        )
+
     def _spec_decode_forward_lidu(
         self,
         ql_nope: torch.Tensor,
         q_pe: torch.Tensor,
-        q_index: torch.Tensor,
-        weights: torch.Tensor,
+        q_index: torch.Tensor | None,
+        weights: torch.Tensor | None,
     ) -> torch.Tensor:
         """Run eager MTP3 target verification through the offload chain."""
 
@@ -1937,7 +2017,10 @@ class GlmMLAAttention(nn.Module):
 
         if context.is_spec_decode:
             if self.uses_offload and context.needs_dsa_update:
-                if q_index is None or weights is None:
+                if (
+                    self.is_index_share_owner
+                    and (q_index is None or weights is None)
+                ):
                     raise RuntimeError(
                         "MTP-LIDU verification requires indexer outputs."
                     )

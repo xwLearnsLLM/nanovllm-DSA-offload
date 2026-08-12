@@ -10,6 +10,7 @@ from nanovllm.engine.dsa_offload import (
     LIDU_MAX_SOURCE_TOKENS,
     LIDU_OFFLOAD_MODES,
     OFFLOAD_NONE,
+    OFFLOAD_SPLIT,
     IndexShareGroupManager,
     normalize_offload_mode,
     validate_lidu_cache_token_budgets,
@@ -293,10 +294,16 @@ class Config:
         if self.glm_version != GLM_VERSION_52:
             return
         if self.num_speculative_tokens and self.offload_mode != OFFLOAD_NONE:
-            raise ValueError(
-                "GLM-5.2 MTP offload is implemented in a later phase; set "
-                "offload_mode=none."
-            )
+            if self.offload_mode != OFFLOAD_SPLIT:
+                raise ValueError(
+                    "GLM-5.2 MTP offload currently supports "
+                    "offload_mode=offload_split only."
+                )
+            if not self.enforce_eager:
+                raise ValueError(
+                    "GLM-5.2 MTP offload graph mode is implemented in a "
+                    "later phase; set enforce_eager=True."
+                )
     def _configure_decode_graph(self) -> None:
         # There are exactly two execution modes. Prefill and first decode are
         # always eager; enforce_eager controls steady-state decode.
