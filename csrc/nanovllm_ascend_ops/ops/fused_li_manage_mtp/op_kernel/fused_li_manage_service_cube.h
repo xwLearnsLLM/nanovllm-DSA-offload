@@ -139,6 +139,7 @@ __aicore__ inline void LIMatmul<LIT>::ComputeMm1(const LICommon::RunInfo &runInf
 {
     uint64_t s2GmBaseOffset = runInfo.s2Idx * constInfo_.s2BaseSize;
     uint64_t s2ProcessSize = runInfo.actualSingleProcessSInnerSize;
+    uint64_t queryL0LoadCount = 0;
     for (uint64_t s2GmOffset = 0; s2GmOffset < s2ProcessSize; s2GmOffset += S2_BASIC_BLOCK) {
         WaitFlag<HardEvent::MTE1_MTE2>(KEY_MTE1_MTE2_EVENT + keyL1BufIdx_ % KEY_BUF_NUM);
         uint64_t s2L1RealSize =
@@ -158,7 +159,13 @@ __aicore__ inline void LIMatmul<LIT>::ComputeMm1(const LICommon::RunInfo &runInf
             uint64_t s2L0RealSize =
                 s2L1Offset + S2_BASIC_BLOCK_L0 > s2L1RealSize ? s2L1RealSize - s2L1Offset : S2_BASIC_BLOCK_L0;
             WaitFlag<HardEvent::M_MTE1>(M_MTE1_EVENT + l0BufIdx_ % L0_BUF_NUM);
-            LoadQueryToL0a(runInfo);
+            // The query is unchanged across all S2 chunks. Populate each L0A
+            // buffer once in the first chunk, then only rotate the resident
+            // copies while streaming new Key tiles through L0B.
+            if (runInfo.isFirstS2InnerLoop && queryL0LoadCount < L0_BUF_NUM) {
+                LoadQueryToL0a(runInfo);
+                queryL0LoadCount++;
+            }
             LoadKeyToL0b(s2L1Offset, s2L1RealSize, s2L0RealSize, runInfo);
             SetFlag<HardEvent::MTE1_M>(MTE1_M_EVENT);
             WaitFlag<HardEvent::MTE1_M>(MTE1_M_EVENT);
