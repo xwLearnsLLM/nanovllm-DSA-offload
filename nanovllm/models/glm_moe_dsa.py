@@ -400,8 +400,17 @@ class GlmW4A8SparseMoeBlock(nn.Module):
             group_list=expert_tokens,
             output_dtype=torch.bfloat16,
         )[0]
-        activated = torch_npu.npu_swiglu(gate_up)
-        activated, activated_scale = torch_npu.npu_dynamic_quant(activated)
+        # w13 stores [gate, up], so activate the left (gate) half.  The
+        # count-mode expert token list also prevents the fused operator from
+        # touching rows outside the active local-expert groups.
+        activated, activated_scale = torch_npu.npu_swiglu_quant(
+            gate_up,
+            group_index=expert_tokens,
+            activate_left=True,
+            quant_mode=1,
+            group_list_type=1,
+            dst_type=torch.int8,
+        )
         routed_output = torch_npu.npu_grouped_matmul(
             x=[activated],
             weight=[self.w2_weight],
