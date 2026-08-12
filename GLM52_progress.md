@@ -20,8 +20,8 @@
 - 阶段 0、阶段 1 和阶段 2 均已完成并通过当前范围内的验收；阶段 2 的实现提交为 `15f1a7f`，后续修复为 `f9f4123` 和 `7c77e81`。
 - 阶段 2 昇腾整网已覆盖 21K、40K 和 64K 的 `MTP0 + offload_split + eager`。21K 和 64K 与 `none` 的 token IDs 完全一致；40K 在后续 greedy token 上存在稀疏 top-2048 + dense-tail Attention 的预期近似分叉。
 - 40K eager profile 确认每个 stable decode step 为 21 次 LIM、78 次 SCATTER、78 次 SFA；同一 IndexShare group 内的 miss metadata 一致，KV payload 仍按层独立。
-- 阶段 3（MTP0 + offload_fuse + eager）已完成并通过验收；阶段 4（MTP0 full-decode-only graph）也已完成并通过验收。GLM-5.2 允许 `offload_mode=none/offload_split/offload_fuse`、`MTP0`、eager 和 stable full-decode-only graph；MTP3 仍明确报错。
-- 阶段 4 仅改 Python 图调度与能力门禁，不需要重新编译 Ascend 自定义算子；下一阶段为 GLM-5.2 量化 MTP layer 的 nonoffload eager bring-up。
+- 阶段 3（MTP0 + offload_fuse + eager）和阶段 4（MTP0 full-decode-only graph）均已完成并通过验收。阶段 5 已打通 `MTP3 + offload_mode=none + eager`，并完成 21K、40K、64K 的 K=0/K=3 token 对齐验收。
+- 阶段 5 仅改 Python 模型加载、调度与 target 验证，不需要重新编译 Ascend 自定义算子；下一阶段为 MTP3 nonoffload full-decode-only graph。
 
 相关文档：[`README.md`](README.md)、[`README_ops.md`](README_ops.md)、[`TODO.md`](TODO.md)。
 
@@ -477,4 +477,21 @@ CPU/UT：IndexShare 39 passed / 1 skipped；DSA offload 39 passed（历史 8.2K 
   - 21K fuse：token IDs 为 [39, 672, 339, 1512, 19836, 154827, 39, 672, 339, 1512, 19836, 154842, 39, 672, 339, 1512, 19836]
 profile/性能：split 为 21 次 LIM、78 次 SCATTER、78 次 SFA；fuse 为 21 次 LIM、78 次 COPYSFA。profile 运行包含 lazy capture 与 profiler 开销，尚未记录 GLM-5.1/GLM-5.2 稳定 TPOT 对比
 结论与下一步：阶段 4 验收通过；进入阶段 5（GLM-5.2 量化 MTP layer，先打通 MTP3 + none + eager）
+```
+
+### 阶段 5：GLM-5.2 量化 MTP layer，MTP3 + none + eager
+
+```text
+日期：2026-08-12
+阶段：5（MTP3 + none + eager）
+commit：e6dcd07；语义修复 4116711
+代码状态：已完成，仅改 Python，无需重编算子
+CPU/UT：MTP、IndexShare、DSA offload 联合回归 134 passed / 1 skipped（历史 8.2K 预算断言单独排除）；MTP + full-decode graph 回归 77 passed
+实现：GLM-5.2 第 78 层复用 W4A8 routed-expert 加载与执行路径；其余 dense 权重继续走 W8A8 通用加载。GLM-5.2 eager target verification 改为逐 token ordinary decode，保证 partial reject 后与 K=0 的因果 cache 语义一致
+昇腾整网：通过
+  - MTP3 + none + eager 覆盖 21K、40K、64K
+  - K=3 与 K=0 的 token IDs 在相同 completion 范围内逐位一致；40K K=3 的 35 个 token 与 K=0 前 35 个 token 一致
+  - K=3 的 max_steps 统计 decode 调度轮次，每轮最多提交 4 个 token；因此不能用相同 max_steps 比较 K=0/K=3 的输出长度
+profile/性能：本阶段串行 target verification 优先保证语义，暂不以 eager TPOT 作为性能结论
+结论与下一步：阶段 5 eager 验收通过；进入阶段 6（MTP3 + none full-decode-only graph）
 ```
