@@ -1853,7 +1853,10 @@ class GlmMLAAttention(nn.Module):
             dsa_updated = False
             cache_aliases = None
             if needs_decode_dsa_update and self.is_index_share_owner:
-                if context.full_decode_graph:
+                if (
+                    context.full_decode_graph
+                    and not self.uses_mtp_index_share
+                ):
                     cache_aliases = self._run_dsa_pipeline_with_qc_full_graph(
                         hidden_states,
                         q_c,

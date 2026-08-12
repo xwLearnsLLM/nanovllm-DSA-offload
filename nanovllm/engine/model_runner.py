@@ -1230,6 +1230,7 @@ class ModelRunner:
         *,
         has_first_decode: bool = False,
         index_share: _MtpIndexShareMetadata | None = None,
+        actual_seq_lengths_kv_tensor: torch.Tensor | None = None,
     ) -> None:
         batch_size = int(positions.numel())
         slots = self._slots_from_positions(block_tables, positions)
@@ -1241,7 +1242,7 @@ class ModelRunner:
                 "MTP recurrence KV-length batch changed: "
                 f"expected={batch_size}, actual={len(actual_seq_lengths_kv)}."
             )
-        if index_share is not None:
+        if index_share is not None and actual_seq_lengths_kv_tensor is None:
             if int(index_share.block_tables.shape[0]) != batch_size:
                 raise ValueError("MTP IndexShare metadata batch changed.")
             actual_seq_lengths_kv_tensor = torch.tensor(
@@ -1249,7 +1250,7 @@ class ModelRunner:
                 dtype=torch.int32,
                 device=self.device,
             )
-        else:
+        elif index_share is None:
             actual_seq_lengths_kv_tensor = None
         set_context(
             False,
@@ -1297,6 +1298,7 @@ class ModelRunner:
         actual_seq_lengths_by_step: list[list[int]] | None = None,
         balanced_route_offset: int | None = None,
         index_share: _MtpIndexShareMetadata | None = None,
+        actual_seq_lengths_tensors_by_step: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
         mtp = getattr(self.model, "mtp", None)
         if mtp is None:
@@ -1308,6 +1310,13 @@ class ModelRunner:
             raise ValueError(
                 "MTP recurrence requires one KV-length row per step: "
                 f"steps={steps}, rows={len(actual_seq_lengths_by_step)}."
+            )
+        if (
+            actual_seq_lengths_tensors_by_step is not None
+            and len(actual_seq_lengths_tensors_by_step) != steps
+        ):
+            raise ValueError(
+                "MTP recurrence requires one graph KV tensor per step."
             )
         drafts: list[torch.Tensor] = []
         try:
@@ -1323,6 +1332,11 @@ class ModelRunner:
                     positions,
                     actual_seq_lengths_kv=seq_lengths,
                     index_share=index_share,
+                    actual_seq_lengths_kv_tensor=(
+                        None
+                        if actual_seq_lengths_tensors_by_step is None
+                        else actual_seq_lengths_tensors_by_step[step]
+                    ),
                 )
                 if balanced_route_offset is not None:
                     moe = mtp.mtp_block.mlp
@@ -1380,21 +1394,17 @@ class ModelRunner:
         if not is_last_chunk:
             return None
 
-        # Graph drafting will gain its own fixed-address MTP IndexShare
-        # metadata in the following phase. Keep its prefill dense meanwhile
-        # so an established graph run never mixes dense and sparse drafts.
-        mtp_index_share = (
-            self._mtp_index_share_metadata(seqs)
-            if self.decode_graph_manager is None
-            else None
-        )
-        if mtp_index_share is not None:
+        mtp_index_share_metadata = self._mtp_index_share_metadata(seqs)
+        if mtp_index_share_metadata is not None:
             mtp.mtp_block.self_attn.initialize_mtp_index_share_rows(
                 [seq.mtp_index_pool_entry for seq in seqs],
                 [seq.mtp_lidu_cache_tokens for seq in seqs],
             )
             for seq in seqs:
                 seq.mtp_lidu_cache_initialized = True
+        # Prefill is eager even when stable decode uses a graph, so it can
+        # directly consume the just-built MTP IndexShare metadata.
+        mtp_index_share = mtp_index_share_metadata
 
         draft_eligible = [
             len(seq) + 2 * self.num_speculative_tokens
@@ -1768,7 +1778,20 @@ class ModelRunner:
         selected_hidden_states: torch.Tensor,
         block_tables: torch.Tensor,
         actual_seq_lengths_by_step: list[list[int]],
+        graph_index_share: Any | None = None,
     ) -> torch.Tensor:
+        index_share = None
+        actual_seq_lengths_tensors_by_step = None
+        if graph_index_share is not None:
+            index_share = _MtpIndexShareMetadata(
+                block_tables=graph_index_share.mtp_index_block_tables,
+                req_pool_entries=graph_index_share.mtp_req_pool_entries,
+                candidate_lens=graph_index_share.mtp_candidate_lens,
+                lidu_cache_tokens=graph_index_share.mtp_lidu_cache_tokens,
+            )
+            actual_seq_lengths_tensors_by_step = (
+                graph_index_share.mtp_actual_seq_lengths_by_step
+            )
         return self._run_mtp_recurrence(
             next_token_ids,
             selected_positions,
@@ -1776,6 +1799,10 @@ class ModelRunner:
             block_tables,
             self.num_speculative_tokens,
             actual_seq_lengths_by_step=actual_seq_lengths_by_step,
+            index_share=index_share,
+            actual_seq_lengths_tensors_by_step=(
+                actual_seq_lengths_tensors_by_step
+            ),
         )
 
     def _mtp_draft_graph_eager_warmup(
@@ -1785,6 +1812,7 @@ class ModelRunner:
         selected_hidden_states: torch.Tensor,
         block_tables: torch.Tensor,
         actual_seq_lengths_by_step: list[list[int]],
+        graph_index_share: Any | None = None,
     ) -> int:
         mtp = getattr(self.model, "mtp", None)
         if mtp is None:
@@ -1804,6 +1832,27 @@ class ModelRunner:
                 self.num_speculative_tokens,
                 actual_seq_lengths_by_step=actual_seq_lengths_by_step,
                 balanced_route_offset=pass_index * routes_per_pass,
+                index_share=(
+                    None
+                    if graph_index_share is None
+                    else _MtpIndexShareMetadata(
+                        block_tables=graph_index_share.mtp_index_block_tables,
+                        req_pool_entries=(
+                            graph_index_share.mtp_req_pool_entries
+                        ),
+                        candidate_lens=(
+                            graph_index_share.mtp_candidate_lens
+                        ),
+                        lidu_cache_tokens=(
+                            graph_index_share.mtp_lidu_cache_tokens
+                        ),
+                    )
+                ),
+                actual_seq_lengths_tensors_by_step=(
+                    None
+                    if graph_index_share is None
+                    else graph_index_share.mtp_actual_seq_lengths_by_step
+                ),
             )
             torch.npu.synchronize()
         reset_context()
@@ -1856,6 +1905,7 @@ class ModelRunner:
                 get_context(),
                 base_seq_lengths,
                 mtp_block_tables,
+                mtp_index_share,
             )
         else:
             if self.config.glm_version == "5.2":

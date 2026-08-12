@@ -784,6 +784,11 @@ class MTPDecodeGraphEntry:
     cu_seqlens_q: torch.Tensor
     block_tables: torch.Tensor
     mtp_block_tables: torch.Tensor
+    mtp_index_block_tables: torch.Tensor
+    mtp_req_pool_entries: torch.Tensor
+    mtp_candidate_lens: torch.Tensor
+    mtp_lidu_cache_tokens: torch.Tensor
+    mtp_actual_seq_lengths_by_step: list[torch.Tensor]
     actual_seq_lengths_kv: torch.Tensor
     index_block_tables: torch.Tensor
     dram_block_tables: torch.Tensor
@@ -861,6 +866,25 @@ class MTPDecodeGraphEntry:
                 dtype=torch.int32,
                 device=device,
             ),
+            mtp_index_block_tables=torch.zeros(
+                batch_size,
+                max_block_columns,
+                dtype=torch.int32,
+                device=device,
+            ),
+            mtp_req_pool_entries=torch.zeros(
+                batch_size, dtype=torch.int32, device=device
+            ),
+            mtp_candidate_lens=torch.zeros(
+                batch_size, dtype=torch.int32, device=device
+            ),
+            mtp_lidu_cache_tokens=torch.zeros(
+                batch_size, dtype=torch.int32, device=device
+            ),
+            mtp_actual_seq_lengths_by_step=[
+                torch.zeros(batch_size, dtype=torch.int32, device=device)
+                for _ in range(speculative_tokens)
+            ],
             actual_seq_lengths_kv=torch.zeros(
                 batch_size, dtype=torch.int32, device=device
             ),
@@ -921,6 +945,7 @@ class MTPDecodeGraphEntry:
         draft_token_ids: torch.Tensor,
         context: Context,
         mtp_block_tables: torch.Tensor | None = None,
+        mtp_index_share: Any | None = None,
         *,
         offload_mode: str = OFFLOAD_NONE,
     ) -> None:
@@ -1002,6 +1027,44 @@ class MTPDecodeGraphEntry:
                 mtp_block_tables,
                 "mtp_block_tables",
             )
+            if mtp_index_share is not None:
+                required = {
+                    "block_tables": getattr(
+                        mtp_index_share, "block_tables", None
+                    ),
+                    "req_pool_entries": getattr(
+                        mtp_index_share, "req_pool_entries", None
+                    ),
+                    "candidate_lens": getattr(
+                        mtp_index_share, "candidate_lens", None
+                    ),
+                    "lidu_cache_tokens": getattr(
+                        mtp_index_share, "lidu_cache_tokens", None
+                    ),
+                }
+                missing = [
+                    name for name, value in required.items()
+                    if value is None
+                ]
+                if missing:
+                    raise RuntimeError(
+                        "MTP graph IndexShare metadata is missing: "
+                        + ", ".join(missing)
+                    )
+                self._copy_table(
+                    self.mtp_index_block_tables,
+                    required["block_tables"],
+                    "mtp_index_block_tables",
+                )
+                self.mtp_req_pool_entries.copy_(
+                    required["req_pool_entries"]
+                )
+                self.mtp_candidate_lens.copy_(
+                    required["candidate_lens"]
+                )
+                self.mtp_lidu_cache_tokens.copy_(
+                    required["lidu_cache_tokens"]
+                )
             if stateful_offload:
                 self._copy_table(
                     self.index_block_tables,
@@ -1023,6 +1086,25 @@ class MTPDecodeGraphEntry:
             self.metadata_refresh_count += 1
         else:
             self.metadata_reuse_count += 1
+
+    def stage_mtp_actual_seq_lengths(
+        self,
+        values_by_step: list[list[int]],
+    ) -> None:
+        if len(values_by_step) != self.speculative_tokens:
+            raise ValueError("MTP graph draft length step count changed.")
+        for destination, values in zip(
+            self.mtp_actual_seq_lengths_by_step, values_by_step
+        ):
+            if len(values) != self.batch_size:
+                raise ValueError("MTP graph draft length batch changed.")
+            destination.copy_(
+                torch.tensor(
+                    values,
+                    dtype=torch.int32,
+                    device=destination.device,
+                )
+            )
 
 
 class MTPDecodeOnlyGraphManager:
@@ -1277,13 +1359,17 @@ class MTPDecodeOnlyGraphManager:
         self,
         entry: MTPDecodeGraphEntry,
         draft_seq_lengths: list[list[int]],
+        *,
+        use_mtp_index_share: bool = False,
     ) -> None:
-        if len(entry.draft_tasks) != len(draft_seq_lengths):
+        if len(entry.draft_tasks) not in (0, len(draft_seq_lengths)):
             raise RuntimeError(
                 "MTP draft graph task count changed before replay: "
                 f"tasks={len(entry.draft_tasks)}, "
                 f"steps={len(draft_seq_lengths)}."
             )
+        if use_mtp_index_share:
+            entry.stage_mtp_actual_seq_lengths(draft_seq_lengths)
         entry.draft_graph.replay()
         with torch.npu.stream(self._update_stream):
             for task, seq_lengths in zip(
@@ -1297,6 +1383,44 @@ class MTPDecodeOnlyGraphManager:
         self.target_replay_count += 1
         self.draft_replay_count += 1
 
+    def _call_draft_forward(
+        self,
+        entry: MTPDecodeGraphEntry,
+        draft_seq_lengths: list[list[int]],
+        *,
+        use_mtp_index_share: bool,
+    ) -> torch.Tensor:
+        args = (
+            entry.next_token_ids,
+            entry.selected_positions,
+            entry.selected_hidden_states,
+            entry.mtp_block_tables,
+            draft_seq_lengths,
+        )
+        if use_mtp_index_share:
+            return self.draft_forward(*args, entry)
+        return self.draft_forward(*args)
+
+    def _call_draft_warmup(
+        self,
+        entry: MTPDecodeGraphEntry,
+        draft_seq_lengths: list[list[int]],
+        *,
+        use_mtp_index_share: bool,
+    ) -> int:
+        if self.draft_warmup is None:
+            return 0
+        args = (
+            entry.next_token_ids,
+            entry.selected_positions,
+            entry.selected_hidden_states,
+            entry.mtp_block_tables,
+            draft_seq_lengths,
+        )
+        if use_mtp_index_share:
+            return self.draft_warmup(*args, entry)
+        return self.draft_warmup(*args)
+
     def _capture(
         self,
         entry: MTPDecodeGraphEntry,
@@ -1306,6 +1430,7 @@ class MTPDecodeOnlyGraphManager:
         runtime_context: Context,
         base_seq_lengths: list[int],
         mtp_block_tables: torch.Tensor | None = None,
+        mtp_index_share: Any | None = None,
     ) -> None:
         self._ensure_capture_resources()
         distributed = dist.is_initialized() and dist.get_world_size() > 1
@@ -1320,6 +1445,7 @@ class MTPDecodeOnlyGraphManager:
                     draft_token_ids,
                     runtime_context,
                     mtp_block_tables,
+                    mtp_index_share,
                     offload_mode=self.offload_mode,
                 )
                 target_seq_lengths = self._target_seq_lengths(
@@ -1334,6 +1460,7 @@ class MTPDecodeOnlyGraphManager:
                         draft_token_ids,
                         runtime_context,
                         mtp_block_tables,
+                        mtp_index_share,
                         offload_mode=self.offload_mode,
                     )
                     self._set_target_context(entry, target_seq_lengths)
@@ -1381,21 +1508,19 @@ class MTPDecodeOnlyGraphManager:
                     accepted_counts,
                     self.speculative_tokens,
                 )
+                if mtp_index_share is not None:
+                    entry.stage_mtp_actual_seq_lengths(draft_seq_lengths)
                 if self.draft_warmup is not None:
-                    self.draft_warmup(
-                        entry.next_token_ids,
-                        entry.selected_positions,
-                        entry.selected_hidden_states,
-                        entry.mtp_block_tables,
+                    self._call_draft_warmup(
+                        entry,
                         draft_seq_lengths,
+                        use_mtp_index_share=mtp_index_share is not None,
                     )
                 else:
-                    self.draft_forward(
-                        entry.next_token_ids,
-                        entry.selected_positions,
-                        entry.selected_hidden_states,
-                        entry.mtp_block_tables,
+                    self._call_draft_forward(
+                        entry,
                         draft_seq_lengths,
+                        use_mtp_index_share=mtp_index_share is not None,
                     )
                 torch.npu.synchronize()
                 gc.collect()
@@ -1407,18 +1532,19 @@ class MTPDecodeOnlyGraphManager:
                     with torch.npu.graph(
                         entry.draft_graph, pool=self._graph_pool
                     ):
-                        entry.next_drafts = self.draft_forward(
-                            entry.next_token_ids,
-                            entry.selected_positions,
-                            entry.selected_hidden_states,
-                            entry.mtp_block_tables,
+                        entry.next_drafts = self._call_draft_forward(
+                            entry,
                             draft_seq_lengths,
+                            use_mtp_index_share=mtp_index_share is not None,
                         )
                 torch.npu.synchronize()
-                if len(entry.draft_tasks) != self.speculative_tokens:
+                expected_draft_tasks = (
+                    0 if mtp_index_share is not None else self.speculative_tokens
+                )
+                if len(entry.draft_tasks) != expected_draft_tasks:
                     raise RuntimeError(
                         "MTP draft graph captured an unexpected number of FIA "
-                        f"tasks: expected={self.speculative_tokens}, "
+                        f"tasks: expected={expected_draft_tasks}, "
                         f"actual={len(entry.draft_tasks)}."
                     )
                 if tuple(entry.next_drafts.shape) != (
@@ -1431,7 +1557,11 @@ class MTPDecodeOnlyGraphManager:
                     )
                 # For the same reason, the capture step returns only the first
                 # real replay of the draft graph, never capture-time storage.
-                self._replay_draft_graph(entry, draft_seq_lengths)
+                self._replay_draft_graph(
+                    entry,
+                    draft_seq_lengths,
+                    use_mtp_index_share=mtp_index_share is not None,
+                )
                 torch.npu.synchronize()
                 self._record_complete_replay(entry)
                 self.capture_count += 1
@@ -1457,6 +1587,7 @@ class MTPDecodeOnlyGraphManager:
         runtime_context: Context,
         base_seq_lengths: list[int],
         mtp_block_tables: torch.Tensor | None = None,
+        mtp_index_share: Any | None = None,
     ) -> None:
         entry.copy_runtime_inputs(
             input_ids,
@@ -1464,6 +1595,7 @@ class MTPDecodeOnlyGraphManager:
             draft_token_ids,
             runtime_context,
             mtp_block_tables,
+            mtp_index_share,
             offload_mode=self.offload_mode,
         )
         self._replay_target_graph(
@@ -1477,7 +1609,11 @@ class MTPDecodeOnlyGraphManager:
             accepted_counts,
             self.speculative_tokens,
         )
-        self._replay_draft_graph(entry, draft_seq_lengths)
+        self._replay_draft_graph(
+            entry,
+            draft_seq_lengths,
+            use_mtp_index_share=mtp_index_share is not None,
+        )
         self._record_complete_replay(entry)
         if self.log_enabled and self.replay_count == 1:
             logger.info(
@@ -1494,6 +1630,7 @@ class MTPDecodeOnlyGraphManager:
         runtime_context: Context,
         base_seq_lengths: list[int],
         mtp_block_tables: torch.Tensor | None = None,
+        mtp_index_share: Any | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size = len(base_seq_lengths)
         if batch_size not in self.capture_sizes:
@@ -1513,6 +1650,7 @@ class MTPDecodeOnlyGraphManager:
                 runtime_context,
                 base_seq_lengths,
                 mtp_block_tables,
+                mtp_index_share,
             )
         else:
             self._replay(
@@ -1523,6 +1661,7 @@ class MTPDecodeOnlyGraphManager:
                 runtime_context,
                 base_seq_lengths,
                 mtp_block_tables,
+                mtp_index_share,
             )
         return entry.target_tokens, entry.accepted_counts, entry.next_drafts
 
