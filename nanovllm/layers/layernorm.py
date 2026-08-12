@@ -12,6 +12,12 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
 
     def rms_forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.device.type == "npu":
+            import torch_npu  # type: ignore
+
+            x, _ = torch_npu.npu_rms_norm(x, self.weight, self.eps)
+            return x
+
         orig_dtype = x.dtype
         x = x.float()
         var = x.pow(2).mean(dim=-1, keepdim=True)
@@ -20,6 +26,14 @@ class RMSNorm(nn.Module):
         return x
 
     def add_rms_forward(self, x: torch.Tensor, residual: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if x.device.type == "npu":
+            import torch_npu  # type: ignore
+
+            x, _, residual = torch_npu.npu_add_rms_norm(
+                x, residual, self.weight, self.eps
+            )
+            return x, residual
+
         orig_dtype = x.dtype
         x = x.float() + residual.float()
         residual = x.to(orig_dtype)

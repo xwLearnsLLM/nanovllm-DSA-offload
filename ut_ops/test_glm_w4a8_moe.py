@@ -1,8 +1,9 @@
-"""Semantic UT for GLM-5.1 ModelSlim W4A8 expert GMMs.
+"""Semantic and performance UT for GLM-5.1 ModelSlim W4A8 MoE.
 
 This reads one real routed expert, checks the packed bytes/scales/biases, and
 compares both NPU grouped matmuls with an independently unpacked CPU golden.
-It intentionally tests the unfused eager chain used by the stage-1 model.
+It also compares the old split SwiGLU + DynamicQuant path with the official
+fused torch_npu operator used by the model.
 """
 
 from __future__ import annotations
@@ -10,7 +11,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from time import perf_counter
 
 import torch
 import torch_npu  # type: ignore
@@ -133,6 +133,38 @@ def run_gmm(x, x_scale, weight, scale, bias, group_list):
     )[0]
 
 
+def run_split_swiglu_quant(gate_up):
+    return torch_npu.npu_dynamic_quant(torch_npu.npu_swiglu(gate_up))
+
+
+def run_fused_swiglu_quant(gate_up, group_list):
+    return torch_npu.npu_dequant_swiglu_quant(
+        x=gate_up,
+        weight_scale=None,
+        activation_scale=None,
+        bias=None,
+        quant_scale=None,
+        quant_offset=None,
+        group_index=group_list,
+        activate_left=True,
+        quant_mode=1,
+    )
+
+
+def benchmark_npu(fn, warmup: int, iters: int) -> float:
+    for _ in range(warmup):
+        fn()
+    torch.npu.synchronize()
+    start = torch.npu.Event(enable_timing=True)
+    end = torch.npu.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        fn()
+    end.record()
+    end.synchronize()
+    return float(start.elapsed_time(end)) / iters
+
+
 @torch.inference_mode()
 def main():
     args = parse_args()
@@ -241,65 +273,146 @@ def main():
         atol=0.25,
     )
 
-    activated = torch_npu.npu_swiglu(gate_up)
-    activated_q, activated_scale = torch_npu.npu_dynamic_quant(activated)
-    output = run_gmm(
-        activated_q,
-        activated_scale,
+    split_q, split_scale = run_split_swiglu_quant(gate_up)
+    fused_q, fused_scale = run_fused_swiglu_quant(gate_up, group_list)
+    if split_q.shape != fused_q.shape or split_q.dtype != fused_q.dtype:
+        raise AssertionError(
+            "Fused SwiGLU-quant output metadata differs from split path: "
+            f"split={split_q.shape}/{split_q.dtype}, "
+            f"fused={fused_q.shape}/{fused_q.dtype}."
+        )
+    split_scale_flat = split_scale.reshape(-1).float().cpu()
+    fused_scale_flat = fused_scale.reshape(-1).float().cpu()
+    torch.testing.assert_close(
+        fused_scale_flat,
+        split_scale_flat,
+        rtol=0.02,
+        atol=1e-6,
+    )
+    int8_max_diff = int(
+        (fused_q.to(torch.int16) - split_q.to(torch.int16))
+        .abs()
+        .max()
+        .item()
+    )
+    if int8_max_diff > 1:
+        raise AssertionError(
+            "Fused SwiGLU-quant differs from the split INT8 result by more "
+            f"than one quantization level: max_diff={int8_max_diff}."
+        )
+    split_dequant = (
+        split_q.float() * split_scale.reshape(-1, 1).float()
+    )
+    fused_dequant = (
+        fused_q.float() * fused_scale.reshape(-1, 1).float()
+    )
+    torch.testing.assert_close(
+        fused_dequant.cpu(),
+        split_dequant.cpu(),
+        rtol=0.03,
+        atol=0.03,
+    )
+
+    split_output = run_gmm(
+        split_q,
+        split_scale,
         w2_npu,
         s2_npu,
         b2_npu,
         group_list,
     )
-    output_golden = gmm_golden(
-        activated_q.cpu(),
-        activated_scale.cpu(),
+    fused_output = run_gmm(
+        fused_q,
+        fused_scale,
+        w2_npu,
+        s2_npu,
+        b2_npu,
+        group_list,
+    )
+    fused_output_golden = gmm_golden(
+        fused_q.cpu(),
+        fused_scale.cpu(),
         down_w,
         down_s,
         b2_cpu,
     )
     torch.testing.assert_close(
-        output.float().cpu(),
-        output_golden.to(torch.bfloat16).float(),
+        fused_output.float().cpu(),
+        fused_output_golden.to(torch.bfloat16).float(),
+        rtol=0.02,
+        atol=0.25,
+    )
+    torch.testing.assert_close(
+        fused_output.float().cpu(),
+        split_output.float().cpu(),
         rtol=0.02,
         atol=0.25,
     )
     restored = torch_npu.npu_moe_token_unpermute(
-        permuted_tokens=output,
+        permuted_tokens=fused_output,
         sorted_indices=torch.abs(expanded_row_idx),
         probs=torch.ones(
             args.tokens, 1, dtype=torch.bfloat16, device=args.device
         ),
     )
-    torch.testing.assert_close(restored, output, rtol=0, atol=0)
+    torch.testing.assert_close(restored, fused_output, rtol=0, atol=0)
 
-    for _ in range(args.warmup):
-        gate_up = run_gmm(
+    def split_activation():
+        return run_split_swiglu_quant(gate_up)
+
+    def fused_activation():
+        return run_fused_swiglu_quant(gate_up, group_list)
+
+    def split_chain():
+        current_gate_up = run_gmm(
             x_q, x_scale, w13_npu, s13_npu, b13_npu, group_list
         )
-        act_q, act_scale = torch_npu.npu_dynamic_quant(
-            torch_npu.npu_swiglu(gate_up)
+        act_q, act_scale = run_split_swiglu_quant(current_gate_up)
+        return run_gmm(
+            act_q, act_scale, w2_npu, s2_npu, b2_npu, group_list
         )
-        run_gmm(act_q, act_scale, w2_npu, s2_npu, b2_npu, group_list)
-    torch.npu.synchronize()
-    start = perf_counter()
-    for _ in range(args.iters):
-        gate_up = run_gmm(
+
+    def fused_chain():
+        current_gate_up = run_gmm(
             x_q, x_scale, w13_npu, s13_npu, b13_npu, group_list
         )
-        act_q, act_scale = torch_npu.npu_dynamic_quant(
-            torch_npu.npu_swiglu(gate_up)
+        act_q, act_scale = run_fused_swiglu_quant(
+            current_gate_up, group_list
         )
-        run_gmm(act_q, act_scale, w2_npu, s2_npu, b2_npu, group_list)
-    torch.npu.synchronize()
-    avg_ms = (perf_counter() - start) * 1000 / max(args.iters, 1)
+        return run_gmm(
+            act_q, act_scale, w2_npu, s2_npu, b2_npu, group_list
+        )
+
+    split_activation_ms = benchmark_npu(
+        split_activation, args.warmup, args.iters
+    )
+    fused_activation_ms = benchmark_npu(
+        fused_activation, args.warmup, args.iters
+    )
+    split_chain_ms = benchmark_npu(split_chain, args.warmup, args.iters)
+    fused_chain_ms = benchmark_npu(fused_chain, args.warmup, args.iters)
+    print(
+        "GLM_W4A8_SWIGLU_QUANT_CHECK "
+        f"tokens={args.tokens} int8_max_diff={int8_max_diff} "
+        f"scale_max_abs="
+        f"{(fused_scale_flat - split_scale_flat).abs().max().item():.9f} "
+        "downstream_gmm_close=1 ok=1"
+    )
+    print(
+        "GLM_W4A8_SWIGLU_QUANT_RESULT "
+        f"tokens={args.tokens} split_ms={split_activation_ms:.6f} "
+        f"fused_ms={fused_activation_ms:.6f} "
+        f"speedup={split_activation_ms / fused_activation_ms:.4f} "
+        f"warmup={args.warmup} iters={args.iters} performance_assert=0"
+    )
     print(
         "GLM_W4A8_MOE_UT_OK "
         f"layer={args.layer} expert={args.expert} tokens={args.tokens} "
-        f"avg_two_gmm_ms={avg_ms:.6f}"
+        f"split_chain_ms={split_chain_ms:.6f} "
+        f"fused_chain_ms={fused_chain_ms:.6f} "
+        f"speedup={split_chain_ms / fused_chain_ms:.4f}"
     )
 
 
 if __name__ == "__main__":
     main()
-

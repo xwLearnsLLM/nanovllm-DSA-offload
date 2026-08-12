@@ -1915,7 +1915,6 @@ class GlmMLAAttention(nn.Module):
 
         use_decode_mlapo = (
             not context.is_prefill
-            and not context.is_spec_decode
             and not context.has_first_decode
         )
         needs_decode_dsa_update = bool(
@@ -1936,6 +1935,7 @@ class GlmMLAAttention(nn.Module):
             if needs_decode_dsa_update and self.is_index_share_owner:
                 if (
                     context.full_decode_graph
+                    and not context.is_spec_decode
                     and not self.uses_mtp_index_share
                 ):
                     cache_aliases = self._run_dsa_pipeline_with_qc_full_graph(
@@ -1955,14 +1955,35 @@ class GlmMLAAttention(nn.Module):
             if index_k is not None:
                 self._store_index_cache(index_k)
 
-            attn_output = self._decode_forward_mla(
-                ql_nope,
-                q_pe,
-                q_index,
-                weights,
-                dsa_updated=dsa_updated,
-                cache_aliases=cache_aliases,
-            )
+            if context.is_spec_decode:
+                if self.uses_offload and needs_decode_dsa_update:
+                    if (
+                        self.is_index_share_owner
+                        and (q_index is None or weights is None)
+                    ):
+                        raise RuntimeError(
+                            "MTP-LIDU verification requires indexer outputs."
+                        )
+                    attn_output = self._spec_decode_forward_lidu(
+                        ql_nope,
+                        q_pe,
+                        q_index,
+                        weights,
+                    )
+                else:
+                    attn_output = self._spec_decode_forward_npu_mla(
+                        ql_nope,
+                        q_pe,
+                    )
+            else:
+                attn_output = self._decode_forward_mla(
+                    ql_nope,
+                    q_pe,
+                    q_index,
+                    weights,
+                    dsa_updated=dsa_updated,
+                    cache_aliases=cache_aliases,
+                )
             return attn_output if skip_o_proj else self.o_proj(attn_output)
 
         qkv_a = F.linear(hidden_states, self.wd_qkv)

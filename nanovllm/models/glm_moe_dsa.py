@@ -403,8 +403,20 @@ class GlmW4A8SparseMoeBlock(nn.Module):
             group_list=expert_tokens,
             output_dtype=torch.bfloat16,
         )[0]
-        activated = torch_npu.npu_swiglu(gate_up)
-        activated, activated_scale = torch_npu.npu_dynamic_quant(activated)
+        # w13 stores [gate, up], so activate the left (gate) half.  With a
+        # BF16 input the dequant stage is a no-op; this official A3-compatible
+        # operator therefore fuses exactly SwiGLU + dynamic INT8 quantization.
+        activated, activated_scale = torch_npu.npu_dequant_swiglu_quant(
+            x=gate_up,
+            weight_scale=None,
+            activation_scale=None,
+            bias=None,
+            quant_scale=None,
+            quant_offset=None,
+            group_index=expert_tokens,
+            activate_left=True,
+            quant_mode=1,
+        )
         routed_output = torch_npu.npu_grouped_matmul(
             x=[activated],
             weight=[self.w2_weight],
@@ -817,7 +829,6 @@ class GlmMoeDsaDecoderLayer(nn.Module):
         context = get_context()
         fuse_o_proj_norm = (
             not context.is_prefill
-            and not context.is_spec_decode
             and self.self_attn.can_fuse_o_proj_add_rms_norm()
         )
         hidden_states = self.self_attn(
