@@ -65,6 +65,7 @@ public:
     static constexpr uint64_t L0C_BUFFER_OFFSET = M_BASIC_BLOCK_L0 * S2_BASIC_BLOCK_L0;
     static constexpr uint64_t MTP_QUERY_COUNT = 4;
     static constexpr uint64_t MTP_M_SIZE = MTP_QUERY_COUNT * 32;
+    static constexpr uint64_t MTP_QUERY_TILE_SIZE = 32;
 
 protected:
     __aicore__ inline void Fixp(uint64_t s2GmOffset, uint64_t s2L0RealSize,
@@ -147,7 +148,9 @@ __aicore__ inline void LIMatmul<LIT>::ComputeMm1Mtp(const LICommon::RunInfo &run
         }
         for (uint64_t s2L1Offset = 0; s2L1Offset < s2L1RealSize; s2L1Offset += S2_BASIC_BLOCK_L0) {
             uint64_t s2L0RealSize = Min(S2_BASIC_BLOCK_L0, s2L1RealSize - s2L1Offset);
-            for (uint32_t queryTile = 0; queryTile < MTP_M_SIZE / M_BASIC_BLOCK_L0; ++queryTile) {
+            for (uint32_t queryTile = 0;
+                 queryTile < MTP_M_SIZE / MTP_QUERY_TILE_SIZE;
+                 ++queryTile) {
                 WaitFlag<HardEvent::M_MTE1>(M_MTE1_EVENT + l0BufIdx_ % L0_BUF_NUM);
                 LoadQueryToL0aMtp(queryTile);
                 LoadKeyToL0b(s2L1Offset, s2L1RealSize, s2L0RealSize, runInfo);
@@ -280,18 +283,19 @@ __aicore__ inline void LIMatmul<LIT>::QueryNd2NzMtp(const LICommon::RunInfo &run
 {
     Nd2NzParams params;
     params.ndNum = 1;
-    params.nValue = M_BASIC_BLOCK_L0;
+    params.nValue = MTP_QUERY_TILE_SIZE;
     params.dValue = constInfo_.headDim;
     params.srcDValue = constInfo_.headDim;
     params.dstNzC0Stride =
-        CeilAlign(M_BASIC_BLOCK_L0, static_cast<uint64_t>(BLOCK_CUBE));
+        CeilAlign(MTP_QUERY_TILE_SIZE, static_cast<uint64_t>(BLOCK_CUBE));
     params.dstNzNStride = 1;
     params.srcNdMatrixStride = 0;
     params.dstNzMatrixStride = 0;
     uint64_t firstQueryRow = static_cast<uint64_t>(runInfo.bIdx) * MTP_QUERY_COUNT;
-    for (uint32_t queryTile = 0; queryTile < MTP_M_SIZE / M_BASIC_BLOCK_L0;
+    for (uint32_t queryTile = 0;
+         queryTile < MTP_M_SIZE / MTP_QUERY_TILE_SIZE;
          ++queryTile) {
-        uint64_t tileRowOffset = queryTile * M_BASIC_BLOCK_L0;
+        uint64_t tileRowOffset = queryTile * MTP_QUERY_TILE_SIZE;
         uint64_t tileElementOffset = tileRowOffset * constInfo_.headDim;
         DataCopy(
             queryL1_[tileElementOffset],
@@ -305,14 +309,14 @@ template <typename LIT>
 __aicore__ inline void LIMatmul<LIT>::LoadQueryToL0aMtp(uint32_t queryTile)
 {
     LoadData3DParamsV2<Q_T> params;
-    params.l1H = M_BASIC_BLOCK_L0 / BLOCK_CUBE;
+    params.l1H = MTP_QUERY_TILE_SIZE / BLOCK_CUBE;
     params.l1W = BLOCK_CUBE;
     params.channelSize = constInfo_.headDim;
     params.padList[0] = 0;
     params.padList[1] = 0;
     params.padList[2] = 0;
     params.padList[3] = 255;
-    params.mExtension = M_BASIC_BLOCK_L0;
+    params.mExtension = MTP_QUERY_TILE_SIZE;
     params.kExtension = constInfo_.headDim;
     params.mStartPt = 0;
     params.kStartPt = 0;
@@ -327,7 +331,7 @@ __aicore__ inline void LIMatmul<LIT>::LoadQueryToL0aMtp(uint32_t queryTile)
     params.enTranspose = 0;
     params.fMatrixCtrl = 0;
     uint64_t tileElementOffset =
-        static_cast<uint64_t>(queryTile) * M_BASIC_BLOCK_L0 *
+        static_cast<uint64_t>(queryTile) * MTP_QUERY_TILE_SIZE *
         constInfo_.headDim;
     LoadData<Q_T, LOAD3DV2_CONFIG>(
         queryL0_[(l0BufIdx_ % L0_BUF_NUM) * QUERY_L0_BUFFER_OFFSET],
@@ -338,7 +342,7 @@ template <typename LIT>
 __aicore__ inline void LIMatmul<LIT>::ComputeL0cMtp(uint64_t s2L0RealSize)
 {
     MmadParams params;
-    params.m = M_BASIC_BLOCK_L0;
+    params.m = MTP_QUERY_TILE_SIZE;
     params.n = s2L0RealSize;
     params.k = constInfo_.headDim;
     params.cmatrixInitVal = true;
@@ -354,17 +358,17 @@ __aicore__ inline void LIMatmul<LIT>::FixpMtp(uint64_t s2GmOffset, uint64_t s2L0
                                               uint32_t queryTile, const LICommon::RunInfo &runInfo)
 {
     AscendC::DataCopyCO12DstParams params;
-    params.mSize = M_BASIC_BLOCK_L0;
+    params.mSize = MTP_QUERY_TILE_SIZE;
     params.nSize = s2L0RealSize;
     params.dstStride = runInfo.actualSingleProcessSInnerSizeAlign;
-    params.srcStride = M_BASIC_BLOCK_L0;
+    params.srcStride = MTP_QUERY_TILE_SIZE;
     params.quantPre = QuantMode_t::NoQuant;
     params.nz2ndEn = true;
     params.unitFlag = 0b11;
     params.reluPre = 1;
     AscendC::SetFixpipeNz2ndFlag(1, 1, 1);
     uint64_t bufferStride = MTP_QUERY_COUNT * constInfo_.qHeadNum * constInfo_.s2BaseSize;
-    uint64_t tileOffset = queryTile * M_BASIC_BLOCK_L0 *
+    uint64_t tileOffset = queryTile * MTP_QUERY_TILE_SIZE *
                           runInfo.actualSingleProcessSInnerSizeAlign;
     AscendC::DataCopy(mm1ResGm_[(runInfo.loop % 2) * bufferStride + tileOffset + s2GmOffset],
                       cL0_[(l0BufIdx_ % L0_BUF_NUM) * L0C_BUFFER_OFFSET], params);
