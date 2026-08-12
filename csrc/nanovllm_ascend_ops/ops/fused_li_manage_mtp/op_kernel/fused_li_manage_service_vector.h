@@ -42,7 +42,6 @@ static_assert(MTP_EVICT_PRELOAD_CAP % S2_BASE_SIZE == 0U &&
 constexpr uint32_t SORT_TMP_FLOATS = 512 * 8;
 constexpr uint32_t CHUNK_PAIR_FLOATS = 512 * VALUE_AND_INDEX_NUM;
 constexpr uint32_t TOPK_PAIR_FLOATS = BASE_TOPK * VALUE_AND_INDEX_NUM;
-constexpr uint32_t TOPK_CHUNK_COUNT = BASE_TOPK / S2_BASE_SIZE;
 constexpr uint32_t EVICT_PAIR_FLOATS = EVICT_CANDIDATE_CAP * VALUE_AND_INDEX_NUM;
 constexpr uint32_t SORTED_SCRATCH_FLOATS = SORT_TMP_FLOATS + CHUNK_PAIR_FLOATS;
 constexpr uint32_t SORT_BUFFER_FLOATS = TOPK_PAIR_FLOATS + EVICT_PAIR_FLOATS + SORTED_SCRATCH_FLOATS;
@@ -50,26 +49,6 @@ constexpr uint32_t PARTIAL_SLOTS_PER_CORE = 2;
 constexpr uint32_t PARTIAL_META_INTS_PER_CORE = 8;
 constexpr uint32_t MTP_QUERY_COUNT = 4;
 constexpr uint32_t MTP_UNION_CAPACITY = MTP_QUERY_COUNT * BASE_TOPK;
-static_assert(NANOVLLM_MTP_CHUNK_MAJOR == 0 ||
-                  NANOVLLM_MTP_CHUNK_MAJOR == 1,
-              "NANOVLLM_MTP_CHUNK_MAJOR must be 0 or 1");
-
-// The chunk-major MTP path keeps one TopK state per query in UB.  The four
-// states remove every aggregate-score GM round trip: q0 initializes the
-// current chunk's aggregate and q1..q3 update it in place.  Once q3 has
-// published all TopK rows, those states are dead and are reused as Finalize
-// scratch, so no extra 20 KiB finalize region is needed.
-constexpr uint32_t MTP_TOPK_STATE_FLOATS =
-    MTP_QUERY_COUNT * TOPK_PAIR_FLOATS;
-constexpr uint32_t MTP_EVICT_PAIR_FLOATS =
-    MTP_EVICT_PRELOAD_CAP * VALUE_AND_INDEX_NUM;
-constexpr uint32_t MTP_SORT_BUFFER_FLOATS =
-    MTP_TOPK_STATE_FLOATS + MTP_EVICT_PAIR_FLOATS + CHUNK_PAIR_FLOATS;
-// Keep the validated four-call reuse distance for payload UB. In chunk-major
-// order q0..q3 of one source chunk use different slots; the next chunk reuses
-// them only after four complete vector calls, avoiding an MTE2 overwrite of a
-// payload that Sort may still consume on PIPE_V.
-constexpr uint32_t MTP_PAYLOAD_BUF_SLOTS = PAYLOAD_BUF_SLOTS;
 // MTP LIM intentionally remains on the validated 18-bit source format.
 constexpr uint32_t MTP_SOURCE_CAPACITY = 1U << 18;
 constexpr uint32_t MTP_UNION_BITSET_WORDS = MTP_SOURCE_CAPACITY / 32U;
@@ -180,7 +159,6 @@ private:
     LocalTensor<float> globalTopkUb_;
     LocalTensor<float> evictCandidateUb_;
     LocalTensor<float> SortedBasicBlock_;
-    LocalTensor<float> mtpChunkPairUb_;
     LocalTensor<int32_t> partialMetaLocal_;
 
     static constexpr int32_t s2BaseSize_ = S2_BASE_SIZE;
@@ -213,9 +191,7 @@ private:
         const LocalTensor<int32_t> &payloadLocal,
         LocalTensor<float> &tmpSortBuf,
         uint32_t cachedChunkIdx);
-    __aicore__ inline void StoreMtpQueryTopK(
-        const LICommon::RunInfo &info,
-        const LocalTensor<float> &queryTopkUb);
+    __aicore__ inline void StoreMtpQueryTopK(const LICommon::RunInfo &info);
     __aicore__ inline void FinalizeMtpRequest(const LICommon::RunInfo &info);
     __aicore__ inline void WritePartialTopK(uint32_t coreIdx, uint32_t partialSlot, uint32_t bIdx);
     __aicore__ inline void SortEvictCandidateChunk(uint32_t bIdx, uint32_t cacheRowIdx, uint32_t chunkIdx,
@@ -293,48 +269,10 @@ __aicore__ inline void LIVector<LIT>::InitMtpBuffers(TPipe *pipe)
     if ((GetBlockIdx() & 1U) != 0U) {
         return;
     }
-#if NANOVLLM_MTP_CHUNK_MAJOR
-    uint32_t outNeedBufSize = TOPK_PAIR_FLOATS * 2 * sizeof(float);
-    uint32_t reduceCacheSize =
-        REDUCE_BANK_CONFLICT_OFFSETS +
-        GROUP_INNER * S2_BASE_SIZE * sizeof(float);
-    outNeedBufSize =
-        reduceCacheSize > outNeedBufSize ? reduceCacheSize : outNeedBufSize;
-
-    pipe->InitBuffer(
-        inQueue_, 2,
-        GROUP_INNER * S2_BASE_SIZE * sizeof(float) +
-            S2_BASE_SIZE * sizeof(float));
-    pipe->InitBuffer(outQueue_, 1, outNeedBufSize);
-    pipe->InitBuffer(sortOutBuf_, MTP_SORT_BUFFER_FLOATS * sizeof(float));
-    pipe->InitBuffer(indexBuf_, S2_BASE_SIZE * sizeof(int32_t));
-    pipe->InitBuffer(
-        payloadBuf_,
-        S2_BASE_SIZE * MTP_PAYLOAD_BUF_SLOTS * sizeof(int32_t));
-    pipe->InitBuffer(reduceOutBuf_, S2_BASE_SIZE * 2 * sizeof(float));
-    pipe->InitBuffer(brcBuf_, GROUP_INNER * 8 * sizeof(float));
-    pipe->InitBuffer(
-        partialMetaBuf_, PARTIAL_META_INTS_PER_CORE * sizeof(int32_t));
-    pipe->InitBuffer(aggregateScoreBuf_, S2_BASE_SIZE * sizeof(float));
-
-    globalTopkIndice_ = indexBuf_.Get<int32_t>();
-    globalTopkUb_ = sortOutBuf_.Get<float>();
-    // q1..q3 are dead when Finalize starts.  Use q1 as the large sort scratch
-    // while q0 supplies independent payload/global-TopK scratch.
-    SortedBasicBlock_ = globalTopkUb_[TOPK_PAIR_FLOATS];
-    evictCandidateUb_ = globalTopkUb_[MTP_TOPK_STATE_FLOATS];
-    mtpChunkPairUb_ = evictCandidateUb_[MTP_EVICT_PAIR_FLOATS];
-    partialMetaLocal_ = partialMetaBuf_.Get<int32_t>();
-
-    ArithProgression<int32_t>(
-        globalTopkIndice_, 0, 1, S2_BASE_SIZE);
-    PipeBarrier<PIPE_V>();
-#else
     InitBuffers(pipe);
     // Only MTP needs the fourth-query aggregate-score scratch. Keep it out
     // of the single-query LIM UB footprint.
     pipe->InitBuffer(aggregateScoreBuf_, S2_BASE_SIZE * sizeof(float));
-#endif
 }
 
 template <typename LIT>
@@ -522,17 +460,6 @@ __aicore__ inline void LIVector<LIT>::WriteMtpAggregateScoreChunk(
     uint32_t bIdx, uint32_t queryIdx, int32_t s2BaseIdx,
     const LocalTensor<float> &scoreLocal, int32_t alignedLen)
 {
-#if NANOVLLM_MTP_CHUNK_MAJOR
-    // All four queries for this chunk are consecutive.  Keep the aggregate in
-    // UB from q0 through q3 and never materialize it in the score workspace.
-    LocalTensor<float> aggregateScore = aggregateScoreBuf_.Get<float>();
-    if (queryIdx == 0U) {
-        DataCopy(aggregateScore, scoreLocal, alignedLen);
-    } else {
-        Max(aggregateScore, aggregateScore, scoreLocal, alignedLen);
-    }
-    PipeBarrier<PIPE_V>();
-#else
     uint64_t gmOffset = static_cast<uint64_t>(bIdx) * scoreStride_ +
                         static_cast<uint32_t>(s2BaseIdx);
     LocalTensor<float> previousScore = aggregateScoreBuf_.Get<float>();
@@ -573,7 +500,6 @@ __aicore__ inline void LIVector<LIT>::WriteMtpAggregateScoreChunk(
     }
     SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
     LIServiceVec::CopyOut(scoresGm[gmOffset], previousScore, alignedLen);
-#endif
 }
 
 template <typename LIT>
@@ -595,12 +521,8 @@ __aicore__ inline void LIVector<LIT>::CollectMtpEvictCandidateChunk(
     // sort below overwrites it.
     LocalTensor<float> aggregateScore = aggregateScoreBuf_.Get<float>();
     LocalTensor<float> keyLocal = reduceOutBuf_.Get<float>()[s2BaseSize_];
-#if NANOVLLM_MTP_CHUNK_MAJOR
-    LocalTensor<float> chunkPairLocal = mtpChunkPairUb_;
-#else
     LocalTensor<float> chunkPairLocal =
         SortedBasicBlock_[cachedChunkIdx * CHUNK_PAIR_FLOATS];
-#endif
     BuildEvictCandidateKeyFromPayload(
         keyLocal, aggregateScore,
         payloadLocal.template ReinterpretCast<uint32_t>(),
@@ -1030,19 +952,15 @@ __aicore__ inline void LIVector<LIT>::WriteMissCount(uint32_t bIdx, int32_t miss
 }
 
 template <typename LIT>
-__aicore__ inline void LIVector<LIT>::StoreMtpQueryTopK(
-    const LICommon::RunInfo &info,
-    const LocalTensor<float> &queryTopkUb)
+__aicore__ inline void LIVector<LIT>::StoreMtpQueryTopK(const LICommon::RunInfo &info)
 {
     LocalTensor<float> valueLocal = outQueue_.AllocTensor<float>();
     LocalTensor<uint32_t> payloadLocal = valueLocal.template ReinterpretCast<uint32_t>();
     SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
     mtpThresholdsGm.SetValue(
         info.queryRow,
-        queryTopkUb.GetValue((BASE_TOPK - 1U) * VALUE_AND_INDEX_NUM));
-    ExtractIndex(
-        payloadLocal, queryTopkUb.template ReinterpretCast<uint32_t>(),
-        BASE_TOPK);
+        globalTopkUb_.GetValue((BASE_TOPK - 1U) * VALUE_AND_INDEX_NUM));
+    ExtractIndex(payloadLocal, globalTopkUb_.template ReinterpretCast<uint32_t>(), BASE_TOPK);
 
     uint64_t rowOffset = static_cast<uint64_t>(info.queryRow) * BASE_TOPK;
     SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
@@ -1066,14 +984,7 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
     LocalTensor<uint32_t> unionBits = unionStorage.template ReinterpretCast<uint32_t>();
     LocalTensor<int32_t> missTokens = missStorage.template ReinterpretCast<int32_t>();
     LocalTensor<int32_t> destinationSlots = slotStorage.template ReinterpretCast<int32_t>();
-#if NANOVLLM_MTP_CHUNK_MAJOR
-    // All four persistent TopK states have already been written to GM. Reuse
-    // q0's dead state as the 2048-int payload staging area for Finalize.
-    LocalTensor<int32_t> topkPayloads =
-        globalTopkUb_.template ReinterpretCast<int32_t>();
-#else
     LocalTensor<int32_t> topkPayloads = payloadBuf_.Get<int32_t>();
-#endif
 
     const uint64_t cacheBase =
         static_cast<uint64_t>(info.cacheRowIdx) * cacheSlotsSize_;
@@ -1464,27 +1375,14 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
     int32_t cuS2Len = info.actualSingleProcessSInnerSize;
     int64_t mmGmOffset = (info.loop % 2) * (gSize_ * s2BaseSize_);
     int64_t weightGmOffset = static_cast<int64_t>(info.queryRow) * gSize_;
-#if NANOVLLM_MTP_CHUNK_MAJOR
-    LocalTensor<float> queryTopkUb =
-        globalTopkUb_[info.queryIdx * TOPK_PAIR_FLOATS];
-    if (info.isFirstS2InnerLoop) {
-        InitSortOutBuf(queryTopkUb, TOPK_PAIR_FLOATS);
-    }
-#else
-    LocalTensor<float> queryTopkUb = globalTopkUb_;
     if (info.isFirstS2InnerLoop) {
         InitSortOutBuf(globalTopkUb_, TOPK_PAIR_FLOATS);
     }
-#endif
 
     int32_t mmUbStride =
         (s2BaseSize_ - info.actualSingleProcessSInnerSizeAlign) /
         B32_BLOCK_ALIGN_NUM;
-#if NANOVLLM_MTP_CHUNK_MAJOR
-    int64_t payloadBufIdx = info.loop % MTP_PAYLOAD_BUF_SLOTS;
-#else
     int64_t payloadBufIdx = info.s2Idx % PAYLOAD_BUF_SLOTS;
-#endif
     LocalTensor<int32_t> payloadUb =
         payloadBuf_.Get<int32_t>()[payloadBufIdx * s2BaseSize_];
     StartPayloadCopy(payloadUb, info.cacheRowIdx, cuBaseS2Idx, cuS2Len,
@@ -1531,46 +1429,11 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
                                 sortScoreUb, s2BaseSize_);
 
     LocalTensor<float> tmpSortBuf = outQueue_.AllocTensor<float>();
-#if NANOVLLM_MTP_CHUNK_MAJOR
-    uint32_t cachedChunkIdx = 0U;
-#else
     uint32_t cachedChunkIdx = info.segmentChunkIdx % PAYLOAD_BUF_SLOTS;
-#endif
     if (info.queryIdx + 1U == MTP_QUERY_COUNT) {
         CollectMtpEvictCandidateChunk(info, payloadUb, tmpSortBuf,
                                       cachedChunkIdx);
     }
-#if NANOVLLM_MTP_CHUNK_MAJOR
-    if (info.segmentChunkIdx < TOPK_CHUNK_COUNT) {
-        // Bootstrap the 2048-entry state in its own four 512-entry quarters.
-        // This preserves the old single four-way merge for the first chunks
-        // instead of merging each one against an all-invalid TopK state.
-        Sort<float, true>(
-            queryTopkUb[info.segmentChunkIdx * CHUNK_PAIR_FLOATS],
-            reduceOutBuff, payloadUb.template ReinterpretCast<uint32_t>(),
-            tmpSortBuf, s2BaseSize_ / 32);
-        PipeBarrier<PIPE_V>();
-        if (info.segmentChunkIdx + 1U == TOPK_CHUNK_COUNT ||
-            info.isLastS2InnerLoop) {
-            MrgBasicBlock(
-                tmpSortBuf, queryTopkUb,
-                static_cast<int64_t>(info.segmentChunkIdx + 1U),
-                s2BaseSize_);
-            PipeBarrier<PIPE_V>();
-            DataCopy(
-                queryTopkUb, tmpSortBuf,
-                (info.segmentChunkIdx + 1U) * CHUNK_PAIR_FLOATS);
-        }
-    } else {
-        Sort<float, true>(
-            mtpChunkPairUb_, reduceOutBuff,
-            payloadUb.template ReinterpretCast<uint32_t>(), tmpSortBuf,
-            s2BaseSize_ / 32);
-        PipeBarrier<PIPE_V>();
-        SparseTopK(queryTopkUb, mtpChunkPairUb_, tmpSortBuf, BASE_TOPK,
-                   s2BaseSize_);
-    }
-#else
     Sort<float, true>(
         SortedBasicBlock_[cachedChunkIdx * s2BaseSize_ * VALUE_AND_INDEX_NUM],
         reduceOutBuff, payloadUb.template ReinterpretCast<uint32_t>(),
@@ -1596,12 +1459,11 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
                        s2BaseSize_ * (cachedChunkIdx + 1U));
         }
     }
-#endif
     PipeBarrier<PIPE_V>();
     outQueue_.FreeTensor(tmpSortBuf);
 
     if (info.isLastS2InnerLoop) {
-        StoreMtpQueryTopK(info, queryTopkUb);
+        StoreMtpQueryTopK(info);
         if (info.queryIdx + 1U == MTP_QUERY_COUNT) {
             FinalizeMtpRequest(info);
         }
