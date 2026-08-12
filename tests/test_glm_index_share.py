@@ -358,14 +358,17 @@ def test_glm52_config_accepts_split_graph_in_stage4(tmp_path):
     assert config.decode_graph_capture_sizes == (1,)
 
 
-def test_glm52_config_rejects_fuse_graph_until_later_stage(tmp_path):
+def test_glm52_config_accepts_fuse_graph_in_stage4(tmp_path):
     _write_glm52_config(tmp_path)
-    with pytest.raises(ValueError, match="offload_fuse graph"):
-        _make_config(
-            tmp_path,
-            offload_mode="offload_fuse",
-            enforce_eager=False,
-        )
+    config = _make_config(
+        tmp_path,
+        offload_mode="offload_fuse",
+        enforce_eager=False,
+        max_num_decode_seqs_per_step=1,
+    )
+
+    assert config.offload_mode == "offload_fuse"
+    assert config.decode_graph_capture_sizes == (1,)
 
 
 # ---------------------------------------------------------------------------

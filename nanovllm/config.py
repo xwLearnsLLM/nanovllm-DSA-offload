@@ -10,7 +10,6 @@ from nanovllm.engine.dsa_offload import (
     IndexShareGroupManager,
     LIDU_OFFLOAD_MODES,
     LIDU_MAX_SOURCE_TOKENS,
-    OFFLOAD_FUSE,
     OFFLOAD_NONE,
     normalize_offload_mode,
     validate_lidu_cache_token_budgets,
@@ -268,13 +267,6 @@ class Config:
                 "GLM-5.2 quantized MTP layer is implemented in a later phase; "
                 "set num_speculative_tokens=0."
             )
-        if self.offload_mode == OFFLOAD_FUSE and not self.enforce_eager:
-            raise ValueError(
-                "GLM-5.2 IndexShare offload_fuse graph is implemented in a "
-                "later stage; use offload_split or set enforce_eager=True / "
-                "NANOVLLM_ENFORCE_EAGER=1."
-            )
-
     def _configure_decode_graph(self) -> None:
         # There are exactly two execution modes. Prefill and first decode are
         # always eager; enforce_eager controls steady-state decode.
