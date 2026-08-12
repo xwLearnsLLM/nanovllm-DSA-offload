@@ -18,11 +18,10 @@ constexpr int64_t MTP_SCATTER_KPE_BYTES =
 constexpr int64_t MTP_SCATTER_CKV_BYTES =
     MTP_SCATTER_CKV_DIM * sizeof(uint16_t);
 
-// Copies each unique union miss exactly once.  The compact concatenation of
-// all requests' valid miss lists is divided into contiguous, balanced ranges
-// across all AIVs.  The source-aware Attention path reads current misses
-// directly from DRAM, so no copy->Attention barrier is required; this stage
-// only updates persistent HBM.
+// Copies each unique union miss exactly once.  AIV work is flattened over
+// [B, 8192] and striped across both vector sub-cores of every SFA AIC.  The
+// source-aware Attention path reads current misses directly from DRAM, so no
+// copy->Attention barrier is required; this stage only updates persistent HBM.
 template <typename T>
 class FusedMtpUnionScatterStage {
 public:
@@ -48,6 +47,8 @@ public:
         logicalCoreCount_ =
             tiling_->singleCoreParams.usedCoreNum * 2U;
         batchSize_ = tiling_->baseParams.batchSize;
+        totalPairSlots_ = static_cast<int64_t>(batchSize_) *
+            MTP_SCATTER_UNION_CAPACITY;
         kpeUbOffset_ = MTP_SCATTER_CKV_BYTES / sizeof(T);
 
         pipe_->InitBuffer(
@@ -73,71 +74,41 @@ public:
         if (logicalCoreCount_ == 0 || blockIdx_ >= logicalCoreCount_) {
             return;
         }
-        int64_t totalMisses = 0;
-        for (uint32_t batchIdx = 0; batchIdx < batchSize_; ++batchIdx) {
-            const int32_t missCount = missCountsGm_.GetValue(batchIdx);
-            ASSERT_MSG(
-                missCount >= 0 &&
-                    missCount <= MTP_SCATTER_UNION_CAPACITY,
-                "MTP union miss_count exceeds 8192.");
-            totalMisses += missCount;
+        cachedBatchIdx_ = -1;
+        cachedMissCount_ = 0;
+
+        int64_t currentPair = FindNextValidPair(blockIdx_);
+        CopyAddress currentAddress;
+        while (currentPair < totalPairSlots_ &&
+               !ResolveAddress(currentPair, currentAddress)) {
+            currentPair = FindNextValidPair(
+                currentPair + logicalCoreCount_);
         }
-        const int64_t workStart = totalMisses * blockIdx_ /
-            logicalCoreCount_;
-        const int64_t workEnd = totalMisses * (blockIdx_ + 1) /
-            logicalCoreCount_;
-        if (workStart >= workEnd) {
+        if (currentPair >= totalPairSlots_) {
             return;
         }
 
-        uint32_t batchIdx = 0;
-        int64_t requestStart = 0;
-        int32_t missCount = 0;
-        while (batchIdx < batchSize_) {
-            missCount = missCountsGm_.GetValue(batchIdx);
-            if (workStart < requestStart + missCount) {
+        CopyIn(currentAddress);
+        while (true) {
+            int64_t nextPair = FindNextValidPair(
+                currentPair + logicalCoreCount_);
+            CopyAddress nextAddress;
+            while (nextPair < totalPairSlots_ &&
+                   !ResolveAddress(nextPair, nextAddress)) {
+                nextPair = FindNextValidPair(
+                    nextPair + logicalCoreCount_);
+            }
+            const bool hasNext = nextPair < totalPairSlots_;
+            if (hasNext) {
+                CopyIn(nextAddress);
+            }
+            CopyOut(currentAddress);
+            if (!hasNext) {
                 break;
             }
-            requestStart += missCount;
-            ++batchIdx;
-        }
-        ASSERT_MSG(batchIdx < batchSize_, "Invalid compact MTP miss range.");
-        if (batchIdx >= batchSize_) {
-            return;
-        }
-
-        int32_t copyIdx = static_cast<int32_t>(workStart - requestStart);
-        CopyAddress currentAddress;
-        if (!ResolveAddress(batchIdx, copyIdx, currentAddress)) {
-            return;
-        }
-        CopyIn(currentAddress);
-        for (int64_t compactIdx = workStart + 1;
-             compactIdx < workEnd;
-             ++compactIdx) {
-            ++copyIdx;
-            while (copyIdx >= missCount) {
-                ++batchIdx;
-                ASSERT_MSG(
-                    batchIdx < batchSize_,
-                    "Compact MTP miss range exceeds batch metadata.");
-                if (batchIdx >= batchSize_) {
-                    CopyOut(currentAddress);
-                    return;
-                }
-                missCount = missCountsGm_.GetValue(batchIdx);
-                copyIdx = 0;
-            }
-            CopyAddress nextAddress;
-            if (!ResolveAddress(batchIdx, copyIdx, nextAddress)) {
-                CopyOut(currentAddress);
-                return;
-            }
-            CopyIn(nextAddress);
-            CopyOut(currentAddress);
+            currentPair = nextPair;
             currentAddress = nextAddress;
         }
-        CopyOut(currentAddress);
 
         // Publish this AIV's persistent writes before it enters Attention.
         SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
@@ -152,11 +123,50 @@ private:
         int64_t dstKpe = 0;
     };
 
-    __aicore__ inline bool ResolveAddress(
-        uint32_t batchIdx, int32_t copyIdx, CopyAddress &address)
+    __aicore__ inline int64_t FirstFlatPairAtOrAfter(int64_t start)
     {
-        const int64_t pairOffset = static_cast<int64_t>(batchIdx) *
-            MTP_SCATTER_UNION_CAPACITY + copyIdx;
+        if (start <= blockIdx_) {
+            return blockIdx_;
+        }
+        const int64_t steps = CeilDiv(
+            start - blockIdx_,
+            static_cast<int64_t>(logicalCoreCount_));
+        return blockIdx_ + steps * logicalCoreCount_;
+    }
+
+    __aicore__ inline int64_t FindNextValidPair(int64_t flatPair)
+    {
+        while (flatPair < totalPairSlots_) {
+            const int64_t batchIdx =
+                flatPair / MTP_SCATTER_UNION_CAPACITY;
+            const int32_t copyIdx = static_cast<int32_t>(
+                flatPair - batchIdx * MTP_SCATTER_UNION_CAPACITY);
+            if (batchIdx != cachedBatchIdx_) {
+                cachedMissCount_ = missCountsGm_.GetValue(batchIdx);
+                ASSERT_MSG(
+                    cachedMissCount_ >= 0 &&
+                        cachedMissCount_ <= MTP_SCATTER_UNION_CAPACITY,
+                    "MTP union miss_count exceeds 8192.");
+                cachedBatchIdx_ = batchIdx;
+            }
+            if (copyIdx < cachedMissCount_) {
+                return flatPair;
+            }
+            flatPair = FirstFlatPairAtOrAfter(
+                (batchIdx + 1) * MTP_SCATTER_UNION_CAPACITY);
+        }
+        return totalPairSlots_;
+    }
+
+    __aicore__ inline bool ResolveAddress(
+        int64_t flatPair, CopyAddress &address)
+    {
+        const int64_t batchIdx =
+            flatPair / MTP_SCATTER_UNION_CAPACITY;
+        const int32_t copyIdx = static_cast<int32_t>(
+            flatPair - batchIdx * MTP_SCATTER_UNION_CAPACITY);
+        const int64_t pairOffset =
+            batchIdx * MTP_SCATTER_UNION_CAPACITY + copyIdx;
         const int32_t srcToken = missSrcIdsGm_.GetValue(pairOffset);
         const int32_t dstSlot = missDstSlotsGm_.GetValue(pairOffset);
         ASSERT_MSG(
@@ -246,13 +256,21 @@ private:
         copyQueue_.FreeTensor(local);
     }
 
+    __aicore__ inline int64_t CeilDiv(int64_t value, int64_t divisor)
+    {
+        return (value + divisor - 1) / divisor;
+    }
+
 private:
     TPipe *pipe_;
     const NanovllmFusedCopySfaMtpTilingData *tiling_;
     int32_t blockIdx_ = -1;
     uint32_t logicalCoreCount_ = 0;
     uint32_t batchSize_ = 0;
+    int64_t totalPairSlots_ = 0;
     int32_t kpeUbOffset_ = 0;
+    int64_t cachedBatchIdx_ = -1;
+    int32_t cachedMissCount_ = 0;
 
     GlobalTensor<T> hbmKpeGm_;
     GlobalTensor<T> hbmCkvGm_;
