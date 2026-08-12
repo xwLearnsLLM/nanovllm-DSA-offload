@@ -45,12 +45,18 @@ __aicore__ inline void RunFusedMtp(
     // AICs can start immediately, while current Attention misses continue to
     // gather directly from DRAM and therefore do not depend on these writes.
     if ASCEND_IS_AIV {
-        FusedMtpUnionScatterStage<T> scatter(pipe, fusedTiling);
-        scatter.Init(
-            hbmKeyRope, key, dramKeyRope, dramKvCache,
-            hbmBlockTable, dramBlockTable,
-            missSourceIds, missDestinationSlots, missCounts);
-        scatter.Process();
+        {
+            FusedMtpUnionScatterStage<T> scatter(pipe, fusedTiling);
+            scatter.Init(
+                hbmKeyRope, key, dramKeyRope, dramKvCache,
+                hbmBlockTable, dramBlockTable,
+                missSourceIds, missDestinationSlots, missCounts);
+            scatter.Process();
+        }
+        // The SFA vector path consumes nearly all UB.  Reclaim the temporary
+        // scatter queue and its events before SFA initializes its own queues.
+        // Process() has already waited for all MTE3 writes to complete.
+        pipe->Reset();
     }
 
     using MtpType = SFAType<
