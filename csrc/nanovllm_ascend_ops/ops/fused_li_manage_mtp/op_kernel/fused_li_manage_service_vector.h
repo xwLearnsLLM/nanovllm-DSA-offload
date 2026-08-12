@@ -49,6 +49,10 @@ constexpr uint32_t PARTIAL_SLOTS_PER_CORE = 2;
 constexpr uint32_t PARTIAL_META_INTS_PER_CORE = 8;
 constexpr uint32_t MTP_QUERY_COUNT = 4;
 constexpr uint32_t MTP_UNION_CAPACITY = MTP_QUERY_COUNT * BASE_TOPK;
+constexpr uint32_t MTP_PENDING_TOPK_FLOATS =
+    PAYLOAD_BUF_SLOTS * CHUNK_PAIR_FLOATS;
+constexpr uint32_t MTP_TOPK_STATE_FLOATS =
+    TOPK_PAIR_FLOATS + MTP_PENDING_TOPK_FLOATS;
 // MTP LIM intentionally remains on the validated 18-bit source format.
 constexpr uint32_t MTP_SOURCE_CAPACITY = 1U << 18;
 constexpr uint32_t MTP_UNION_BITSET_WORDS = MTP_SOURCE_CAPACITY / 32U;
@@ -91,6 +95,7 @@ public:
     __aicore__ inline LIVector(){};
     __aicore__ inline void ProcessVec(const LICommon::RunInfo &info);
     __aicore__ inline void ProcessVecMtp(const LICommon::RunInfo &info);
+    __aicore__ inline void ProcessVecMtpBatch(const LICommon::RunInfo &info);
     __aicore__ inline void InitBuffers(TPipe *pipe);
     __aicore__ inline void InitMtpBuffers(TPipe *pipe);
     __aicore__ inline void InitParams(
@@ -113,7 +118,8 @@ public:
         GlobalTensor<int32_t> missCountGm,
         GlobalTensor<float> scoresGm,
         GlobalTensor<int32_t> mtpTopkPayloadsGm,
-        GlobalTensor<float> mtpThresholdsGm);
+        GlobalTensor<float> mtpThresholdsGm,
+        GlobalTensor<float> mtpTopkStatesGm);
     __aicore__ inline void InitPartialMetadata(uint32_t coreIdx);
     __aicore__ inline void FinalizePartialRequest(uint32_t bIdx, uint32_t cacheRowIdx,
                                                   uint32_t actualSeqLen,
@@ -140,6 +146,7 @@ protected:
     GlobalTensor<int32_t> mtpMissSourceIdsGm;
     GlobalTensor<int32_t> mtpMissDestinationSlotsGm;
     GlobalTensor<float> mtpThresholdsGm;
+    GlobalTensor<float> mtpTopkStatesGm;
 
 private:
     // queue
@@ -316,7 +323,8 @@ __aicore__ inline void LIVector<LIT>::InitMtpGlobalTensor(
     GlobalTensor<int32_t> missCountGm,
     GlobalTensor<float> scoresGm,
     GlobalTensor<int32_t> mtpTopkPayloadsGm,
-    GlobalTensor<float> mtpThresholdsGm)
+    GlobalTensor<float> mtpThresholdsGm,
+    GlobalTensor<float> mtpTopkStatesGm)
 {
     this->mm1ResGm = mm1ResGm;
     this->weightsGm = weightsGm;
@@ -329,6 +337,7 @@ __aicore__ inline void LIVector<LIT>::InitMtpGlobalTensor(
     this->scoresGm = scoresGm;
     this->mtpTopkPayloadsGm = mtpTopkPayloadsGm;
     this->mtpThresholdsGm = mtpThresholdsGm;
+    this->mtpTopkStatesGm = mtpTopkStatesGm;
 }
 
 template <typename LIT>
@@ -1373,7 +1382,10 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
 
     int32_t cuBaseS2Idx = info.s2Idx * s2BaseSize_;
     int32_t cuS2Len = info.actualSingleProcessSInnerSize;
-    int64_t mmGmOffset = (info.loop % 2) * (gSize_ * s2BaseSize_);
+    int64_t mmBufferStride = MTP_QUERY_COUNT * gSize_ * s2BaseSize_;
+    int64_t mmGmOffset = (info.loop % 2) * mmBufferStride +
+                         info.queryIdx * gSize_ *
+                             info.actualSingleProcessSInnerSizeAlign;
     int64_t weightGmOffset = static_cast<int64_t>(info.queryRow) * gSize_;
     if (info.isFirstS2InnerLoop) {
         InitSortOutBuf(globalTopkUb_, TOPK_PAIR_FLOATS);
@@ -1466,6 +1478,45 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
         StoreMtpQueryTopK(info);
         if (info.queryIdx + 1U == MTP_QUERY_COUNT) {
             FinalizeMtpRequest(info);
+        }
+    }
+}
+
+template <typename LIT>
+__aicore__ inline void LIVector<LIT>::ProcessVecMtpBatch(const LICommon::RunInfo &info)
+{
+    if ((GetBlockIdx() & 1U) != 0U) {
+        return;
+    }
+    uint32_t aiCoreIdx = GetBlockIdx() / 2U;
+    for (uint32_t queryIdx = 0; queryIdx < MTP_QUERY_COUNT; ++queryIdx) {
+        LICommon::RunInfo queryInfo = info;
+        queryInfo.queryIdx = queryIdx;
+        queryInfo.queryRow = info.bIdx * MTP_QUERY_COUNT + queryIdx;
+        uint64_t stateOffset =
+            (static_cast<uint64_t>(aiCoreIdx) * MTP_QUERY_COUNT + queryIdx) *
+            MTP_TOPK_STATE_FLOATS;
+        if (!info.isFirstS2InnerLoop) {
+            SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
+            DataCopyPad(globalTopkUb_, mtpTopkStatesGm[stateOffset],
+                        AscendC::DataCopyExtParams{
+                            1, static_cast<uint32_t>(TOPK_PAIR_FLOATS * sizeof(float)), 0, 0, 0},
+                        AscendC::DataCopyPadExtParams<float>{false, 0, 0, 0.0f});
+            DataCopyPad(SortedBasicBlock_,
+                        mtpTopkStatesGm[stateOffset + TOPK_PAIR_FLOATS],
+                        AscendC::DataCopyExtParams{
+                            1, static_cast<uint32_t>(MTP_PENDING_TOPK_FLOATS * sizeof(float)), 0, 0, 0},
+                        AscendC::DataCopyPadExtParams<float>{false, 0, 0, 0.0f});
+            SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
+        }
+        ProcessVecMtp(queryInfo);
+        if (!info.isLastS2InnerLoop) {
+            SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
+            LIServiceVec::CopyOut(mtpTopkStatesGm[stateOffset], globalTopkUb_, TOPK_PAIR_FLOATS);
+            LIServiceVec::CopyOut(
+                mtpTopkStatesGm[stateOffset + TOPK_PAIR_FLOATS],
+                SortedBasicBlock_, MTP_PENDING_TOPK_FLOATS);
+            SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
         }
     }
 }
