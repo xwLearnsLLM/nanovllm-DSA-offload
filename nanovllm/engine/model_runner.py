@@ -1892,14 +1892,7 @@ class ModelRunner:
         targets = torch.empty(
             (batch_size, query_len), dtype=torch.long, device=self.device
         )
-        selected_hidden_states = torch.empty(
-            (
-                batch_size,
-                self.hf_config.hidden_size,
-            ),
-            dtype=torch.get_default_dtype(),
-            device=self.device,
-        )
+        selected_hidden_states: torch.Tensor | None = None
         accepted_counts = torch.zeros(
             (batch_size,), dtype=torch.long, device=self.device
         )
@@ -1934,6 +1927,12 @@ class ModelRunner:
             hidden_states = self.model(
                 token_rows[active_rows, step], step_positions
             )
+            if selected_hidden_states is None:
+                selected_hidden_states = torch.empty(
+                    (batch_size, int(hidden_states.shape[-1])),
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                )
             target_tokens = self._greedy_sample(
                 self.model.compute_logits(hidden_states)
             )
@@ -1958,6 +1957,8 @@ class ModelRunner:
         rows = torch.arange(
             batch_size, dtype=torch.long, device=self.device
         )
+        if selected_hidden_states is None:
+            raise RuntimeError("Offloaded MTP target did not execute a row.")
         next_token_ids = targets[rows, accepted_counts]
         selected_positions = position_rows[:, 0] + accepted_counts
         return (
