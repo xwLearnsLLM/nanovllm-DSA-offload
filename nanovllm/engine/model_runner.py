@@ -1233,9 +1233,14 @@ class ModelRunner:
         actual_seq_lengths_kv_tensor: torch.Tensor | None = None,
         dram_block_tables: torch.Tensor | None = None,
         lidu_init_rows: torch.Tensor | None = None,
+        flat_slot_mapping: torch.Tensor | None = None,
     ) -> None:
         batch_size = int(positions.numel())
-        slots = self._slots_from_positions(block_tables, positions)
+        slots = (
+            flat_slot_mapping
+            if flat_slot_mapping is not None
+            else self._slots_from_positions(block_tables, positions)
+        )
         cu_seqlens_q = self._get_mtp_decode_cu_seqlens(batch_size)
         if actual_seq_lengths_kv is None:
             actual_seq_lengths_kv = positions.add(1).detach().cpu().tolist()
@@ -1704,6 +1709,7 @@ class ModelRunner:
         target_dram_block_tables: torch.Tensor | None = None
         target_lidu_init_rows: torch.Tensor | None = None
         target_final_seq_lengths: list[int] | None = None
+        target_slot_rows: torch.Tensor | None = None
         if self.uses_offload:
             target_context = get_context()
             required = {
@@ -1713,6 +1719,7 @@ class ModelRunner:
                 "candidate_lens": target_context.candidate_lens,
                 "lidu_cache_tokens": target_context.lidu_cache_tokens,
                 "actual_seq_lengths_kv": target_context.actual_seq_lengths_kv,
+                "flat_slot_mapping": target_context.flat_slot_mapping,
             }
             missing = [
                 name for name, value in required.items() if value is None
@@ -1733,6 +1740,9 @@ class ModelRunner:
             target_final_seq_lengths = [
                 int(length) for length in target_context.actual_seq_lengths_kv
             ]
+            target_slot_rows = target_context.flat_slot_mapping.view(
+                batch_size, query_len
+            )
         if is_full_decode_graph_capturing():
             target_seq_lengths = (
                 target_final_seq_lengths
@@ -1775,6 +1785,11 @@ class ModelRunner:
                 dram_block_tables=target_dram_block_tables,
                 lidu_init_rows=(
                     target_lidu_init_rows if step == 0 else None
+                ),
+                flat_slot_mapping=(
+                    None
+                    if target_slot_rows is None
+                    else target_slot_rows[:, step]
                 ),
             )
             hidden_states = self.model(
