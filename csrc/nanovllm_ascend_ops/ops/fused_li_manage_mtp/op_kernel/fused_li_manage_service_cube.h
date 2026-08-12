@@ -143,7 +143,8 @@ __aicore__ inline void LIMatmul<LIT>::ComputeMm1(const LICommon::RunInfo &runInf
 
         SetFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
         WaitFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
-        if (runInfo.isFirstS2InnerLoop && s2GmOffset == 0) {
+        if ((runInfo.isFirstS2InnerLoop || runInfo.reloadQuery) &&
+            s2GmOffset == 0) {
             WaitFlag<HardEvent::MTE1_MTE2>(QUERY_MTE1_MTE2_EVENT);
             QueryNd2Nz(runInfo);
             SetFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
@@ -162,7 +163,8 @@ __aicore__ inline void LIMatmul<LIT>::ComputeMm1(const LICommon::RunInfo &runInf
             Fixp(s2GmOffset + s2L1Offset, s2L0RealSize, runInfo);
             l0BufIdx_++;
         }
-        if (s2GmOffset + S2_BASIC_BLOCK >= s2ProcessSize && runInfo.isLastS2InnerLoop) {
+        if (s2GmOffset + S2_BASIC_BLOCK >= s2ProcessSize &&
+            (runInfo.isLastS2InnerLoop || runInfo.releaseQuery)) {
             SetFlag<HardEvent::MTE1_MTE2>(QUERY_MTE1_MTE2_EVENT);
         }
 
@@ -340,4 +342,3 @@ __aicore__ inline void LIMatmul<LIT>::FreeEventID()
 }
 } // namespace LIKernel
 #endif
-
