@@ -1718,7 +1718,8 @@ class GlmMLAAttention(nn.Module):
     def _can_use_fused_copy_sfa(self) -> bool:
         context = get_context()
         return (
-            self._use_fused_copy_sfa
+            self.uses_offload
+            and self._use_fused_copy_sfa
             and not context.has_first_decode
             and context.lidu_init_rows is None
         )
