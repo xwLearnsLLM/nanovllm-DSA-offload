@@ -1407,6 +1407,11 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
     int64_t payloadBufIdx = info.loop % PAYLOAD_BUF_SLOTS;
     LocalTensor<int32_t> payloadUb =
         payloadBuf_.Get<int32_t>()[payloadBufIdx * s2BaseSize_];
+    // A full 512-token chunk does not take StartPayloadCopy's padding path,
+    // so it otherwise has no V->MTE2 dependency before reusing this slot.
+    // Make the ownership transfer explicit instead of relying on four calls
+    // of pipeline latency to finish the preceding Sort payload read.
+    SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
     StartPayloadCopy(payloadUb, info.cacheRowIdx, cuBaseS2Idx, cuS2Len,
                      s2BaseSize_);
     LocalTensor<float> reduceOutBuff = reduceOutBuf_.Get<float>();
