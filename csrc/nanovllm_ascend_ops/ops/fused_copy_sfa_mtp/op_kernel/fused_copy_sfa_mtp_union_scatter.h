@@ -111,7 +111,8 @@ public:
         }
 
         // Publish this AIV's persistent writes before it enters Attention.
-        PipeSync<HardEvent::MTE3_S>();
+        SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+        WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
     }
 
 private:
