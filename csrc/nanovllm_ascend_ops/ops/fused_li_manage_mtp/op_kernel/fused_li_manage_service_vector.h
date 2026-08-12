@@ -1473,13 +1473,17 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
                               static_cast<int64_t>(cachedChunkIdx + 1U),
                               s2BaseSize_);
                 PipeBarrier<PIPE_V>();
-                DataCopy(SortedBasicBlock_, tmpSortBuf,
-                         (cachedChunkIdx + 1U) * s2BaseSize_ *
-                             VALUE_AND_INDEX_NUM);
+                // The four sorted chunks have already been merged into
+                // tmpSortBuf.  Use SortedBasicBlock_ as SparseTopK scratch
+                // instead of copying the merged list back first.
+                SparseTopK(globalTopkUb_, tmpSortBuf, SortedBasicBlock_,
+                           BASE_TOPK,
+                           s2BaseSize_ * (cachedChunkIdx + 1U));
+            } else {
+                PipeBarrier<PIPE_V>();
+                SparseTopK(globalTopkUb_, SortedBasicBlock_, tmpSortBuf,
+                           BASE_TOPK, s2BaseSize_);
             }
-            PipeBarrier<PIPE_V>();
-            SparseTopK(globalTopkUb_, SortedBasicBlock_, tmpSortBuf, BASE_TOPK,
-                       s2BaseSize_ * (cachedChunkIdx + 1U));
         }
     }
     PipeBarrier<PIPE_V>();
