@@ -64,7 +64,6 @@ private:
     GlobalTensor<float> aggregateScoresGm;
     GlobalTensor<int32_t> internalTopkPayloadsGm;
     GlobalTensor<float> internalThresholdsGm;
-    GlobalTensor<float> internalTopkStatesGm;
 
     uint32_t tmpBlockIdx = 0;
     uint32_t aiCoreIdx = 0;
@@ -124,7 +123,7 @@ __aicore__ inline void LIMtpPreload<LIT>::Init(
     constInfo.qHeadNum = tiling->n1Size;
 
     uint64_t singleCoreMm1Bytes =
-        WS_DOUBLE * QUERY_COUNT * constInfo.qHeadNum * constInfo.s2BaseSize *
+        WS_DOUBLE * constInfo.qHeadNum * constInfo.s2BaseSize *
         sizeof(MM1_OUT_T);
     mm1ResGm.SetGlobalBuffer(
         (__gm__ MM1_OUT_T *)(workspace + aiCoreIdx * singleCoreMm1Bytes));
@@ -143,12 +142,6 @@ __aicore__ inline void LIMtpPreload<LIT>::Init(
         constInfo.batchSize * MAX_UNION_TOKENS * sizeof(int32_t);
     internalThresholdsGm.SetGlobalBuffer(
         (__gm__ float *)(workspace + thresholdOffset));
-    uint64_t thresholdBytes =
-        constInfo.batchSize * QUERY_COUNT * sizeof(float);
-    uint64_t topkStateOffset = thresholdOffset +
-        LICommon::Align(thresholdBytes, static_cast<uint64_t>(32U));
-    internalTopkStatesGm.SetGlobalBuffer(
-        (__gm__ float *)(workspace + topkStateOffset));
 
     reqPoolEntriesGm.SetGlobalBuffer((__gm__ int32_t *)reqPoolEntries,
                                      constInfo.batchSize);
@@ -175,7 +168,7 @@ __aicore__ inline void LIMtpPreload<LIT>::Init(
             topkSourceIdsGm,
             missSourceIdsGm, missDestinationSlotsGm, missCountsGm,
             aggregateScoresGm, internalTopkPayloadsGm,
-            internalThresholdsGm, internalTopkStatesGm);
+            internalThresholdsGm);
         vectorService.InitMtpBuffers(pipe);
     } else {
         matmulService.InitParams(constInfo);
@@ -242,28 +235,31 @@ __aicore__ inline void LIMtpPreload<LIT>::ProcessMain()
         }
 
         uint32_t chunkCount = CeilDiv(candidateLen, constInfo.s2BaseSize);
-        for (uint32_t chunkIdx = 0; chunkIdx < chunkCount; ++chunkIdx) {
-            RunInfo runInfo{};
-            runInfo.loop = loop++;
-            runInfo.bIdx = bIdx;
-            runInfo.queryRow = bIdx * QUERY_COUNT;
-            runInfo.queryIdx = 0U;
-            runInfo.s2Idx = chunkIdx;
-            runInfo.segmentChunkIdx = chunkIdx;
-            runInfo.actS2Size = candidateLen;
-            runInfo.cacheTokenCount = static_cast<uint32_t>(cacheTokenCount);
-            runInfo.cacheRowIdx = static_cast<uint32_t>(poolEntry);
-            uint32_t chunkStart = chunkIdx * constInfo.s2BaseSize;
-            runInfo.actualSingleProcessSInnerSize =
-                Min(constInfo.s2BaseSize, candidateLen - chunkStart);
-            runInfo.actualSingleProcessSInnerSizeAlign = LICommon::Align(
-                runInfo.actualSingleProcessSInnerSize,
-                ConstInfo::BUFFER_SIZE_BYTE_32B);
-            runInfo.isFirstS2InnerLoop = chunkIdx == 0U;
-            runInfo.isLastS2InnerLoop = chunkIdx + 1U == chunkCount;
-            runInfo.isPartialSegment = false;
-            runInfo.partialSlot = 0U;
-            ProcessChunk(runInfo);
+        for (uint32_t queryIdx = 0; queryIdx < QUERY_COUNT; ++queryIdx) {
+            for (uint32_t chunkIdx = 0; chunkIdx < chunkCount; ++chunkIdx) {
+                RunInfo runInfo{};
+                runInfo.loop = loop++;
+                runInfo.bIdx = bIdx;
+                runInfo.queryRow = bIdx * QUERY_COUNT + queryIdx;
+                runInfo.queryIdx = queryIdx;
+                runInfo.s2Idx = chunkIdx;
+                runInfo.segmentChunkIdx = chunkIdx;
+                runInfo.actS2Size = candidateLen;
+                runInfo.cacheTokenCount =
+                    static_cast<uint32_t>(cacheTokenCount);
+                runInfo.cacheRowIdx = static_cast<uint32_t>(poolEntry);
+                uint32_t chunkStart = chunkIdx * constInfo.s2BaseSize;
+                runInfo.actualSingleProcessSInnerSize =
+                    Min(constInfo.s2BaseSize, candidateLen - chunkStart);
+                runInfo.actualSingleProcessSInnerSizeAlign = LICommon::Align(
+                    runInfo.actualSingleProcessSInnerSize,
+                    ConstInfo::BUFFER_SIZE_BYTE_32B);
+                runInfo.isFirstS2InnerLoop = chunkIdx == 0U;
+                runInfo.isLastS2InnerLoop = chunkIdx + 1U == chunkCount;
+                runInfo.isPartialSegment = false;
+                runInfo.partialSlot = 0U;
+                ProcessChunk(runInfo);
+            }
         }
     }
 
@@ -279,12 +275,12 @@ __aicore__ inline void LIMtpPreload<LIT>::ProcessChunk(const RunInfo &runInfo)
 {
     if ASCEND_IS_AIC {
         CrossCoreWaitFlag(constInfo.syncV1C1);
-        matmulService.ComputeMm1Mtp(runInfo);
+        matmulService.ComputeMm1(runInfo);
         CrossCoreSetFlag<ConstInfo::FIA_SYNC_MODE2, PIPE_FIX>(
             constInfo.syncC1V1);
     } else {
         CrossCoreWaitFlag(constInfo.syncC1V1);
-        vectorService.ProcessVecMtpBatch(runInfo);
+        vectorService.ProcessVecMtp(runInfo);
         CrossCoreSetFlag<ConstInfo::FIA_SYNC_MODE2, PIPE_MTE2>(
             constInfo.syncV1C1);
     }
