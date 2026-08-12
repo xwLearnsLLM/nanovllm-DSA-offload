@@ -41,6 +41,8 @@ static_assert(MTP_EVICT_PRELOAD_CAP % S2_BASE_SIZE == 0U &&
               "MTP eviction preload must fit the shared candidate buffer");
 constexpr uint32_t SORT_TMP_FLOATS = 512 * 8;
 constexpr uint32_t CHUNK_PAIR_FLOATS = 512 * VALUE_AND_INDEX_NUM;
+constexpr uint32_t MTP_EVICT_PENDING_FLOATS =
+    PAYLOAD_BUF_SLOTS * CHUNK_PAIR_FLOATS;
 constexpr uint32_t TOPK_PAIR_FLOATS = BASE_TOPK * VALUE_AND_INDEX_NUM;
 constexpr uint32_t EVICT_PAIR_FLOATS = EVICT_CANDIDATE_CAP * VALUE_AND_INDEX_NUM;
 constexpr uint32_t SORTED_SCRATCH_FLOATS = SORT_TMP_FLOATS + CHUNK_PAIR_FLOATS;
@@ -150,6 +152,7 @@ private:
     TBuf<TPosition::VECCALC> sortOutBuf_;
     TBuf<TPosition::VECCALC> indexBuf_;
     TBuf<TPosition::VECCALC> aggregateScoreBuf_;
+    TBuf<TPosition::VECCALC> evictPendingBuf_;
     TBuf<TPosition::VECCALC> payloadBuf_;
     TBuf<TPosition::VECCALC> reduceOutBuf_;
     TBuf<TPosition::VECCALC> brcBuf_;
@@ -158,6 +161,7 @@ private:
     LocalTensor<int32_t> globalTopkIndice_;
     LocalTensor<float> globalTopkUb_;
     LocalTensor<float> evictCandidateUb_;
+    LocalTensor<float> evictPendingUb_;
     LocalTensor<float> SortedBasicBlock_;
     LocalTensor<int32_t> partialMetaLocal_;
 
@@ -273,6 +277,11 @@ __aicore__ inline void LIVector<LIT>::InitMtpBuffers(TPipe *pipe)
     // Only MTP needs the fourth-query aggregate-score scratch. Keep it out
     // of the single-query LIM UB footprint.
     pipe->InitBuffer(aggregateScoreBuf_, S2_BASE_SIZE * sizeof(float));
+    // Accumulate four independently sorted q3 victim blocks before touching
+    // the global 512-entry victim prefix.
+    pipe->InitBuffer(evictPendingBuf_,
+                     MTP_EVICT_PENDING_FLOATS * sizeof(float));
+    evictPendingUb_ = evictPendingBuf_.Get<float>();
 }
 
 template <typename LIT>
@@ -514,15 +523,14 @@ __aicore__ inline void LIVector<LIT>::CollectMtpEvictCandidateChunk(
                        MTP_EVICT_PRELOAD_CAP * VALUE_AND_INDEX_NUM);
     }
 
-    // q3 leaves the final max(q0..q3) score in aggregateScoreBuf_.  Reuse the
-    // cache-slot payload already fetched for this score chunk, sort cached
-    // entries by -aggregate_score, and retain the global lowest 512 entries.
-    // SortedBasicBlock_'s current ping-pong slot is free until the q3 TopK
-    // sort below overwrites it.
+    // q3 leaves the final max(q0..q3) score in aggregateScoreBuf_. Reuse the
+    // cache-slot payload already fetched for this score chunk and retain four
+    // independently sorted victim blocks. Only the fourth block (or the tail)
+    // updates the global 512-entry victim prefix.
     LocalTensor<float> aggregateScore = aggregateScoreBuf_.Get<float>();
     LocalTensor<float> keyLocal = reduceOutBuf_.Get<float>()[s2BaseSize_];
     LocalTensor<float> chunkPairLocal =
-        SortedBasicBlock_[cachedChunkIdx * CHUNK_PAIR_FLOATS];
+        evictPendingUb_[cachedChunkIdx * CHUNK_PAIR_FLOATS];
     BuildEvictCandidateKeyFromPayload(
         keyLocal, aggregateScore,
         payloadLocal.template ReinterpretCast<uint32_t>(),
@@ -532,7 +540,22 @@ __aicore__ inline void LIVector<LIT>::CollectMtpEvictCandidateChunk(
         payloadLocal.template ReinterpretCast<uint32_t>(),
         tmpSortBuf, s2BaseSize_ / BLOCK_BYTES);
     PipeBarrier<PIPE_V>();
-    MergeEvictCandidateChunk(chunkPairLocal, MTP_EVICT_PRELOAD_CAP,
+    if (cachedChunkIdx != PAYLOAD_BUF_SLOTS - 1U &&
+        !info.isLastS2InnerLoop) {
+        return;
+    }
+
+    uint32_t pendingBlockNum = cachedChunkIdx + 1U;
+    MrgBasicBlock(tmpSortBuf, evictPendingUb_, pendingBlockNum,
+                  s2BaseSize_);
+    PipeBarrier<PIPE_V>();
+    // MrgBasicBlock is ordered by the same -aggregate key. Its first 512
+    // entries are exactly the only batch prefix that can survive the global
+    // 512-entry merge.
+    LocalTensor<float> batchCandidate = evictPendingUb_;
+    DataCopy(batchCandidate, tmpSortBuf, CHUNK_PAIR_FLOATS);
+    PipeBarrier<PIPE_V>();
+    MergeEvictCandidateChunk(batchCandidate, MTP_EVICT_PRELOAD_CAP,
                              tmpSortBuf);
     PipeBarrier<PIPE_V>();
 }
