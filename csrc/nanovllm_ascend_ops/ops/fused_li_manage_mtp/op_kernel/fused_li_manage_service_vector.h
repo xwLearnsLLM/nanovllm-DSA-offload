@@ -48,6 +48,10 @@ constexpr uint32_t SORT_BUFFER_FLOATS = TOPK_PAIR_FLOATS + EVICT_PAIR_FLOATS + S
 constexpr uint32_t PARTIAL_SLOTS_PER_CORE = 2;
 constexpr uint32_t PARTIAL_META_INTS_PER_CORE = 8;
 constexpr uint32_t MTP_QUERY_COUNT = 4;
+constexpr uint32_t MTP_TOPK_STATES_FLOATS =
+    MTP_QUERY_COUNT * TOPK_PAIR_FLOATS;
+constexpr uint32_t MTP_SORT_BUFFER_FLOATS =
+    MTP_TOPK_STATES_FLOATS + EVICT_PAIR_FLOATS + SORTED_SCRATCH_FLOATS;
 constexpr uint32_t MTP_UNION_CAPACITY = MTP_QUERY_COUNT * BASE_TOPK;
 // MTP LIM intentionally remains on the validated 18-bit source format.
 constexpr uint32_t MTP_SOURCE_CAPACITY = 1U << 18;
@@ -269,10 +273,38 @@ __aicore__ inline void LIVector<LIT>::InitMtpBuffers(TPipe *pipe)
     if ((GetBlockIdx() & 1U) != 0U) {
         return;
     }
-    InitBuffers(pipe);
-    // Only MTP needs the fourth-query aggregate-score scratch. Keep it out
-    // of the single-query LIM UB footprint.
+    uint32_t outNeedBufSize = TOPK_PAIR_FLOATS * 2 * sizeof(float);
+    uint32_t reduceCacheSize =
+        REDUCE_BANK_CONFLICT_OFFSETS +
+        GROUP_INNER * S2_BASE_SIZE * sizeof(float);
+    outNeedBufSize = reduceCacheSize > outNeedBufSize ?
+        reduceCacheSize : outNeedBufSize;
+
+    // Keep one independent TopK state per query.  Only one VECIN queue slot
+    // is needed because finalization can reuse the four published TopK states
+    // as its union bitset storage.
+    pipe->InitBuffer(inQueue_, 1,
+                     GROUP_INNER * S2_BASE_SIZE * sizeof(float) +
+                         S2_BASE_SIZE * sizeof(float));
+    pipe->InitBuffer(outQueue_, 1, outNeedBufSize);
+    pipe->InitBuffer(sortOutBuf_, MTP_SORT_BUFFER_FLOATS * sizeof(float));
+    pipe->InitBuffer(indexBuf_, S2_BASE_SIZE * sizeof(int32_t));
+    pipe->InitBuffer(payloadBuf_,
+                     S2_BASE_SIZE * PAYLOAD_BUF_SLOTS * sizeof(int32_t));
+    pipe->InitBuffer(reduceOutBuf_, S2_BASE_SIZE * 2 * sizeof(float));
+    pipe->InitBuffer(brcBuf_, GROUP_INNER * 8 * sizeof(float));
+    pipe->InitBuffer(partialMetaBuf_,
+                     PARTIAL_META_INTS_PER_CORE * sizeof(int32_t));
     pipe->InitBuffer(aggregateScoreBuf_, S2_BASE_SIZE * sizeof(float));
+
+    globalTopkIndice_ = indexBuf_.Get<int32_t>();
+    globalTopkUb_ = sortOutBuf_.Get<float>();
+    evictCandidateUb_ = globalTopkUb_[MTP_TOPK_STATES_FLOATS];
+    SortedBasicBlock_ = evictCandidateUb_[EVICT_PAIR_FLOATS];
+    partialMetaLocal_ = partialMetaBuf_.Get<int32_t>();
+
+    ArithProgression<int32_t>(globalTopkIndice_, 0, 1, S2_BASE_SIZE);
+    PipeBarrier<PIPE_V>();
 }
 
 template <typename LIT>
@@ -954,13 +986,16 @@ __aicore__ inline void LIVector<LIT>::WriteMissCount(uint32_t bIdx, int32_t miss
 template <typename LIT>
 __aicore__ inline void LIVector<LIT>::StoreMtpQueryTopK(const LICommon::RunInfo &info)
 {
+    LocalTensor<float> queryTopkUb =
+        globalTopkUb_[info.queryIdx * TOPK_PAIR_FLOATS];
     LocalTensor<float> valueLocal = outQueue_.AllocTensor<float>();
     LocalTensor<uint32_t> payloadLocal = valueLocal.template ReinterpretCast<uint32_t>();
     SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
     mtpThresholdsGm.SetValue(
         info.queryRow,
-        globalTopkUb_.GetValue((BASE_TOPK - 1U) * VALUE_AND_INDEX_NUM));
-    ExtractIndex(payloadLocal, globalTopkUb_.template ReinterpretCast<uint32_t>(), BASE_TOPK);
+        queryTopkUb.GetValue((BASE_TOPK - 1U) * VALUE_AND_INDEX_NUM));
+    ExtractIndex(payloadLocal,
+                 queryTopkUb.template ReinterpretCast<uint32_t>(), BASE_TOPK);
 
     uint64_t rowOffset = static_cast<uint64_t>(info.queryRow) * BASE_TOPK;
     SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
@@ -974,11 +1009,9 @@ __aicore__ inline void LIVector<LIT>::StoreMtpQueryTopK(const LICommon::RunInfo 
 template <typename LIT>
 __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo &info)
 {
-    // Two VECIN buffers hold the membership bitset and ordered union misses.
-    // The bitset has 2^18-token capacity, but only its active candidate prefix
-    // is touched. The VECOUT buffer first stages destination slots, then is
-    // reused to materialize the four per-query sparse-slot rows.
-    LocalTensor<float> unionStorage = inQueue_.AllocTensor<float>();
+    // All four TopK rows have been published. Reuse their UB states for the
+    // membership bitset while VECIN holds the ordered union misses.
+    LocalTensor<float> unionStorage = globalTopkUb_;
     LocalTensor<float> missStorage = inQueue_.AllocTensor<float>();
     LocalTensor<float> slotStorage = outQueue_.AllocTensor<float>();
     LocalTensor<uint32_t> unionBits = unionStorage.template ReinterpretCast<uint32_t>();
@@ -1361,7 +1394,6 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
 
     outQueue_.FreeTensor(slotStorage);
     inQueue_.FreeTensor(missStorage);
-    inQueue_.FreeTensor(unionStorage);
 }
 
 template <typename LIT>
@@ -1375,8 +1407,10 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
     int32_t cuS2Len = info.actualSingleProcessSInnerSize;
     int64_t mmGmOffset = (info.loop % 2) * (gSize_ * s2BaseSize_);
     int64_t weightGmOffset = static_cast<int64_t>(info.queryRow) * gSize_;
+    LocalTensor<float> queryTopkUb =
+        globalTopkUb_[info.queryIdx * TOPK_PAIR_FLOATS];
     if (info.isFirstS2InnerLoop) {
-        InitSortOutBuf(globalTopkUb_, TOPK_PAIR_FLOATS);
+        InitSortOutBuf(queryTopkUb, TOPK_PAIR_FLOATS);
     }
 
     int32_t mmUbStride =
@@ -1441,7 +1475,7 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
     PipeBarrier<PIPE_V>();
     if (cachedChunkIdx == 3U || info.isLastS2InnerLoop) {
         if (info.segmentChunkIdx < PAYLOAD_BUF_SLOTS) {
-            MrgBasicBlock(globalTopkUb_, SortedBasicBlock_,
+            MrgBasicBlock(queryTopkUb, SortedBasicBlock_,
                           static_cast<int64_t>(cachedChunkIdx + 1U),
                           s2BaseSize_);
         } else {
@@ -1455,7 +1489,7 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
                              VALUE_AND_INDEX_NUM);
             }
             PipeBarrier<PIPE_V>();
-            SparseTopK(globalTopkUb_, SortedBasicBlock_, tmpSortBuf, BASE_TOPK,
+            SparseTopK(queryTopkUb, SortedBasicBlock_, tmpSortBuf, BASE_TOPK,
                        s2BaseSize_ * (cachedChunkIdx + 1U));
         }
     }
