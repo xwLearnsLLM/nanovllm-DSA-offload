@@ -142,6 +142,22 @@ class _DecodeStaticMetadata:
     temperatures: torch.Tensor | None
 
 
+@dataclass
+class _MtpIndexShareMetadata:
+    block_tables: torch.Tensor
+    req_pool_entries: torch.Tensor
+    candidate_lens: torch.Tensor
+    lidu_cache_tokens: torch.Tensor
+
+    def select(self, rows: torch.Tensor) -> "_MtpIndexShareMetadata":
+        return _MtpIndexShareMetadata(
+            block_tables=self.block_tables.index_select(0, rows),
+            req_pool_entries=self.req_pool_entries.index_select(0, rows),
+            candidate_lens=self.candidate_lens.index_select(0, rows),
+            lidu_cache_tokens=self.lidu_cache_tokens.index_select(0, rows),
+        )
+
+
 class ModelRunner:
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
@@ -513,6 +529,20 @@ class ModelRunner:
                 )
                 logger.info("Dense MLA CKV cache shape: %s", ckv_shape)
                 logger.info("Dense MLA KPE cache shape: %s", kpe_shape)
+            mtp_lidu_slots = None
+            if self.uses_mtp_index_share:
+                max_source_tokens = (
+                    self.config.max_model_len // self.block_size
+                ) * self.block_size
+                mtp_lidu_slots = torch.full(
+                    (
+                        config.max_num_decode_seqs_per_step,
+                        max_source_tokens,
+                    ),
+                    -1,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
             for module in self.model.modules():
                 if not hasattr(module, "assign_mla_cache"):
                     continue
@@ -539,7 +569,13 @@ class ModelRunner:
                         dtype=cache_dtype,
                         device=self.device,
                     )
-                    module.assign_mtp_index_cache(index_cache)
+                    if mtp_lidu_slots is None:
+                        raise RuntimeError(
+                            "MTP IndexShare slots were not allocated."
+                        )
+                    module.assign_mtp_index_share_state(
+                        index_cache, mtp_lidu_slots
+                    )
             return
 
         index_dim = int(text_config.index_head_dim)
@@ -678,7 +714,15 @@ class ModelRunner:
                     dtype=cache_dtype,
                     device=self.device,
                 )
-                module.assign_mtp_index_cache(mtp_index_cache)
+                module.assign_mtp_index_share_state(
+                    mtp_index_cache,
+                    torch.full(
+                        lidu_slots_shape,
+                        -1,
+                        dtype=torch.int32,
+                        device=self.device,
+                    ),
+                )
             if self.rank == 0:
                 logger.info(
                     "MTP dense MLA cache: blocks=%d, CKV=%s, KPE=%s",
@@ -800,6 +844,36 @@ class ModelRunner:
         )
         self._decode_static_metadata = cached
         return cached
+
+    def _mtp_index_share_metadata(
+        self,
+        seqs: list[Sequence | DecodeSequenceMetadata],
+    ) -> _MtpIndexShareMetadata | None:
+        if not self.uses_mtp_index_share:
+            return None
+        if any(int(seq.mtp_index_pool_entry) < 0 for seq in seqs):
+            raise RuntimeError("MTP IndexShare sequence is missing a pool row.")
+        return _MtpIndexShareMetadata(
+            block_tables=self.prepare_block_tables(seqs, "mtp_block_table"),
+            req_pool_entries=torch.tensor(
+                [seq.mtp_index_pool_entry for seq in seqs],
+                dtype=torch.int32,
+                device=self.device,
+            ),
+            candidate_lens=torch.tensor(
+                [
+                    seq.num_prefill_full_blocks * self.block_size
+                    for seq in seqs
+                ],
+                dtype=torch.int32,
+                device=self.device,
+            ),
+            lidu_cache_tokens=torch.tensor(
+                [seq.mtp_lidu_cache_tokens for seq in seqs],
+                dtype=torch.int32,
+                device=self.device,
+            ),
+        )
 
     def _sequence_slots(self, block_table: list[int], seq_len: int) -> list[int]:
         slots: list[int] = []
@@ -1155,6 +1229,7 @@ class ModelRunner:
         actual_seq_lengths_kv: list[int] | None = None,
         *,
         has_first_decode: bool = False,
+        index_share: _MtpIndexShareMetadata | None = None,
     ) -> None:
         batch_size = int(positions.numel())
         slots = self._slots_from_positions(block_tables, positions)
@@ -1166,13 +1241,48 @@ class ModelRunner:
                 "MTP recurrence KV-length batch changed: "
                 f"expected={batch_size}, actual={len(actual_seq_lengths_kv)}."
             )
+        if index_share is not None:
+            if int(index_share.block_tables.shape[0]) != batch_size:
+                raise ValueError("MTP IndexShare metadata batch changed.")
+            actual_seq_lengths_kv_tensor = torch.tensor(
+                actual_seq_lengths_kv,
+                dtype=torch.int32,
+                device=self.device,
+            )
+        else:
+            actual_seq_lengths_kv_tensor = None
         set_context(
             False,
             cu_seqlens_q=cu_seqlens_q,
             flat_slot_mapping=slots,
             flat_slot_mapping_i32=slots.to(torch.int32),
             actual_seq_lengths_kv=actual_seq_lengths_kv,
+            actual_seq_lengths_kv_tensor=actual_seq_lengths_kv_tensor,
             block_tables=block_tables,
+            index_block_tables=(
+                index_share.block_tables if index_share is not None else None
+            ),
+            # MTP keeps all source KV in its dense HBM cache, so the logical
+            # source table is the same for the no-miss sparse attention path.
+            dram_block_tables=(
+                index_share.block_tables if index_share is not None else None
+            ),
+            req_pool_entries=(
+                index_share.req_pool_entries if index_share is not None else None
+            ),
+            candidate_lens=(
+                index_share.candidate_lens if index_share is not None else None
+            ),
+            candidate_query_lens=(
+                cu_seqlens_q[1:] if index_share is not None else None
+            ),
+            lidu_cache_tokens=(
+                index_share.lidu_cache_tokens
+                if index_share is not None
+                else None
+            ),
+            needs_dsa_update=index_share is not None,
+            lidu_all_rows_ready=index_share is not None,
             has_first_decode=has_first_decode,
             full_decode_graph=is_full_decode_graph_capturing(),
         )
@@ -1186,6 +1296,7 @@ class ModelRunner:
         steps: int,
         actual_seq_lengths_by_step: list[list[int]] | None = None,
         balanced_route_offset: int | None = None,
+        index_share: _MtpIndexShareMetadata | None = None,
     ) -> torch.Tensor:
         mtp = getattr(self.model, "mtp", None)
         if mtp is None:
@@ -1199,42 +1310,47 @@ class ModelRunner:
                 f"steps={steps}, rows={len(actual_seq_lengths_by_step)}."
             )
         drafts: list[torch.Tensor] = []
-        for step in range(steps):
-            seq_lengths = (
-                None
-                if actual_seq_lengths_by_step is None
-                else actual_seq_lengths_by_step[step]
-            )
-            self._set_mtp_decode_context(
-                block_tables,
-                positions,
-                actual_seq_lengths_kv=seq_lengths,
-            )
-            if balanced_route_offset is not None:
-                moe = mtp.mtp_block.mlp
-                routes_per_step = int(input_ids.shape[0]) * int(moe.top_k)
-                get_context().scratch[GLM_BALANCED_MOE_EXPERT_IDS_KEY] = (
-                    balanced_moe_expert_ids(
-                        rows=int(input_ids.shape[0]),
-                        top_k=int(moe.top_k),
-                        num_experts=int(moe.num_experts),
-                        ep_size=int(moe.ep_size),
-                        route_offset=(
-                            int(balanced_route_offset)
-                            + step * routes_per_step
-                        ),
-                        device=input_ids.device,
-                        dtype=torch.int32,
-                    )
+        try:
+            for step in range(steps):
+                seq_lengths = (
+                    None
+                    if actual_seq_lengths_by_step is None
+                    else actual_seq_lengths_by_step[step]
                 )
-            previous_hidden_states = mtp(
-                input_ids, positions, previous_hidden_states
-            )
-            input_ids = self._greedy_sample(
-                mtp.compute_logits(previous_hidden_states)
-            )
-            drafts.append(input_ids)
-            positions = positions + 1
+                mtp.set_skip_topk(index_share is not None and step > 0)
+                self._set_mtp_decode_context(
+                    block_tables,
+                    positions,
+                    actual_seq_lengths_kv=seq_lengths,
+                    index_share=index_share,
+                )
+                if balanced_route_offset is not None:
+                    moe = mtp.mtp_block.mlp
+                    routes_per_step = int(input_ids.shape[0]) * int(moe.top_k)
+                    get_context().scratch[GLM_BALANCED_MOE_EXPERT_IDS_KEY] = (
+                        balanced_moe_expert_ids(
+                            rows=int(input_ids.shape[0]),
+                            top_k=int(moe.top_k),
+                            num_experts=int(moe.num_experts),
+                            ep_size=int(moe.ep_size),
+                            route_offset=(
+                                int(balanced_route_offset)
+                                + step * routes_per_step
+                            ),
+                            device=input_ids.device,
+                            dtype=torch.int32,
+                        )
+                    )
+                previous_hidden_states = mtp(
+                    input_ids, positions, previous_hidden_states
+                )
+                input_ids = self._greedy_sample(
+                    mtp.compute_logits(previous_hidden_states)
+                )
+                drafts.append(input_ids)
+                positions = positions + 1
+        finally:
+            mtp.set_skip_topk(False)
         if not drafts:
             return torch.empty(
                 (input_ids.shape[0], 0),
@@ -1263,6 +1379,22 @@ class ModelRunner:
         )
         if not is_last_chunk:
             return None
+
+        # Graph drafting will gain its own fixed-address MTP IndexShare
+        # metadata in the following phase. Keep its prefill dense meanwhile
+        # so an established graph run never mixes dense and sparse drafts.
+        mtp_index_share = (
+            self._mtp_index_share_metadata(seqs)
+            if self.decode_graph_manager is None
+            else None
+        )
+        if mtp_index_share is not None:
+            mtp.mtp_block.self_attn.initialize_mtp_index_share_rows(
+                [seq.mtp_index_pool_entry for seq in seqs],
+                [seq.mtp_lidu_cache_tokens for seq in seqs],
+            )
+            for seq in seqs:
+                seq.mtp_lidu_cache_initialized = True
 
         draft_eligible = [
             len(seq) + 2 * self.num_speculative_tokens
@@ -1302,8 +1434,19 @@ class ModelRunner:
                 first_draft.index_select(0, eligible_rows),
                 last_positions.index_select(0, eligible_rows) + 1,
                 last_hidden_states.index_select(0, eligible_rows),
-                context.block_tables.index_select(0, eligible_rows),
+                (
+                    mtp_index_share.block_tables.index_select(
+                        0, eligible_rows
+                    )
+                    if mtp_index_share is not None
+                    else context.block_tables.index_select(0, eligible_rows)
+                ),
                 self.num_speculative_tokens - 1,
+                index_share=(
+                    mtp_index_share.select(eligible_rows)
+                    if mtp_index_share is not None
+                    else None
+                ),
             )
             eligible_drafts = torch.cat(
                 (
@@ -1700,6 +1843,7 @@ class ModelRunner:
             else [int(row) for row in init_rows.detach().cpu().tolist()]
         )
         base_seq_lengths = [len(seq) for seq in seqs]
+        mtp_index_share = self._mtp_index_share_metadata(seqs)
         graph_manager = self.decode_graph_manager
         if (
             isinstance(graph_manager, MTPDecodeOnlyGraphManager)
@@ -1750,6 +1894,7 @@ class ModelRunner:
                     accepted_counts_host,
                     self.num_speculative_tokens,
                 ),
+                index_share=mtp_index_share,
             )
 
         if init_rows_host:
