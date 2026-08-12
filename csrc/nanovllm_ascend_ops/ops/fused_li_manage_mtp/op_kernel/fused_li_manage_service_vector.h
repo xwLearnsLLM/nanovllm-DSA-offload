@@ -49,6 +49,10 @@ constexpr uint32_t PARTIAL_SLOTS_PER_CORE = 2;
 constexpr uint32_t PARTIAL_META_INTS_PER_CORE = 8;
 constexpr uint32_t MTP_QUERY_COUNT = 4;
 constexpr uint32_t MTP_UNION_CAPACITY = MTP_QUERY_COUNT * BASE_TOPK;
+constexpr uint32_t MTP_PENDING_TOPK_FLOATS =
+    PAYLOAD_BUF_SLOTS * CHUNK_PAIR_FLOATS;
+constexpr uint32_t MTP_TOPK_STATE_FLOATS =
+    TOPK_PAIR_FLOATS + MTP_PENDING_TOPK_FLOATS;
 // MTP LIM intentionally remains on the validated 18-bit source format.
 constexpr uint32_t MTP_SOURCE_CAPACITY = 1U << 18;
 constexpr uint32_t MTP_UNION_BITSET_WORDS = MTP_SOURCE_CAPACITY / 32U;
@@ -1447,19 +1451,25 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
         reduceOutBuff, payloadUb.template ReinterpretCast<uint32_t>(),
         tmpSortBuf, s2BaseSize_ / 32);
     PipeBarrier<PIPE_V>();
-    // MTP executes the four queries chunk-major so the Cube can reuse one Key
-    // load and AIC/AIV only handshake once. SortedBasicBlock_ is shared UB;
-    // retaining four chunks here would let the following query overwrite the
-    // previous query's pending chunks. Merge each sorted chunk immediately and
-    // persist only globalTopkUb_ between chunks.
-    LocalTensor<float> currentChunk =
-        SortedBasicBlock_[cachedChunkIdx * s2BaseSize_ * VALUE_AND_INDEX_NUM];
-    if (info.segmentChunkIdx == 0U) {
-        MrgBasicBlock(globalTopkUb_, currentChunk, 1, s2BaseSize_);
-    } else {
-        PipeBarrier<PIPE_V>();
-        SparseTopK(globalTopkUb_, currentChunk, tmpSortBuf, BASE_TOPK,
-                   s2BaseSize_);
+    if (cachedChunkIdx == 3U || info.isLastS2InnerLoop) {
+        if (info.segmentChunkIdx < PAYLOAD_BUF_SLOTS) {
+            MrgBasicBlock(globalTopkUb_, SortedBasicBlock_,
+                          static_cast<int64_t>(cachedChunkIdx + 1U),
+                          s2BaseSize_);
+        } else {
+            if (cachedChunkIdx > 0U) {
+                MrgBasicBlock(tmpSortBuf, SortedBasicBlock_,
+                              static_cast<int64_t>(cachedChunkIdx + 1U),
+                              s2BaseSize_);
+                PipeBarrier<PIPE_V>();
+                DataCopy(SortedBasicBlock_, tmpSortBuf,
+                         (cachedChunkIdx + 1U) * s2BaseSize_ *
+                             VALUE_AND_INDEX_NUM);
+            }
+            PipeBarrier<PIPE_V>();
+            SparseTopK(globalTopkUb_, SortedBasicBlock_, tmpSortBuf, BASE_TOPK,
+                       s2BaseSize_ * (cachedChunkIdx + 1U));
+        }
     }
     PipeBarrier<PIPE_V>();
     outQueue_.FreeTensor(tmpSortBuf);
@@ -1484,12 +1494,18 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtpBatch(const LICommon::RunInfo
         queryInfo.queryIdx = queryIdx;
         queryInfo.queryRow = info.bIdx * MTP_QUERY_COUNT + queryIdx;
         uint64_t stateOffset =
-            (static_cast<uint64_t>(aiCoreIdx) * MTP_QUERY_COUNT + queryIdx) * TOPK_PAIR_FLOATS;
+            (static_cast<uint64_t>(aiCoreIdx) * MTP_QUERY_COUNT + queryIdx) *
+            MTP_TOPK_STATE_FLOATS;
         if (!info.isFirstS2InnerLoop) {
             SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
             DataCopyPad(globalTopkUb_, mtpTopkStatesGm[stateOffset],
                         AscendC::DataCopyExtParams{
                             1, static_cast<uint32_t>(TOPK_PAIR_FLOATS * sizeof(float)), 0, 0, 0},
+                        AscendC::DataCopyPadExtParams<float>{false, 0, 0, 0.0f});
+            DataCopyPad(SortedBasicBlock_,
+                        mtpTopkStatesGm[stateOffset + TOPK_PAIR_FLOATS],
+                        AscendC::DataCopyExtParams{
+                            1, static_cast<uint32_t>(MTP_PENDING_TOPK_FLOATS * sizeof(float)), 0, 0, 0},
                         AscendC::DataCopyPadExtParams<float>{false, 0, 0, 0.0f});
             SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
         }
@@ -1497,6 +1513,9 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtpBatch(const LICommon::RunInfo
         if (!info.isLastS2InnerLoop) {
             SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
             LIServiceVec::CopyOut(mtpTopkStatesGm[stateOffset], globalTopkUb_, TOPK_PAIR_FLOATS);
+            LIServiceVec::CopyOut(
+                mtpTopkStatesGm[stateOffset + TOPK_PAIR_FLOATS],
+                SortedBasicBlock_, MTP_PENDING_TOPK_FLOATS);
             SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
         }
     }
