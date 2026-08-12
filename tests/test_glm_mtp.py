@@ -578,42 +578,22 @@ def test_glm52_mtp_runtime_accepts_offload_eager(tmp_path, offload_mode):
     assert config.offload_mode == offload_mode
 
 
-def test_glm52_mtp_runtime_accepts_split_offload_graph(tmp_path):
+@pytest.mark.parametrize("offload_mode", ["offload_split", "offload_fuse"])
+def test_glm52_mtp_runtime_accepts_offload_graph(tmp_path, offload_mode):
     _write_glm52_mtp_config(tmp_path)
 
     config = _mtp_config(
         tmp_path,
-        offload_mode="offload_split",
+        offload_mode=offload_mode,
         enforce_eager=False,
         kvcache_block_size=128,
         num_dram_kvcache_blocks=64,
     )
 
-    assert config.offload_mode == "offload_split"
+    assert config.offload_mode == offload_mode
     assert config.decode_graph_capture_sizes == (
         config.max_num_decode_seqs_per_step,
     )
-
-
-@pytest.mark.parametrize(
-    ("offload_mode", "enforce_eager", "message"),
-    [
-        ("offload_fuse", False, "graph mode"),
-    ],
-)
-def test_glm52_mtp_runtime_rejects_unimplemented_offload_modes(
-    tmp_path, offload_mode, enforce_eager, message
-):
-    _write_glm52_mtp_config(tmp_path)
-
-    with pytest.raises(ValueError, match=message):
-        _mtp_config(
-            tmp_path,
-            offload_mode=offload_mode,
-            enforce_eager=enforce_eager,
-            kvcache_block_size=128,
-            num_dram_kvcache_blocks=64,
-        )
 
 
 def test_glm52_mtp_runtime_accepts_nonoffload_graph(tmp_path):
