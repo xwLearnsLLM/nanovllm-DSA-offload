@@ -1121,8 +1121,8 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
             f"aligned_dram_reads={aligned_dram_reads} "
             f"split_ms={split_ms:.6f} fused_ms={fused_ms:.6f} "
             f"speedup={split_ms / fused_ms:.4f} "
-            "unique_union_writeback=1 performance_assert=0 "
-            "implementation=source_aware_union_v3 "
+            "query_gather_writeback=1 performance_assert=0 "
+            "implementation=source_aware_reuse_v4 "
             f"warmup={args.warmup} iters={args.iters}",
             flush=True,
         )

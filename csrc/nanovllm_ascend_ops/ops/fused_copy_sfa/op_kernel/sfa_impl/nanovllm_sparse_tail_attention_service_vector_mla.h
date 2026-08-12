@@ -112,6 +112,8 @@ public:
         int64_t &mte2Size, int64_t mte3Size, int64_t mergeMte3Idx,
         int32_t sourceToken0, int32_t sourceToken1,
         int64_t destinationSlot0, int64_t destinationSlot1,
+        int32_t &persistentDestination0,
+        int32_t &persistentDestination1,
         int64_t s2IdLimit, const RunInfo &runInfo);
     __aicore__ inline int64_t GetDramKeyGmOffset(
         int64_t sourceTokenIdx, const RunInfo &runInfo);
@@ -125,7 +127,8 @@ public:
         int64_t mte2Size, int64_t mte3Size,
         int64_t s2StartGmOffset, int64_t mergeMte3Idx,
         const RunInfo &runInfo, int64_t missRangeSize,
-        int64_t sourceRangeStart, bool hasActualMiss);
+        int64_t sourceRangeStart, bool hasActualMiss,
+        const int32_t *persistentDestinations);
     __aicore__ inline void SetInfInBlk(const LocalTensor<T> &mmResUb, uint32_t dealRowCount, uint32_t columnCount,
                                        uint64_t startId, uint64_t endId);
     __aicore__ inline void SetMidInf(const LocalTensor<T> &mmResUb, uint32_t dealRowCount, uint32_t columnCount,
@@ -1067,10 +1070,14 @@ SFAVectorService<SFAT>::CopyInSourceAwareKvPair(
     int64_t &mte2Size, int64_t mte3Size, int64_t mergeMte3Idx,
     int32_t sourceToken0, int32_t sourceToken1,
     int64_t destinationSlot0, int64_t destinationSlot1,
+    int32_t &persistentDestination0,
+    int32_t &persistentDestination1,
     int64_t s2IdLimit, const RunInfo &runInfo)
 {
     const bool source0FromDram = sourceToken0 >= 0;
     const bool source1FromDram = sourceToken1 >= 0;
+    persistentDestination0 = -1;
+    persistentDestination1 = -1;
     if (!source0FromDram && !source1FromDram) {
         CopyInHbmKvPair(
             mte2Size, mte3Size, mergeMte3Idx,
@@ -1120,6 +1127,10 @@ SFAVectorService<SFAT>::CopyInSourceAwareKvPair(
     const bool swapPair = canUseHbmPairOrder && keyOffset1 < keyOffset0;
 
     if (swapPair) {
+        persistentDestination0 = source1FromDram
+            ? static_cast<int32_t>(destinationSlot1) : -1;
+        persistentDestination1 = source0FromDram
+            ? static_cast<int32_t>(destinationSlot0) : -1;
         if (source1FromDram) {
             CopyInDramKv(
                 mte2Size, mte3Size, mergeMte3Idx,
@@ -1143,6 +1154,10 @@ SFAVectorService<SFAT>::CopyInSourceAwareKvPair(
         return;
     }
 
+    persistentDestination0 = source0FromDram
+        ? static_cast<int32_t>(destinationSlot0) : -1;
+    persistentDestination1 = source1FromDram
+        ? static_cast<int32_t>(destinationSlot1) : -1;
     if (source0FromDram) {
         CopyInDramKv(
             mte2Size, mte3Size, mergeMte3Idx,
@@ -1307,15 +1322,27 @@ SFAVectorService<SFAT>::CopyOutSourceAwareResult(
     int64_t mte2Size, int64_t mte3Size,
     int64_t s2GmStartOffset, int64_t mergeMte3Idx,
     const RunInfo &runInfo, int64_t missRangeSize,
-    int64_t sourceRangeStart, bool hasActualMiss)
+    int64_t sourceRangeStart, bool hasActualMiss,
+    const int32_t *persistentDestinations)
 {
     CopyOutMrgeResult(
         mte2Size, mte3Size, s2GmStartOffset,
         mergeMte3Idx, runInfo);
     if constexpr (ALIGNED_MISS) {
-        // MTP persistent cache updates are handled once from the compact
-        // union miss list by FusedMtpUnionScatterStage.  This path only emits
-        // the current query's source-aware Attention workspace rows.
+        if (!hasActualMiss || mte2Size <= mte3Size) {
+            return;
+        }
+        const int64_t rowCount = mte2Size - mte3Size;
+        for (int64_t row = 0; row < rowCount; ++row) {
+            const int32_t destinationSlot = persistentDestinations[row];
+            if (destinationSlot < 0) {
+                continue;
+            }
+            const int64_t ubRow =
+                mergeMte3Idx % 2 * 32 + row;
+            CopyMissToPersistentCache(
+                ubRow, destinationSlot, runInfo);
+        }
         return;
     }
     if (!hasActualMiss || mte2Size <= mte3Size ||
@@ -1370,6 +1397,7 @@ __aicore__ inline void SFAVectorService<SFAT>::MergeKvRange(
     int64_t realS2Idx1 = -1;
     bool needWaitMte3ToMte2 = true;
     bool flushHasActualMiss = false;
+    int32_t persistentDestinations[32];
     SetFlag<AscendC::HardEvent::MTE3_MTE2>(0);
     SetFlag<AscendC::HardEvent::MTE3_MTE2>(1);
     for (int64_t s2GmOffsetArray = s2GmStartOffset;
@@ -1399,11 +1427,20 @@ __aicore__ inline void SFAVectorService<SFAT>::MergeKvRange(
                         topkGmBaseOffset + sourceIndex1);
                     flushHasActualMiss = flushHasActualMiss ||
                         source0FromDram || source1FromDram;
+                    const int64_t pairRowStart = mte2Size - mte3Size;
+                    int32_t persistentDestination0 = -1;
+                    int32_t persistentDestination1 = -1;
                     CopyInSourceAwareKvPair(
                         mte2Size, mte3Size, mergeMte3Idx,
                         sourceToken0, sourceToken1,
                         realS2Idx0, realS2Idx1,
+                        persistentDestination0,
+                        persistentDestination1,
                         s2IdLimit, runInfo);
+                    persistentDestinations[pairRowStart] =
+                        persistentDestination0;
+                    persistentDestinations[pairRowStart + 1] =
+                        persistentDestination1;
                 } else {
                     const bool source0FromDram =
                         rangeOffset < missRangeSize;
@@ -1490,7 +1527,8 @@ __aicore__ inline void SFAVectorService<SFAT>::MergeKvRange(
                 CopyOutSourceAwareResult<ALIGNED_MISS>(
                     mte2Size, mte3Size, s2GmStartOffset,
                     mergeMte3Idx, runInfo, missRangeSize,
-                    sourceRangeStart, flushHasActualMiss);
+                    sourceRangeStart, flushHasActualMiss,
+                    persistentDestinations);
                 flushHasActualMiss = false;
             } else {
                 CopyOutMrgeResult(
