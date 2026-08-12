@@ -1485,14 +1485,32 @@ class ModelRunner:
 
         token_rows = input_ids.view(batch_size, query_len)
         position_rows = positions.view(batch_size, query_len)
+        capture_base_seq_lengths: list[int] | None = None
+        if is_full_decode_graph_capturing():
+            target_seq_lengths = get_context().actual_seq_lengths_kv
+            if target_seq_lengths is None or len(target_seq_lengths) != batch_size:
+                raise RuntimeError(
+                    "GLM-5.2 MTP graph target is missing captured KV "
+                    "lengths."
+                )
+            capture_base_seq_lengths = [
+                int(length) - self.num_speculative_tokens
+                for length in target_seq_lengths
+            ]
         target_tokens: list[torch.Tensor] = []
         target_hidden_states: list[torch.Tensor] = []
         for step in range(query_len):
             step_positions = position_rows[:, step]
+            if capture_base_seq_lengths is None:
+                actual_seq_lengths_kv = step_positions.add(1).cpu().tolist()
+            else:
+                actual_seq_lengths_kv = [
+                    length + step for length in capture_base_seq_lengths
+                ]
             self._set_mtp_decode_context(
                 block_tables,
                 step_positions,
-                actual_seq_lengths_kv=step_positions.add(1).cpu().tolist(),
+                actual_seq_lengths_kv=actual_seq_lengths_kv,
                 has_first_decode=has_first_decode and step == 0,
             )
             hidden_states = self.model(
