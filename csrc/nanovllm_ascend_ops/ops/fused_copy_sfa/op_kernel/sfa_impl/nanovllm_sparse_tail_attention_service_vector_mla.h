@@ -108,6 +108,11 @@ public:
         int64_t &mte2Size, int64_t mte3Size, int64_t mergeMte3Idx,
         int64_t sourceTokenIdx,
         const RunInfo &runInfo);
+    __aicore__ inline void CopyInSourceAwareKvPair(
+        int64_t &mte2Size, int64_t mte3Size, int64_t mergeMte3Idx,
+        int32_t sourceToken0, int32_t sourceToken1,
+        int64_t destinationSlot0, int64_t destinationSlot1,
+        int64_t s2IdLimit, const RunInfo &runInfo);
     __aicore__ inline int64_t GetDramKeyGmOffset(
         int64_t sourceTokenIdx, const RunInfo &runInfo);
     __aicore__ inline void CopyMissToPersistentCache(
@@ -1057,6 +1062,110 @@ __aicore__ inline void SFAVectorService<SFAT>::CopyInDramKv(
 }
 
 template <typename SFAT>
+__aicore__ inline void
+SFAVectorService<SFAT>::CopyInSourceAwareKvPair(
+    int64_t &mte2Size, int64_t mte3Size, int64_t mergeMte3Idx,
+    int32_t sourceToken0, int32_t sourceToken1,
+    int64_t destinationSlot0, int64_t destinationSlot1,
+    int64_t s2IdLimit, const RunInfo &runInfo)
+{
+    const bool source0FromDram = sourceToken0 >= 0;
+    const bool source1FromDram = sourceToken1 >= 0;
+    if (!source0FromDram && !source1FromDram) {
+        CopyInHbmKvPair(
+            mte2Size, mte3Size, mergeMte3Idx,
+            destinationSlot0, destinationSlot1,
+            s2IdLimit, runInfo);
+        return;
+    }
+
+    const int64_t keyOffset0 = GetKeyGmOffset(
+        destinationSlot0, runInfo, s2IdLimit);
+    const int64_t keyOffset1 = GetKeyGmOffset(
+        destinationSlot1, runInfo, s2IdLimit);
+    int64_t keySrcStride = 0;
+    int64_t keyRopeSrcStride = 0;
+    if (keyOffset0 >= 0 && keyOffset1 >= 0) {
+        const int64_t keyOffsetDelta = keyOffset0 > keyOffset1
+            ? keyOffset0 - keyOffset1
+            : keyOffset1 - keyOffset0;
+        keySrcStride =
+            (keyOffsetDelta - constInfo.sparseBlockSize) *
+            constInfo.headDim * sizeof(KV_T);
+        if constexpr (!PAGE_ATTENTION) {
+            const int64_t keyRopeOffset0 = GetKeyRopeGmOffset(
+                destinationSlot0, runInfo, s2IdLimit);
+            const int64_t keyRopeOffset1 = GetKeyRopeGmOffset(
+                destinationSlot1, runInfo, s2IdLimit);
+            const int64_t keyRopeOffsetDelta =
+                keyRopeOffset0 > keyRopeOffset1
+                    ? keyRopeOffset0 - keyRopeOffset1
+                    : keyRopeOffset1 - keyRopeOffset0;
+            keyRopeSrcStride =
+                (keyRopeOffsetDelta - constInfo.sparseBlockSize) *
+                constInfo.headDimRope * sizeof(KV_T);
+        }
+    }
+
+    // Match CopyInHbmKvPair: its two-block DataCopy emits the lower physical
+    // HBM address first.  Preserve that row order when one or both payloads
+    // come directly from DRAM so Attention sees the split path's token order.
+    const bool canUseHbmPairOrder =
+        keyOffset0 >= 0 && keyOffset1 >= 0 &&
+        keySrcStride >= 0 && keySrcStride < INT32_MAX &&
+        (PAGE_ATTENTION ||
+         (keyRopeSrcStride >= 0 && keyRopeSrcStride < INT32_MAX)) &&
+        destinationSlot0 + constInfo.sparseBlockSize < s2IdLimit &&
+        destinationSlot1 + constInfo.sparseBlockSize < s2IdLimit;
+    const bool swapPair = canUseHbmPairOrder && keyOffset1 < keyOffset0;
+
+    if (swapPair) {
+        if (source1FromDram) {
+            CopyInDramKv(
+                mte2Size, mte3Size, mergeMte3Idx,
+                sourceToken1, runInfo);
+        } else {
+            CopyInSingleKv(
+                mte2Size, mte3Size, mergeMte3Idx,
+                destinationSlot1, keyOffset1,
+                s2IdLimit, runInfo);
+        }
+        if (source0FromDram) {
+            CopyInDramKv(
+                mte2Size, mte3Size, mergeMte3Idx,
+                sourceToken0, runInfo);
+        } else {
+            CopyInSingleKv(
+                mte2Size, mte3Size, mergeMte3Idx,
+                destinationSlot0, keyOffset0,
+                s2IdLimit, runInfo);
+        }
+        return;
+    }
+
+    if (source0FromDram) {
+        CopyInDramKv(
+            mte2Size, mte3Size, mergeMte3Idx,
+            sourceToken0, runInfo);
+    } else {
+        CopyInSingleKv(
+            mte2Size, mte3Size, mergeMte3Idx,
+            destinationSlot0, keyOffset0,
+            s2IdLimit, runInfo);
+    }
+    if (source1FromDram) {
+        CopyInDramKv(
+            mte2Size, mte3Size, mergeMte3Idx,
+            sourceToken1, runInfo);
+    } else {
+        CopyInSingleKv(
+            mte2Size, mte3Size, mergeMte3Idx,
+            destinationSlot1, keyOffset1,
+            s2IdLimit, runInfo);
+    }
+}
+
+template <typename SFAT>
 __aicore__ inline void SFAVectorService<SFAT>::CopyInHbmKvPair(
     int64_t &mte2Size, int64_t mte3Size, int64_t mergeMte3Idx,
     int64_t realS2Idx1, int64_t realS2Idx2, int64_t s2IdLimit,
@@ -1323,59 +1432,70 @@ __aicore__ inline void SFAVectorService<SFAT>::MergeKvRange(
                 sourceRangeStart + rangeOffset;
             const int64_t sourceIndex1 = sourceIndex0 + 1;
             if constexpr (HAS_MISS) {
-                bool source0FromDram = false;
-                bool source1FromDram = false;
                 if constexpr (ALIGNED_MISS) {
-                    realS2Idx0 = sourceTokenIdsGm_.GetValue(
+                    const int32_t sourceToken0 = sourceTokenIdsGm_.GetValue(
                         topkGmBaseOffset + sourceIndex0);
-                    realS2Idx1 = sourceTokenIdsGm_.GetValue(
+                    const int32_t sourceToken1 = sourceTokenIdsGm_.GetValue(
                         topkGmBaseOffset + sourceIndex1);
-                    source0FromDram = realS2Idx0 >= 0;
-                    source1FromDram = realS2Idx1 >= 0;
+                    const bool source0FromDram = sourceToken0 >= 0;
+                    const bool source1FromDram = sourceToken1 >= 0;
+                    realS2Idx0 = topkGm_.GetValue(
+                        topkGmBaseOffset + sourceIndex0);
+                    realS2Idx1 = topkGm_.GetValue(
+                        topkGmBaseOffset + sourceIndex1);
+                    flushHasActualMiss = flushHasActualMiss ||
+                        source0FromDram || source1FromDram;
+                    CopyInSourceAwareKvPair(
+                        mte2Size, mte3Size, mergeMte3Idx,
+                        sourceToken0, sourceToken1,
+                        realS2Idx0, realS2Idx1,
+                        s2IdLimit, runInfo);
                 } else {
-                    source0FromDram = rangeOffset < missRangeSize;
-                    source1FromDram = rangeOffset + 1 < missRangeSize;
+                    const bool source0FromDram =
+                        rangeOffset < missRangeSize;
+                    const bool source1FromDram =
+                        rangeOffset + 1 < missRangeSize;
                     realS2Idx0 = source0FromDram
                         ? sourceTokenIdsGm_.GetValue(missBase + sourceIndex0)
                         : topkGm_.GetValue(topkGmBaseOffset + sourceIndex0);
                     realS2Idx1 = source1FromDram
                         ? sourceTokenIdsGm_.GetValue(missBase + sourceIndex1)
                         : topkGm_.GetValue(topkGmBaseOffset + sourceIndex1);
-                }
-                flushHasActualMiss = flushHasActualMiss ||
-                    source0FromDram || source1FromDram;
-                if (source0FromDram || source1FromDram) {
-                    if (source0FromDram) {
-                        CopyInDramKv(
-                            mte2Size, mte3Size, mergeMte3Idx,
-                            realS2Idx0, runInfo);
+                    flushHasActualMiss = flushHasActualMiss ||
+                        source0FromDram || source1FromDram;
+                    if (source0FromDram || source1FromDram) {
+                        if (source0FromDram) {
+                            CopyInDramKv(
+                                mte2Size, mte3Size, mergeMte3Idx,
+                                realS2Idx0, runInfo);
+                        } else {
+                            const int64_t keyOffset0 =
+                                GetKeyGmOffset(
+                                    realS2Idx0, runInfo, s2IdLimit);
+                            CopyInSingleKv(
+                                mte2Size, mte3Size, mergeMte3Idx,
+                                realS2Idx0, keyOffset0,
+                                s2IdLimit, runInfo);
+                        }
+                        if (source1FromDram) {
+                            CopyInDramKv(
+                                mte2Size, mte3Size, mergeMte3Idx,
+                                realS2Idx1, runInfo);
+                        } else {
+                            const int64_t keyOffset1 =
+                                GetKeyGmOffset(
+                                    realS2Idx1, runInfo, s2IdLimit);
+                            CopyInSingleKv(
+                                mte2Size, mte3Size, mergeMte3Idx,
+                                realS2Idx1, keyOffset1,
+                                s2IdLimit, runInfo);
+                        }
                     } else {
-                        const int64_t keyOffset0 =
-                            GetKeyGmOffset(
-                                realS2Idx0, runInfo, s2IdLimit);
-                        CopyInSingleKv(
+                        CopyInHbmKvPair(
                             mte2Size, mte3Size, mergeMte3Idx,
-                            realS2Idx0, keyOffset0,
+                            realS2Idx0, realS2Idx1,
                             s2IdLimit, runInfo);
                     }
-                    if (source1FromDram) {
-                        CopyInDramKv(
-                            mte2Size, mte3Size, mergeMte3Idx,
-                            realS2Idx1, runInfo);
-                    } else {
-                        const int64_t keyOffset1 =
-                            GetKeyGmOffset(
-                                realS2Idx1, runInfo, s2IdLimit);
-                        CopyInSingleKv(
-                            mte2Size, mte3Size, mergeMte3Idx,
-                            realS2Idx1, keyOffset1,
-                            s2IdLimit, runInfo);
-                    }
-                } else {
-                    CopyInHbmKvPair(
-                        mte2Size, mte3Size, mergeMte3Idx,
-                        realS2Idx0, realS2Idx1,
-                        s2IdLimit, runInfo);
                 }
             } else {
                 realS2Idx0 =

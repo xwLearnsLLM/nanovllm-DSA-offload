@@ -758,6 +758,7 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
         canonical_counts = torch.zeros_like(eager_outputs[4])
         nonzero_counts = torch.ones_like(eager_outputs[4])
         tail_cases = sorted({0, tail_tokens})
+        hit_sentinel_diffs: list[float] = []
 
         def diagnostic_fused(
             *,
@@ -868,6 +869,8 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
             )
             for pair, lhs, rhs in comparisons:
                 max_abs, query_max_abs = attention_diff_by_query(lhs, rhs)
+                if pair == "canonical_vs_nonzero_hbm":
+                    hit_sentinel_diffs.append(max_abs)
                 formatted_query_max = ",".join(
                     f"{value:.6f}" for value in query_max_abs
                 )
@@ -879,6 +882,20 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
                     "cache_exact=1",
                     flush=True,
                 )
+
+        hit_sentinel_max_abs = max(hit_sentinel_diffs, default=0.0)
+        if hit_sentinel_max_abs != 0.0:
+            raise AssertionError(
+                "nonzero request-level miss_count changed an all-HBM "
+                "Attention gather: "
+                f"max_abs={hit_sentinel_max_abs:.9f}"
+            )
+        print(
+            "FUSED_COPY_SFA_MTP_HIT_SENTINEL_CHECK "
+            f"tail_cases={tail_cases} max_abs={hit_sentinel_max_abs:.9f} "
+            "exact=1 ok=1",
+            flush=True,
+        )
 
     # Warm up LIM plus the caller-owned fused interface on disposable state.
     warm_cache = case.initial_cache_cpu.to(device)
