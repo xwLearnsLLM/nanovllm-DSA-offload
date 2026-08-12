@@ -1822,153 +1822,6 @@ class ModelRunner:
             selected_positions,
         )
 
-    def _mtp_target_forward_serial_offload(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        draft_token_ids: torch.Tensor,
-        block_tables: torch.Tensor,
-        *,
-        has_first_decode: bool,
-    ) -> tuple[torch.Tensor, ...]:
-        """Verify offloaded MTP drafts without updating rejected DSA rows.
-
-        A dense target can evaluate every ``K+1`` token independently, even
-        after a draft mismatch.  LIDU selection state is persistent, however:
-        evaluating a rejected speculative suffix would update its sparse
-        source-to-slot mapping and make the next request step depend on tokens
-        that were never committed.  Compact the live requests after each
-        accepted draft, so every LIDU update belongs to the accepted prefix or
-        its target bonus token.
-        """
-
-        batch_size, k = draft_token_ids.shape
-        if k != self.num_speculative_tokens:
-            raise RuntimeError(
-                "MTP target draft width changed: "
-                f"expected={self.num_speculative_tokens}, actual={k}."
-            )
-        query_len = k + 1
-        if input_ids.numel() != batch_size * query_len:
-            raise ValueError(
-                "Offloaded serialized MTP target input shape does not match "
-                f"draft batch: tokens={input_ids.numel()}, "
-                f"batch={batch_size}, query_len={query_len}."
-            )
-
-        context = get_context()
-        required = {
-            "index_block_tables": context.index_block_tables,
-            "dram_block_tables": context.dram_block_tables,
-            "req_pool_entries": context.req_pool_entries,
-            "candidate_lens": context.candidate_lens,
-            "lidu_cache_tokens": context.lidu_cache_tokens,
-            "actual_seq_lengths_kv": context.actual_seq_lengths_kv,
-            "flat_slot_mapping": context.flat_slot_mapping,
-        }
-        missing = [name for name, value in required.items() if value is None]
-        if missing:
-            raise RuntimeError(
-                "GLM-5.2 MTP offload target is missing: "
-                + ", ".join(missing)
-            )
-
-        token_rows = input_ids.view(batch_size, query_len)
-        position_rows = positions.view(batch_size, query_len)
-        target_index_share = _MtpIndexShareMetadata(
-            block_tables=context.index_block_tables,
-            req_pool_entries=context.req_pool_entries,
-            candidate_lens=context.candidate_lens,
-            lidu_cache_tokens=context.lidu_cache_tokens,
-        )
-        target_slot_rows = context.flat_slot_mapping.view(
-            batch_size, query_len
-        )
-        target_final_seq_lengths = [
-            int(length) for length in context.actual_seq_lengths_kv
-        ]
-        target_init_rows = context.lidu_init_rows
-
-        targets = torch.empty(
-            (batch_size, query_len), dtype=torch.long, device=self.device
-        )
-        selected_hidden_states: torch.Tensor | None = None
-        accepted_counts = torch.zeros(
-            (batch_size,), dtype=torch.long, device=self.device
-        )
-        active_rows = torch.arange(
-            batch_size, dtype=torch.long, device=self.device
-        )
-        for step in range(query_len):
-            if active_rows.numel() == 0:
-                break
-            step_positions = position_rows[active_rows, step]
-            self._set_mtp_decode_context(
-                block_tables.index_select(0, active_rows),
-                step_positions,
-                actual_seq_lengths_kv=[
-                    target_final_seq_lengths[int(row)]
-                    - self.num_speculative_tokens
-                    + step
-                    for row in active_rows.detach().cpu().tolist()
-                ],
-                has_first_decode=has_first_decode and step == 0,
-                index_share=target_index_share.select(active_rows),
-                dram_block_tables=context.dram_block_tables.index_select(
-                    0, active_rows
-                ),
-                lidu_init_rows=(
-                    target_init_rows if step == 0 else None
-                ),
-                flat_slot_mapping=target_slot_rows[
-                    active_rows, step
-                ],
-            )
-            hidden_states = self.model(
-                token_rows[active_rows, step], step_positions
-            )
-            if selected_hidden_states is None:
-                selected_hidden_states = torch.empty(
-                    (batch_size, int(hidden_states.shape[-1])),
-                    dtype=hidden_states.dtype,
-                    device=hidden_states.device,
-                )
-            target_tokens = self._greedy_sample(
-                self.model.compute_logits(hidden_states)
-            )
-            targets[active_rows, step] = target_tokens
-
-            if step == k:
-                selected_hidden_states[active_rows] = hidden_states
-                break
-
-            accepted = target_tokens.eq(
-                draft_token_ids[active_rows, step]
-            )
-            rejected_rows = active_rows[~accepted]
-            if rejected_rows.numel():
-                selected_hidden_states[rejected_rows] = hidden_states[
-                    ~accepted
-                ]
-            if accepted.any():
-                accepted_counts[active_rows[accepted]] += 1
-            active_rows = active_rows[accepted]
-
-        rows = torch.arange(
-            batch_size, dtype=torch.long, device=self.device
-        )
-        if selected_hidden_states is None:
-            raise RuntimeError("Offloaded MTP target did not execute a row.")
-        next_token_ids = targets[rows, accepted_counts]
-        selected_positions = position_rows[:, 0] + accepted_counts
-        return (
-            targets,
-            accepted_counts,
-            next_token_ids,
-            selected_hidden_states,
-            selected_positions,
-        )
-
     def _mtp_target_graph_forward(
         self,
         input_ids: torch.Tensor,
@@ -2132,18 +1985,13 @@ class ModelRunner:
             )
         else:
             if self.config.glm_version == "5.2":
-                target_forward = (
-                    self._mtp_target_forward_serial_offload
-                    if self.uses_offload
-                    else self._mtp_target_forward_serial
-                )
                 (
                     target_tokens,
                     accepted_counts,
                     next_token_ids,
                     selected_hidden_states,
                     selected_positions,
-                ) = target_forward(
+                ) = self._mtp_target_forward_serial(
                     input_ids,
                     positions,
                     draft_token_ids,
