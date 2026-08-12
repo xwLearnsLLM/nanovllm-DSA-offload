@@ -1447,25 +1447,19 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
         reduceOutBuff, payloadUb.template ReinterpretCast<uint32_t>(),
         tmpSortBuf, s2BaseSize_ / 32);
     PipeBarrier<PIPE_V>();
-    if (cachedChunkIdx == 3U || info.isLastS2InnerLoop) {
-        if (info.segmentChunkIdx < PAYLOAD_BUF_SLOTS) {
-            MrgBasicBlock(globalTopkUb_, SortedBasicBlock_,
-                          static_cast<int64_t>(cachedChunkIdx + 1U),
-                          s2BaseSize_);
-        } else {
-            if (cachedChunkIdx > 0U) {
-                MrgBasicBlock(tmpSortBuf, SortedBasicBlock_,
-                              static_cast<int64_t>(cachedChunkIdx + 1U),
-                              s2BaseSize_);
-                PipeBarrier<PIPE_V>();
-                DataCopy(SortedBasicBlock_, tmpSortBuf,
-                         (cachedChunkIdx + 1U) * s2BaseSize_ *
-                             VALUE_AND_INDEX_NUM);
-            }
-            PipeBarrier<PIPE_V>();
-            SparseTopK(globalTopkUb_, SortedBasicBlock_, tmpSortBuf, BASE_TOPK,
-                       s2BaseSize_ * (cachedChunkIdx + 1U));
-        }
+    // MTP executes the four queries chunk-major so the Cube can reuse one Key
+    // load and AIC/AIV only handshake once. SortedBasicBlock_ is shared UB;
+    // retaining four chunks here would let the following query overwrite the
+    // previous query's pending chunks. Merge each sorted chunk immediately and
+    // persist only globalTopkUb_ between chunks.
+    LocalTensor<float> currentChunk =
+        SortedBasicBlock_[cachedChunkIdx * s2BaseSize_ * VALUE_AND_INDEX_NUM];
+    if (info.segmentChunkIdx == 0U) {
+        MrgBasicBlock(globalTopkUb_, currentChunk, 1, s2BaseSize_);
+    } else {
+        PipeBarrier<PIPE_V>();
+        SparseTopK(globalTopkUb_, currentChunk, tmpSortBuf, BASE_TOPK,
+                   s2BaseSize_);
     }
     PipeBarrier<PIPE_V>();
     outQueue_.FreeTensor(tmpSortBuf);
