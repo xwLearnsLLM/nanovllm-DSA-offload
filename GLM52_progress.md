@@ -8,7 +8,8 @@
 - [x] 完成 MTP0 的 target-layer IndexShare：先 `offload_split + eager`，再 `offload_fuse + eager`。
 - [x] 完成 MTP0 的 stable full-decode-only graph。
 - [x] 适配 GLM-5.2 的量化 MTP layer，打通 `MTP3 + none` 的 eager 和 graph。
-- [ ] 完成 MTP3 的 target-layer IndexShare offload：split、fuse、eager、graph。
+- [x] 完成 MTP3 的 target-layer IndexShare offload eager：split、fuse。
+- [ ] 完成 MTP3 的 target-layer IndexShare offload full-decode-only graph。
 - [ ] 处理 MTP iteration 内的 IndexShare，完成 20K～64K 性能验收、回归和文档收尾。
 
 ## 1. 当前状态
@@ -21,7 +22,8 @@
 - 阶段 2 昇腾整网已覆盖 21K、40K 和 64K 的 `MTP0 + offload_split + eager`。21K 和 64K 与 `none` 的 token IDs 完全一致；40K 在后续 greedy token 上存在稀疏 top-2048 + dense-tail Attention 的预期近似分叉。
 - 40K eager profile 确认每个 stable decode step 为 21 次 LIM、78 次 SCATTER、78 次 SFA；同一 IndexShare group 内的 miss metadata 一致，KV payload 仍按层独立。
 - 阶段 3（MTP0 + offload_fuse + eager）和阶段 4（MTP0 full-decode-only graph）均已完成并通过验收。阶段 5 已打通 `MTP3 + offload_mode=none + eager`，并完成 21K、40K、64K 的 K=0/K=3 token 对齐验收。阶段 6 的 `MTP3 + none` full-decode-only graph 也已通过相同长度覆盖，输出与 eager 完全一致。
-- 阶段 5、阶段 6 仅改 Python 模型加载、调度、target 验证和图管理，不需要重新编译 Ascend 自定义算子；下一步为 MTP iteration 内的 IndexShare。
+- 阶段 7 的 `MTP3 + offload_split/offload_fuse + eager` 已完成 21K 昇腾验收。target verification 为四次因果正确的 ordinary single-token DSA decode：split 稳定阶段走 LIM+SCATTER+SFA，fuse 稳定阶段走 LIM+COPYSFA；首次 LIDU 初始化仍走 split 链。MTP draft 保持独立 dense source 的单 query LIM+SFA 路径，不走 COPYSFA。
+- `none` 的 dense MLA 与 split/fuse 的 top-2048 sparse + dense-tail MLA 并非相同算法。短窗口可以对齐，但长 MTP 生成会放大稀疏近似分叉；验收以任务质量、稳定性及 split/fuse 一致性为准，不再要求与 none 的全部 token IDs 严格一致。
 
 相关文档：[`README.md`](README.md)、[`README_ops.md`](README_ops.md)、[`TODO.md`](TODO.md)。
 
@@ -270,21 +272,20 @@ CPU 验收：
 
 实现项：
 
-- 只有 21 个 full target layer 调用 `fused_li_manage_mtp`。
-- 每次 LIM 仍处理每请求 4 个 verification query，并保护四路 top2048 的并集。
-- 57 个 shared layer 复用 owner 的 `topk_src_ids/topk_dst_slots/miss_src_ids/miss_dst_slots/miss_counts`。
-- 78 层分别调用 MTP SCATTER/SFA 或 COPYSFA-MTP。
+- GLM-5.2 target verification 保持四次 ordinary single-token decode，保证 partial reject 与 K=0 的因果 KV 语义一致。
+- 每次 target token 只有 21 个 full layer 调用普通 `fused_li_manage`；57 个 shared layer 复用 owner 的 `topk_src_ids/topk_dst_slots/miss_counts`。
+- split 稳定 token 分别走 78 层 SCATTER+SFA；fuse 稳定 token 分别走 78 层 COPYSFA。首次 LIDU 初始化不走 COPYSFA，仍使用 SCATTER+SFA。
+- MTP draft iteration 继续使用独立 dense MTP KV source 的单 query LIM+SFA；该路径没有 DRAM miss，因此不能调用 COPYSFA。
 
 验收：
 
-- K=3 `none/split/fuse` 最终 token IDs 一致。
-- 每请求典型 unique union miss 应按实际模型数据观测，不用人工假定为四路 miss 的简单和。
-- eager 逻辑调用应为 21 次 LIM-MTP、78 次 COPY/SFA-MTP 或 78 次 COPYSFA-MTP。当前保守版 `fused_copy_sfa_mtp` 内部仍由 SCATTER+SFA 组成，因此 Ascend Hardware 视图中看到两个内部算子是正常的。
-- 先看语义，再看 step latency；不在这一阶段同时改 LIM-MTP/COPYSFA-MTP kernel。
+- split 与 fuse 在相同请求、采样和 completion 范围内输出一致；与 dense none 的长生成允许出现稀疏近似分叉。
+- profile：首个 LIDU token 为 LIM+SCATTER+SFA；后续 split 为 LIM+SCATTER+SFA，后续 fuse 为 LIM+COPYSFA。MTP draft 不出现 COPYSFA。
+- 先看语义与任务质量，再看 step latency；本阶段不改 LIM-MTP/COPYSFA-MTP kernel，也不改变 7 个 offloading 算子的 ABI。
 
 ### 阶段 8：MTP3 full-decode-only graph
 
-- 固定 `B*4` verification shape 和 group output buffer 地址。
+- 图内保持四次 ordinary single-token target verification，不使用会破坏 GLM-5.2 partial-reject 因果语义的并行 `B*4` target 路径。
 - split 路径先通过，再接 fuse。
 - 首次 decode、cache init 和 lazy capture 可以慢；只优化后续 stable replay。
 - 覆盖请求同时结束、EOS、`NANOVLLM_MAX_STEPS`、batch reorder 和 request-pool reuse。
@@ -293,7 +294,7 @@ CPU 验收：
 
 - eager/graph 结果一致。
 - 初始化后连续 stable decode replay，不出现周期性 eager fallback。
-- profile 算子次数为 21/78。
+- profile 的 target 算子次数随四次串行 verification 和实际 decode 调度统计；split/fuse 编排分别保持正确。
 - 用 DuReader 多请求验证真实 MTP acceptance 和 effective TPOT。
 
 ### 阶段 9：性能、回归与收尾
@@ -558,4 +559,20 @@ CPU/UT：MTP、full-decode graph、IndexShare、DSA offload 联合回归 164 pas
   - 三个长度的输出均与既有 MTP3 + none eager 结果完全一致
   - profile 中 MTP IndexShare 算子和 graph capture/replay 行为符合预期
 结论与下一步：MTP iteration IndexShare 完整验收通过；进入阶段 7，先接入 MTP3 target IndexShare offload_split eager。
+```
+
+### 阶段 7：MTP3 target IndexShare offload eager
+
+```text
+日期：2026-08-12
+阶段：7（MTP3 + offload_split/offload_fuse + eager）
+commit：23ab8d8；target 因果语义与 offload slot 修复 bab2c65、b69434e；fuse 接入 a9572c4、14402af
+代码状态：已完成，仅改 Python 调度、缓存 metadata 与模式门禁，无需重编 Ascend 自定义算子
+实现：target verification 沿用 GLM-5.2 的四次 ordinary single-token decode，按 L、L+1、L+2、L+3 递进更新 KV。split 稳定阶段走普通 LIM+SCATTER+SFA；fuse 稳定阶段走普通 LIM+COPYSFA。首个 LIDU token 仍需初始化，安全地保留 LIM+SCATTER+SFA。MTP draft 的独立 dense source 不具备 DRAM cache，继续走单 query LIM+SFA，禁止误入 COPYSFA。
+CPU/UT：MTP 与 IndexShare 回归 100 passed / 1 skipped
+昇腾整网：通过（当前覆盖 21K）
+  - MTP3 + split + eager 的短窗口 target token 与 none 对齐；长生成出现稀疏 top-2048 近似在 MTP acceptance 中放大的预期分叉，首个长 QA 答案正确
+  - MTP3 + fuse + eager 输出与 split 完全一致，profile 算子符合编排预期
+profile/性能：target 采用因果正确的串行单 query 路径，算子次数按四次 verification 与实际请求步统计；不将旧的 B*4 `*_mtp` 算子次数作为本阶段验收条件
+结论与下一步：阶段 7 eager 验收通过；进入阶段 8，先接入 split 的 full-decode-only graph，并保持四次串行 target verification 的因果语义
 ```
