@@ -7,7 +7,7 @@
 - [x] 在昇腾上验收 `MTP0 + none + eager`：短序列、21K、接近 64K。
 - [x] 完成 MTP0 的 target-layer IndexShare：先 `offload_split + eager`，再 `offload_fuse + eager`。
 - [x] 完成 MTP0 的 stable full-decode-only graph。
-- [ ] 适配 GLM-5.2 的量化 MTP layer，打通 `MTP3 + none` 的 eager 和 graph。
+- [x] 适配 GLM-5.2 的量化 MTP layer，打通 `MTP3 + none` 的 eager 和 graph。
 - [ ] 完成 MTP3 的 target-layer IndexShare offload：split、fuse、eager、graph。
 - [ ] 处理 MTP iteration 内的 IndexShare，完成 20K～64K 性能验收、回归和文档收尾。
 
@@ -20,8 +20,8 @@
 - 阶段 0、阶段 1 和阶段 2 均已完成并通过当前范围内的验收；阶段 2 的实现提交为 `15f1a7f`，后续修复为 `f9f4123` 和 `7c77e81`。
 - 阶段 2 昇腾整网已覆盖 21K、40K 和 64K 的 `MTP0 + offload_split + eager`。21K 和 64K 与 `none` 的 token IDs 完全一致；40K 在后续 greedy token 上存在稀疏 top-2048 + dense-tail Attention 的预期近似分叉。
 - 40K eager profile 确认每个 stable decode step 为 21 次 LIM、78 次 SCATTER、78 次 SFA；同一 IndexShare group 内的 miss metadata 一致，KV payload 仍按层独立。
-- 阶段 3（MTP0 + offload_fuse + eager）和阶段 4（MTP0 full-decode-only graph）均已完成并通过验收。阶段 5 已打通 `MTP3 + offload_mode=none + eager`，并完成 21K、40K、64K 的 K=0/K=3 token 对齐验收。
-- 阶段 5 仅改 Python 模型加载、调度与 target 验证，不需要重新编译 Ascend 自定义算子；下一阶段为 MTP3 nonoffload full-decode-only graph。
+- 阶段 3（MTP0 + offload_fuse + eager）和阶段 4（MTP0 full-decode-only graph）均已完成并通过验收。阶段 5 已打通 `MTP3 + offload_mode=none + eager`，并完成 21K、40K、64K 的 K=0/K=3 token 对齐验收。阶段 6 的 `MTP3 + none` full-decode-only graph 也已通过相同长度覆盖，输出与 eager 完全一致。
+- 阶段 5、阶段 6 仅改 Python 模型加载、调度、target 验证和图管理，不需要重新编译 Ascend 自定义算子；下一步为 MTP iteration 内的 IndexShare。
 
 相关文档：[`README.md`](README.md)、[`README_ops.md`](README_ops.md)、[`TODO.md`](TODO.md)。
 
@@ -252,7 +252,7 @@ CPU 验收：
 
 ### 阶段 6：MTP3 + none 的 graph，以及 MTP iteration IndexShare
 
-先让现有 nonoffload MTP3 stable decode 正确入图，再单独处理 `index_share_for_mtp_iteration`：
+`MTP3 + none` stable decode graph 已完成；`index_share_for_mtp_iteration` 仍待单独处理：
 
 - MTP layer 第一次 draft iteration 计算选择结果。
 - 后续 draft iteration 复用该结果，但仍分别计算自己的 attention。
@@ -260,9 +260,9 @@ CPU 验收：
 
 验收：
 
-- `captures/replays` 正常，K=3 输出与 eager 一致。
-- draft iteration 的 Indexer 次数符合模型语义。
-- 单独记录该优化前后的 MTP draft graph 时延。
+- [x] `captures/replays` 正常，K=3 输出与 eager 一致。
+- [ ] draft iteration 的 Indexer 次数符合模型语义。
+- [ ] 单独记录该优化前后的 MTP draft graph 时延。
 
 ### 阶段 7：MTP3 target IndexShare offload eager
 
@@ -494,4 +494,20 @@ CPU/UT：MTP、IndexShare、DSA offload 联合回归 134 passed / 1 skipped（�
   - K=3 的 max_steps 统计 decode 调度轮次，每轮最多提交 4 个 token；因此不能用相同 max_steps 比较 K=0/K=3 的输出长度
 profile/性能：本阶段串行 target verification 优先保证语义，暂不以 eager TPOT 作为性能结论
 结论与下一步：阶段 5 eager 验收通过；进入阶段 6（MTP3 + none full-decode-only graph）
+```
+
+### 阶段 6：MTP3 + none full-decode-only graph
+
+```text
+日期：2026-08-12
+阶段：6（MTP3 + none full-decode-only graph）
+commit：c47f5e6；捕获期同步修复 5b77a24
+代码状态：已完成，仅改 Python，无需重编 Ascend 自定义算子
+CPU/UT：MTP、full-decode graph、IndexShare、DSA offload 联合回归 157 passed / 1 skipped（历史 8.2K 预算断言单独排除）
+实现：GLM-5.2 target verification 在图内保持四次 ordinary single-token decode；target graph 捕获 312 个 FIA task，并按验证步骤分别刷新 KV 长度 L、L+1、L+2、L+3。draft graph 继续捕获三个递归 MTP step
+昇腾整网：通过
+  - MTP3 + none + full-decode-only graph 覆盖 21K、40K、64K
+  - 三个长度的输出均与 MTP3 + none + eager 完全一致，无任何 token 偏差
+profile/性能：本阶段优先保证图内因果语义与 eager 对齐；尚未进行 MTP iteration IndexShare 的性能优化对比
+结论与下一步：阶段 6 graph 验收通过；进入 MTP iteration IndexShare
 ```
