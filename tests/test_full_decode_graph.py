@@ -258,7 +258,7 @@ def test_mtp_offload_graph_waits_for_initialized_rows():
     assert stats["eager_lidu_uninitialized"] == 1
 
 
-def test_mtp_offload_target_context_uses_fixed_graph_metadata():
+def test_mtp_offload_target_context_uses_parallel_graph_metadata():
     manager = MTPDecodeOnlyGraphManager(
         target_forward=lambda *_args: (),
         draft_forward=lambda *_args: torch.empty(0),
@@ -275,7 +275,6 @@ def test_mtp_offload_target_context_uses_fixed_graph_metadata():
     )
     entry = manager._allocate_entry(2)
     entry.actual_seq_lengths_kv.copy_(torch.tensor([5188, 5192]))
-    entry.stage_mtp_target_actual_seq_lengths()
     entry.req_pool_entries.copy_(torch.tensor([7, 3]))
     entry.candidate_lens.copy_(torch.tensor([20992, 32768]))
     entry.lidu_cache_tokens.copy_(torch.tensor([8192, 12288]))
@@ -289,19 +288,6 @@ def test_mtp_offload_target_context_uses_fixed_graph_metadata():
         assert context.lidu_all_rows_ready is True
         assert context.actual_seq_lengths_kv == [21003, 32779]
         assert context.actual_seq_lengths_kv_tensor is entry.actual_seq_lengths_kv
-        assert (
-            context.mtp_target_actual_seq_lengths_by_step
-            is entry.mtp_target_actual_seq_lengths_by_step
-        )
-        assert [
-            values.tolist()
-            for values in context.mtp_target_actual_seq_lengths_by_step
-        ] == [
-            [5185, 5189],
-            [5186, 5190],
-            [5187, 5191],
-            [5188, 5192],
-        ]
         assert context.block_tables is entry.block_tables
         assert context.index_block_tables is entry.index_block_tables
         assert context.dram_block_tables is entry.dram_block_tables
@@ -834,7 +820,7 @@ def test_mtp_graph_replays_target_then_refreshes_three_draft_steps(
     assert manager.replay_count == 1
 
 
-def test_mtp_graph_serial_target_refreshes_each_verification_step(
+def test_mtp_graph_parallel_target_refreshes_final_verification_length(
     monkeypatch,
 ):
     calls = []
@@ -876,7 +862,7 @@ def test_mtp_graph_serial_target_refreshes_each_verification_step(
     entry.selected_hidden_states = torch.zeros(2, 4)
     entry.selected_positions = torch.tensor([99, 201])
     entry.next_drafts = torch.tensor([[9, 10, 11], [12, 13, 14]])
-    entry.target_tasks = [FakeTask(f"target-{step}") for step in range(4)]
+    entry.target_tasks = [FakeTask("target")]
     entry.draft_tasks = [FakeTask(f"draft-{step}") for step in range(3)]
 
     manager = MTPDecodeOnlyGraphManager(
@@ -889,8 +875,7 @@ def test_mtp_graph_serial_target_refreshes_each_verification_step(
         block_size=128,
         device="cpu",
         speculative_tokens=3,
-        expected_target_tasks=4,
-        serial_target_verification=True,
+        expected_target_tasks=1,
         log_enabled=False,
     )
     manager._entries[2] = entry
@@ -911,10 +896,7 @@ def test_mtp_graph_serial_target_refreshes_each_verification_step(
     assert calls == [
         "synchronize",
         ("replay", "target"),
-        ("update", "target-0", [100, 200]),
-        ("update", "target-1", [101, 201]),
-        ("update", "target-2", [102, 202]),
-        ("update", "target-3", [103, 203]),
+        ("update", "target", [103, 203]),
         ("replay", "draft"),
         ("update", "draft-0", [100, 202]),
         ("update", "draft-1", [101, 203]),

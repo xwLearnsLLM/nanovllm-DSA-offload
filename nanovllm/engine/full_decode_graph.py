@@ -789,7 +789,6 @@ class MTPDecodeGraphEntry:
     mtp_candidate_lens: torch.Tensor
     mtp_lidu_cache_tokens: torch.Tensor
     mtp_actual_seq_lengths_by_step: list[torch.Tensor]
-    mtp_target_actual_seq_lengths_by_step: list[torch.Tensor]
     actual_seq_lengths_kv: torch.Tensor
     index_block_tables: torch.Tensor
     dram_block_tables: torch.Tensor
@@ -885,10 +884,6 @@ class MTPDecodeGraphEntry:
             mtp_actual_seq_lengths_by_step=[
                 torch.zeros(batch_size, dtype=torch.int32, device=device)
                 for _ in range(speculative_tokens)
-            ],
-            mtp_target_actual_seq_lengths_by_step=[
-                torch.zeros(batch_size, dtype=torch.int32, device=device)
-                for _ in range(query_len)
             ],
             actual_seq_lengths_kv=torch.zeros(
                 batch_size, dtype=torch.int32, device=device
@@ -1111,16 +1106,6 @@ class MTPDecodeGraphEntry:
                 )
             )
 
-    def stage_mtp_target_actual_seq_lengths(self) -> None:
-        """Stage the four serial target SFA KV lengths at fixed addresses."""
-
-        base = self.actual_seq_lengths_kv - self.speculative_tokens
-        for step, destination in enumerate(
-            self.mtp_target_actual_seq_lengths_by_step
-        ):
-            destination.copy_(base + step)
-
-
 class MTPDecodeOnlyGraphManager:
     """Two exact-size graphs for steady GLM MTP verification and drafting.
 
@@ -1143,7 +1128,6 @@ class MTPDecodeOnlyGraphManager:
         device: str,
         speculative_tokens: int,
         expected_target_tasks: int,
-        serial_target_verification: bool = False,
         offload_mode: str = OFFLOAD_NONE,
         log_enabled: bool = True,
     ) -> None:
@@ -1163,7 +1147,6 @@ class MTPDecodeOnlyGraphManager:
         self.device = torch.device(device)
         self.speculative_tokens = int(speculative_tokens)
         self.expected_target_tasks = int(expected_target_tasks)
-        self.serial_target_verification = bool(serial_target_verification)
         self.log_enabled = bool(log_enabled)
         self.offload_mode = normalize_offload_mode(offload_mode)
         self.stateful_offload = self.offload_mode != OFFLOAD_NONE
@@ -1230,19 +1213,6 @@ class MTPDecodeOnlyGraphManager:
             for length in base_seq_lengths
         ]
 
-    def _target_task_seq_lengths(
-        self, base_seq_lengths: list[int]
-    ) -> list[int] | list[list[int]]:
-        """Return the KV length each captured target attention task observes."""
-        if not self.serial_target_verification:
-            return self._target_seq_lengths(
-                base_seq_lengths, self.speculative_tokens
-            )
-        return [
-            [int(length) + step for length in base_seq_lengths]
-            for step in range(self.speculative_tokens + 1)
-        ]
-
     @staticmethod
     def _draft_seq_lengths(
         base_seq_lengths: list[int],
@@ -1280,11 +1250,6 @@ class MTPDecodeOnlyGraphManager:
             actual_seq_lengths_kv=target_seq_lengths,
             actual_seq_lengths_kv_tensor=(
                 entry.actual_seq_lengths_kv
-                if self.stateful_offload
-                else None
-            ),
-            mtp_target_actual_seq_lengths_by_step=(
-                entry.mtp_target_actual_seq_lengths_by_step
                 if self.stateful_offload
                 else None
             ),
@@ -1349,30 +1314,13 @@ class MTPDecodeOnlyGraphManager:
     def _replay_target_graph(
         self,
         entry: MTPDecodeGraphEntry,
-        target_task_seq_lengths: list[int] | list[list[int]],
+        target_task_seq_lengths: list[int],
     ) -> None:
         torch.npu.current_stream().synchronize()
         entry.target_graph.replay()
         with torch.npu.stream(self._update_stream):
-            if not self.serial_target_verification:
-                for task in entry.target_tasks:
-                    task.update(self._update_stream, target_task_seq_lengths)
-                return
-            target_steps = self.speculative_tokens + 1
-            if (
-                not isinstance(target_task_seq_lengths[0], list)
-                or len(target_task_seq_lengths) != target_steps
-                or len(entry.target_tasks) % target_steps != 0
-            ):
-                raise RuntimeError(
-                    "Serial MTP target graph task metadata is inconsistent "
-                    "with the configured speculative depth."
-                )
-            tasks_per_step = len(entry.target_tasks) // target_steps
-            for step, task_seq_lengths in enumerate(target_task_seq_lengths):
-                start = step * tasks_per_step
-                for task in entry.target_tasks[start : start + tasks_per_step]:
-                    task.update(self._update_stream, task_seq_lengths)
+            for task in entry.target_tasks:
+                task.update(self._update_stream, target_task_seq_lengths)
 
     def _replay_draft_graph(
         self,
@@ -1467,8 +1415,6 @@ class MTPDecodeOnlyGraphManager:
                     mtp_index_share,
                     offload_mode=self.offload_mode,
                 )
-                if self.stateful_offload:
-                    entry.stage_mtp_target_actual_seq_lengths()
                 target_seq_lengths = self._target_seq_lengths(
                     base_seq_lengths, self.speculative_tokens
                 )
@@ -1484,8 +1430,6 @@ class MTPDecodeOnlyGraphManager:
                         mtp_index_share,
                         offload_mode=self.offload_mode,
                     )
-                    if self.stateful_offload:
-                        entry.stage_mtp_target_actual_seq_lengths()
                     self._set_target_context(entry, target_seq_lengths)
 
                 # Allocate FIA workspaces and output buffers before capture.
@@ -1523,7 +1467,9 @@ class MTPDecodeOnlyGraphManager:
                 # outputs. Replay target once before consuming acceptance.
                 self._replay_target_graph(
                     entry,
-                    self._target_task_seq_lengths(base_seq_lengths),
+                    self._target_seq_lengths(
+                        base_seq_lengths, self.speculative_tokens
+                    ),
                 )
                 accepted_counts = entry.accepted_counts.cpu().tolist()
                 draft_seq_lengths = self._draft_seq_lengths(
@@ -1621,11 +1567,11 @@ class MTPDecodeOnlyGraphManager:
             mtp_index_share,
             offload_mode=self.offload_mode,
         )
-        if self.stateful_offload:
-            entry.stage_mtp_target_actual_seq_lengths()
         self._replay_target_graph(
             entry,
-            self._target_task_seq_lengths(base_seq_lengths),
+            self._target_seq_lengths(
+                base_seq_lengths, self.speculative_tokens
+            ),
         )
         accepted_counts = entry.accepted_counts.cpu().tolist()
 
@@ -1700,7 +1646,6 @@ class MTPDecodeOnlyGraphManager:
             "mode": FULL_DECODE_ONLY,
             "capture_sizes": list(self.capture_sizes),
             "offload_mode": self.offload_mode,
-            "serial_target_verification": self.serial_target_verification,
             "exact_size_only": True,
             "captures": self.capture_count,
             "replays": self.replay_count,

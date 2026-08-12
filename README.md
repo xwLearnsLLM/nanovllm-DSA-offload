@@ -2,7 +2,7 @@
 
 运行时要求 BF16、Expert Parallel、128-token KV block，以及 ModelSlim 1.0.0 per-channel W4A8 checkpoint。Routed experts 保持原生 W4A8；Attention、dense/shared MLP 的 W8A8 权重在加载时反量化为 BF16。
 
-`main-glm52` 第一阶段支持 `GLM-5.2-w4a8 + MTP0 + offload_mode=none + eager`，目标上下文为 20K～64K。GLM-5.2 的 IndexShare offload、MTP3 和图模式将在后续阶段逐步加入；当前若误开会明确报错。
+`main-glm52` 支持 `GLM-5.2-w4a8` 在 20K～64K 范围内使用 `MTP0/MTP3 × none/offload_split/offload_fuse × eager/FULL_DECODE_ONLY`。MTP3 target verification 一次处理每请求四路因果 query；offload 路径使用对应的 `*_mtp` LIM 和 Attention 算子。
 
 　
 

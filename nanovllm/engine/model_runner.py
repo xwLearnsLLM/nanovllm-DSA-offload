@@ -227,13 +227,7 @@ class ModelRunner:
                         0
                         if self.uses_offload
                         else int(text_config.num_hidden_layers)
-                        * (
-                            self.num_speculative_tokens + 1
-                            if config.glm_version == "5.2"
-                            else 1
-                        )
                     ),
-                    serial_target_verification=(config.glm_version == "5.2"),
                     offload_mode=self.offload_mode,
                     log_enabled=self.rank == 0,
                 )
@@ -1492,7 +1486,6 @@ class ModelRunner:
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
-        torch.Tensor,
     ]:
         k = self.num_speculative_tokens
         query_len = k + 1
@@ -1623,7 +1616,6 @@ class ModelRunner:
             input_ids_tensor,
             positions_tensor,
             drafts,
-            static_metadata.block_tables,
             mtp_block_tables,
         )
 
@@ -1664,203 +1656,16 @@ class ModelRunner:
             selected_positions,
         )
 
-    def _mtp_target_forward_serial(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        draft_token_ids: torch.Tensor,
-        block_tables: torch.Tensor,
-        *,
-        has_first_decode: bool,
-    ) -> tuple[torch.Tensor, ...]:
-        """Verify GLM-5.2 MTP drafts through the ordinary target decode path.
-
-        The TND K+1 verification kernel is faster, but GLM-5.2's first
-        bring-up must preserve exact K=0 greedy semantics across partial
-        draft rejection.  One-token target forwards provide the same cache
-        and causal-attention contract as ordinary decode.  The MTP layer still
-        produces all drafts; only target verification is serialized.
-        """
-
-        batch_size, k = draft_token_ids.shape
-        if k != self.num_speculative_tokens:
-            raise RuntimeError(
-                "MTP target draft width changed: "
-                f"expected={self.num_speculative_tokens}, actual={k}."
-            )
-        query_len = k + 1
-        if input_ids.numel() != batch_size * query_len:
-            raise ValueError(
-                "Serialized MTP target input shape does not match draft "
-                f"batch: tokens={input_ids.numel()}, batch={batch_size}, "
-                f"query_len={query_len}."
-            )
-        if positions.shape != input_ids.shape:
-            raise ValueError(
-                "Serialized MTP target positions must match input_ids: "
-                f"positions={tuple(positions.shape)}, "
-                f"input_ids={tuple(input_ids.shape)}."
-            )
-
-        token_rows = input_ids.view(batch_size, query_len)
-        position_rows = positions.view(batch_size, query_len)
-        capture_base_seq_lengths: list[int] | None = None
-        target_index_share: _MtpIndexShareMetadata | None = None
-        target_dram_block_tables: torch.Tensor | None = None
-        target_lidu_init_rows: torch.Tensor | None = None
-        target_final_seq_lengths: list[int] | None = None
-        target_slot_rows: torch.Tensor | None = None
-        target_actual_seq_lengths_by_step: list[torch.Tensor] | None = None
-        if self.uses_offload:
-            target_context = get_context()
-            required = {
-                "index_block_tables": target_context.index_block_tables,
-                "dram_block_tables": target_context.dram_block_tables,
-                "req_pool_entries": target_context.req_pool_entries,
-                "candidate_lens": target_context.candidate_lens,
-                "lidu_cache_tokens": target_context.lidu_cache_tokens,
-                "actual_seq_lengths_kv": target_context.actual_seq_lengths_kv,
-                "flat_slot_mapping": target_context.flat_slot_mapping,
-            }
-            missing = [
-                name for name, value in required.items() if value is None
-            ]
-            if missing:
-                raise RuntimeError(
-                    "GLM-5.2 MTP offload target is missing: "
-                    + ", ".join(missing)
-                )
-            target_index_share = _MtpIndexShareMetadata(
-                block_tables=target_context.index_block_tables,
-                req_pool_entries=target_context.req_pool_entries,
-                candidate_lens=target_context.candidate_lens,
-                lidu_cache_tokens=target_context.lidu_cache_tokens,
-            )
-            target_dram_block_tables = target_context.dram_block_tables
-            target_lidu_init_rows = target_context.lidu_init_rows
-            target_final_seq_lengths = [
-                int(length) for length in target_context.actual_seq_lengths_kv
-            ]
-            target_slot_rows = target_context.flat_slot_mapping.view(
-                batch_size, query_len
-            )
-            target_actual_seq_lengths_by_step = (
-                target_context.mtp_target_actual_seq_lengths_by_step
-            )
-            if target_actual_seq_lengths_by_step is not None and len(
-                target_actual_seq_lengths_by_step
-            ) != query_len:
-                raise RuntimeError(
-                    "GLM-5.2 MTP graph target has an invalid serial "
-                    "KV-length buffer count."
-                )
-        if is_full_decode_graph_capturing():
-            target_seq_lengths = (
-                target_final_seq_lengths
-                if target_final_seq_lengths is not None
-                else get_context().actual_seq_lengths_kv
-            )
-            if target_seq_lengths is None or len(target_seq_lengths) != batch_size:
-                raise RuntimeError(
-                    "GLM-5.2 MTP graph target is missing captured KV "
-                    "lengths."
-                )
-            capture_base_seq_lengths = [
-                int(length) - self.num_speculative_tokens
-                for length in target_seq_lengths
-            ]
-        target_tokens: list[torch.Tensor] = []
-        target_hidden_states: list[torch.Tensor] = []
-        for step in range(query_len):
-            step_positions = position_rows[:, step]
-            if capture_base_seq_lengths is None:
-                if target_final_seq_lengths is None:
-                    actual_seq_lengths_kv = (
-                        step_positions.add(1).cpu().tolist()
-                    )
-                else:
-                    actual_seq_lengths_kv = [
-                        length - self.num_speculative_tokens + step
-                        for length in target_final_seq_lengths
-                    ]
-            else:
-                actual_seq_lengths_kv = [
-                    length + step for length in capture_base_seq_lengths
-                ]
-            self._set_mtp_decode_context(
-                block_tables,
-                step_positions,
-                actual_seq_lengths_kv=actual_seq_lengths_kv,
-                has_first_decode=has_first_decode and step == 0,
-                index_share=target_index_share,
-                dram_block_tables=target_dram_block_tables,
-                lidu_init_rows=(
-                    target_lidu_init_rows if step == 0 else None
-                ),
-                actual_seq_lengths_kv_tensor=(
-                    None
-                    if target_actual_seq_lengths_by_step is None
-                    else target_actual_seq_lengths_by_step[step]
-                ),
-                flat_slot_mapping=(
-                    None
-                    if target_slot_rows is None
-                    else target_slot_rows[:, step]
-                ),
-            )
-            hidden_states = self.model(
-                token_rows[:, step], step_positions
-            )
-            target_hidden_states.append(hidden_states)
-            target_tokens.append(
-                self._greedy_sample(
-                    self.model.compute_logits(hidden_states)
-                )
-            )
-
-        targets = torch.stack(target_tokens, dim=1)
-        accepted_counts, next_token_ids = greedy_prefix_accept(
-            targets, draft_token_ids
-        )
-        hidden_by_request = torch.stack(target_hidden_states, dim=1)
-        rows = torch.arange(
-            batch_size, dtype=torch.long, device=input_ids.device
-        )
-        selected_hidden_states = hidden_by_request[rows, accepted_counts]
-        selected_positions = (
-            position_rows[:, 0] + accepted_counts
-        )
-        return (
-            targets,
-            accepted_counts,
-            next_token_ids,
-            selected_hidden_states,
-            selected_positions,
-        )
-
     def _mtp_target_graph_forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         draft_token_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, ...]:
-        """Select the graph-safe target verification implementation."""
+        """Run one causal B*4 target verification graph."""
 
-        if self.config.glm_version != "5.2":
-            return self._mtp_target_forward(
-                input_ids, positions, draft_token_ids
-            )
-        context = get_context()
-        if context.block_tables is None:
-            raise RuntimeError(
-                "GLM-5.2 MTP graph target is missing block tables."
-            )
-        return self._mtp_target_forward_serial(
-            input_ids,
-            positions,
-            draft_token_ids,
-            context.block_tables,
-            has_first_decode=False,
+        return self._mtp_target_forward(
+            input_ids, positions, draft_token_ids
         )
 
     def _mtp_draft_graph_forward(
@@ -1974,7 +1779,6 @@ class ModelRunner:
             input_ids,
             positions,
             draft_token_ids,
-            block_tables,
             mtp_block_tables,
         ) = self._prepare_mtp_verify(seqs)
         init_rows = get_context().lidu_init_rows
@@ -2000,30 +1804,15 @@ class ModelRunner:
                 mtp_index_share,
             )
         else:
-            if self.config.glm_version == "5.2":
-                (
-                    target_tokens,
-                    accepted_counts,
-                    next_token_ids,
-                    selected_hidden_states,
-                    selected_positions,
-                ) = self._mtp_target_forward_serial(
-                    input_ids,
-                    positions,
-                    draft_token_ids,
-                    block_tables,
-                    has_first_decode=get_context().has_first_decode,
-                )
-            else:
-                (
-                    target_tokens,
-                    accepted_counts,
-                    next_token_ids,
-                    selected_hidden_states,
-                    selected_positions,
-                ) = self._mtp_target_forward(
-                    input_ids, positions, draft_token_ids
-                )
+            (
+                target_tokens,
+                accepted_counts,
+                next_token_ids,
+                selected_hidden_states,
+                selected_positions,
+            ) = self._mtp_target_forward(
+                input_ids, positions, draft_token_ids
+            )
             accepted_counts_host = accepted_counts.cpu().tolist()
             next_drafts = self._run_mtp_recurrence(
                 next_token_ids,

@@ -22,7 +22,7 @@
 - 阶段 2 昇腾整网已覆盖 21K、40K 和 64K 的 `MTP0 + offload_split + eager`。21K 和 64K 与 `none` 的 token IDs 完全一致；40K 在后续 greedy token 上存在稀疏 top-2048 + dense-tail Attention 的预期近似分叉。
 - 40K eager profile 确认每个 stable decode step 为 21 次 LIM、78 次 SCATTER、78 次 SFA；同一 IndexShare group 内的 miss metadata 一致，KV payload 仍按层独立。
 - 阶段 3（MTP0 + offload_fuse + eager）和阶段 4（MTP0 full-decode-only graph）均已完成并通过验收。阶段 5 已打通 `MTP3 + offload_mode=none + eager`，并完成 21K、40K、64K 的 K=0/K=3 token 对齐验收。阶段 6 的 `MTP3 + none` full-decode-only graph 也已通过相同长度覆盖，输出与 eager 完全一致。
-- 阶段 7 的 `MTP3 + offload_split/offload_fuse + eager` 已完成 21K 昇腾验收。target verification 为四次因果正确的 ordinary single-token DSA decode：split 稳定阶段走 LIM+SCATTER+SFA，fuse 稳定阶段走 LIM+COPYSFA；首次 LIDU 初始化仍走 split 链。MTP draft 保持独立 dense source 的单 query LIM+SFA 路径，不走 COPYSFA。
+- 阶段 7 的 `MTP3 + offload_split/offload_fuse + eager` 已完成 21K 昇腾验收；阶段 9.1 已将运行时 target verification 切换为单次因果 `B×4` 前向，等待新的昇腾一致性和性能验收。MTP draft 保持独立 dense source 的单 query LIM+SFA 路径，不走 COPYSFA。
 - `none` 的 dense MLA 与 split/fuse 的 top-2048 sparse + dense-tail MLA 并非相同算法。短窗口可以对齐，但长 MTP 生成会放大稀疏近似分叉；验收以任务质量、稳定性及 split/fuse 一致性为准，不再要求与 none 的全部 token IDs 严格一致。
 - 阶段 8 的 `MTP3 + offload_split/offload_fuse + full-decode-only graph` 已覆盖 21K、40K、64K；三个长度均与对应 eager 输出完全一致，profile 算子数量符合预期。
 
@@ -592,4 +592,22 @@ CPU/UT：full-decode graph、MTP 与 IndexShare 回归 123 passed / 1 skipped
   - MTP3 + fuse + full-decode-only graph 覆盖 21K、40K、64K，三个长度均与 fuse eager 完全一致，算子数量符合预期
 profile/性能：首次 decode、LIDU 初始化及 lazy capture 允许 eager；初始化完成后 target+draft 使用稳定 replay。split 使用 SCATTER+SFA，fuse 使用 COPYSFA。
 结论与下一步：阶段 8 graph 验收通过；进入阶段 9，开展多请求性能矩阵、真实评测回归与文档收尾。
+```
+
+### 阶段 9.1：MTP3 并行 target verification
+
+```text
+日期：2026-08-12
+阶段：9.1（MTP3 B×4 causal target verification）
+commit：本提交
+代码状态：已完成 Python 调度、图 metadata 与回归测试修改；等待昇腾整网验收
+实现：移除 GLM-5.2 target 的四次 ordinary single-token forward。eager 和 full-decode-only graph 均改为一次 B×4 target forward，保留每个请求四个连续 slot、TND query length=[4, 8, ...] 与最终 KV length=L+3。offload_split 走 fused_li_manage_mtp → SCATTER → sparse_tail_attention_mtp；offload_fuse 走 fused_li_manage_mtp → fused_copy_sfa_mtp。MTP SFA 内核按 query row 施加因果可见长度，因此每个验证位置只能读取本位置及之前的 KV。
+图模式：移除四组 L、L+1、L+2、L+3 的串行 target KV-length buffer。none target graph 预期捕获 78 个 FIA task（不再是 312）；offload target graph 由自定义 MTP 算子组成，预期没有 FIA task。
+CPU/UT：`PYTHONPATH=$PWD pytest -q tests/test_full_decode_graph.py tests/test_glm_mtp.py tests/test_glm_index_share.py`，123 passed / 1 skipped；`python -m compileall -q nanovllm tests` 通过
+昇腾整网：待验收
+  - 同模式 B×4 与此前串行 baseline：21K、40K、64K 的 target tokens、accepted_drafts、完整 response/token_ids 必须一致
+  - eager 与 graph 必须一致；split 与 fuse 必须一致
+  - profile：每个 B×4 target forward 为 21 次 NanovllmFusedLiManageMtp，split 为 78 次 NanovllmSparseTailAttentionMtp，fuse 为 78 次 NanovllmFusedCopySfaMtp
+性能：仅统计 stable graph replay；预期 target 从约四个完整 target forward 降为一个 B×4 forward，实际收益以 accepted drafts 和整步 latency 为准
+结论与下一步：等待昇腾验收；若与串行 baseline 存在任何 token/acceptance 差异，停止性能推广并定位 MTP causal 或 persistent LIDU state 语义。
 ```
