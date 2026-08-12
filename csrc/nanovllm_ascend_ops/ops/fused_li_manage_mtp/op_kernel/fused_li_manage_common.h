@@ -90,4 +90,3 @@ __aicore__ inline T CeilDiv(T num, T rnd)
 } // namespace LICommon
 
 #endif // FUSED_LI_MANAGE_COMMON_H
-

@@ -61,10 +61,8 @@ private:
     GlobalTensor<int32_t> missDestinationSlotsGm;
     GlobalTensor<int32_t> missCountsGm;
     GlobalTensor<MM1_OUT_T> mm1ResGm;
-    GlobalTensor<float> aggregateScoresGm;
     GlobalTensor<int32_t> internalTopkPayloadsGm;
     GlobalTensor<float> internalThresholdsGm;
-    GlobalTensor<float> internalTopkStatesGm;
 
     uint32_t tmpBlockIdx = 0;
     uint32_t aiCoreIdx = 0;
@@ -128,27 +126,14 @@ __aicore__ inline void LIMtpPreload<LIT>::Init(
         sizeof(MM1_OUT_T);
     mm1ResGm.SetGlobalBuffer(
         (__gm__ MM1_OUT_T *)(workspace + aiCoreIdx * singleCoreMm1Bytes));
-    uint64_t scoresOffset =
+    uint64_t topkOffset =
         static_cast<uint64_t>(tiling->usedCoreNum) * singleCoreMm1Bytes;
-    aggregateScoresGm.SetGlobalBuffer((__gm__ float *)(workspace + scoresOffset));
-    uint64_t scoreStride =
-        CeilDiv(static_cast<uint64_t>(constInfo.kSeqSize),
-                static_cast<uint64_t>(constInfo.s2BaseSize)) *
-        constInfo.s2BaseSize;
-    uint64_t topkOffset = scoresOffset +
-        constInfo.batchSize * scoreStride * sizeof(float);
     internalTopkPayloadsGm.SetGlobalBuffer(
         (__gm__ int32_t *)(workspace + topkOffset));
     uint64_t thresholdOffset = topkOffset +
         constInfo.batchSize * MAX_UNION_TOKENS * sizeof(int32_t);
     internalThresholdsGm.SetGlobalBuffer(
         (__gm__ float *)(workspace + thresholdOffset));
-    uint64_t thresholdBytes =
-        constInfo.batchSize * QUERY_COUNT * sizeof(float);
-    uint64_t topkStateOffset = thresholdOffset +
-        LICommon::Align(thresholdBytes, static_cast<uint64_t>(32U));
-    internalTopkStatesGm.SetGlobalBuffer(
-        (__gm__ float *)(workspace + topkStateOffset));
 
     reqPoolEntriesGm.SetGlobalBuffer((__gm__ int32_t *)reqPoolEntries,
                                      constInfo.batchSize);
@@ -174,8 +159,7 @@ __aicore__ inline void LIMtpPreload<LIT>::Init(
             mm1ResGm, weightsGm, cacheSlotsGm, topkSlotsGm,
             topkSourceIdsGm,
             missSourceIdsGm, missDestinationSlotsGm, missCountsGm,
-            aggregateScoresGm, internalTopkPayloadsGm,
-            internalThresholdsGm, internalTopkStatesGm);
+            internalTopkPayloadsGm, internalThresholdsGm);
         vectorService.InitMtpBuffers(pipe);
     } else {
         matmulService.InitParams(constInfo);
