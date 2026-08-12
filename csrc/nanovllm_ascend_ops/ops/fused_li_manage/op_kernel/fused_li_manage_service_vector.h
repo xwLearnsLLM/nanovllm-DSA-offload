@@ -32,8 +32,17 @@ constexpr uint32_t S2_BASE_SIZE = 512;
 constexpr uint32_t GROUP_INNER = 16;
 constexpr uint32_t PAYLOAD_BUF_SLOTS = 4;
 constexpr uint32_t EVICT_CANDIDATE_CAP = BASE_TOPK;
+// The target MTP workload has about 300-400 unique union misses. Preloading
+// one 512-entry block keeps q3's per-chunk merge at 512+512; atypical larger
+// miss sets retain exact semantics through FinalizeMtpRequest's GM fallback.
+constexpr uint32_t MTP_EVICT_PRELOAD_CAP = S2_BASE_SIZE;
+static_assert(MTP_EVICT_PRELOAD_CAP % S2_BASE_SIZE == 0U &&
+                  MTP_EVICT_PRELOAD_CAP <= EVICT_CANDIDATE_CAP,
+              "MTP eviction preload must fit the shared candidate buffer");
 constexpr uint32_t SORT_TMP_FLOATS = 512 * 8;
 constexpr uint32_t CHUNK_PAIR_FLOATS = 512 * VALUE_AND_INDEX_NUM;
+constexpr uint32_t MTP_EVICT_PENDING_FLOATS =
+    PAYLOAD_BUF_SLOTS * CHUNK_PAIR_FLOATS;
 constexpr uint32_t TOPK_PAIR_FLOATS = BASE_TOPK * VALUE_AND_INDEX_NUM;
 constexpr uint32_t EVICT_PAIR_FLOATS = EVICT_CANDIDATE_CAP * VALUE_AND_INDEX_NUM;
 constexpr uint32_t SORTED_SCRATCH_FLOATS = SORT_TMP_FLOATS + CHUNK_PAIR_FLOATS;
@@ -138,6 +147,7 @@ private:
     TBuf<TPosition::VECCALC> sortOutBuf_;
     TBuf<TPosition::VECCALC> indexBuf_;
     TBuf<TPosition::VECCALC> aggregateScoreBuf_;
+    TBuf<TPosition::VECCALC> evictPendingBuf_;
     TBuf<TPosition::VECCALC> payloadBuf_;
     TBuf<TPosition::VECCALC> reduceOutBuf_;
     TBuf<TPosition::VECCALC> brcBuf_;
@@ -146,6 +156,7 @@ private:
     LocalTensor<int32_t> globalTopkIndice_;
     LocalTensor<float> globalTopkUb_;
     LocalTensor<float> evictCandidateUb_;
+    LocalTensor<float> evictPendingUb_;
     LocalTensor<float> SortedBasicBlock_;
     LocalTensor<int32_t> partialMetaLocal_;
 
@@ -174,6 +185,11 @@ private:
     __aicore__ inline void WriteMtpAggregateScoreChunk(
         uint32_t bIdx, uint32_t queryIdx, int32_t s2BaseIdx,
         const LocalTensor<float> &scoreLocal, int32_t alignedLen);
+    __aicore__ inline void CollectMtpEvictCandidateChunk(
+        const LICommon::RunInfo &info,
+        const LocalTensor<int32_t> &payloadLocal,
+        LocalTensor<float> &tmpSortBuf,
+        uint32_t cachedChunkIdx);
     __aicore__ inline void StoreMtpQueryTopK(const LICommon::RunInfo &info);
     __aicore__ inline void FinalizeMtpRequest(const LICommon::RunInfo &info);
     __aicore__ inline void WritePartialTopK(uint32_t coreIdx, uint32_t partialSlot, uint32_t bIdx);
@@ -256,6 +272,11 @@ __aicore__ inline void LIVector<LIT>::InitMtpBuffers(TPipe *pipe)
     // Only MTP needs the fourth-query aggregate-score scratch. Keep it out
     // of the single-query LIM UB footprint.
     pipe->InitBuffer(aggregateScoreBuf_, S2_BASE_SIZE * sizeof(float));
+    // Accumulate four independently sorted q3 victim blocks before touching
+    // the global 512-entry victim prefix.
+    pipe->InitBuffer(evictPendingBuf_,
+                     MTP_EVICT_PENDING_FLOATS * sizeof(float));
+    evictPendingUb_ = evictPendingBuf_.Get<float>();
 }
 
 template <typename LIT>
@@ -455,6 +476,12 @@ __aicore__ inline void LIVector<LIT>::WriteMtpAggregateScoreChunk(
     // queries; using it as async GM scratch corrupts query 1+ payloads on
     // Ascend910_93 even when it is rewritten before the next chunk.
     LocalTensor<float> previousScore = aggregateScoreBuf_.Get<float>();
+    // q1..q2 write the previous chunk's aggregate from this same UB scratch.
+    // Delay that write's completion until the scratch is actually reused so
+    // MTE3 can overlap the intervening TopK merge and next MM/scale work.
+    if (queryIdx + 1U != MTP_QUERY_COUNT && s2BaseIdx > 0) {
+        SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
+    }
     SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
     DataCopyPad(previousScore, scoresGm[gmOffset],
                 AscendC::DataCopyExtParams{
@@ -463,10 +490,61 @@ __aicore__ inline void LIVector<LIT>::WriteMtpAggregateScoreChunk(
     SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
     Max(previousScore, previousScore, scoreLocal, alignedLen);
     PipeBarrier<PIPE_V>();
+    if (queryIdx + 1U == MTP_QUERY_COUNT) {
+        // q3 produces max(q0..q3). Its consumer builds the eviction candidate
+        // prefix directly from this UB tensor, so the final GM write is dead.
+        return;
+    }
     SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
     LIServiceVec::CopyOut(scoresGm[gmOffset], previousScore, alignedLen);
-    SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
+}
 
+template <typename LIT>
+__aicore__ inline void LIVector<LIT>::CollectMtpEvictCandidateChunk(
+    const LICommon::RunInfo &info,
+    const LocalTensor<int32_t> &payloadLocal,
+    LocalTensor<float> &tmpSortBuf,
+    uint32_t cachedChunkIdx)
+{
+    if (info.isFirstS2InnerLoop) {
+        InitSortOutBuf(evictCandidateUb_,
+                       MTP_EVICT_PRELOAD_CAP * VALUE_AND_INDEX_NUM);
+    }
+
+    // q3 leaves the final max(q0..q3) score in aggregateScoreBuf_. Reuse the
+    // cache-slot payload already fetched for this score chunk and retain four
+    // independently sorted victim blocks. Only the fourth block (or the tail)
+    // updates the global 512-entry victim prefix.
+    LocalTensor<float> aggregateScore = aggregateScoreBuf_.Get<float>();
+    LocalTensor<float> keyLocal = reduceOutBuf_.Get<float>()[s2BaseSize_];
+    LocalTensor<float> chunkPairLocal =
+        evictPendingUb_[cachedChunkIdx * CHUNK_PAIR_FLOATS];
+    BuildEvictCandidateKeyFromPayload(
+        keyLocal, aggregateScore,
+        payloadLocal.template ReinterpretCast<uint32_t>(),
+        tmpSortBuf, s2BaseSize_);
+    SortByKeyWithPayload512(
+        chunkPairLocal, keyLocal,
+        payloadLocal.template ReinterpretCast<uint32_t>(),
+        tmpSortBuf, s2BaseSize_ / BLOCK_BYTES);
+    PipeBarrier<PIPE_V>();
+    if (cachedChunkIdx != PAYLOAD_BUF_SLOTS - 1U &&
+        !info.isLastS2InnerLoop) {
+        return;
+    }
+
+    uint32_t pendingBlockNum = cachedChunkIdx + 1U;
+    MrgBasicBlock(tmpSortBuf, evictPendingUb_, pendingBlockNum,
+                  s2BaseSize_);
+    PipeBarrier<PIPE_V>();
+    // MrgBasicBlock uses the same -aggregate key. Its first 512 entries are
+    // exactly the only batch prefix that can survive the global merge.
+    LocalTensor<float> batchCandidate = evictPendingUb_;
+    DataCopy(batchCandidate, tmpSortBuf, CHUNK_PAIR_FLOATS);
+    PipeBarrier<PIPE_V>();
+    MergeEvictCandidateChunk(batchCandidate, MTP_EVICT_PRELOAD_CAP,
+                             tmpSortBuf);
+    PipeBarrier<PIPE_V>();
 }
 
 template <typename LIT>
@@ -955,14 +1033,11 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
     uint32_t candidateCap = 0;
     if (missCount > 0U) {
         candidateCap = CeilDiv(missCount, S2_BASE_SIZE) * S2_BASE_SIZE;
-        candidateCap = Min(candidateCap, EVICT_CANDIDATE_CAP);
-        // A very high threshold stops the score-guided scan after it has a
-        // full candidate prefix plus the configured extra chunks.  ScoresGm
-        // contains max(q0..q3), so low aggregate-score cache entries win.
-        uint32_t guidedCount = Min(missCount, candidateCap);
-        FindEvictCandidates(info.bIdx, info.cacheRowIdx, info.actS2Size,
-                            info.actS2Size, guidedCount, candidateCap,
-                            3.0e38f, SortedBasicBlock_);
+        candidateCap = Min(candidateCap, MTP_EVICT_PRELOAD_CAP);
+        // q3 incrementally retained the global lowest-score cached entries in
+        // evictCandidateUb_. Finalization consumes at most that 512-entry
+        // prefix; atypical larger miss sets continue through the exact GM
+        // fallback without scanning aggregateScoresGm end to end.
     }
 
     uint32_t candidateCursor = 0;
@@ -1188,6 +1263,10 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
 
     LocalTensor<float> tmpSortBuf = outQueue_.AllocTensor<float>();
     uint32_t cachedChunkIdx = info.segmentChunkIdx % PAYLOAD_BUF_SLOTS;
+    if (info.queryIdx + 1U == MTP_QUERY_COUNT) {
+        CollectMtpEvictCandidateChunk(info, payloadUb, tmpSortBuf,
+                                      cachedChunkIdx);
+    }
     Sort<float, true>(
         SortedBasicBlock_[cachedChunkIdx * s2BaseSize_ * VALUE_AND_INDEX_NUM],
         reduceOutBuff, payloadUb.template ReinterpretCast<uint32_t>(),

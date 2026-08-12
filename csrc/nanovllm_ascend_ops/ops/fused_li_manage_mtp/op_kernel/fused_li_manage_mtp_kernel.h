@@ -171,7 +171,7 @@ __aicore__ inline void LIMtpPreload<LIT>::Init(
         blockTableGm.SetGlobalBuffer((__gm__ int32_t *)blockTable);
         matmulService.InitMm1GlobalTensor(blockTableGm, keyGm, queryGm,
                                          mm1ResGm);
-        matmulService.InitBuffers(pipe);
+        matmulService.InitMtpBuffers(pipe);
     }
 }
 
