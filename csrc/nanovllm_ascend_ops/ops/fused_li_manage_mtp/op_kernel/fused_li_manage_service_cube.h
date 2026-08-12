@@ -280,22 +280,32 @@ __aicore__ inline void LIMatmul<LIT>::QueryNd2NzMtp(const LICommon::RunInfo &run
 {
     Nd2NzParams params;
     params.ndNum = 1;
-    params.nValue = MTP_M_SIZE;
+    params.nValue = M_BASIC_BLOCK_L0;
     params.dValue = constInfo_.headDim;
     params.srcDValue = constInfo_.headDim;
-    params.dstNzC0Stride = CeilAlign(MTP_M_SIZE, static_cast<uint64_t>(BLOCK_CUBE));
+    params.dstNzC0Stride =
+        CeilAlign(M_BASIC_BLOCK_L0, static_cast<uint64_t>(BLOCK_CUBE));
     params.dstNzNStride = 1;
     params.srcNdMatrixStride = 0;
     params.dstNzMatrixStride = 0;
     uint64_t firstQueryRow = static_cast<uint64_t>(runInfo.bIdx) * MTP_QUERY_COUNT;
-    DataCopy(queryL1_, queryGm_[firstQueryRow * constInfo_.qHeadNum * constInfo_.headDim], params);
+    for (uint32_t queryTile = 0; queryTile < MTP_M_SIZE / M_BASIC_BLOCK_L0;
+         ++queryTile) {
+        uint64_t tileRowOffset = queryTile * M_BASIC_BLOCK_L0;
+        uint64_t tileElementOffset = tileRowOffset * constInfo_.headDim;
+        DataCopy(
+            queryL1_[tileElementOffset],
+            queryGm_[(firstQueryRow * constInfo_.qHeadNum + tileRowOffset) *
+                     constInfo_.headDim],
+            params);
+    }
 }
 
 template <typename LIT>
 __aicore__ inline void LIMatmul<LIT>::LoadQueryToL0aMtp(uint32_t queryTile)
 {
     LoadData3DParamsV2<Q_T> params;
-    params.l1H = MTP_M_SIZE / BLOCK_CUBE;
+    params.l1H = M_BASIC_BLOCK_L0 / BLOCK_CUBE;
     params.l1W = BLOCK_CUBE;
     params.channelSize = constInfo_.headDim;
     params.padList[0] = 0;
@@ -304,7 +314,7 @@ __aicore__ inline void LIMatmul<LIT>::LoadQueryToL0aMtp(uint32_t queryTile)
     params.padList[3] = 255;
     params.mExtension = M_BASIC_BLOCK_L0;
     params.kExtension = constInfo_.headDim;
-    params.mStartPt = queryTile * M_BASIC_BLOCK_L0;
+    params.mStartPt = 0;
     params.kStartPt = 0;
     params.strideW = 1;
     params.strideH = 1;
@@ -316,8 +326,12 @@ __aicore__ inline void LIMatmul<LIT>::LoadQueryToL0aMtp(uint32_t queryTile)
     params.dilationFilterH = 1;
     params.enTranspose = 0;
     params.fMatrixCtrl = 0;
+    uint64_t tileElementOffset =
+        static_cast<uint64_t>(queryTile) * M_BASIC_BLOCK_L0 *
+        constInfo_.headDim;
     LoadData<Q_T, LOAD3DV2_CONFIG>(
-        queryL0_[(l0BufIdx_ % L0_BUF_NUM) * QUERY_L0_BUFFER_OFFSET], queryL1_, params);
+        queryL0_[(l0BufIdx_ % L0_BUF_NUM) * QUERY_L0_BUFFER_OFFSET],
+        queryL1_[tileElementOffset], params);
 }
 
 template <typename LIT>
