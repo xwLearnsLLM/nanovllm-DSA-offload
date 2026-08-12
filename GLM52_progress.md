@@ -511,3 +511,19 @@ CPU/UT：MTP、full-decode graph、IndexShare、DSA offload 联合回归 157 pas
 profile/性能：本阶段优先保证图内因果语义与 eager 对齐；尚未进行 MTP iteration IndexShare 的性能优化对比
 结论与下一步：阶段 6 graph 验收通过；进入 MTP iteration IndexShare
 ```
+
+### 阶段 6.1：MTP iteration IndexShare 基础状态
+
+```text
+日期：2026-08-12
+阶段：6.1（MTP iteration IndexShare 基础状态）
+commit：1fb93d0、4789b73、aeb05b2
+代码状态：已完成，仅改 Python，无需重编 Ascend 自定义算子
+实现：加载 MTP layer 的 Indexer 权重；MTP prefill 写入独立 IndexCache；为 MTP 分配独立 dense KV block pool、request-pool row 与可序列化 metadata。该状态不与 target layer 的 21 个 IndexShare group 共用。
+CPU/UT：MTP 与 decode IPC 回归 63 passed
+昇腾整网：通过
+  - MTP3 + none eager 与 graph 均覆盖 21K、40K、64K，输出正确且 profile 符合预期
+  - 已确认新增 MTP Indexer 权重加载、IndexCache 写入及独立状态不会改变既有 token 语义
+profile/性能：本阶段只验证状态和权重路径；MTP draft attention 仍为 dense MLA，尚未计入 DSA 稀疏性能收益
+结论与下一步：基础状态验收通过；接入 MTP draft iteration 的单 query LIM/SFA 路径，并让后续 iteration 复用首轮选择结果。target verification 继续使用四 query 的 fused_li_manage_mtp 与 sparse_tail_attention_mtp。
+```
