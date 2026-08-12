@@ -770,6 +770,11 @@ class GlmMTP(nn.Module):
         )
         return hidden_states + residual
 
+    def set_skip_topk(self, skip: bool) -> None:
+        """Select whether this MTP iteration recomputes sparse Top-K state."""
+
+        self.mtp_block.self_attn.skip_mtp_topk = bool(skip)
+
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.shared_head(self.shared_head_norm(hidden_states))
 
@@ -1016,8 +1021,6 @@ class GlmMoeDsaForCausalLM(nn.Module):
         if not weight_name.startswith(prefix):
             return None
         suffix = weight_name[len(prefix):]
-        if suffix.startswith("self_attn.indexer."):
-            return None
         special = {
             "embed_tokens.weight": "mtp.embed_tokens.weight",
             "enorm.weight": "mtp.enorm.weight",
@@ -1051,10 +1054,17 @@ class GlmMoeDsaForCausalLM(nn.Module):
 
     def weight_name_mapping(self, weight_name: str) -> str | WeightTarget | None:
         if ".self_attn.indexer." in weight_name:
+            mtp_prefix = (
+                f"model.layers.{int(self.config.num_hidden_layers)}."
+            )
+            is_mtp_indexer = (
+                self.mtp is not None and weight_name.startswith(mtp_prefix)
+            )
             if (
                 getattr(
                     self.config, "nanovllm_offload_mode", OFFLOAD_NONE
                 ) == OFFLOAD_NONE
+                and not is_mtp_indexer
             ):
                 return None
             # GLM-5.2 IndexShare: shared layers don't carry indexer weights.

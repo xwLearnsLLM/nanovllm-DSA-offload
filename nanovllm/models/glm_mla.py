@@ -388,11 +388,16 @@ class GlmMLAAttention(nn.Module):
         )
         self.num_hidden_layers = int(config.num_hidden_layers)
         self.is_mtp_layer = self.layer_idx >= self.num_hidden_layers
-        # The 78 target layers are offloaded. The recursively reused MTP layer
-        # deliberately keeps a separate dense HBM KV cache and has no DSA
-        # indexer weights in the checkpoint.
+        # The 78 target layers participate in LIDU when offload is enabled.
+        # MTP keeps its KV cache physically separate, but GLM-5.2 still ships
+        # an Indexer for its recursively reused draft layer so later MTP
+        # iterations can reuse the first iteration's Top-K selection.
         self.uses_offload = (
             self.offload_mode != OFFLOAD_NONE and not self.is_mtp_layer
+        )
+        self.uses_mtp_index_share = bool(
+            self.is_mtp_layer
+            and getattr(config, "index_share_for_mtp_iteration", False)
         )
         # GLM-5.2 IndexShare: only ``full`` (owner) layers create an indexer
         # and index key cache.  ``shared`` layers consume the owner's
@@ -457,7 +462,11 @@ class GlmMLAAttention(nn.Module):
         )
         self.indexer_rotary_emb = None
         self.indexer = None
-        if self.uses_offload and self.is_index_share_owner:
+        self.uses_indexer = bool(
+            (self.uses_offload and self.is_index_share_owner)
+            or self.uses_mtp_index_share
+        )
+        if self.uses_indexer:
             self.indexer_rotary_emb = GlmRotaryEmbedding(
                 self.qk_rope_head_dim,
                 max_position_embeddings=int(config.max_position_embeddings),
@@ -468,6 +477,9 @@ class GlmMLAAttention(nn.Module):
         # layers.  Set by ModelRunner after all layers are created.
         # None for owner layers and GLM-5.1 (every layer is its own owner).
         self._index_share_owner: "GlmMLAAttention | None" = None
+        # Set by GlmMTP around a draft chain.  The first iteration writes the
+        # MTP Top-K state; later iterations consume that same state.
+        self.skip_mtp_topk = False
         # Caller-owned custom-op outputs stay alive at fixed graph addresses.
         self._use_sparse_tail_attention = self.uses_offload
         self._use_fused_copy_sfa = self.offload_mode == OFFLOAD_FUSE
