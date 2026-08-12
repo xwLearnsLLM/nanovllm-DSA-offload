@@ -32,8 +32,17 @@ class Scheduler:
             getattr(config, "num_speculative_tokens", 0)
         )
         self.uses_offload = self.offload_mode != OFFLOAD_NONE
+        self.uses_mtp_index_share = bool(
+            self.num_speculative_tokens
+            and getattr(
+                getattr(config, "hf_config", None),
+                "index_share_for_mtp_iteration",
+                False,
+            )
+        )
         self.uses_separate_mtp_cache = bool(
-            self.uses_offload and self.num_speculative_tokens
+            self.num_speculative_tokens
+            and (self.uses_offload or self.uses_mtp_index_share)
         )
         eos = config.eos
         if isinstance(eos, int):
@@ -46,6 +55,7 @@ class Scheduler:
         self.index_block_manager = None
         self.dram_block_manager = None
         self.pool_entry_manager = None
+        self.mtp_index_pool_entry_manager = None
         self.mtp_block_manager = None
         if self.uses_offload:
             self.index_block_manager = SimpleBlockManager(
@@ -59,14 +69,23 @@ class Scheduler:
             self.pool_entry_manager = PoolEntryManager(
                 config.max_num_decode_seqs_per_step
             )
-            if self.uses_separate_mtp_cache:
-                # One dense MTP layer is cheap enough to keep in HBM. Its
-                # capacity follows the full-source DRAM pool rather than the
-                # much smaller sparse target-layer HBM pool.
-                self.mtp_block_manager = SimpleBlockManager(
-                    config.num_dram_kvcache_blocks - 1,
-                    reserve_null_block=True,
-                )
+        if self.uses_separate_mtp_cache:
+            # One dense MTP layer is cheap enough to keep in HBM. With target
+            # offload it follows the full-source DRAM pool; otherwise it
+            # follows the ordinary dense target HBM pool.
+            mtp_blocks = (
+                config.num_dram_kvcache_blocks
+                if self.uses_offload
+                else config.num_hbm_kvcache_blocks
+            )
+            self.mtp_block_manager = SimpleBlockManager(
+                mtp_blocks - 1,
+                reserve_null_block=True,
+            )
+        if self.uses_mtp_index_share:
+            self.mtp_index_pool_entry_manager = PoolEntryManager(
+                config.max_num_decode_seqs_per_step
+            )
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
         self.prefilling: Sequence | None = None
@@ -135,6 +154,16 @@ class Scheduler:
         seq.num_sparse_tokens = num_sparse_blocks * seq.block_size
         seq.lidu_cache_tokens = lidu_tokens
         seq.lidu_cache_initialized = not lidu_tokens
+        # MTP's sparse selection is intentionally independent from target
+        # groups. Its dense KV cache retains the complete source, so its
+        # LIDU arena covers every complete prompt block and has no DRAM miss
+        # path.
+        seq.mtp_lidu_cache_tokens = (
+            num_prefill_full_blocks * seq.block_size
+            if self.uses_mtp_index_share
+            else 0
+        )
+        seq.mtp_lidu_cache_initialized = not seq.mtp_lidu_cache_tokens
         seq.lidu_decode_hbm_pending = False
         seq.num_prefix_cached_blocks = 0
         seq.offload_finalized = False
@@ -191,6 +220,11 @@ class Scheduler:
             )
         ):
             return False
+        if (
+            self.mtp_index_pool_entry_manager is not None
+            and not self.mtp_index_pool_entry_manager.can_allocate()
+        ):
+            return False
         if not self.uses_offload:
             return True
         if seq.lidu_cache_tokens == 0:
@@ -215,6 +249,10 @@ class Scheduler:
         if self.mtp_block_manager is not None:
             seq.mtp_block_table = self.mtp_block_manager.allocate_blocks(
                 self._mtp_prefill_blocks(seq)
+            )
+        if self.mtp_index_pool_entry_manager is not None:
+            seq.mtp_index_pool_entry = (
+                self.mtp_index_pool_entry_manager.allocate()
             )
         if self.uses_offload:
             seq.offload_pool_entry = self.pool_entry_manager.allocate()
@@ -483,6 +521,8 @@ class Scheduler:
             self.dram_block_manager.free_blocks(seq.dram_block_table)
         if self.pool_entry_manager is not None:
             self.pool_entry_manager.free(seq.offload_pool_entry)
+        if self.mtp_index_pool_entry_manager is not None:
+            self.mtp_index_pool_entry_manager.free(seq.mtp_index_pool_entry)
 
         seq.index_block_table.clear()
         seq.hbm_block_table.clear()
@@ -491,8 +531,10 @@ class Scheduler:
         seq.dram_block_table.clear()
         seq.hbm_blocks_to_release.clear()
         seq.offload_pool_entry = -1
+        seq.mtp_index_pool_entry = -1
         seq.offload_finalized = False
         seq.lidu_cache_initialized = not seq.lidu_cache_tokens
+        seq.mtp_lidu_cache_initialized = not seq.mtp_lidu_cache_tokens
         seq.lidu_decode_hbm_pending = False
         seq.draft_token_ids.clear()
         seq.bump_decode_metadata_version()

@@ -151,14 +151,15 @@ class ModelRunner:
         self.offload_mode = config.offload_mode
         self.num_speculative_tokens = config.num_speculative_tokens
         self.uses_offload = self.offload_mode != OFFLOAD_NONE
-        self.uses_separate_mtp_cache = bool(
-            self.uses_offload and self.num_speculative_tokens
-        )
         self.uses_mtp_index_share = bool(
             self.num_speculative_tokens
             and getattr(
                 self.hf_config, "index_share_for_mtp_iteration", False
             )
+        )
+        self.uses_separate_mtp_cache = bool(
+            self.num_speculative_tokens
+            and (self.uses_offload or self.uses_mtp_index_share)
         )
         self.world_size = config.tensor_parallel_size
         self.rank = rank
