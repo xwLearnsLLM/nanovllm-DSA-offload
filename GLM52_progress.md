@@ -9,7 +9,7 @@
 - [x] 完成 MTP0 的 stable full-decode-only graph。
 - [x] 适配 GLM-5.2 的量化 MTP layer，打通 `MTP3 + none` 的 eager 和 graph。
 - [x] 完成 MTP3 的 target-layer IndexShare offload eager：split、fuse。
-- [ ] 完成 MTP3 的 target-layer IndexShare offload full-decode-only graph。
+- [x] 完成 MTP3 的 target-layer IndexShare offload full-decode-only graph：split、fuse。
 - [ ] 处理 MTP iteration 内的 IndexShare，完成 20K～64K 性能验收、回归和文档收尾。
 
 ## 1. 当前状态
@@ -24,6 +24,7 @@
 - 阶段 3（MTP0 + offload_fuse + eager）和阶段 4（MTP0 full-decode-only graph）均已完成并通过验收。阶段 5 已打通 `MTP3 + offload_mode=none + eager`，并完成 21K、40K、64K 的 K=0/K=3 token 对齐验收。阶段 6 的 `MTP3 + none` full-decode-only graph 也已通过相同长度覆盖，输出与 eager 完全一致。
 - 阶段 7 的 `MTP3 + offload_split/offload_fuse + eager` 已完成 21K 昇腾验收。target verification 为四次因果正确的 ordinary single-token DSA decode：split 稳定阶段走 LIM+SCATTER+SFA，fuse 稳定阶段走 LIM+COPYSFA；首次 LIDU 初始化仍走 split 链。MTP draft 保持独立 dense source 的单 query LIM+SFA 路径，不走 COPYSFA。
 - `none` 的 dense MLA 与 split/fuse 的 top-2048 sparse + dense-tail MLA 并非相同算法。短窗口可以对齐，但长 MTP 生成会放大稀疏近似分叉；验收以任务质量、稳定性及 split/fuse 一致性为准，不再要求与 none 的全部 token IDs 严格一致。
+- 阶段 8 的 `MTP3 + offload_split/offload_fuse + full-decode-only graph` 已覆盖 21K、40K、64K；三个长度均与对应 eager 输出完全一致，profile 算子数量符合预期。
 
 相关文档：[`README.md`](README.md)、[`README_ops.md`](README_ops.md)、[`TODO.md`](TODO.md)。
 
@@ -575,4 +576,20 @@ CPU/UT：MTP 与 IndexShare 回归 100 passed / 1 skipped
   - MTP3 + fuse + eager 输出与 split 完全一致，profile 算子符合编排预期
 profile/性能：target 采用因果正确的串行单 query 路径，算子次数按四次 verification 与实际请求步统计；不将旧的 B*4 `*_mtp` 算子次数作为本阶段验收条件
 结论与下一步：阶段 7 eager 验收通过；进入阶段 8，先接入 split 的 full-decode-only graph，并保持四次串行 target verification 的因果语义
+```
+
+### 阶段 8：MTP3 target IndexShare offload full-decode-only graph
+
+```text
+日期：2026-08-12
+阶段：8（MTP3 + offload_split/offload_fuse + full-decode-only graph）
+commit：split graph 204073a；fuse graph c9cfabd
+代码状态：已完成，仅改 Python 图 metadata、调度与模式门禁，无需重编 Ascend 自定义算子
+实现：为四次串行 target verification 分配固定地址的 SFA KV-length buffer，并在每次 capture/replay 前按 L、L+1、L+2、L+3 刷新。图内 target 继续调用与 eager 相同的 ordinary single-token DSA decode；MTP draft graph 继续使用独立 IndexShare metadata。
+CPU/UT：full-decode graph、MTP 与 IndexShare 回归 123 passed / 1 skipped
+昇腾整网：通过
+  - MTP3 + split + full-decode-only graph 已验证，输出与 split eager 一致，算子符合预期
+  - MTP3 + fuse + full-decode-only graph 覆盖 21K、40K、64K，三个长度均与 fuse eager 完全一致，算子数量符合预期
+profile/性能：首次 decode、LIDU 初始化及 lazy capture 允许 eager；初始化完成后 target+draft 使用稳定 replay。split 使用 SCATTER+SFA，fuse 使用 COPYSFA。
+结论与下一步：阶段 8 graph 验收通过；进入阶段 9，开展多请求性能矩阵、真实评测回归与文档收尾。
 ```
