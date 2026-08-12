@@ -41,7 +41,6 @@ public:
 private:
     static constexpr uint32_t WS_DOUBLE = 2;
     static constexpr uint32_t QUERY_COUNT = 4;
-    static constexpr uint32_t SUPERTILE_CHUNKS = 4;
     static constexpr uint32_t MIN_SOURCE_TOKENS = 2048;
     static constexpr uint32_t MAX_UNION_TOKENS = 8192;
 
@@ -65,7 +64,6 @@ private:
     GlobalTensor<float> aggregateScoresGm;
     GlobalTensor<int32_t> internalTopkPayloadsGm;
     GlobalTensor<float> internalThresholdsGm;
-    GlobalTensor<float> internalTopkStatesGm;
 
     uint32_t tmpBlockIdx = 0;
     uint32_t aiCoreIdx = 0;
@@ -75,8 +73,7 @@ private:
 
     __aicore__ inline void InitRequestRange(uint32_t requestedCoreNum);
     __aicore__ inline void ProcessMain();
-    __aicore__ inline void ProcessSupertile(const RunInfo &runInfo,
-                                            uint32_t chunkNum);
+    __aicore__ inline void ProcessChunk(const RunInfo &runInfo);
     __aicore__ inline void CleanRequest(uint32_t bIdx);
 };
 
@@ -126,14 +123,13 @@ __aicore__ inline void LIMtpPreload<LIT>::Init(
     constInfo.qHeadNum = tiling->n1Size;
 
     uint64_t singleCoreMm1Bytes =
-        WS_DOUBLE * SUPERTILE_CHUNKS * QUERY_COUNT * constInfo.qHeadNum * constInfo.s2BaseSize *
+        WS_DOUBLE * constInfo.qHeadNum * constInfo.s2BaseSize *
         sizeof(MM1_OUT_T);
     mm1ResGm.SetGlobalBuffer(
         (__gm__ MM1_OUT_T *)(workspace + aiCoreIdx * singleCoreMm1Bytes));
     uint64_t scoresOffset =
         static_cast<uint64_t>(tiling->usedCoreNum) * singleCoreMm1Bytes;
-    aggregateScoresGm.SetGlobalBuffer(
-        (__gm__ float *)(workspace + scoresOffset));
+    aggregateScoresGm.SetGlobalBuffer((__gm__ float *)(workspace + scoresOffset));
     uint64_t scoreStride =
         CeilDiv(static_cast<uint64_t>(constInfo.kSeqSize),
                 static_cast<uint64_t>(constInfo.s2BaseSize)) *
@@ -146,12 +142,6 @@ __aicore__ inline void LIMtpPreload<LIT>::Init(
         constInfo.batchSize * MAX_UNION_TOKENS * sizeof(int32_t);
     internalThresholdsGm.SetGlobalBuffer(
         (__gm__ float *)(workspace + thresholdOffset));
-    uint64_t thresholdBytes =
-        constInfo.batchSize * QUERY_COUNT * sizeof(float);
-    uint64_t topkStateOffset = thresholdOffset +
-        LICommon::Align(thresholdBytes, static_cast<uint64_t>(32U));
-    internalTopkStatesGm.SetGlobalBuffer(
-        (__gm__ float *)(workspace + topkStateOffset));
 
     reqPoolEntriesGm.SetGlobalBuffer((__gm__ int32_t *)reqPoolEntries,
                                      constInfo.batchSize);
@@ -177,8 +167,8 @@ __aicore__ inline void LIMtpPreload<LIT>::Init(
             mm1ResGm, weightsGm, cacheSlotsGm, topkSlotsGm,
             topkSourceIdsGm,
             missSourceIdsGm, missDestinationSlotsGm, missCountsGm,
-            aggregateScoresGm, internalTopkPayloadsGm, internalThresholdsGm,
-            internalTopkStatesGm);
+            aggregateScoresGm, internalTopkPayloadsGm,
+            internalThresholdsGm);
         vectorService.InitMtpBuffers(pipe);
     } else {
         matmulService.InitParams(constInfo);
@@ -245,26 +235,31 @@ __aicore__ inline void LIMtpPreload<LIT>::ProcessMain()
         }
 
         uint32_t chunkCount = CeilDiv(candidateLen, constInfo.s2BaseSize);
-        for (uint32_t chunkIdx = 0; chunkIdx < chunkCount;
-             chunkIdx += SUPERTILE_CHUNKS) {
-            RunInfo runInfo{};
-            runInfo.loop = loop++;
-            runInfo.bIdx = bIdx;
-            runInfo.queryRow = bIdx * QUERY_COUNT;
-            runInfo.queryIdx = 0U;
-            runInfo.s2Idx = chunkIdx;
-            runInfo.segmentChunkIdx = chunkIdx;
-            runInfo.actS2Size = candidateLen;
-            runInfo.cacheTokenCount = static_cast<uint32_t>(cacheTokenCount);
-            runInfo.cacheRowIdx = static_cast<uint32_t>(poolEntry);
-            runInfo.isFirstS2InnerLoop = chunkIdx == 0U;
-            uint32_t supertileChunkNum =
-                Min(SUPERTILE_CHUNKS, chunkCount - chunkIdx);
-            runInfo.isLastS2InnerLoop =
-                chunkIdx + supertileChunkNum == chunkCount;
-            runInfo.isPartialSegment = false;
-            runInfo.partialSlot = 0U;
-            ProcessSupertile(runInfo, supertileChunkNum);
+        for (uint32_t queryIdx = 0; queryIdx < QUERY_COUNT; ++queryIdx) {
+            for (uint32_t chunkIdx = 0; chunkIdx < chunkCount; ++chunkIdx) {
+                RunInfo runInfo{};
+                runInfo.loop = loop++;
+                runInfo.bIdx = bIdx;
+                runInfo.queryRow = bIdx * QUERY_COUNT + queryIdx;
+                runInfo.queryIdx = queryIdx;
+                runInfo.s2Idx = chunkIdx;
+                runInfo.segmentChunkIdx = chunkIdx;
+                runInfo.actS2Size = candidateLen;
+                runInfo.cacheTokenCount =
+                    static_cast<uint32_t>(cacheTokenCount);
+                runInfo.cacheRowIdx = static_cast<uint32_t>(poolEntry);
+                uint32_t chunkStart = chunkIdx * constInfo.s2BaseSize;
+                runInfo.actualSingleProcessSInnerSize =
+                    Min(constInfo.s2BaseSize, candidateLen - chunkStart);
+                runInfo.actualSingleProcessSInnerSizeAlign = LICommon::Align(
+                    runInfo.actualSingleProcessSInnerSize,
+                    ConstInfo::BUFFER_SIZE_BYTE_32B);
+                runInfo.isFirstS2InnerLoop = chunkIdx == 0U;
+                runInfo.isLastS2InnerLoop = chunkIdx + 1U == chunkCount;
+                runInfo.isPartialSegment = false;
+                runInfo.partialSlot = 0U;
+                ProcessChunk(runInfo);
+            }
         }
     }
 
@@ -276,62 +271,16 @@ __aicore__ inline void LIMtpPreload<LIT>::ProcessMain()
 }
 
 template <typename LIT>
-__aicore__ inline void LIMtpPreload<LIT>::ProcessSupertile(
-    const RunInfo &runInfo, uint32_t chunkNum)
+__aicore__ inline void LIMtpPreload<LIT>::ProcessChunk(const RunInfo &runInfo)
 {
     if ASCEND_IS_AIC {
         CrossCoreWaitFlag(constInfo.syncV1C1);
-        for (uint32_t chunkOffset = 0; chunkOffset < chunkNum; ++chunkOffset) {
-            RunInfo chunkInfo = runInfo;
-            chunkInfo.s2Idx = runInfo.s2Idx + chunkOffset;
-            chunkInfo.segmentChunkIdx = chunkInfo.s2Idx;
-            uint32_t chunkStart = chunkInfo.s2Idx * constInfo.s2BaseSize;
-            chunkInfo.actualSingleProcessSInnerSize =
-                Min(constInfo.s2BaseSize, chunkInfo.actS2Size - chunkStart);
-            chunkInfo.actualSingleProcessSInnerSizeAlign = LICommon::Align(
-                chunkInfo.actualSingleProcessSInnerSize,
-                ConstInfo::BUFFER_SIZE_BYTE_32B);
-            chunkInfo.isFirstS2InnerLoop = chunkInfo.s2Idx == 0U;
-            chunkInfo.isLastS2InnerLoop =
-                chunkStart + chunkInfo.actualSingleProcessSInnerSize >=
-                chunkInfo.actS2Size;
-            matmulService.ComputeMm1Mtp(chunkInfo);
-        }
+        matmulService.ComputeMm1(runInfo);
         CrossCoreSetFlag<ConstInfo::FIA_SYNC_MODE2, PIPE_FIX>(
             constInfo.syncC1V1);
     } else {
         CrossCoreWaitFlag(constInfo.syncC1V1);
-        // Consume query-major inside the supertile so each query retains the
-        // validated four-chunk pending-sort and SparseTopK cadence.
-        for (uint32_t queryIdx = 0; queryIdx < QUERY_COUNT; ++queryIdx) {
-            if (!runInfo.isFirstS2InnerLoop) {
-                vectorService.LoadMtpTopKState(aiCoreIdx, queryIdx);
-            }
-            for (uint32_t chunkOffset = 0; chunkOffset < chunkNum;
-                 ++chunkOffset) {
-                RunInfo queryInfo = runInfo;
-                queryInfo.queryIdx = queryIdx;
-                queryInfo.queryRow =
-                    runInfo.bIdx * QUERY_COUNT + queryIdx;
-                queryInfo.s2Idx = runInfo.s2Idx + chunkOffset;
-                queryInfo.segmentChunkIdx = queryInfo.s2Idx;
-                uint32_t chunkStart =
-                    queryInfo.s2Idx * constInfo.s2BaseSize;
-                queryInfo.actualSingleProcessSInnerSize = Min(
-                    constInfo.s2BaseSize, queryInfo.actS2Size - chunkStart);
-                queryInfo.actualSingleProcessSInnerSizeAlign = LICommon::Align(
-                    queryInfo.actualSingleProcessSInnerSize,
-                    ConstInfo::BUFFER_SIZE_BYTE_32B);
-                queryInfo.isFirstS2InnerLoop = queryInfo.s2Idx == 0U;
-                queryInfo.isLastS2InnerLoop =
-                    chunkStart + queryInfo.actualSingleProcessSInnerSize >=
-                    queryInfo.actS2Size;
-                vectorService.ProcessVecMtp(queryInfo);
-            }
-            if (!runInfo.isLastS2InnerLoop) {
-                vectorService.StoreMtpTopKState(aiCoreIdx, queryIdx);
-            }
-        }
+        vectorService.ProcessVecMtp(runInfo);
         CrossCoreSetFlag<ConstInfo::FIA_SYNC_MODE2, PIPE_MTE2>(
             constInfo.syncV1C1);
     }

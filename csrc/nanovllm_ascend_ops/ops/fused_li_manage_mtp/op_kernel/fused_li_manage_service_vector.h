@@ -113,10 +113,7 @@ public:
         GlobalTensor<int32_t> missCountGm,
         GlobalTensor<float> scoresGm,
         GlobalTensor<int32_t> mtpTopkPayloadsGm,
-        GlobalTensor<float> mtpThresholdsGm,
-        GlobalTensor<float> mtpTopkStatesGm);
-    __aicore__ inline void LoadMtpTopKState(uint32_t coreIdx, uint32_t queryIdx);
-    __aicore__ inline void StoreMtpTopKState(uint32_t coreIdx, uint32_t queryIdx);
+        GlobalTensor<float> mtpThresholdsGm);
     __aicore__ inline void InitPartialMetadata(uint32_t coreIdx);
     __aicore__ inline void FinalizePartialRequest(uint32_t bIdx, uint32_t cacheRowIdx,
                                                   uint32_t actualSeqLen,
@@ -143,7 +140,6 @@ protected:
     GlobalTensor<int32_t> mtpMissSourceIdsGm;
     GlobalTensor<int32_t> mtpMissDestinationSlotsGm;
     GlobalTensor<float> mtpThresholdsGm;
-    GlobalTensor<float> mtpTopkStatesGm;
 
 private:
     // queue
@@ -320,8 +316,7 @@ __aicore__ inline void LIVector<LIT>::InitMtpGlobalTensor(
     GlobalTensor<int32_t> missCountGm,
     GlobalTensor<float> scoresGm,
     GlobalTensor<int32_t> mtpTopkPayloadsGm,
-    GlobalTensor<float> mtpThresholdsGm,
-    GlobalTensor<float> mtpTopkStatesGm)
+    GlobalTensor<float> mtpThresholdsGm)
 {
     this->mm1ResGm = mm1ResGm;
     this->weightsGm = weightsGm;
@@ -334,30 +329,6 @@ __aicore__ inline void LIVector<LIT>::InitMtpGlobalTensor(
     this->scoresGm = scoresGm;
     this->mtpTopkPayloadsGm = mtpTopkPayloadsGm;
     this->mtpThresholdsGm = mtpThresholdsGm;
-    this->mtpTopkStatesGm = mtpTopkStatesGm;
-}
-
-template <typename LIT>
-__aicore__ inline void LIVector<LIT>::LoadMtpTopKState(uint32_t coreIdx, uint32_t queryIdx)
-{
-    uint64_t stateOffset =
-        (static_cast<uint64_t>(coreIdx) * MTP_QUERY_COUNT + queryIdx) * TOPK_PAIR_FLOATS;
-    SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
-    DataCopyPad(globalTopkUb_, mtpTopkStatesGm[stateOffset],
-                AscendC::DataCopyExtParams{
-                    1, static_cast<uint32_t>(TOPK_PAIR_FLOATS * sizeof(float)), 0, 0, 0},
-                AscendC::DataCopyPadExtParams<float>{false, 0, 0, 0.0f});
-    SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
-}
-
-template <typename LIT>
-__aicore__ inline void LIVector<LIT>::StoreMtpTopKState(uint32_t coreIdx, uint32_t queryIdx)
-{
-    uint64_t stateOffset =
-        (static_cast<uint64_t>(coreIdx) * MTP_QUERY_COUNT + queryIdx) * TOPK_PAIR_FLOATS;
-    SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
-    LIServiceVec::CopyOut(mtpTopkStatesGm[stateOffset], globalTopkUb_, TOPK_PAIR_FLOATS);
-    SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
 }
 
 template <typename LIT>
@@ -1402,12 +1373,7 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
 
     int32_t cuBaseS2Idx = info.s2Idx * s2BaseSize_;
     int32_t cuS2Len = info.actualSingleProcessSInnerSize;
-    constexpr int64_t MTP_SUPERTILE_CHUNKS = 4;
-    int64_t chunkStride = MTP_QUERY_COUNT * gSize_ * s2BaseSize_;
-    int64_t mmGmOffset =
-        (info.loop % 2) * MTP_SUPERTILE_CHUNKS * chunkStride +
-        (info.segmentChunkIdx % MTP_SUPERTILE_CHUNKS) * chunkStride +
-        info.queryIdx * gSize_ * s2BaseSize_;
+    int64_t mmGmOffset = (info.loop % 2) * (gSize_ * s2BaseSize_);
     int64_t weightGmOffset = static_cast<int64_t>(info.queryRow) * gSize_;
     if (info.isFirstS2InnerLoop) {
         InitSortOutBuf(globalTopkUb_, TOPK_PAIR_FLOATS);
