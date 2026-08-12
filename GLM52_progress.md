@@ -5,8 +5,8 @@
 - [x] 从 `main@7c096e0` 创建独立分支 `main-glm52`。
 - [x] 完成 GLM-5.2 模型识别、官方 IndexShare 拓扑校验和第一阶段能力门禁（`7b2effb`）。
 - [x] 在昇腾上验收 `MTP0 + none + eager`：短序列、21K、接近 64K。
-- [ ] 完成 MTP0 的 target-layer IndexShare：先 `offload_split + eager`，再 `offload_fuse + eager`。
-- [ ] 完成 MTP0 的 stable full-decode-only graph。
+- [x] 完成 MTP0 的 target-layer IndexShare：先 `offload_split + eager`，再 `offload_fuse + eager`。
+- [x] 完成 MTP0 的 stable full-decode-only graph。
 - [ ] 适配 GLM-5.2 的量化 MTP layer，打通 `MTP3 + none` 的 eager 和 graph。
 - [ ] 完成 MTP3 的 target-layer IndexShare offload：split、fuse、eager、graph。
 - [ ] 处理 MTP iteration 内的 IndexShare，完成 20K～64K 性能验收、回归和文档收尾。
@@ -20,8 +20,8 @@
 - 阶段 0、阶段 1 和阶段 2 均已完成并通过当前范围内的验收；阶段 2 的实现提交为 `15f1a7f`，后续修复为 `f9f4123` 和 `7c77e81`。
 - 阶段 2 昇腾整网已覆盖 21K、40K 和 64K 的 `MTP0 + offload_split + eager`。21K 和 64K 与 `none` 的 token IDs 完全一致；40K 在后续 greedy token 上存在稀疏 top-2048 + dense-tail Attention 的预期近似分叉。
 - 40K eager profile 确认每个 stable decode step 为 21 次 LIM、78 次 SCATTER、78 次 SFA；同一 IndexShare group 内的 miss metadata 一致，KV payload 仍按层独立。
-- 阶段 3（MTP0 + offload_fuse + eager）已完成并通过验收；GLM-5.2 允许 `offload_mode=none/offload_split/offload_fuse`、`MTP0`、eager。MTP3 和 graph 仍明确报错。
-- 阶段 3 只改 Python 调度与能力门禁，不需要重新编译 Ascend 自定义算子；下一阶段为 MTP0 full-decode-only graph。
+- 阶段 3（MTP0 + offload_fuse + eager）已完成并通过验收；阶段 4（MTP0 full-decode-only graph）也已完成并通过验收。GLM-5.2 允许 `offload_mode=none/offload_split/offload_fuse`、`MTP0`、eager 和 stable full-decode-only graph；MTP3 仍明确报错。
+- 阶段 4 仅改 Python 图调度与能力门禁，不需要重新编译 Ascend 自定义算子；下一阶段为 GLM-5.2 量化 MTP layer 的 nonoffload eager bring-up。
 
 相关文档：[`README.md`](README.md)、[`README_ops.md`](README_ops.md)、[`TODO.md`](TODO.md)。
 
@@ -460,4 +460,21 @@ CPU/UT：GLM-5.2 fuse eager 配置允许；split/fuse 的 graph 门禁仍正确�
   - 20K：清理 profile/miss-count 诊断环境变量后，offload_fuse 与 offload_split 的 token IDs 完全一致
 profile/性能：稳定 decode 为 21 次 LIM、78 次 COPYSFA
 结论与下一步：阶段 3 验收通过；后续进入阶段 4（MTP0 full-decode-only graph），先实现 offload_split graph
+```
+
+### 阶段 4：MTP0 full-decode-only graph
+
+```text
+日期：2026-08-12
+阶段：4（MTP0 full-decode-only graph）
+commit：ea6fe43（offload_split）、8ef5359（offload_fuse）
+代码状态：已完成，仅改 Python 图调度与能力门禁，无需重编算子
+CPU/UT：IndexShare 39 passed / 1 skipped；DSA offload 39 passed（历史 8.2K 预算断言单独排除）；full-decode graph 21 passed
+昇腾整网：通过
+  - offload_split 和 offload_fuse 均覆盖 21K、40K、64K；输出符合预期
+  - 首次 decode 与 LIDU 初始化保持 eager；首次 initialized stable decode 完成 lazy capture，后续 stable decode 持续 replay
+  - 21K fuse：16 个 decode = eager_first_decode 1 + eager_lidu_capture 1 + replay 14；无 uninitialized/uncaptured eager fallback
+  - 21K fuse：token IDs 为 [39, 672, 339, 1512, 19836, 154827, 39, 672, 339, 1512, 19836, 154842, 39, 672, 339, 1512, 19836]
+profile/性能：split 为 21 次 LIM、78 次 SCATTER、78 次 SFA；fuse 为 21 次 LIM、78 次 COPYSFA。profile 运行包含 lazy capture 与 profiler 开销，尚未记录 GLM-5.1/GLM-5.2 稳定 TPOT 对比
+结论与下一步：阶段 4 验收通过；进入阶段 5（GLM-5.2 量化 MTP layer，先打通 MTP3 + none + eager）
 ```
