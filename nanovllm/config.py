@@ -297,11 +297,6 @@ class Config:
                 "GLM-5.2 MTP offload is implemented in a later phase; set "
                 "offload_mode=none."
             )
-        if self.num_speculative_tokens and not self.enforce_eager:
-            raise ValueError(
-                "GLM-5.2 MTP full-decode graph is implemented in a later "
-                "phase; set enforce_eager=True / NANOVLLM_ENFORCE_EAGER=1."
-            )
     def _configure_decode_graph(self) -> None:
         # There are exactly two execution modes. Prefill and first decode are
         # always eager; enforce_eager controls steady-state decode.

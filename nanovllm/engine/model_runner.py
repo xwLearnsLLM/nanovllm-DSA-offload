@@ -191,7 +191,7 @@ class ModelRunner:
             text_config = getattr(config.hf_config, "text_config", config.hf_config)
             if self.num_speculative_tokens:
                 self.decode_graph_manager = MTPDecodeOnlyGraphManager(
-                    target_forward=self._mtp_target_forward,
+                    target_forward=self._mtp_target_graph_forward,
                     draft_forward=self._mtp_draft_graph_forward,
                     target_warmup=self.model.full_decode_graph_eager_warmup,
                     draft_warmup=self._mtp_draft_graph_eager_warmup,
@@ -204,7 +204,13 @@ class ModelRunner:
                         0
                         if self.uses_offload
                         else int(text_config.num_hidden_layers)
+                        * (
+                            self.num_speculative_tokens + 1
+                            if config.glm_version == "5.2"
+                            else 1
+                        )
                     ),
+                    serial_target_verification=(config.glm_version == "5.2"),
                     offload_mode=self.offload_mode,
                     log_enabled=self.rank == 0,
                 )
@@ -1517,6 +1523,31 @@ class ModelRunner:
             next_token_ids,
             selected_hidden_states,
             selected_positions,
+        )
+
+    def _mtp_target_graph_forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        draft_token_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
+        """Select the graph-safe target verification implementation."""
+
+        if self.config.glm_version != "5.2":
+            return self._mtp_target_forward(
+                input_ids, positions, draft_token_ids
+            )
+        context = get_context()
+        if context.block_tables is None:
+            raise RuntimeError(
+                "GLM-5.2 MTP graph target is missing block tables."
+            )
+        return self._mtp_target_forward_serial(
+            input_ids,
+            positions,
+            draft_token_ids,
+            context.block_tables,
+            has_first_decode=False,
         )
 
     def _mtp_draft_graph_forward(

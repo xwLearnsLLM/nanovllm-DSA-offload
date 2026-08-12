@@ -540,7 +540,7 @@ def test_glm52_mtp_runtime_accepts_quantized_nonoffload_eager(tmp_path):
     assert config.hf_config.nanovllm_mtp_uses_w4a8_experts is True
 
 
-def test_glm52_mtp_runtime_rejects_offload_and_graph(tmp_path):
+def test_glm52_mtp_runtime_rejects_offload(tmp_path):
     _write_glm52_mtp_config(tmp_path)
 
     with pytest.raises(ValueError, match="MTP offload"):
@@ -549,8 +549,18 @@ def test_glm52_mtp_runtime_rejects_offload_and_graph(tmp_path):
             offload_mode="offload_split",
             num_dram_kvcache_blocks=64,
         )
-    with pytest.raises(ValueError, match="MTP full-decode graph"):
-        _mtp_config(tmp_path, enforce_eager=False)
+
+
+def test_glm52_mtp_runtime_accepts_nonoffload_graph(tmp_path):
+    _write_glm52_mtp_config(tmp_path)
+
+    config = _mtp_config(
+        tmp_path,
+        enforce_eager=False,
+        max_num_decode_seqs_per_step=1,
+    )
+
+    assert config.decode_graph_capture_sizes == (1,)
 
 
 def test_glm52_mtp_runtime_requires_w4a8_routed_experts(tmp_path):

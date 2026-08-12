@@ -1047,6 +1047,7 @@ class MTPDecodeOnlyGraphManager:
         device: str,
         speculative_tokens: int,
         expected_target_tasks: int,
+        serial_target_verification: bool = False,
         offload_mode: str = OFFLOAD_NONE,
         log_enabled: bool = True,
     ) -> None:
@@ -1066,6 +1067,7 @@ class MTPDecodeOnlyGraphManager:
         self.device = torch.device(device)
         self.speculative_tokens = int(speculative_tokens)
         self.expected_target_tasks = int(expected_target_tasks)
+        self.serial_target_verification = bool(serial_target_verification)
         self.log_enabled = bool(log_enabled)
         self.offload_mode = normalize_offload_mode(offload_mode)
         self.stateful_offload = self.offload_mode != OFFLOAD_NONE
@@ -1130,6 +1132,19 @@ class MTPDecodeOnlyGraphManager:
         return [
             int(length) + int(speculative_tokens)
             for length in base_seq_lengths
+        ]
+
+    def _target_task_seq_lengths(
+        self, base_seq_lengths: list[int]
+    ) -> list[int] | list[list[int]]:
+        """Return the KV length each captured target attention task observes."""
+        if not self.serial_target_verification:
+            return self._target_seq_lengths(
+                base_seq_lengths, self.speculative_tokens
+            )
+        return [
+            [int(length) + step for length in base_seq_lengths]
+            for step in range(self.speculative_tokens + 1)
         ]
 
     @staticmethod
@@ -1233,13 +1248,30 @@ class MTPDecodeOnlyGraphManager:
     def _replay_target_graph(
         self,
         entry: MTPDecodeGraphEntry,
-        target_seq_lengths: list[int],
+        target_task_seq_lengths: list[int] | list[list[int]],
     ) -> None:
         torch.npu.current_stream().synchronize()
         entry.target_graph.replay()
         with torch.npu.stream(self._update_stream):
-            for task in entry.target_tasks:
-                task.update(self._update_stream, target_seq_lengths)
+            if not self.serial_target_verification:
+                for task in entry.target_tasks:
+                    task.update(self._update_stream, target_task_seq_lengths)
+                return
+            target_steps = self.speculative_tokens + 1
+            if (
+                not isinstance(target_task_seq_lengths[0], list)
+                or len(target_task_seq_lengths) != target_steps
+                or len(entry.target_tasks) % target_steps != 0
+            ):
+                raise RuntimeError(
+                    "Serial MTP target graph task metadata is inconsistent "
+                    "with the configured speculative depth."
+                )
+            tasks_per_step = len(entry.target_tasks) // target_steps
+            for step, task_seq_lengths in enumerate(target_task_seq_lengths):
+                start = step * tasks_per_step
+                for task in entry.target_tasks[start : start + tasks_per_step]:
+                    task.update(self._update_stream, task_seq_lengths)
 
     def _replay_draft_graph(
         self,
@@ -1339,7 +1371,10 @@ class MTPDecodeOnlyGraphManager:
 
                 # External FIA tasks do not guarantee usable capture-time
                 # outputs. Replay target once before consuming acceptance.
-                self._replay_target_graph(entry, target_seq_lengths)
+                self._replay_target_graph(
+                    entry,
+                    self._target_task_seq_lengths(base_seq_lengths),
+                )
                 accepted_counts = entry.accepted_counts.cpu().tolist()
                 draft_seq_lengths = self._draft_seq_lengths(
                     base_seq_lengths,
@@ -1431,10 +1466,10 @@ class MTPDecodeOnlyGraphManager:
             mtp_block_tables,
             offload_mode=self.offload_mode,
         )
-        target_seq_lengths = self._target_seq_lengths(
-            base_seq_lengths, self.speculative_tokens
+        self._replay_target_graph(
+            entry,
+            self._target_task_seq_lengths(base_seq_lengths),
         )
-        self._replay_target_graph(entry, target_seq_lengths)
         accepted_counts = entry.accepted_counts.cpu().tolist()
 
         draft_seq_lengths = self._draft_seq_lengths(
@@ -1501,6 +1536,7 @@ class MTPDecodeOnlyGraphManager:
             "mode": FULL_DECODE_ONLY,
             "capture_sizes": list(self.capture_sizes),
             "offload_mode": self.offload_mode,
+            "serial_target_verification": self.serial_target_verification,
             "exact_size_only": True,
             "captures": self.capture_count,
             "replays": self.replay_count,

@@ -774,3 +774,91 @@ def test_mtp_graph_replays_target_then_refreshes_three_draft_steps(
         ("update", "draft-2", [102, 204]),
     ]
     assert manager.replay_count == 1
+
+
+def test_mtp_graph_serial_target_refreshes_each_verification_step(
+    monkeypatch,
+):
+    calls = []
+
+    class FakeGraph:
+        def __init__(self, name):
+            self.name = name
+
+        def replay(self):
+            calls.append(("replay", self.name))
+
+    class FakeStream:
+        def synchronize(self):
+            calls.append("synchronize")
+
+    class FakeTask:
+        def __init__(self, name):
+            self.name = name
+
+        def update(self, _stream, seq_lengths):
+            calls.append(("update", self.name, list(seq_lengths)))
+
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        SimpleNamespace(
+            current_stream=lambda: FakeStream(),
+            stream=lambda _stream: nullcontext(),
+        ),
+        raising=False,
+    )
+
+    entry = MTPDecodeGraphEntry.allocate(2, 3, 4, torch.device("cpu"))
+    entry.target_graph = FakeGraph("target")
+    entry.draft_graph = FakeGraph("draft")
+    entry.target_tokens = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]])
+    entry.accepted_counts = torch.tensor([0, 2])
+    entry.next_token_ids = torch.tensor([1, 7])
+    entry.selected_hidden_states = torch.zeros(2, 4)
+    entry.selected_positions = torch.tensor([99, 201])
+    entry.next_drafts = torch.tensor([[9, 10, 11], [12, 13, 14]])
+    entry.target_tasks = [FakeTask(f"target-{step}") for step in range(4)]
+    entry.draft_tasks = [FakeTask(f"draft-{step}") for step in range(3)]
+
+    manager = MTPDecodeOnlyGraphManager(
+        target_forward=lambda *_args: (),
+        draft_forward=lambda *_args: torch.empty(0),
+        target_warmup=None,
+        draft_warmup=None,
+        capture_sizes=(2,),
+        max_model_len=512,
+        block_size=128,
+        device="cpu",
+        speculative_tokens=3,
+        expected_target_tasks=4,
+        serial_target_verification=True,
+        log_enabled=False,
+    )
+    manager._entries[2] = entry
+    manager._update_stream = object()
+    context = Context(
+        flat_slot_mapping=torch.arange(8, dtype=torch.int64),
+        block_tables=torch.tensor([[1, 2], [3, 4]], dtype=torch.int32),
+    )
+
+    manager.run(
+        torch.arange(8, dtype=torch.int64),
+        torch.arange(8, dtype=torch.int64) + 99,
+        torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int64),
+        context,
+        [100, 200],
+    )
+
+    assert calls == [
+        "synchronize",
+        ("replay", "target"),
+        ("update", "target-0", [100, 200]),
+        ("update", "target-1", [101, 201]),
+        ("update", "target-2", [102, 202]),
+        ("update", "target-3", [103, 203]),
+        ("replay", "draft"),
+        ("update", "draft-0", [100, 202]),
+        ("update", "draft-1", [101, 203]),
+        ("update", "draft-2", [102, 204]),
+    ]
