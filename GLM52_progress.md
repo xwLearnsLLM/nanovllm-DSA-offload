@@ -543,3 +543,19 @@ CPU/UT：MTP、full-decode graph、IndexShare、DSA offload 联合回归 158 pas
   - 40K、64K 的输出和 profile 行为均与 21K 一致
 结论与下一步：阶段 6.2 eager 验收通过；接入 full-decode-only graph 的固定地址 MTP IndexShare metadata。
 ```
+
+### 阶段 6.3：MTP iteration IndexShare full-decode-only graph
+
+```text
+日期：2026-08-12
+阶段：6.3（MTP iteration IndexShare full-decode-only graph）
+commit：78342e4
+代码状态：已完成，仅改 Python 图调度与 metadata 生命周期，无需重编 Ascend 自定义算子
+实现：MTP graph entry 为独立 IndexShare row、MTP block table、candidate length、cache budget 以及三个 draft step 的 KV length 分配 caller-owned 固定地址 buffer。每次 replay 在 target acceptance 同步后刷新这三个长度；首个 draft iteration 捕获单 query LIM+SFA，后两个 iteration 捕获复用 Top-K 的 SFA。稀疏 MTP draft 不使用 dense FIA，因此 graph 中预期没有原先三个 draft FIA task。
+CPU/UT：MTP、full-decode graph、IndexShare、DSA offload 联合回归 164 passed / 1 skipped（历史 8.2K 预算断言单独排除）
+昇腾整网：通过
+  - MTP3 + none + full-decode-only graph 覆盖 21K、40K、64K
+  - 三个长度的输出均与既有 MTP3 + none eager 结果完全一致
+  - profile 中 MTP IndexShare 算子和 graph capture/replay 行为符合预期
+结论与下一步：MTP iteration IndexShare 完整验收通过；进入阶段 7，先接入 MTP3 target IndexShare offload_split eager。
+```
