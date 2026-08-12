@@ -198,10 +198,10 @@ def test_glm52_stage3_accepts_offload_fuse(tmp_path):
     assert config.glm_version == "5.2"
 
 
-def test_glm52_phase1_rejects_mtp3(tmp_path):
+def test_glm52_mtp_requires_mtp_checkpoint_configuration(tmp_path):
     _write_glm52_config(tmp_path)
 
-    with pytest.raises(ValueError, match="quantized MTP layer"):
+    with pytest.raises(ValueError, match="num_nextn_predict_layers=1"):
         _make_config(
             tmp_path,
             offload_mode="none",

@@ -722,7 +722,7 @@ def test_glm52_offload_split_config_builds_index_share_groups(tmp_path):
 
 def test_glm52_offload_split_rejects_mtp3(tmp_path):
     _write_glm52_config(tmp_path)
-    with pytest.raises(ValueError, match="quantized MTP layer"):
+    with pytest.raises(ValueError, match="MTP offload"):
         _make_config(
             tmp_path,
             offload_mode="offload_split",

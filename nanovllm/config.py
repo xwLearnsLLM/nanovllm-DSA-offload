@@ -7,15 +7,14 @@ from typing import Any
 
 from nanovllm.engine.dsa_offload import (
     DSA_SELECTION_TOPK_TOKENS,
-    IndexShareGroupManager,
-    LIDU_OFFLOAD_MODES,
     LIDU_MAX_SOURCE_TOKENS,
+    LIDU_OFFLOAD_MODES,
     OFFLOAD_NONE,
+    IndexShareGroupManager,
     normalize_offload_mode,
     validate_lidu_cache_token_budgets,
 )
 from nanovllm.engine.full_decode_graph import normalize_capture_sizes
-
 
 GLM_VERSION_51 = "5.1"
 GLM_VERSION_52 = "5.2"
@@ -213,6 +212,37 @@ class Config:
             raise ValueError(
                 "GLM checkpoint has no model.layers.78 MTP weights."
             )
+        if self.glm_version == GLM_VERSION_52:
+            expert_entries = {
+                name: quant_type
+                for name, quant_type in mtp_entries.items()
+                if ".mlp.experts." in name
+            }
+            if not expert_entries or any(
+                quant_type != "W4A8_DYNAMIC"
+                for quant_type in expert_entries.values()
+            ):
+                raise ValueError(
+                    "GLM-5.2 MTP experts must use ModelSlim W4A8_DYNAMIC "
+                    "weights."
+                )
+            non_expert_w4 = sorted(
+                name
+                for name, quant_type in mtp_entries.items()
+                if ".mlp.experts." not in name
+                and quant_type == "W4A8_DYNAMIC"
+            )
+            if non_expert_w4:
+                raise ValueError(
+                    "GLM-5.2 MTP W4A8 is supported for routed experts "
+                    f"only; unsupported entries include {non_expert_w4[:3]}."
+                )
+            setattr(
+                self.hf_config,
+                "nanovllm_mtp_uses_w4a8_experts",
+                True,
+            )
+            return
         non_float = sorted(
             name
             for name, quant_type in mtp_entries.items()
@@ -262,10 +292,15 @@ class Config:
     def _validate_glm52_phase1_runtime(self) -> None:
         if self.glm_version != GLM_VERSION_52:
             return
-        if self.num_speculative_tokens:
+        if self.num_speculative_tokens and self.offload_mode != OFFLOAD_NONE:
             raise ValueError(
-                "GLM-5.2 quantized MTP layer is implemented in a later phase; "
-                "set num_speculative_tokens=0."
+                "GLM-5.2 MTP offload is implemented in a later phase; set "
+                "offload_mode=none."
+            )
+        if self.num_speculative_tokens and not self.enforce_eager:
+            raise ValueError(
+                "GLM-5.2 MTP full-decode graph is implemented in a later "
+                "phase; set enforce_eager=True / NANOVLLM_ENFORCE_EAGER=1."
             )
     def _configure_decode_graph(self) -> None:
         # There are exactly two execution modes. Prefill and first decode are

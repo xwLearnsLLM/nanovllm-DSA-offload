@@ -680,13 +680,18 @@ class GlmFloatSparseMoeBlock(nn.Module):
 
 
 class GlmMTPDecoderLayer(nn.Module):
-    """The checkpoint's FLOAT decoder block at model.layers.78."""
+    """The checkpoint's decoder block at model.layers.78."""
 
     def __init__(self, config: GlmMoeDsaConfig) -> None:
         super().__init__()
         layer_idx = int(config.num_hidden_layers)
         self.self_attn = GlmMLAAttention(config, layer_idx)
-        self.mlp = GlmFloatSparseMoeBlock(config, layer_idx)
+        if bool(
+            getattr(config, "nanovllm_mtp_uses_w4a8_experts", False)
+        ):
+            self.mlp = GlmW4A8SparseMoeBlock(config, layer_idx)
+        else:
+            self.mlp = GlmFloatSparseMoeBlock(config, layer_idx)
         self.input_layernorm = RMSNorm(
             int(config.hidden_size), eps=float(config.rms_norm_eps)
         )
@@ -960,6 +965,47 @@ class GlmMoeDsaForCausalLM(nn.Module):
                 f"{len(missing)} parameter(s), including {missing[:5]}."
             )
 
+    @staticmethod
+    def _map_w4a8_expert_weight(
+        weight_name: str,
+        moe: GlmW4A8SparseMoeBlock,
+        target_prefix: str,
+    ) -> WeightTarget | str | None:
+        match = _EXPERT_WEIGHT_RE.match(weight_name)
+        if match is None:
+            return None
+        expert_idx = int(match.group("expert"))
+        if expert_idx not in moe.local_expert_id_set:
+            return None
+        projection = match.group("projection")
+        field = match.group("field")
+        if field == "weight_offset":
+            # The generic quant loader reads local offsets only to assert that
+            # this checkpoint is symmetric, then skips parameter lookup.
+            return weight_name
+        if projection in ("gate_proj", "up_proj"):
+            target_by_field = {
+                "weight": "w13_weight",
+                "weight_scale": "w13_weight_scale",
+                "scale_bias": "w13_scale_bias",
+            }
+        else:
+            target_by_field = {
+                "weight": "w2_weight",
+                "weight_scale": "w2_weight_scale",
+                "scale_bias": "w2_scale_bias",
+            }
+        target = target_by_field.get(field)
+        if target is None:
+            raise ValueError(
+                "Unsupported GLM W4A8 expert tensor "
+                f"{weight_name!r}."
+            )
+        return WeightTarget(
+            f"{target_prefix}.{target}",
+            (expert_idx - moe.local_expert_start, projection),
+        )
+
     def _map_mtp_weight(
         self, weight_name: str
     ) -> str | WeightTarget | None:
@@ -986,8 +1032,15 @@ class GlmMoeDsaForCausalLM(nn.Module):
 
         match = _EXPERT_WEIGHT_RE.match(weight_name)
         if match is not None:
+            moe = self.mtp.mtp_block.mlp
+            if isinstance(moe, GlmW4A8SparseMoeBlock):
+                return self._map_w4a8_expert_weight(
+                    weight_name,
+                    moe,
+                    "mtp.mtp_block.mlp",
+                )
             expert_idx = int(match.group("expert"))
-            if expert_idx not in self.mtp.mtp_block.mlp.local_expert_id_set:
+            if expert_idx not in moe.local_expert_id_set:
                 return None
             if match.group("field") != "weight":
                 raise ValueError(
@@ -1030,35 +1083,14 @@ class GlmMoeDsaForCausalLM(nn.Module):
         if match is None:
             return weight_name
         layer_idx = int(match.group("layer"))
-        expert_idx = int(match.group("expert"))
-        projection = match.group("projection")
-        field = match.group("field")
         if layer_idx >= len(self.model.layers):
             return None
         moe = self.model.layers[layer_idx].mlp
         if not isinstance(moe, GlmW4A8SparseMoeBlock):
             return None
-        if expert_idx not in moe.local_expert_id_set:
-            return None
-        if field == "weight_offset":
-            # The generic quant loader reads local offsets only to assert that
-            # this checkpoint is symmetric, then skips parameter lookup.
-            return weight_name
-
-        local_idx = expert_idx - moe.local_expert_start
         prefix = f"model.layers.{layer_idx}.mlp"
-        if projection in ("gate_proj", "up_proj"):
-            target = {
-                "weight": "w13_weight",
-                "weight_scale": "w13_weight_scale",
-                "scale_bias": "w13_scale_bias",
-            }[field]
-        else:
-            target = {
-                "weight": "w2_weight",
-                "weight_scale": "w2_weight_scale",
-                "scale_bias": "w2_scale_bias",
-            }[field]
-        return WeightTarget(
-            f"{prefix}.{target}", (local_idx, projection)
+        return self._map_w4a8_expert_weight(
+            weight_name,
+            moe,
+            prefix,
         )

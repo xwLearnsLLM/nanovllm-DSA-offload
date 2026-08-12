@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from nanovllm.config import Config
+from nanovllm.config import Config, glm52_indexer_types
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.dsa_offload import (
     finalize_prefill_hbm_layout,
@@ -436,6 +436,32 @@ def _write_mtp_config(path, *, is_rot_used=True):
     (path / "rot.safetensors").write_bytes(b"config-only-test")
 
 
+def _write_glm52_mtp_config(path):
+    _write_mtp_config(path)
+    config_path = path / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config.update(
+        head_dim=192,
+        max_position_embeddings=1_048_576,
+        rope_parameters={"rope_theta": 8_000_000, "rope_type": "default"},
+        indexer_types=list(glm52_indexer_types(78)),
+        mlp_layer_types=["dense"] * 3 + ["sparse"] * 75,
+    )
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    description_path = path / "quant_model_description.json"
+    description = json.loads(description_path.read_text(encoding="utf-8"))
+    description.update(
+        {
+            "model.layers.78.self_attn.q_a_proj.weight": "W8A8_DYNAMIC",
+            "model.layers.78.mlp.experts.0.gate_proj.weight": "W4A8_DYNAMIC",
+            "model.layers.78.mlp.experts.0.gate_proj.weight_scale": "W4A8_DYNAMIC",
+            "model.layers.78.mlp.experts.0.gate_proj.scale_bias": "W4A8_DYNAMIC",
+        }
+    )
+    description_path.write_text(json.dumps(description), encoding="utf-8")
+
+
 def _mtp_config(path, **overrides):
     kwargs = dict(
         max_model_len=256,
@@ -501,4 +527,38 @@ def test_glm_mtp_requires_root_rotation_and_float_layer_78(tmp_path):
     description["model.layers.78.hnorm.weight"] = "W8A8_DYNAMIC"
     description_path.write_text(json.dumps(description), encoding="utf-8")
     with pytest.raises(ValueError, match="FLOAT/BF16"):
+        _mtp_config(tmp_path)
+
+
+def test_glm52_mtp_runtime_accepts_quantized_nonoffload_eager(tmp_path):
+    _write_glm52_mtp_config(tmp_path)
+
+    config = _mtp_config(tmp_path)
+
+    assert config.glm_version == "5.2"
+    assert config.num_speculative_tokens == 3
+    assert config.hf_config.nanovllm_mtp_uses_w4a8_experts is True
+
+
+def test_glm52_mtp_runtime_rejects_offload_and_graph(tmp_path):
+    _write_glm52_mtp_config(tmp_path)
+
+    with pytest.raises(ValueError, match="MTP offload"):
+        _mtp_config(
+            tmp_path,
+            offload_mode="offload_split",
+            num_dram_kvcache_blocks=64,
+        )
+    with pytest.raises(ValueError, match="MTP full-decode graph"):
+        _mtp_config(tmp_path, enforce_eager=False)
+
+
+def test_glm52_mtp_runtime_requires_w4a8_routed_experts(tmp_path):
+    _write_glm52_mtp_config(tmp_path)
+    description_path = tmp_path / "quant_model_description.json"
+    description = json.loads(description_path.read_text(encoding="utf-8"))
+    description["model.layers.78.mlp.experts.0.gate_proj.weight"] = "FLOAT"
+    description_path.write_text(json.dumps(description), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="W4A8_DYNAMIC"):
         _mtp_config(tmp_path)
