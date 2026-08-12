@@ -9,6 +9,7 @@ from nanovllm.engine.dsa_offload import (
     DSA_SELECTION_TOPK_TOKENS,
     LIDU_MAX_SOURCE_TOKENS,
     LIDU_OFFLOAD_MODES,
+    OFFLOAD_FUSE,
     OFFLOAD_NONE,
     OFFLOAD_SPLIT,
     IndexShareGroupManager,
@@ -294,10 +295,10 @@ class Config:
         if self.glm_version != GLM_VERSION_52:
             return
         if self.num_speculative_tokens and self.offload_mode != OFFLOAD_NONE:
-            if self.offload_mode != OFFLOAD_SPLIT:
+            if self.offload_mode not in (OFFLOAD_SPLIT, OFFLOAD_FUSE):
                 raise ValueError(
                     "GLM-5.2 MTP offload currently supports "
-                    "offload_mode=offload_split only."
+                    "offload_mode=offload_split or offload_fuse."
                 )
             if not self.enforce_eager:
                 raise ValueError(
