@@ -138,13 +138,16 @@ def run_split_swiglu_quant(gate_up):
 
 
 def run_fused_swiglu_quant(gate_up, group_list):
-    return torch_npu.npu_swiglu_quant(
-        gate_up,
+    return torch_npu.npu_dequant_swiglu_quant(
+        x=gate_up,
+        weight_scale=None,
+        activation_scale=None,
+        bias=None,
+        quant_scale=None,
+        quant_offset=None,
         group_index=group_list,
         activate_left=True,
         quant_mode=1,
-        group_list_type=1,
-        dst_type=torch.int8,
     )
 
 
