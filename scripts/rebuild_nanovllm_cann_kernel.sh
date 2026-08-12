@@ -27,10 +27,12 @@ case "${OP_NAME}" in
   fused_li_manage_mtp)
     KERNEL_NAME="nanovllm_fused_li_manage_mtp"
     OP_TYPE="NanovllmFusedLiManageMtp"
+    DEPEND_OP_NAMES=()
     ;;
   fused_copy_sfa_mtp)
     KERNEL_NAME="nanovllm_fused_copy_sfa_mtp"
     OP_TYPE="NanovllmFusedCopySfaMtp"
+    DEPEND_OP_NAMES=(fused_copy_sfa)
     ;;
   *)
     usage >&2
@@ -131,6 +133,9 @@ echo "[nanovllm incremental] jobs: ${BUILD_JOBS}"
 # CANN's generated build graph uses copied sources and .done files as outputs.
 # Invalidate only the selected standalone kernel copy and generated stamps.
 rm -rf "${SRC_DIR}/${KERNEL_NAME}" "${SRC_DIR}/${OP_NAME}"
+for depend_op_name in "${DEPEND_OP_NAMES[@]}"; do
+  rm -rf "${SRC_DIR:?}/${depend_op_name}"
+done
 find "${GEN_DIR}" -maxdepth 1 -type f \
   -name "${TARGET_NAME}_*.done" -delete
 find "${CANN_BUILD_DIR}" -type f \
