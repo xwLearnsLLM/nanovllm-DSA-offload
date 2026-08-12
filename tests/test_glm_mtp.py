@@ -578,10 +578,26 @@ def test_glm52_mtp_runtime_accepts_offload_eager(tmp_path, offload_mode):
     assert config.offload_mode == offload_mode
 
 
+def test_glm52_mtp_runtime_accepts_split_offload_graph(tmp_path):
+    _write_glm52_mtp_config(tmp_path)
+
+    config = _mtp_config(
+        tmp_path,
+        offload_mode="offload_split",
+        enforce_eager=False,
+        kvcache_block_size=128,
+        num_dram_kvcache_blocks=64,
+    )
+
+    assert config.offload_mode == "offload_split"
+    assert config.decode_graph_capture_sizes == (
+        config.max_num_decode_seqs_per_step,
+    )
+
+
 @pytest.mark.parametrize(
     ("offload_mode", "enforce_eager", "message"),
     [
-        ("offload_split", False, "graph mode"),
         ("offload_fuse", False, "graph mode"),
     ],
 )

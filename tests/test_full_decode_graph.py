@@ -275,6 +275,7 @@ def test_mtp_offload_target_context_uses_fixed_graph_metadata():
     )
     entry = manager._allocate_entry(2)
     entry.actual_seq_lengths_kv.copy_(torch.tensor([5188, 5192]))
+    entry.stage_mtp_target_actual_seq_lengths()
     entry.req_pool_entries.copy_(torch.tensor([7, 3]))
     entry.candidate_lens.copy_(torch.tensor([20992, 32768]))
     entry.lidu_cache_tokens.copy_(torch.tensor([8192, 12288]))
@@ -288,6 +289,19 @@ def test_mtp_offload_target_context_uses_fixed_graph_metadata():
         assert context.lidu_all_rows_ready is True
         assert context.actual_seq_lengths_kv == [21003, 32779]
         assert context.actual_seq_lengths_kv_tensor is entry.actual_seq_lengths_kv
+        assert (
+            context.mtp_target_actual_seq_lengths_by_step
+            is entry.mtp_target_actual_seq_lengths_by_step
+        )
+        assert [
+            values.tolist()
+            for values in context.mtp_target_actual_seq_lengths_by_step
+        ] == [
+            [5185, 5189],
+            [5186, 5190],
+            [5187, 5191],
+            [5188, 5192],
+        ]
         assert context.block_tables is entry.block_tables
         assert context.index_block_tables is entry.index_block_tables
         assert context.dram_block_tables is entry.dram_block_tables

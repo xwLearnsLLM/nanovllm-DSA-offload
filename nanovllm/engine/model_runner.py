@@ -1710,6 +1710,7 @@ class ModelRunner:
         target_lidu_init_rows: torch.Tensor | None = None
         target_final_seq_lengths: list[int] | None = None
         target_slot_rows: torch.Tensor | None = None
+        target_actual_seq_lengths_by_step: list[torch.Tensor] | None = None
         if self.uses_offload:
             target_context = get_context()
             required = {
@@ -1743,6 +1744,16 @@ class ModelRunner:
             target_slot_rows = target_context.flat_slot_mapping.view(
                 batch_size, query_len
             )
+            target_actual_seq_lengths_by_step = (
+                target_context.mtp_target_actual_seq_lengths_by_step
+            )
+            if target_actual_seq_lengths_by_step is not None and len(
+                target_actual_seq_lengths_by_step
+            ) != query_len:
+                raise RuntimeError(
+                    "GLM-5.2 MTP graph target has an invalid serial "
+                    "KV-length buffer count."
+                )
         if is_full_decode_graph_capturing():
             target_seq_lengths = (
                 target_final_seq_lengths
@@ -1785,6 +1796,11 @@ class ModelRunner:
                 dram_block_tables=target_dram_block_tables,
                 lidu_init_rows=(
                     target_lidu_init_rows if step == 0 else None
+                ),
+                actual_seq_lengths_kv_tensor=(
+                    None
+                    if target_actual_seq_lengths_by_step is None
+                    else target_actual_seq_lengths_by_step[step]
                 ),
                 flat_slot_mapping=(
                     None

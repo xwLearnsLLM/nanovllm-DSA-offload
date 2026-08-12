@@ -300,10 +300,11 @@ class Config:
                     "GLM-5.2 MTP offload currently supports "
                     "offload_mode=offload_split or offload_fuse."
                 )
-            if not self.enforce_eager:
+            if not self.enforce_eager and self.offload_mode != OFFLOAD_SPLIT:
                 raise ValueError(
-                    "GLM-5.2 MTP offload graph mode is implemented in a "
-                    "later phase; set enforce_eager=True."
+                    "GLM-5.2 MTP offload graph mode currently supports "
+                    "offload_mode=offload_split only; set enforce_eager=True "
+                    "for offload_fuse."
                 )
     def _configure_decode_graph(self) -> None:
         # There are exactly two execution modes. Prefill and first decode are

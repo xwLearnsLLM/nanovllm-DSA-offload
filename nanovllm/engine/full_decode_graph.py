@@ -789,6 +789,7 @@ class MTPDecodeGraphEntry:
     mtp_candidate_lens: torch.Tensor
     mtp_lidu_cache_tokens: torch.Tensor
     mtp_actual_seq_lengths_by_step: list[torch.Tensor]
+    mtp_target_actual_seq_lengths_by_step: list[torch.Tensor]
     actual_seq_lengths_kv: torch.Tensor
     index_block_tables: torch.Tensor
     dram_block_tables: torch.Tensor
@@ -884,6 +885,10 @@ class MTPDecodeGraphEntry:
             mtp_actual_seq_lengths_by_step=[
                 torch.zeros(batch_size, dtype=torch.int32, device=device)
                 for _ in range(speculative_tokens)
+            ],
+            mtp_target_actual_seq_lengths_by_step=[
+                torch.zeros(batch_size, dtype=torch.int32, device=device)
+                for _ in range(query_len)
             ],
             actual_seq_lengths_kv=torch.zeros(
                 batch_size, dtype=torch.int32, device=device
@@ -1106,6 +1111,15 @@ class MTPDecodeGraphEntry:
                 )
             )
 
+    def stage_mtp_target_actual_seq_lengths(self) -> None:
+        """Stage the four serial target SFA KV lengths at fixed addresses."""
+
+        base = self.actual_seq_lengths_kv - self.speculative_tokens
+        for step, destination in enumerate(
+            self.mtp_target_actual_seq_lengths_by_step
+        ):
+            destination.copy_(base + step)
+
 
 class MTPDecodeOnlyGraphManager:
     """Two exact-size graphs for steady GLM MTP verification and drafting.
@@ -1266,6 +1280,11 @@ class MTPDecodeOnlyGraphManager:
             actual_seq_lengths_kv=target_seq_lengths,
             actual_seq_lengths_kv_tensor=(
                 entry.actual_seq_lengths_kv
+                if self.stateful_offload
+                else None
+            ),
+            mtp_target_actual_seq_lengths_by_step=(
+                entry.mtp_target_actual_seq_lengths_by_step
                 if self.stateful_offload
                 else None
             ),
@@ -1448,6 +1467,8 @@ class MTPDecodeOnlyGraphManager:
                     mtp_index_share,
                     offload_mode=self.offload_mode,
                 )
+                if self.stateful_offload:
+                    entry.stage_mtp_target_actual_seq_lengths()
                 target_seq_lengths = self._target_seq_lengths(
                     base_seq_lengths, self.speculative_tokens
                 )
@@ -1463,6 +1484,8 @@ class MTPDecodeOnlyGraphManager:
                         mtp_index_share,
                         offload_mode=self.offload_mode,
                     )
+                    if self.stateful_offload:
+                        entry.stage_mtp_target_actual_seq_lengths()
                     self._set_target_context(entry, target_seq_lengths)
 
                 # Allocate FIA workspaces and output buffers before capture.
@@ -1598,6 +1621,8 @@ class MTPDecodeOnlyGraphManager:
             mtp_index_share,
             offload_mode=self.offload_mode,
         )
+        if self.stateful_offload:
+            entry.stage_mtp_target_actual_seq_lengths()
         self._replay_target_graph(
             entry,
             self._target_task_seq_lengths(base_seq_lengths),
