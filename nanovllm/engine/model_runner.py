@@ -1231,6 +1231,8 @@ class ModelRunner:
         has_first_decode: bool = False,
         index_share: _MtpIndexShareMetadata | None = None,
         actual_seq_lengths_kv_tensor: torch.Tensor | None = None,
+        dram_block_tables: torch.Tensor | None = None,
+        lidu_init_rows: torch.Tensor | None = None,
     ) -> None:
         batch_size = int(positions.numel())
         slots = self._slots_from_positions(block_tables, positions)
@@ -1263,10 +1265,16 @@ class ModelRunner:
             index_block_tables=(
                 index_share.block_tables if index_share is not None else None
             ),
-            # MTP keeps all source KV in its dense HBM cache, so the logical
-            # source table is the same for the no-miss sparse attention path.
+            # MTP draft recurrence keeps source KV in its dense HBM cache.
+            # Target verification supplies its target-layer DRAM table.
             dram_block_tables=(
-                index_share.block_tables if index_share is not None else None
+                dram_block_tables
+                if dram_block_tables is not None
+                else (
+                    index_share.block_tables
+                    if index_share is not None
+                    else None
+                )
             ),
             req_pool_entries=(
                 index_share.req_pool_entries if index_share is not None else None
@@ -1283,7 +1291,10 @@ class ModelRunner:
                 else None
             ),
             needs_dsa_update=index_share is not None,
-            lidu_all_rows_ready=index_share is not None,
+            lidu_init_rows=lidu_init_rows,
+            lidu_all_rows_ready=(
+                index_share is not None and lidu_init_rows is None
+            ),
             has_first_decode=has_first_decode,
             full_decode_graph=is_full_decode_graph_capturing(),
         )
@@ -1689,8 +1700,45 @@ class ModelRunner:
         token_rows = input_ids.view(batch_size, query_len)
         position_rows = positions.view(batch_size, query_len)
         capture_base_seq_lengths: list[int] | None = None
+        target_index_share: _MtpIndexShareMetadata | None = None
+        target_dram_block_tables: torch.Tensor | None = None
+        target_lidu_init_rows: torch.Tensor | None = None
+        target_final_seq_lengths: list[int] | None = None
+        if self.uses_offload:
+            target_context = get_context()
+            required = {
+                "index_block_tables": target_context.index_block_tables,
+                "dram_block_tables": target_context.dram_block_tables,
+                "req_pool_entries": target_context.req_pool_entries,
+                "candidate_lens": target_context.candidate_lens,
+                "lidu_cache_tokens": target_context.lidu_cache_tokens,
+                "actual_seq_lengths_kv": target_context.actual_seq_lengths_kv,
+            }
+            missing = [
+                name for name, value in required.items() if value is None
+            ]
+            if missing:
+                raise RuntimeError(
+                    "GLM-5.2 MTP offload target is missing: "
+                    + ", ".join(missing)
+                )
+            target_index_share = _MtpIndexShareMetadata(
+                block_tables=target_context.index_block_tables,
+                req_pool_entries=target_context.req_pool_entries,
+                candidate_lens=target_context.candidate_lens,
+                lidu_cache_tokens=target_context.lidu_cache_tokens,
+            )
+            target_dram_block_tables = target_context.dram_block_tables
+            target_lidu_init_rows = target_context.lidu_init_rows
+            target_final_seq_lengths = [
+                int(length) for length in target_context.actual_seq_lengths_kv
+            ]
         if is_full_decode_graph_capturing():
-            target_seq_lengths = get_context().actual_seq_lengths_kv
+            target_seq_lengths = (
+                target_final_seq_lengths
+                if target_final_seq_lengths is not None
+                else get_context().actual_seq_lengths_kv
+            )
             if target_seq_lengths is None or len(target_seq_lengths) != batch_size:
                 raise RuntimeError(
                     "GLM-5.2 MTP graph target is missing captured KV "
@@ -1705,7 +1753,15 @@ class ModelRunner:
         for step in range(query_len):
             step_positions = position_rows[:, step]
             if capture_base_seq_lengths is None:
-                actual_seq_lengths_kv = step_positions.add(1).cpu().tolist()
+                if target_final_seq_lengths is None:
+                    actual_seq_lengths_kv = (
+                        step_positions.add(1).cpu().tolist()
+                    )
+                else:
+                    actual_seq_lengths_kv = [
+                        length - self.num_speculative_tokens + step
+                        for length in target_final_seq_lengths
+                    ]
             else:
                 actual_seq_lengths_kv = [
                     length + step for length in capture_base_seq_lengths
@@ -1715,6 +1771,11 @@ class ModelRunner:
                 step_positions,
                 actual_seq_lengths_kv=actual_seq_lengths_kv,
                 has_first_decode=has_first_decode and step == 0,
+                index_share=target_index_share,
+                dram_block_tables=target_dram_block_tables,
+                lidu_init_rows=(
+                    target_lidu_init_rows if step == 0 else None
+                ),
             )
             hidden_states = self.model(
                 token_rows[:, step], step_positions
@@ -1908,19 +1969,7 @@ class ModelRunner:
                 mtp_index_share,
             )
         else:
-            if self.uses_offload:
-                # The MTP3 offload operators consume the complete B*4
-                # verification batch so LIM can protect its four-query union.
-                (
-                    target_tokens,
-                    accepted_counts,
-                    next_token_ids,
-                    selected_hidden_states,
-                    selected_positions,
-                ) = self._mtp_target_forward(
-                    input_ids, positions, draft_token_ids
-                )
-            elif self.config.glm_version == "5.2":
+            if self.config.glm_version == "5.2":
                 (
                     target_tokens,
                     accepted_counts,
