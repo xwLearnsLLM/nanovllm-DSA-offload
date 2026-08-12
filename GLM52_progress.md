@@ -527,3 +527,18 @@ CPU/UT：MTP 与 decode IPC 回归 63 passed
 profile/性能：本阶段只验证状态和权重路径；MTP draft attention 仍为 dense MLA，尚未计入 DSA 稀疏性能收益
 结论与下一步：基础状态验收通过；接入 MTP draft iteration 的单 query LIM/SFA 路径，并让后续 iteration 复用首轮选择结果。target verification 继续使用四 query 的 fused_li_manage_mtp 与 sparse_tail_attention_mtp。
 ```
+
+### 阶段 6.2：MTP iteration IndexShare eager
+
+```text
+日期：2026-08-12
+阶段：6.2（MTP iteration IndexShare eager）
+commit：08d24b8
+代码状态：已完成，仅改 Python，无需重编 Ascend 自定义算子
+实现：MTP draft 链首个递归 iteration 使用单 query fused_li_manage 和 sparse_tail_attention；后续 iteration 复用同一组 Top-K slot metadata，但各自独立计算 Attention。MTP 使用独立的 dense KV source 和 LIDU row，完整 source 常驻 HBM，因此该路径没有 DRAM SCATTER。target 的 K+1 verification 未改变，仍按四 query 语义使用 fused_li_manage_mtp 与 sparse_tail_attention_mtp。
+CPU/UT：MTP、full-decode graph、IndexShare、DSA offload 联合回归 158 passed / 1 skipped（历史 8.2K 预算断言单独排除）
+昇腾整网：21K 通过
+  - MTP3 + none + eager 输出与既有 MTP3 + none 基线前缀一致
+  - profile 中 NanovllmFusedLiManage 共 16 次，符合每个 draft 链仅首轮执行 LIM、后续 iteration 复用 Top-K 的预期
+待完成验收：40K、64K eager 输出与 profile；随后接入 full-decode-only graph 的固定地址 MTP IndexShare metadata。
+```
