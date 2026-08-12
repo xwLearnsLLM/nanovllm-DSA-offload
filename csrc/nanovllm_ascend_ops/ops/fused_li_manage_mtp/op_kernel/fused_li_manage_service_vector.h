@@ -1399,7 +1399,12 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
     int32_t mmUbStride =
         (s2BaseSize_ - info.actualSingleProcessSInnerSizeAlign) /
         B32_BLOCK_ALIGN_NUM;
-    int64_t payloadBufIdx = info.s2Idx % PAYLOAD_BUF_SLOTS;
+    // Rotate by execution order, not source chunk.  The final chunk group can
+    // contain fewer than four chunks; s2Idx-based rotation would then make
+    // consecutive q0..q3 calls overwrite the same payload while PIPE_V may
+    // still consume it.  Four execution slots preserve the validated reuse
+    // distance for both full and partial groups.
+    int64_t payloadBufIdx = info.loop % PAYLOAD_BUF_SLOTS;
     LocalTensor<int32_t> payloadUb =
         payloadBuf_.Get<int32_t>()[payloadBufIdx * s2BaseSize_];
     StartPayloadCopy(payloadUb, info.cacheRowIdx, cuBaseS2Idx, cuS2Len,
