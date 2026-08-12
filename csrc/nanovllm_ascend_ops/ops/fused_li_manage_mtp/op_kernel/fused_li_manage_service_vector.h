@@ -340,6 +340,9 @@ __aicore__ inline void LIVector<LIT>::InitMtpGlobalTensor(
 template <typename LIT>
 __aicore__ inline void LIVector<LIT>::LoadMtpTopKState(uint32_t coreIdx, uint32_t queryIdx)
 {
+    if ((GetBlockIdx() & 1U) != 0U) {
+        return;
+    }
     uint64_t stateOffset =
         (static_cast<uint64_t>(coreIdx) * MTP_QUERY_COUNT + queryIdx) * TOPK_PAIR_FLOATS;
     SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
@@ -353,6 +356,9 @@ __aicore__ inline void LIVector<LIT>::LoadMtpTopKState(uint32_t coreIdx, uint32_
 template <typename LIT>
 __aicore__ inline void LIVector<LIT>::StoreMtpTopKState(uint32_t coreIdx, uint32_t queryIdx)
 {
+    if ((GetBlockIdx() & 1U) != 0U) {
+        return;
+    }
     uint64_t stateOffset =
         (static_cast<uint64_t>(coreIdx) * MTP_QUERY_COUNT + queryIdx) * TOPK_PAIR_FLOATS;
     SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
