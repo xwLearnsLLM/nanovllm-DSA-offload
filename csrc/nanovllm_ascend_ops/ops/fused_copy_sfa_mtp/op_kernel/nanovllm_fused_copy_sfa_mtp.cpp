@@ -11,8 +11,10 @@ using NanovllmSparseTailAttentionTilingDataMla =
     NanovllmFusedCopySfaMtpTilingData;
 
 #include "../fused_copy_sfa/sfa_impl/nanovllm_sparse_tail_attention_kernel_mla.h"
+#include "fused_copy_sfa_mtp_union_scatter.h"
 
 using namespace AscendC;
+using namespace FusedCopySfaMtpNs;
 namespace {
 template <typename T>
 __aicore__ inline void RunFusedMtp(
@@ -39,10 +41,18 @@ __aicore__ inline void RunFusedMtp(
     __gm__ uint8_t *tiling,
     TPipe *pipe)
 {
-    // Reserved for the future unique-union copy pipeline.  Source-aware v2
-    // still gathers from the aligned per-query source metadata.
-    (void)missSourceIds;
-    (void)missDestinationSlots;
+    // AIVs update persistent HBM from the compact union list exactly once.
+    // AICs can start immediately, while current Attention misses continue to
+    // gather directly from DRAM and therefore do not depend on these writes.
+    if ASCEND_IS_AIV {
+        FusedMtpUnionScatterStage<T> scatter(pipe, fusedTiling);
+        scatter.Init(
+            hbmKeyRope, key, dramKeyRope, dramKvCache,
+            hbmBlockTable, dramBlockTable,
+            missSourceIds, missDestinationSlots, missCounts);
+        scatter.Process();
+    }
+
     using MtpType = SFAType<
         T, T, T, false, SFA_LAYOUT::TND, SFA_LAYOUT::PA_BSND,
         V_TEMPLATE, SFA_STAGE_NORMAL, true, true>;

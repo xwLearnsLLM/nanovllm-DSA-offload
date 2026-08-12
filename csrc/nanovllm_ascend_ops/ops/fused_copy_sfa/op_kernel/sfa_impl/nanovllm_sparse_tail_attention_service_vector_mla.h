@@ -1312,65 +1312,19 @@ SFAVectorService<SFAT>::CopyOutSourceAwareResult(
     CopyOutMrgeResult(
         mte2Size, mte3Size, s2GmStartOffset,
         mergeMte3Idx, runInfo);
-    if (!hasActualMiss || mte2Size <= mte3Size ||
-        (!ALIGNED_MISS && mte3Size >= missRangeSize)) {
-        return;
-    }
-
-    const int64_t missEnd = ALIGNED_MISS
-        ? mte2Size
-        : (mte2Size < missRangeSize ? mte2Size : missRangeSize);
     if constexpr (ALIGNED_MISS) {
-        // Attention may permute rows while gathering paged HBM pairs; that is
-        // mathematically harmless for softmax, but the resulting merge-UB row
-        // is not a stable token->destination mapping.  Once the Attention
-        // payload is in workspace, reload only this flush's misses compactly
-        // and use that explicit order for persistent cache writes.
-        SetFlag<AscendC::HardEvent::MTE3_S>(0);
-        WaitFlag<AscendC::HardEvent::MTE3_S>(0);
-
-        int64_t compactMte2Size = 0;
-        for (int64_t rangeOffset = mte3Size;
-             rangeOffset < missEnd; ++rangeOffset) {
-            const int64_t sourceIndex =
-                sourceRangeStart + rangeOffset;
-            const int32_t sourceToken = sourceTokenIdsGm_.GetValue(
-                runInfo.topKBaseOffset + sourceIndex);
-            if (sourceToken < 0) {
-                continue;
-            }
-            CopyInDramKv(
-                compactMte2Size, 0, mergeMte3Idx,
-                sourceToken, runInfo);
-        }
-        if (compactMte2Size == 0) {
-            return;
-        }
-
-        SetFlag<AscendC::HardEvent::MTE2_MTE3>(0);
-        WaitFlag<AscendC::HardEvent::MTE2_MTE3>(0);
-        int64_t compactRow = 0;
-        for (int64_t rangeOffset = mte3Size;
-             rangeOffset < missEnd; ++rangeOffset) {
-            const int64_t sourceIndex =
-                sourceRangeStart + rangeOffset;
-            if (sourceTokenIdsGm_.GetValue(
-                    runInfo.topKBaseOffset + sourceIndex) < 0) {
-                continue;
-            }
-            const int32_t destinationSlot = topkGm_.GetValue(
-                runInfo.topKBaseOffset + sourceIndex);
-            const int64_t ubRow =
-                mergeMte3Idx % 2 * 32 + compactRow;
-            CopyMissToPersistentCache(
-                ubRow, destinationSlot, runInfo);
-            ++compactRow;
-        }
-        SetFlag<AscendC::HardEvent::MTE3_S>(0);
-        WaitFlag<AscendC::HardEvent::MTE3_S>(0);
+        // MTP persistent cache updates are handled once from the compact
+        // union miss list by FusedMtpUnionScatterStage.  This path only emits
+        // the current query's source-aware Attention workspace rows.
+        return;
+    }
+    if (!hasActualMiss || mte2Size <= mte3Size ||
+        mte3Size >= missRangeSize) {
         return;
     }
 
+    const int64_t missEnd =
+        mte2Size < missRangeSize ? mte2Size : missRangeSize;
     for (int64_t rangeOffset = mte3Size;
          rangeOffset < missEnd; ++rangeOffset) {
         const int64_t ubRow =
