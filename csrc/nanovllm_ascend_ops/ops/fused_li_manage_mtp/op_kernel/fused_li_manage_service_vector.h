@@ -276,8 +276,7 @@ __aicore__ inline void LIVector<LIT>::InitMtpBuffers(TPipe *pipe)
     InitBuffers(pipe);
     // Only MTP needs the fourth-query aggregate-score scratch. Keep it out
     // of the single-query LIM UB footprint.
-    pipe->InitBuffer(aggregateScoreBuf_,
-                     2U * S2_BASE_SIZE * sizeof(float));
+    pipe->InitBuffer(aggregateScoreBuf_, S2_BASE_SIZE * sizeof(float));
     // Accumulate four independently sorted q3 victim blocks before touching
     // the global 512-entry victim prefix.
     pipe->InitBuffer(evictPendingBuf_,
@@ -472,15 +471,9 @@ __aicore__ inline void LIVector<LIT>::WriteMtpAggregateScoreChunk(
 {
     uint64_t gmOffset = static_cast<uint64_t>(bIdx) * scoreStride_ +
                         static_cast<uint32_t>(s2BaseIdx);
-    uint32_t aggregateBufIdx =
-        (static_cast<uint32_t>(s2BaseIdx) / S2_BASE_SIZE) & 1U;
-    LocalTensor<float> previousScore =
-        aggregateScoreBuf_.Get<float>()[aggregateBufIdx * S2_BASE_SIZE];
+    LocalTensor<float> previousScore = aggregateScoreBuf_.Get<float>();
     if (queryIdx == 0U) {
-        // Each slot is reused every other chunk.  Let MTE3 drain the other
-        // slot while the next chunk runs, and wait only before this slot is
-        // overwritten.
-        if (s2BaseIdx >= static_cast<int32_t>(2U * S2_BASE_SIZE)) {
+        if (s2BaseIdx > 0) {
             SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
         }
         DataCopy(previousScore, scoreLocal, alignedLen);
@@ -497,11 +490,7 @@ __aicore__ inline void LIVector<LIT>::WriteMtpAggregateScoreChunk(
     // q1..q2 write the previous chunk's aggregate from this same UB scratch.
     // Delay that write's completion until the scratch is actually reused so
     // MTE3 can overlap the intervening TopK merge and next MM/scale work.
-    // A query transition must drain the preceding query's final stores.
-    // Within a query, the ping-pong slot is not reused until two chunks later.
-    if ((s2BaseIdx == 0 && queryIdx > 0U) ||
-        (queryIdx + 1U != MTP_QUERY_COUNT &&
-         s2BaseIdx >= static_cast<int32_t>(2U * S2_BASE_SIZE))) {
+    if (queryIdx + 1U != MTP_QUERY_COUNT && s2BaseIdx > 0) {
         SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
     }
     SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
