@@ -129,11 +129,13 @@ __aicore__ inline void LIMtpPreload<LIT>::Init(
         (__gm__ MM1_OUT_T *)(workspace + aiCoreIdx * singleCoreMm1Bytes));
     uint64_t scoresOffset =
         static_cast<uint64_t>(tiling->usedCoreNum) * singleCoreMm1Bytes;
-    // Aggregate scores remain in UB for the complete q0..q3 chunk lifetime.
-    // Keep the internal tensor binding for the shared vector interface, but
-    // alias it to the following workspace region because MTP never accesses it.
     aggregateScoresGm.SetGlobalBuffer((__gm__ float *)(workspace + scoresOffset));
-    uint64_t topkOffset = scoresOffset;
+    uint64_t scoreStride =
+        CeilDiv(static_cast<uint64_t>(constInfo.kSeqSize),
+                static_cast<uint64_t>(constInfo.s2BaseSize)) *
+        constInfo.s2BaseSize;
+    uint64_t topkOffset = scoresOffset +
+        constInfo.batchSize * scoreStride * sizeof(float);
     internalTopkPayloadsGm.SetGlobalBuffer(
         (__gm__ int32_t *)(workspace + topkOffset));
     uint64_t thresholdOffset = topkOffset +
@@ -233,11 +235,8 @@ __aicore__ inline void LIMtpPreload<LIT>::ProcessMain()
         }
 
         uint32_t chunkCount = CeilDiv(candidateLen, constInfo.s2BaseSize);
-        // Keep one score chunk in UB across all four queries. This removes the
-        // q0/q1/q2 aggregate-score GM round trips without changing the Cube
-        // computation performed for each query.
-        for (uint32_t chunkIdx = 0; chunkIdx < chunkCount; ++chunkIdx) {
-            for (uint32_t queryIdx = 0; queryIdx < QUERY_COUNT; ++queryIdx) {
+        for (uint32_t queryIdx = 0; queryIdx < QUERY_COUNT; ++queryIdx) {
+            for (uint32_t chunkIdx = 0; chunkIdx < chunkCount; ++chunkIdx) {
                 RunInfo runInfo{};
                 runInfo.loop = loop++;
                 runInfo.bIdx = bIdx;
@@ -257,8 +256,6 @@ __aicore__ inline void LIMtpPreload<LIT>::ProcessMain()
                     ConstInfo::BUFFER_SIZE_BYTE_32B);
                 runInfo.isFirstS2InnerLoop = chunkIdx == 0U;
                 runInfo.isLastS2InnerLoop = chunkIdx + 1U == chunkCount;
-                runInfo.reloadQuery = true;
-                runInfo.releaseQuery = true;
                 runInfo.isPartialSegment = false;
                 runInfo.partialSlot = 0U;
                 ProcessChunk(runInfo);

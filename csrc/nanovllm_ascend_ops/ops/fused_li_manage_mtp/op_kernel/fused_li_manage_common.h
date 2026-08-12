@@ -38,8 +38,6 @@ struct RunInfo {
     uint32_t actualSingleProcessSInnerSizeAlign;
     bool isFirstS2InnerLoop;
     bool isLastS2InnerLoop;
-    bool reloadQuery;
-    bool releaseQuery;
     bool isPartialSegment;
     uint32_t partialSlot;
 };
@@ -92,3 +90,4 @@ __aicore__ inline T CeilDiv(T num, T rnd)
 } // namespace LICommon
 
 #endif // FUSED_LI_MANAGE_COMMON_H
+

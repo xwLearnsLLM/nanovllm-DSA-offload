@@ -211,6 +211,11 @@ ge::graphStatus LIUMtpTiling::DoTiling(LIUMtpTilingInfo *info)
     uint64_t workspaceSize = platform.GetLibApiWorkSpaceSize();
     workspaceSize += static_cast<uint64_t>(blockDim) * DOUBLE_BUFFER *
                      MTP_HEADS * SCORE_CHUNK * sizeof(float);
+    uint64_t scoreStride =
+        (static_cast<uint64_t>(info->sourceCapacity) + SCORE_CHUNK - 1U) /
+        SCORE_CHUNK * SCORE_CHUNK;
+    workspaceSize += static_cast<uint64_t>(info->batchSize) * scoreStride *
+                     sizeof(float);
     workspaceSize += static_cast<uint64_t>(info->batchSize) * MTP_QUERY_COUNT *
                      MTP_TOPK * sizeof(int32_t);
     workspaceSize += static_cast<uint64_t>(info->batchSize) * MTP_QUERY_COUNT *
