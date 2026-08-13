@@ -93,6 +93,8 @@ public:
     __aicore__ inline LIVector(){};
     __aicore__ inline void ProcessVec(const LICommon::RunInfo &info);
     __aicore__ inline void ProcessVecMtp(const LICommon::RunInfo &info);
+    __aicore__ inline void ProcessMtpVictimProducer(const LICommon::RunInfo &info);
+    __aicore__ inline void FinalizeMtpVictimProducer(const LICommon::RunInfo &info);
     __aicore__ inline void InitBuffers(TPipe *pipe);
     __aicore__ inline void InitMtpBuffers(TPipe *pipe);
     __aicore__ inline void InitParams(
@@ -115,7 +117,8 @@ public:
         GlobalTensor<int32_t> missCountGm,
         GlobalTensor<float> scoresGm,
         GlobalTensor<int32_t> mtpTopkPayloadsGm,
-        GlobalTensor<float> mtpThresholdsGm);
+        GlobalTensor<float> mtpThresholdsGm,
+        GlobalTensor<float> mtpVictimChunksGm);
     __aicore__ inline void InitPartialMetadata(uint32_t coreIdx);
     __aicore__ inline void FinalizePartialRequest(uint32_t bIdx, uint32_t cacheRowIdx,
                                                   uint32_t actualSeqLen,
@@ -142,6 +145,7 @@ protected:
     GlobalTensor<int32_t> mtpMissSourceIdsGm;
     GlobalTensor<int32_t> mtpMissDestinationSlotsGm;
     GlobalTensor<float> mtpThresholdsGm;
+    GlobalTensor<float> mtpVictimChunksGm;
 
 private:
     // queue
@@ -195,6 +199,9 @@ private:
         const LocalTensor<int32_t> &payloadLocal,
         LocalTensor<float> &tmpSortBuf,
         uint32_t cachedChunkIdx);
+    __aicore__ inline void ConsumeMtpVictimChunk(
+        const LICommon::RunInfo &info, LocalTensor<float> &tmpSortBuf,
+        uint32_t producerLoop, uint32_t pendingSlot);
     __aicore__ inline void StoreMtpQueryTopK(const LICommon::RunInfo &info);
     __aicore__ inline void FinalizeMtpRequest(const LICommon::RunInfo &info);
     __aicore__ inline void WritePartialTopK(uint32_t coreIdx, uint32_t partialSlot, uint32_t bIdx);
@@ -239,9 +246,6 @@ private:
 template <typename LIT>
 __aicore__ inline void LIVector<LIT>::InitBuffers(TPipe *pipe)
 {
-    if ((GetBlockIdx() & 1U) != 0) {
-        return;
-    }
     uint32_t outNeedBufSize = TOPK_PAIR_FLOATS * 2 * sizeof(float);
     uint32_t reduceCacheSize = REDUCE_BANK_CONFLICT_OFFSETS + GROUP_INNER * S2_BASE_SIZE * sizeof(float);
     outNeedBufSize = reduceCacheSize > outNeedBufSize ? reduceCacheSize : outNeedBufSize;
@@ -270,9 +274,6 @@ __aicore__ inline void LIVector<LIT>::InitBuffers(TPipe *pipe)
 template <typename LIT>
 __aicore__ inline void LIVector<LIT>::InitMtpBuffers(TPipe *pipe)
 {
-    if ((GetBlockIdx() & 1U) != 0U) {
-        return;
-    }
     InitBuffers(pipe);
     // Only MTP needs the fourth-query aggregate-score scratch. Keep it out
     // of the single-query LIM UB footprint.
@@ -325,7 +326,8 @@ __aicore__ inline void LIVector<LIT>::InitMtpGlobalTensor(
     GlobalTensor<int32_t> missCountGm,
     GlobalTensor<float> scoresGm,
     GlobalTensor<int32_t> mtpTopkPayloadsGm,
-    GlobalTensor<float> mtpThresholdsGm)
+    GlobalTensor<float> mtpThresholdsGm,
+    GlobalTensor<float> mtpVictimChunksGm)
 {
     this->mm1ResGm = mm1ResGm;
     this->weightsGm = weightsGm;
@@ -338,6 +340,7 @@ __aicore__ inline void LIVector<LIT>::InitMtpGlobalTensor(
     this->scoresGm = scoresGm;
     this->mtpTopkPayloadsGm = mtpTopkPayloadsGm;
     this->mtpThresholdsGm = mtpThresholdsGm;
+    this->mtpVictimChunksGm = mtpVictimChunksGm;
 }
 
 template <typename LIT>
@@ -552,6 +555,34 @@ __aicore__ inline void LIVector<LIT>::CollectMtpEvictCandidateChunk(
     // MrgBasicBlock is ordered by the same -aggregate key. Its first 512
     // entries are exactly the only batch prefix that can survive the global
     // 512-entry merge.
+    LocalTensor<float> batchCandidate = evictPendingUb_;
+    DataCopy(batchCandidate, tmpSortBuf, CHUNK_PAIR_FLOATS);
+    PipeBarrier<PIPE_V>();
+    MergeEvictCandidateChunk(batchCandidate, MTP_EVICT_PRELOAD_CAP,
+                             tmpSortBuf);
+    PipeBarrier<PIPE_V>();
+}
+
+template <typename LIT>
+__aicore__ inline void LIVector<LIT>::ConsumeMtpVictimChunk(
+    const LICommon::RunInfo &info, LocalTensor<float> &tmpSortBuf,
+    uint32_t producerLoop, uint32_t pendingSlot)
+{
+    LocalTensor<float> chunkPairLocal =
+        evictPendingUb_[pendingSlot * CHUNK_PAIR_FLOATS];
+    uint64_t gmOffset =
+        (static_cast<uint64_t>(GetBlockIdx() / 2U) * 2U +
+         (producerLoop & 1U)) * CHUNK_PAIR_FLOATS;
+    SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
+    DataCopy(chunkPairLocal, mtpVictimChunksGm[gmOffset], CHUNK_PAIR_FLOATS);
+    SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
+    if (pendingSlot != PAYLOAD_BUF_SLOTS - 1U &&
+        !info.isLastS2InnerLoop) {
+        return;
+    }
+    uint32_t pendingBlockNum = pendingSlot + 1U;
+    MrgBasicBlock(tmpSortBuf, evictPendingUb_, pendingBlockNum, s2BaseSize_);
+    PipeBarrier<PIPE_V>();
     LocalTensor<float> batchCandidate = evictPendingUb_;
     DataCopy(batchCandidate, tmpSortBuf, CHUNK_PAIR_FLOATS);
     PipeBarrier<PIPE_V>();
@@ -1400,6 +1431,10 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
     int64_t weightGmOffset = static_cast<int64_t>(info.queryRow) * gSize_;
     if (info.isFirstS2InnerLoop) {
         InitSortOutBuf(globalTopkUb_, TOPK_PAIR_FLOATS);
+        if (info.queryIdx + 1U == MTP_QUERY_COUNT) {
+            InitSortOutBuf(evictCandidateUb_,
+                           MTP_EVICT_PRELOAD_CAP * VALUE_AND_INDEX_NUM);
+        }
     }
 
     int32_t mmUbStride =
@@ -1448,14 +1483,20 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
     Adds(sortScoreUb, reduceOutInner, 0.0f, cuS2Len);
     PipeBarrier<PIPE_V>();
     FinishPayload(payloadUb, cuBaseS2Idx, cuS2Len);
-    WriteMtpAggregateScoreChunk(info.bIdx, info.queryIdx, cuBaseS2Idx,
-                                sortScoreUb, s2BaseSize_);
+    if (info.queryIdx + 1U != MTP_QUERY_COUNT) {
+        WriteMtpAggregateScoreChunk(info.bIdx, info.queryIdx, cuBaseS2Idx,
+                                    sortScoreUb, s2BaseSize_);
+    }
 
     LocalTensor<float> tmpSortBuf = outQueue_.AllocTensor<float>();
     uint32_t cachedChunkIdx = info.segmentChunkIdx % PAYLOAD_BUF_SLOTS;
-    if (info.queryIdx + 1U == MTP_QUERY_COUNT) {
-        CollectMtpEvictCandidateChunk(info, payloadUb, tmpSortBuf,
-                                      cachedChunkIdx);
+    if (info.queryIdx + 1U == MTP_QUERY_COUNT && info.s2Idx > 0U) {
+        LICommon::RunInfo victimInfo = info;
+        victimInfo.isLastS2InnerLoop = false;
+        uint32_t previousChunk = info.s2Idx - 1U;
+        ConsumeMtpVictimChunk(victimInfo, tmpSortBuf,
+                              info.loop - 1U,
+                              previousChunk % PAYLOAD_BUF_SLOTS);
     }
     Sort<float, true>(
         SortedBasicBlock_[cachedChunkIdx * s2BaseSize_ * VALUE_AND_INDEX_NUM],
@@ -1487,10 +1528,99 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
 
     if (info.isLastS2InnerLoop) {
         StoreMtpQueryTopK(info);
-        if (info.queryIdx + 1U == MTP_QUERY_COUNT) {
-            FinalizeMtpRequest(info);
-        }
     }
+}
+
+template <typename LIT>
+__aicore__ inline void LIVector<LIT>::ProcessMtpVictimProducer(
+    const LICommon::RunInfo &info)
+{
+    if ((GetBlockIdx() & 1U) == 0U ||
+        info.queryIdx + 1U != MTP_QUERY_COUNT) {
+        return;
+    }
+
+    int32_t cuBaseS2Idx = info.s2Idx * s2BaseSize_;
+    int32_t cuS2Len = info.actualSingleProcessSInnerSize;
+    int64_t mmGmOffset = (info.loop % 2U) * (gSize_ * s2BaseSize_);
+    int64_t weightGmOffset = static_cast<int64_t>(info.queryRow) * gSize_;
+    int32_t mmUbStride =
+        (s2BaseSize_ - info.actualSingleProcessSInnerSizeAlign) /
+        B32_BLOCK_ALIGN_NUM;
+    LocalTensor<int32_t> payloadUb = payloadBuf_.Get<int32_t>();
+    StartPayloadCopy(payloadUb, info.cacheRowIdx, cuBaseS2Idx, cuS2Len,
+                     s2BaseSize_);
+    LocalTensor<float> reduceOutBuff = reduceOutBuf_.Get<float>();
+    LocalTensor<float> reduceOutInner = reduceOutBuff[s2BaseSize_];
+    LocalTensor<float> brcBuf = brcBuf_.Get<float>();
+    LocalTensor<float> reduceCacheBuf = outQueue_.AllocTensor<float>();
+    for (uint32_t outerGidx = 0; outerGidx < outerG_; ++outerGidx) {
+        LocalTensor<float> mmInUb = inQueue_.AllocTensor<float>();
+        LocalTensor<float> weightsInUb = mmInUb[GROUP_INNER * s2BaseSize_];
+        LocalTensor<K_T> weightsInTUb =
+            weightsInUb.template ReinterpretCast<K_T>()[GROUP_INNER];
+        LIServiceVec::CopyIn(
+            mmInUb, weightsInTUb, mm1ResGm, weightsGm,
+            mmGmOffset + outerGidx * GROUP_INNER *
+                             info.actualSingleProcessSInnerSizeAlign,
+            weightGmOffset + outerGidx * GROUP_INNER, GROUP_INNER,
+            info.actualSingleProcessSInnerSizeAlign, mmUbStride);
+        inQueue_.EnQue<float>(mmInUb);
+        mmInUb = inQueue_.DeQue<float>();
+        weightsInUb = mmInUb[GROUP_INNER * s2BaseSize_];
+        LIServiceVec::DoScale(
+            reduceCacheBuf[REDUCE_BANK_CONFLICT_NUM], mmInUb, weightsInUb,
+            weightsInTUb, brcBuf, GROUP_INNER, s2BaseSize_, outerGidx);
+        inQueue_.FreeTensor(mmInUb);
+    }
+    LIServiceVec::DoReduce(reduceCacheBuf[REDUCE_BANK_CONFLICT_NUM],
+                           reduceOutInner, GROUP_INNER, s2BaseSize_);
+    outQueue_.FreeTensor(reduceCacheBuf);
+
+    LocalTensor<float> aggregateScore = aggregateScoreBuf_.Get<float>();
+    uint64_t aggregateOffset = static_cast<uint64_t>(info.bIdx) * scoreStride_ +
+                               static_cast<uint32_t>(cuBaseS2Idx);
+    SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
+    DataCopy(aggregateScore, scoresGm[aggregateOffset], s2BaseSize_);
+    SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
+    Max(aggregateScore, aggregateScore, reduceOutInner, s2BaseSize_);
+    PipeBarrier<PIPE_V>();
+    FinishPayload(payloadUb, cuBaseS2Idx, cuS2Len);
+
+    LocalTensor<float> tmpSortBuf = outQueue_.AllocTensor<float>();
+    LocalTensor<float> keyLocal = reduceOutBuff;
+    BuildEvictCandidateKeyFromPayload(
+        keyLocal, aggregateScore,
+        payloadUb.template ReinterpretCast<uint32_t>(), tmpSortBuf,
+        s2BaseSize_);
+    LocalTensor<float> chunkPairLocal = evictPendingUb_;
+    SortByKeyWithPayload512(
+        chunkPairLocal, keyLocal,
+        payloadUb.template ReinterpretCast<uint32_t>(), tmpSortBuf,
+        s2BaseSize_ / BLOCK_BYTES);
+    PipeBarrier<PIPE_V>();
+    uint64_t victimOffset =
+        (static_cast<uint64_t>(GetBlockIdx() / 2U) * 2U +
+         (info.loop & 1U)) * CHUNK_PAIR_FLOATS;
+    SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
+    DataCopy(mtpVictimChunksGm[victimOffset], chunkPairLocal,
+             CHUNK_PAIR_FLOATS);
+    SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
+    outQueue_.FreeTensor(tmpSortBuf);
+}
+
+template <typename LIT>
+__aicore__ inline void LIVector<LIT>::FinalizeMtpVictimProducer(
+    const LICommon::RunInfo &info)
+{
+    if ((GetBlockIdx() & 1U) != 0U) {
+        return;
+    }
+    LocalTensor<float> tmpSortBuf = outQueue_.AllocTensor<float>();
+    ConsumeMtpVictimChunk(info, tmpSortBuf, info.loop,
+                          info.s2Idx % PAYLOAD_BUF_SLOTS);
+    outQueue_.FreeTensor(tmpSortBuf);
+    FinalizeMtpRequest(info);
 }
 
 template <typename LIT>
