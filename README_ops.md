@@ -168,7 +168,7 @@ export SOC_VERSION=ascend910_9391
 bash scripts/build_nanovllm_ops.sh
 ```
 
-## 单卡 UT 公共环境
+## 运行前先设置以下环境变量
 
 ```bash
 unset NANOVLLM_OFFLOAD_MODE
@@ -185,7 +185,7 @@ export ASCEND_LAUNCH_BLOCKING=0
 export ASCEND_RT_VISIBLE_DEVICES=4
 ```
 
-## 非 MTP UT
+## 非 MTP 算子单测命令
 
 ```bash
 # 21-bit 边界、request pool、完整 top-2048 与 32/64 heads
@@ -235,7 +235,7 @@ for bs in 24 25 48 64; do
 done
 ```
 
-## MTP3 UT
+## MTP3 算子单测命令
 
 ```bash
 # MTP3 LIM 语义、乱序 request pool、动态图 metadata 和性能
@@ -270,3 +270,55 @@ python3 ut_ops/test_glm_mtp_target_verify.py \
   --query-lens 2,4 --graph-replays 3 --seed 7 \
   --atol 0.04 --rtol 0.02 --min-cosine 0.999
 ```
+
+## 非 MTP 算子单测结果
+
+### fused_li_manage 算子（非MTP版）
+
+测试命令如下：
+
+```
+python3 ut_ops/test_fused_li_manage_perf.py --heads 32 --batch-sizes 1,8,16,24,32,48 --seq-lens 65536,131072 --cache-tokens 8192 --miss-ranges 100:200 --warmup 10 --iters 300 --seed 7
+```
+
+测试结果如下：
+
+| baseline | bsz | seqlen | actual miss mean | LightningIndexer (us) | Fused LI Manage (us) | index management (us) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| torch_npu_native | 1 | 65536 | 115.00 | 80.057 | 112.662 | +32.605 |
+| torch_npu_native | 1 | 131072 | 156.00 | 69.064 | 114.357 | +45.293 |
+| torch_npu_native | 8 | 65536 | 138.00 | 126.457 | 164.018 | +37.561 |
+| torch_npu_native | 8 | 131072 | 141.12 | 234.335 | 275.892 | +41.558 |
+| torch_npu_native | 16 | 65536 | 153.25 | 232.467 | 271.575 | +39.108 |
+| torch_npu_native | 16 | 131072 | 143.88 | 452.332 | 536.346 | +84.015 |
+| torch_npu_native | 24 | 65536 | 150.38 | 349.100 | 408.069 | +58.969 |
+| torch_npu_native | 24 | 131072 | 150.75 | 650.426 | 740.666 | +90.241 |
+| torch_npu_native | 32 | 65536 | 147.75 | 458.903 | 551.229 | +92.326 |
+| torch_npu_native | 32 | 131072 | 143.25 | 872.709 | 1004.042 | +131.333 |
+| torch_npu_native | 48 | 65536 | 150.92 | 663.319 | 762.787 | +99.467 |
+| torch_npu_native | 48 | 131072 | 155.46 | 1257.041 | 1426.194 | +169.153 |
+
+
+### fused_copy_sfa 算子（非MTP版）
+
+测试命令如下：
+
+```
+or bs in 1 8 24 25 48 64; do
+  python3 ut_ops/test_fused_copy_sfa.py \
+    --device npu:0 --mode all --batch-size "$bs" --heads 4 \
+    --source-len 65536 --cache-tokens 8192 --tail-tokens 64 \
+    --miss-min 100 --miss-max 200 --graph-replays 3 --seed 7
+done
+```
+
+测试结果如下：
+
+| bsz | serial (ms) | scatter (ms) | SFA (ms) | COPYSFA (ms) | speedup |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 0.104163 | 0.030473 | 0.091203 | 0.093976 | 1.1084 |
+| 8 | 0.127170 | 0.041548 | 0.097387 | 0.102642 | 1.2390 |
+| 24 | 0.166218 | 0.056705 | 0.116870 | 0.122046 | 1.3619 |
+| 25 | 0.235791 | 0.057339 | 0.173988 | 0.183700 | 1.2836 |
+| 48 | 0.306702 | 0.097170 | 0.225263 | 0.229902 | 1.3341 |
+| 64 | 0.431721 | 0.125100 | 0.307973 | 0.350425 | 1.2320 |
