@@ -220,6 +220,9 @@ ge::graphStatus LIUMtpTiling::DoTiling(LIUMtpTilingInfo *info)
                      MTP_TOPK * sizeof(int32_t);
     workspaceSize += static_cast<uint64_t>(info->batchSize) * MTP_QUERY_COUNT *
                      sizeof(float);
+    // Persist the q0/q1 M=64 result across the query-major vector lifetime.
+    workspaceSize += static_cast<uint64_t>(info->batchSize) * 64U *
+                     scoreStride * sizeof(float);
     context_->GetWorkspaceSizes(1)[0] = workspaceSize;
 
     tilingData_.set_bSize(info->batchSize);

@@ -50,6 +50,7 @@ constexpr uint32_t SORT_BUFFER_FLOATS = TOPK_PAIR_FLOATS + EVICT_PAIR_FLOATS + S
 constexpr uint32_t PARTIAL_SLOTS_PER_CORE = 2;
 constexpr uint32_t PARTIAL_META_INTS_PER_CORE = 8;
 constexpr uint32_t MTP_QUERY_COUNT = 4;
+constexpr uint32_t MTP_PAIR_ROWS = 64;
 constexpr uint32_t MTP_UNION_CAPACITY = MTP_QUERY_COUNT * BASE_TOPK;
 // MTP LIM intentionally remains on the validated 18-bit source format.
 constexpr uint32_t MTP_SOURCE_CAPACITY = 1U << 18;
@@ -115,7 +116,8 @@ public:
         GlobalTensor<int32_t> missCountGm,
         GlobalTensor<float> scoresGm,
         GlobalTensor<int32_t> mtpTopkPayloadsGm,
-        GlobalTensor<float> mtpThresholdsGm);
+        GlobalTensor<float> mtpThresholdsGm,
+        GlobalTensor<float> mtpPair01ScoresGm);
     __aicore__ inline void InitPartialMetadata(uint32_t coreIdx);
     __aicore__ inline void FinalizePartialRequest(uint32_t bIdx, uint32_t cacheRowIdx,
                                                   uint32_t actualSeqLen,
@@ -142,6 +144,7 @@ protected:
     GlobalTensor<int32_t> mtpMissSourceIdsGm;
     GlobalTensor<int32_t> mtpMissDestinationSlotsGm;
     GlobalTensor<float> mtpThresholdsGm;
+    GlobalTensor<float> mtpPair01ScoresGm;
 
 private:
     // queue
@@ -325,7 +328,8 @@ __aicore__ inline void LIVector<LIT>::InitMtpGlobalTensor(
     GlobalTensor<int32_t> missCountGm,
     GlobalTensor<float> scoresGm,
     GlobalTensor<int32_t> mtpTopkPayloadsGm,
-    GlobalTensor<float> mtpThresholdsGm)
+    GlobalTensor<float> mtpThresholdsGm,
+    GlobalTensor<float> mtpPair01ScoresGm)
 {
     this->mm1ResGm = mm1ResGm;
     this->weightsGm = weightsGm;
@@ -338,6 +342,7 @@ __aicore__ inline void LIVector<LIT>::InitMtpGlobalTensor(
     this->scoresGm = scoresGm;
     this->mtpTopkPayloadsGm = mtpTopkPayloadsGm;
     this->mtpThresholdsGm = mtpThresholdsGm;
+    this->mtpPair01ScoresGm = mtpPair01ScoresGm;
 }
 
 template <typename LIT>
@@ -1422,12 +1427,29 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
         LocalTensor<K_T> weightsInTUb =
             weightsInUb.template ReinterpretCast<K_T>();
         weightsInTUb = weightsInTUb[GROUP_INNER];
-        LIServiceVec::CopyIn(
-            mmInUb, weightsInTUb, mm1ResGm, weightsGm,
-            mmGmOffset + outerGidx * GROUP_INNER *
-                             info.actualSingleProcessSInnerSizeAlign,
-            weightGmOffset + outerGidx * GROUP_INNER, GROUP_INNER,
-            info.actualSingleProcessSInnerSizeAlign, mmUbStride);
+        if (info.queryIdx < 2U) {
+            int64_t pairOffset =
+                static_cast<int64_t>(info.bIdx) * MTP_PAIR_ROWS *
+                    scoreStride_ +
+                static_cast<int64_t>(info.s2Idx) * MTP_PAIR_ROWS *
+                    s2BaseSize_ +
+                static_cast<int64_t>(info.queryIdx) * gSize_ *
+                    info.actualSingleProcessSInnerSizeAlign +
+                outerGidx * GROUP_INNER *
+                    info.actualSingleProcessSInnerSizeAlign;
+            LIServiceVec::CopyIn(
+                mmInUb, weightsInTUb, mtpPair01ScoresGm, weightsGm,
+                pairOffset,
+                weightGmOffset + outerGidx * GROUP_INNER, GROUP_INNER,
+                info.actualSingleProcessSInnerSizeAlign, mmUbStride);
+        } else {
+            LIServiceVec::CopyIn(
+                mmInUb, weightsInTUb, mm1ResGm, weightsGm,
+                mmGmOffset + outerGidx * GROUP_INNER *
+                                 info.actualSingleProcessSInnerSizeAlign,
+                weightGmOffset + outerGidx * GROUP_INNER, GROUP_INNER,
+                info.actualSingleProcessSInnerSizeAlign, mmUbStride);
+        }
         inQueue_.EnQue<float>(mmInUb);
         mmInUb = inQueue_.DeQue<float>();
         weightsInUb = mmInUb[GROUP_INNER * s2BaseSize_];
