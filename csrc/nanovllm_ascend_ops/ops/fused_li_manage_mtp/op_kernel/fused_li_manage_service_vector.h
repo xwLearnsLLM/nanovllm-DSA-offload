@@ -1473,16 +1473,13 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
                               static_cast<int64_t>(cachedChunkIdx + 1U),
                               s2BaseSize_);
                 PipeBarrier<PIPE_V>();
-                // The merged block already lives in tmpSortBuf. Consume it
-                // directly and reuse the now-dead pending-block region as
-                // SparseTopK scratch, avoiding a 16 KiB UB copy and barrier.
-                SparseTopK(globalTopkUb_, tmpSortBuf, SortedBasicBlock_,
-                           BASE_TOPK,
-                           s2BaseSize_ * (cachedChunkIdx + 1U));
-            } else {
-                SparseTopK(globalTopkUb_, SortedBasicBlock_, tmpSortBuf,
-                           BASE_TOPK, s2BaseSize_);
+                DataCopy(SortedBasicBlock_, tmpSortBuf,
+                         (cachedChunkIdx + 1U) * s2BaseSize_ *
+                             VALUE_AND_INDEX_NUM);
+                PipeBarrier<PIPE_V>();
             }
+            SparseTopK(globalTopkUb_, SortedBasicBlock_, tmpSortBuf, BASE_TOPK,
+                       s2BaseSize_ * (cachedChunkIdx + 1U));
         }
     }
     PipeBarrier<PIPE_V>();
