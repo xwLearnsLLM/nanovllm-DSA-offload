@@ -26,6 +26,16 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Number of longest sorted DuReader requests to run.",
     )
+    parser.add_argument(
+        "--prompt_len",
+        type=int,
+        default=None,
+        help=(
+            "Repeat every tokenized DuReader prompt and truncate it from "
+            "the front to exactly this many tokens. By default, preserve "
+            "the original prompt lengths."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -72,19 +82,37 @@ def build_prompt_token_ids(tokenizer, record: dict) -> list[int]:
     return prefix_ids + body_ids + suffix_ids
 
 
+def resize_prompt_token_ids(
+    token_ids: list[int],
+    target_len: int,
+) -> list[int]:
+    if target_len <= 0:
+        raise ValueError("--prompt_len must be positive.")
+    if not token_ids:
+        raise ValueError("Cannot resize an empty DuReader prompt.")
+    repeats = (target_len + len(token_ids) - 1) // len(token_ids)
+    return (token_ids * repeats)[-target_len:]
+
+
 def main() -> None:
     args = parse_args()
     records = load_requests(args.prompt_count)
     max_steps, max_tokens = decode_step_limits(16)
 
+    if args.prompt_len is not None and args.prompt_len <= 0:
+        raise ValueError("--prompt_len must be positive.")
+
     # The input IDs are built after LLM initialization, so use the dataset
     # length as a safe initial model-length bound. The script verifies the
     # final tokenizer lengths immediately afterward.
-    max_model_len = (
-        max(int(record["length"]) for record in records)
-        + max_tokens
-        + 128
-    )
+    if args.prompt_len is None:
+        max_model_len = (
+            max(int(record["length"]) for record in records)
+            + max_tokens
+            + 128
+        )
+    else:
+        max_model_len = args.prompt_len + max_tokens
     llm = make_llm(
         max_model_len=max_model_len,
         max_num_prefill_seqs_per_step=1,
@@ -93,6 +121,11 @@ def main() -> None:
     prompt_token_ids = [
         build_prompt_token_ids(llm.tokenizer, record) for record in records
     ]
+    if args.prompt_len is not None:
+        prompt_token_ids = [
+            resize_prompt_token_ids(ids, args.prompt_len)
+            for ids in prompt_token_ids
+        ]
     actual_max_len = max(len(ids) for ids in prompt_token_ids) + max_tokens
     if actual_max_len > llm.config.max_model_len:
         raise RuntimeError(
@@ -107,6 +140,7 @@ def main() -> None:
         f"{int(records[0]['length'])}, "
         f"prompt_token_range={min(map(len, prompt_token_ids))}-"
         f"{max(map(len, prompt_token_ids))}, "
+        f"prompt_len_override={args.prompt_len}, "
         f"max_model_len={llm.config.max_model_len}, "
         f"max_steps={max_steps}, "
         f"max_completion_tokens={max_tokens}"
