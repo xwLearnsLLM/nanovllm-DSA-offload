@@ -6,6 +6,8 @@ import pytest
 import nanovllm.engine.dsa_offload as dsa_offload
 from nanovllm.engine.dsa_offload import (
     LIDU_CACHE_TOKEN_BUDGETS,
+    LIDU_MAX_CACHE_TOKENS,
+    LIDU_MAX_SOURCE_TOKENS,
     OFFLOAD_FUSE,
     OFFLOAD_MODES,
     OFFLOAD_SPLIT,
@@ -83,8 +85,8 @@ def test_three_modes_and_default_public_api():
         (2048, 0),
         (2049, 2048),
         (8192, 2048),
-        (8193, 3072),
-        (16384, 3072),
+        (8193, 6144),
+        (16384, 6144),
         (16385, 6144),
         (32768, 6144),
         (32769, 8192),
@@ -99,8 +101,8 @@ def test_lidu_cache_tiers_use_original_prompt_length(prompt_len, expected):
 def test_four_long_prompt_cache_budgets_are_centralized_and_tunable(
     monkeypatch,
 ):
-    assert LIDU_CACHE_TOKEN_BUDGETS == (3072, 6144, 8192, 12288)
-    tuned = (5120, 8192, 16384, 24576)
+    assert LIDU_CACHE_TOKEN_BUDGETS == (6144, 6144, 8192, 12288)
+    tuned = (6144, 8192, 12288, 16256)
     monkeypatch.setattr(
         dsa_offload,
         "LIDU_CACHE_TOKEN_BUDGETS",
@@ -109,14 +111,14 @@ def test_four_long_prompt_cache_budgets_are_centralized_and_tunable(
 
     assert validate_lidu_cache_token_budgets(128) == tuned
     assert lidu_cache_tokens(8192) == 2048
-    assert lidu_cache_tokens(8193) == 5120
+    assert lidu_cache_tokens(8193) == 6144
     assert lidu_cache_tokens(16385) == 8192
-    assert lidu_cache_tokens(32769) == 16384
-    assert lidu_cache_tokens(65537) == 24576
+    assert lidu_cache_tokens(32769) == 12288
+    assert lidu_cache_tokens(65537) == 16256
     assert max(
         lidu_cache_tokens(length)
         for length in (8193, 16385, 32769, 65537)
-    ) == 24576
+    ) == 16256
 
     seq = _seq(21_000, "tuned-21k")
     Scheduler(_config())._prepare_prefill_metadata(seq)
@@ -131,6 +133,7 @@ def test_four_long_prompt_cache_budgets_are_centralized_and_tunable(
         ((12288, 12288, 12288, 12288), "exceeds the complete source"),
         ((1024, 5120, 8192, 12288), "at least 2048"),
         ((3073, 5120, 8192, 12288), "divisible"),
+        ((6144, 8192, 12288, 16384), "at most 16383"),
         ((3072, 5120, 8192), "exactly four integers"),
     ],
 )
@@ -146,6 +149,11 @@ def test_invalid_tuned_lidu_budgets_fail_at_startup(
     )
     with pytest.raises(ValueError, match=message):
         validate_lidu_cache_token_budgets(128)
+
+
+def test_repository_limits_source_to_256k_and_cache_budget_to_14_bits():
+    assert LIDU_MAX_SOURCE_TOKENS == 1 << 18
+    assert LIDU_MAX_CACHE_TOKENS == (1 << 14) - 1
 
 
 def test_lidu_miss_count_layer_switch():
@@ -189,9 +197,9 @@ def test_mixed_short_and_long_requests_get_unique_persistent_pool_rows():
     assert short.lidu_cache_tokens == 0
     assert short.lidu_cache_initialized
     assert short.num_sparse_tokens == 1024
-    assert long.lidu_cache_tokens == 3072
+    assert long.lidu_cache_tokens == 6144
     assert not long.lidu_cache_initialized
-    assert long.num_sparse_tokens == 3072
+    assert long.num_sparse_tokens == 6144
     assert short.offload_pool_entry >= 0
     assert long.offload_pool_entry >= 0
     assert short.offload_pool_entry != long.offload_pool_entry
@@ -289,10 +297,10 @@ def test_decode_growth_does_not_allocate_index_cache_blocks():
 @pytest.mark.parametrize(
     ("prompt_len", "expected_tail_blocks", "expected_new_blocks"),
     [
-        (9000, 1, 24),
+        (9000, 1, 48),
         # A block-aligned prompt needs both its delayed C arena and the first
         # decode-tail block in the same atomic allocation.
-        (9216, 0, 25),
+        (9216, 0, 49),
     ],
 )
 def test_lidu_releases_all_full_prefill_blocks_until_first_decode(
@@ -358,13 +366,13 @@ def _finish_lidu_prefill_without_running_decode(
 
 
 def test_lidu_prefill_borrows_pending_decode_arenas_without_stranding():
-    # Scheduler reserves two blocks outside this manager.  102 configured HBM
-    # blocks therefore provide exactly 100 usable blocks.  A 9K request needs
-    # 71 blocks for prefill but only 24 sparse + 1 tail blocks for decode.
+    # Scheduler reserves two blocks outside this manager.  198 configured HBM
+    # blocks therefore provide exactly 196 usable blocks. A 9K request needs
+    # 71 blocks for prefill but only 48 sparse + 1 tail blocks for decode.
     scheduler = Scheduler(
         _config(
             max_decode_seqs=4,
-            num_hbm_blocks=102,
+            num_hbm_blocks=198,
             num_dram_blocks=800,
         )
     )
@@ -373,7 +381,7 @@ def test_lidu_prefill_borrows_pending_decode_arenas_without_stranding():
         _finish_lidu_prefill_without_running_decode(scheduler, seq)
 
     # All four requests are admitted while only their tails are physically
-    # resident.  Their 4 * 24 pending sparse blocks remain borrowable.
+    # resident.  Their 4 * 48 pending sparse blocks remain borrowable.
     assert len(scheduler.hbm_block_manager.used_block_ids) == 4
     assert all(seq.lidu_decode_hbm_pending for seq in seqs)
 
@@ -382,18 +390,18 @@ def test_lidu_prefill_borrows_pending_decode_arenas_without_stranding():
     assert not is_prefill
     assert scheduled == seqs
     assert all(not seq.lidu_decode_hbm_pending for seq in seqs)
-    assert all(len(seq.hbm_block_table) == 25 for seq in seqs)
-    assert len(scheduler.hbm_block_manager.used_block_ids) == 100
+    assert all(len(seq.hbm_block_table) == 49 for seq in seqs)
+    assert len(scheduler.hbm_block_manager.used_block_ids) == 196
 
 
 def test_lidu_decode_reservation_rejects_oversubscription_before_prefill():
-    # With 99 usable blocks, physical HBM can still run the fourth 71-block
-    # prefill after three tails are retained, but 4 * 25 decode blocks cannot
+    # With 195 usable blocks, physical HBM can still run the fourth 71-block
+    # prefill after three tails are retained, but 4 * 49 decode blocks cannot
     # coexist.  Reject at admission instead of failing at first decode.
     scheduler = Scheduler(
         _config(
             max_decode_seqs=4,
-            num_hbm_blocks=101,
+            num_hbm_blocks=197,
             num_dram_blocks=800,
         )
     )
@@ -444,7 +452,7 @@ def test_chunk_prefill_keeps_sparse_arena_delayed_until_decode():
     assert not is_prefill
     assert scheduled == [seq]
     assert not seq.lidu_decode_hbm_pending
-    assert len(seq.hbm_block_table) == 25
+    assert len(seq.hbm_block_table) == 49
 
 
 def test_abort_releases_tail_and_pending_lidu_state():

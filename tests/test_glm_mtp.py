@@ -246,7 +246,7 @@ def test_mtp_lidu_uses_independent_dense_mtp_block_pool():
     assert not scheduler.mtp_block_manager.used_block_ids
 
 
-def test_mtp_index_share_owns_independent_pool_row_and_cache_blocks():
+def test_mtp_index_share_uses_independent_dense_cache_without_lim_pool():
     config = _scheduler_config()
     config.hf_config = SimpleNamespace(index_share_for_mtp_iteration=True)
     scheduler = Scheduler(config)
@@ -259,15 +259,12 @@ def test_mtp_index_share_owns_independent_pool_row_and_cache_blocks():
     assert len(seq.hbm_block_table) == 3
     assert len(seq.mtp_block_table) == 3
     assert scheduler.mtp_block_manager is not scheduler.hbm_block_manager
-    assert seq.mtp_index_pool_entry >= 0
-    assert seq.mtp_lidu_cache_tokens == 16
-    assert not seq.mtp_lidu_cache_initialized
+    assert not hasattr(seq, "mtp_index_pool_entry")
+    assert not hasattr(scheduler, "mtp_index_pool_entry_manager")
 
     scheduler.deallocate(seq)
 
-    assert seq.mtp_index_pool_entry == -1
     assert not seq.mtp_block_table
-    assert scheduler.mtp_index_pool_entry_manager.used_entries == set()
 
 
 def test_scheduler_commits_multiple_tokens_and_truncates_at_max_tokens():

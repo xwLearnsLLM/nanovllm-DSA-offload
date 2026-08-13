@@ -22,7 +22,12 @@ LIDU_CACHE_TOKEN_BUDGETS: Final = (6144, 6144, 8192, 12288)
 # of its prompt range.  Once this repository's operators have been compiled,
 # any block-aligned values within these limits can be selected in Python.
 _LIDU_CACHE_TOKEN_BUDGET_LIMITS: Final = (8192, 16384, 32768, 65536)
-LIDU_MAX_SOURCE_TOKENS: Final = (1 << 18) - 1
+# This repository deliberately supports at most a 256K-token source.  Source
+# token IDs therefore fit in 18 bits (0..2^18-1); the count itself may be 2^18.
+LIDU_MAX_SOURCE_TOKENS: Final = 1 << 18
+# The runtime deliberately caps target-layer LIM cache budgets at 14 bits; it
+# does not rely on the standalone operator's unused 21-bit source-ID mode.
+LIDU_MAX_CACHE_TOKENS: Final = (1 << 14) - 1
 
 
 def parse_lidu_miss_count_layers(
@@ -174,6 +179,10 @@ def validate_lidu_cache_token_budgets(
         raise ValueError(
             "A LIDU cache budget exceeds the complete source available at "
             f"its prompt-range boundary: {oversized}."
+        )
+    if any(budget > LIDU_MAX_CACHE_TOKENS for budget in budgets):
+        raise ValueError(
+            "Every LIDU cache budget must be at most 16383 tokens."
         )
     if any(budget % int(block_size) for budget in budgets):
         raise ValueError(

@@ -104,10 +104,7 @@ def test_mtp_entry_keeps_index_share_metadata_at_fixed_addresses():
     )
     mtp_tables = target_tables + 100
     index_share = SimpleNamespace(
-        block_tables=mtp_tables,
-        req_pool_entries=torch.tensor([7, 3], dtype=torch.int32),
         candidate_lens=torch.tensor([20992, 32768], dtype=torch.int32),
-        lidu_cache_tokens=torch.tensor([20992, 32768], dtype=torch.int32),
     )
     context = Context(
         flat_slot_mapping=torch.arange(8, dtype=torch.int64),
@@ -127,10 +124,7 @@ def test_mtp_entry_keeps_index_share_metadata_at_fixed_addresses():
         [[100, 202], [101, 203], [102, 204]]
     )
 
-    assert entry.mtp_index_block_tables[:, :3].equal(mtp_tables)
-    assert entry.mtp_req_pool_entries.tolist() == [7, 3]
     assert entry.mtp_candidate_lens.tolist() == [20992, 32768]
-    assert entry.mtp_lidu_cache_tokens.tolist() == [20992, 32768]
     assert [
         values.tolist() for values in entry.mtp_actual_seq_lengths_by_step
     ] == [[100, 202], [101, 203], [102, 204]]

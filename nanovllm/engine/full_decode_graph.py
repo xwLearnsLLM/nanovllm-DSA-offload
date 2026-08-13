@@ -784,10 +784,7 @@ class MTPDecodeGraphEntry:
     cu_seqlens_q: torch.Tensor
     block_tables: torch.Tensor
     mtp_block_tables: torch.Tensor
-    mtp_index_block_tables: torch.Tensor
-    mtp_req_pool_entries: torch.Tensor
     mtp_candidate_lens: torch.Tensor
-    mtp_lidu_cache_tokens: torch.Tensor
     mtp_actual_seq_lengths_by_step: list[torch.Tensor]
     actual_seq_lengths_kv: torch.Tensor
     index_block_tables: torch.Tensor
@@ -866,19 +863,7 @@ class MTPDecodeGraphEntry:
                 dtype=torch.int32,
                 device=device,
             ),
-            mtp_index_block_tables=torch.zeros(
-                batch_size,
-                max_block_columns,
-                dtype=torch.int32,
-                device=device,
-            ),
-            mtp_req_pool_entries=torch.zeros(
-                batch_size, dtype=torch.int32, device=device
-            ),
             mtp_candidate_lens=torch.zeros(
-                batch_size, dtype=torch.int32, device=device
-            ),
-            mtp_lidu_cache_tokens=torch.zeros(
                 batch_size, dtype=torch.int32, device=device
             ),
             mtp_actual_seq_lengths_by_step=[
@@ -1029,17 +1014,8 @@ class MTPDecodeGraphEntry:
             )
             if mtp_index_share is not None:
                 required = {
-                    "block_tables": getattr(
-                        mtp_index_share, "block_tables", None
-                    ),
-                    "req_pool_entries": getattr(
-                        mtp_index_share, "req_pool_entries", None
-                    ),
                     "candidate_lens": getattr(
                         mtp_index_share, "candidate_lens", None
-                    ),
-                    "lidu_cache_tokens": getattr(
-                        mtp_index_share, "lidu_cache_tokens", None
                     ),
                 }
                 missing = [
@@ -1051,19 +1027,8 @@ class MTPDecodeGraphEntry:
                         "MTP graph IndexShare metadata is missing: "
                         + ", ".join(missing)
                     )
-                self._copy_table(
-                    self.mtp_index_block_tables,
-                    required["block_tables"],
-                    "mtp_index_block_tables",
-                )
-                self.mtp_req_pool_entries.copy_(
-                    required["req_pool_entries"]
-                )
                 self.mtp_candidate_lens.copy_(
                     required["candidate_lens"]
-                )
-                self.mtp_lidu_cache_tokens.copy_(
-                    required["lidu_cache_tokens"]
                 )
             if stateful_offload:
                 self._copy_table(

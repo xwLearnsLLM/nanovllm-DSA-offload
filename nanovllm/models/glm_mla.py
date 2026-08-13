@@ -58,8 +58,8 @@ _LiduUpdateResult = tuple[
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor | None,
 ]
 _MtpLiduUpdateResult = tuple[
     torch.Tensor,
@@ -488,6 +488,7 @@ class GlmMLAAttention(nn.Module):
         self._fused_li_manage_outputs: dict[
             int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]
         ] = {}
+        self._mtp_index_share_topk: dict[int, torch.Tensor] = {}
         self._fused_li_manage_mtp_outputs: dict[
             int,
             tuple[
@@ -556,56 +557,33 @@ class GlmMLAAttention(nn.Module):
         self.ckv_cache = ckv_cache
         self.kpe_cache = kpe_cache
 
-    def assign_mtp_index_share_state(
-        self,
-        index_cache: torch.Tensor,
-        lidu_cache_slots: torch.Tensor,
-    ) -> None:
-        """Attach the MTP layer's independent IndexShare state."""
+    def assign_mtp_index_share_cache(self, index_cache: torch.Tensor) -> None:
+        """Attach the fully resident MTP layer's IndexShare key cache."""
 
         if not self.uses_mtp_index_share or self.indexer is None:
             raise RuntimeError(
                 "MTP IndexCache was assigned while MTP IndexShare is disabled."
         )
         self.index_cache = index_cache
-        self.lidu_cache_slots = lidu_cache_slots
 
-    def initialize_mtp_index_share_rows(
-        self,
-        pool_entries: list[int],
-        cache_tokens: list[int],
-    ) -> None:
-        """Seed each MTP row with its fully resident dense source mapping."""
-
-        if not self.uses_mtp_index_share:
-            return
-        if len(pool_entries) != len(cache_tokens):
-            raise ValueError("MTP IndexShare rows and cache sizes must match.")
-        for pool_entry, tokens in zip(pool_entries, cache_tokens):
-            row = self.lidu_cache_slots[int(pool_entry)]
-            row.fill_(-1)
-            if int(tokens) > 0:
-                row[: int(tokens)].copy_(
-                    torch.arange(
-                        int(tokens),
-                        dtype=torch.int32,
-                        device=row.device,
-                    )
-                )
-
-    def _mtp_lidu_update(
+    def _mtp_index_share_update(
         self,
         q_index: torch.Tensor | None,
         weights: torch.Tensor | None,
         batch_size: int,
     ) -> _LiduUpdateResult:
-        """Run or reuse the MTP draft chain's single-query LIM result."""
+        """Select MTP draft Top-K directly in its fully resident HBM cache.
+
+        MTP draft KV is never offloaded.  The official LightningIndexer token
+        IDs are therefore already the logical slots consumed by SFA; routing
+        them through LIM's 14-bit destination-slot mapping is both redundant
+        and incorrect for source positions at or above 16384.
+        """
 
         context = get_context()
         required = {
-            "req_pool_entries": context.req_pool_entries,
-            "lidu_cache_tokens": context.lidu_cache_tokens,
             "candidate_lens": context.candidate_lens,
+            "candidate_query_lens": context.candidate_query_lens,
             "index_block_tables": context.index_block_tables,
         }
         missing = [name for name, value in required.items() if value is None]
@@ -614,9 +592,9 @@ class GlmMLAAttention(nn.Module):
                 "MTP IndexShare decode context is missing: "
                 + ", ".join(missing)
             )
-        buffers = self._fused_li_manage_outputs.get(batch_size)
         if self.skip_mtp_topk:
-            if buffers is None:
+            topk_slots = self._mtp_index_share_topk.get(batch_size)
+            if topk_slots is None:
                 raise RuntimeError(
                     "MTP IndexShare attempted to reuse Top-K before the "
                     "first draft iteration."
@@ -626,39 +604,41 @@ class GlmMLAAttention(nn.Module):
                 raise RuntimeError(
                     "The first MTP draft iteration requires indexer outputs."
                 )
-            if buffers is None:
-                options = dict(dtype=torch.int32, device=q_index.device)
-                buffers = (
-                    torch.zeros((batch_size, 1, LIDU_TOPK), **options),
-                    torch.zeros((batch_size, 1, LIDU_TOPK), **options),
-                    torch.zeros((batch_size,), **options),
-                )
-                self._fused_li_manage_outputs[batch_size] = buffers
-            topk_src_ids, topk_dst_slots, miss_counts = buffers
-            fused_li_manage(
-                q_index[:batch_size],
-                weights[:batch_size],
-                self.index_cache,
-                context.index_block_tables[:batch_size],
-                context.candidate_lens[:batch_size],
-                context.lidu_cache_tokens[:batch_size],
-                context.req_pool_entries[:batch_size],
-                self.lidu_cache_slots,
-                topk_src_ids,
-                topk_dst_slots,
-                miss_counts,
+            result = torch_npu.npu_lightning_indexer(
+                query=q_index[:batch_size],
+                key=self.index_cache,
+                weights=weights[:batch_size],
+                actual_seq_lengths_query=(
+                    context.candidate_query_lens[:batch_size]
+                ),
+                actual_seq_lengths_key=context.candidate_lens[:batch_size],
+                block_table=context.index_block_tables[:batch_size],
+                layout_query="TND",
+                layout_key="PA_BSND",
+                sparse_count=LIDU_TOPK,
+                sparse_mode=3,
             )
-        assert buffers is not None
-        topk_src_ids, topk_dst_slots, miss_counts = buffers
-        # MTP's dense KV source is fully resident in its own HBM cache. The
-        # identity rows above guarantee LIM misses are zero, so no SCATTER or
-        # DRAM cache is involved in this path.
+            topk_slots = (
+                result[0] if isinstance(result, (tuple, list)) else result
+            )
+            if not isinstance(topk_slots, torch.Tensor):
+                raise TypeError(
+                    "MTP LightningIndexer must return a Tensor or a tuple "
+                    "whose first item is a Tensor."
+                )
+            expected = (batch_size, 1, LIDU_TOPK)
+            if tuple(topk_slots.shape) != expected:
+                raise RuntimeError(
+                    "Unexpected MTP LightningIndexer output shape: "
+                    f"actual={tuple(topk_slots.shape)}, expected={expected}."
+                )
+            self._mtp_index_share_topk[batch_size] = topk_slots
         return (
             self.kpe_cache.squeeze(2),
             self.ckv_cache.squeeze(2),
-            topk_dst_slots,
-            topk_src_ids,
-            miss_counts,
+            topk_slots,
+            None,
+            None,
         )
 
     def post_load_prepare(self) -> None:
@@ -1777,7 +1757,7 @@ class GlmMLAAttention(nn.Module):
         assert context.actual_seq_lengths_kv is not None
         if context.needs_dsa_update and not dsa_updated:
             if self.uses_mtp_index_share:
-                cache_aliases = self._mtp_lidu_update(
+                cache_aliases = self._mtp_index_share_update(
                     q_index, weights, batch_size
                 )
             elif self.is_index_share_owner:

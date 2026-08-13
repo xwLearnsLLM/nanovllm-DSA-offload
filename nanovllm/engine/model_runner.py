@@ -144,17 +144,11 @@ class _DecodeStaticMetadata:
 
 @dataclass
 class _MtpIndexShareMetadata:
-    block_tables: torch.Tensor
-    req_pool_entries: torch.Tensor
     candidate_lens: torch.Tensor
-    lidu_cache_tokens: torch.Tensor
 
     def select(self, rows: torch.Tensor) -> "_MtpIndexShareMetadata":
         return _MtpIndexShareMetadata(
-            block_tables=self.block_tables.index_select(0, rows),
-            req_pool_entries=self.req_pool_entries.index_select(0, rows),
             candidate_lens=self.candidate_lens.index_select(0, rows),
-            lidu_cache_tokens=self.lidu_cache_tokens.index_select(0, rows),
         )
 
 
@@ -523,20 +517,6 @@ class ModelRunner:
                 )
                 logger.info("Dense MLA CKV cache shape: %s", ckv_shape)
                 logger.info("Dense MLA KPE cache shape: %s", kpe_shape)
-            mtp_lidu_slots = None
-            if self.uses_mtp_index_share:
-                max_source_tokens = (
-                    self.config.max_model_len // self.block_size
-                ) * self.block_size
-                mtp_lidu_slots = torch.full(
-                    (
-                        config.max_num_decode_seqs_per_step,
-                        max_source_tokens,
-                    ),
-                    -1,
-                    dtype=torch.int32,
-                    device=self.device,
-                )
             for module in self.model.modules():
                 if not hasattr(module, "assign_mla_cache"):
                     continue
@@ -563,13 +543,7 @@ class ModelRunner:
                         dtype=cache_dtype,
                         device=self.device,
                     )
-                    if mtp_lidu_slots is None:
-                        raise RuntimeError(
-                            "MTP IndexShare slots were not allocated."
-                        )
-                    module.assign_mtp_index_share_state(
-                        index_cache, mtp_lidu_slots
-                    )
+                    module.assign_mtp_index_share_cache(index_cache)
             return
 
         index_dim = int(text_config.index_head_dim)
@@ -708,15 +682,7 @@ class ModelRunner:
                     dtype=cache_dtype,
                     device=self.device,
                 )
-                module.assign_mtp_index_share_state(
-                    mtp_index_cache,
-                    torch.full(
-                        lidu_slots_shape,
-                        -1,
-                        dtype=torch.int32,
-                        device=self.device,
-                    ),
-                )
+                module.assign_mtp_index_share_cache(mtp_index_cache)
             if self.rank == 0:
                 logger.info(
                     "MTP dense MLA cache: blocks=%d, CKV=%s, KPE=%s",
@@ -845,25 +811,12 @@ class ModelRunner:
     ) -> _MtpIndexShareMetadata | None:
         if not self.uses_mtp_index_share:
             return None
-        if any(int(seq.mtp_index_pool_entry) < 0 for seq in seqs):
-            raise RuntimeError("MTP IndexShare sequence is missing a pool row.")
         return _MtpIndexShareMetadata(
-            block_tables=self.prepare_block_tables(seqs, "mtp_block_table"),
-            req_pool_entries=torch.tensor(
-                [seq.mtp_index_pool_entry for seq in seqs],
-                dtype=torch.int32,
-                device=self.device,
-            ),
             candidate_lens=torch.tensor(
                 [
                     seq.num_prefill_full_blocks * self.block_size
                     for seq in seqs
                 ],
-                dtype=torch.int32,
-                device=self.device,
-            ),
-            lidu_cache_tokens=torch.tensor(
-                [seq.mtp_lidu_cache_tokens for seq in seqs],
                 dtype=torch.int32,
                 device=self.device,
             ),
@@ -1244,7 +1197,7 @@ class ModelRunner:
                 f"expected={batch_size}, actual={len(actual_seq_lengths_kv)}."
             )
         if index_share is not None and actual_seq_lengths_kv_tensor is None:
-            if int(index_share.block_tables.shape[0]) != batch_size:
+            if int(index_share.candidate_lens.shape[0]) != batch_size:
                 raise ValueError("MTP IndexShare metadata batch changed.")
             actual_seq_lengths_kv_tensor = torch.tensor(
                 actual_seq_lengths_kv,
@@ -1262,22 +1215,9 @@ class ModelRunner:
             actual_seq_lengths_kv_tensor=actual_seq_lengths_kv_tensor,
             block_tables=block_tables,
             index_block_tables=(
-                index_share.block_tables if index_share is not None else None
+                block_tables if index_share is not None else None
             ),
-            # MTP draft recurrence keeps source KV in its dense HBM cache.
-            # Target verification supplies its target-layer DRAM table.
-            dram_block_tables=(
-                dram_block_tables
-                if dram_block_tables is not None
-                else (
-                    index_share.block_tables
-                    if index_share is not None
-                    else None
-                )
-            ),
-            req_pool_entries=(
-                index_share.req_pool_entries if index_share is not None else None
-            ),
+            dram_block_tables=dram_block_tables,
             candidate_lens=(
                 index_share.candidate_lens if index_share is not None else None
             ),
@@ -1285,7 +1225,7 @@ class ModelRunner:
                 cu_seqlens_q[1:] if index_share is not None else None
             ),
             lidu_cache_tokens=(
-                index_share.lidu_cache_tokens
+                index_share.candidate_lens
                 if index_share is not None
                 else None
             ),
@@ -1405,13 +1345,6 @@ class ModelRunner:
             return None
 
         mtp_index_share_metadata = self._mtp_index_share_metadata(seqs)
-        if mtp_index_share_metadata is not None:
-            mtp.mtp_block.self_attn.initialize_mtp_index_share_rows(
-                [seq.mtp_index_pool_entry for seq in seqs],
-                [seq.mtp_lidu_cache_tokens for seq in seqs],
-            )
-            for seq in seqs:
-                seq.mtp_lidu_cache_initialized = True
         # Prefill is eager even when stable decode uses a graph, so it can
         # directly consume the just-built MTP IndexShare metadata.
         mtp_index_share = mtp_index_share_metadata
@@ -1454,13 +1387,7 @@ class ModelRunner:
                 first_draft.index_select(0, eligible_rows),
                 last_positions.index_select(0, eligible_rows) + 1,
                 last_hidden_states.index_select(0, eligible_rows),
-                (
-                    mtp_index_share.block_tables.index_select(
-                        0, eligible_rows
-                    )
-                    if mtp_index_share is not None
-                    else context.block_tables.index_select(0, eligible_rows)
-                ),
+                context.block_tables.index_select(0, eligible_rows),
                 self.num_speculative_tokens - 1,
                 index_share=(
                     mtp_index_share.select(eligible_rows)
@@ -1681,10 +1608,7 @@ class ModelRunner:
         actual_seq_lengths_tensors_by_step = None
         if graph_index_share is not None:
             index_share = _MtpIndexShareMetadata(
-                block_tables=graph_index_share.mtp_index_block_tables,
-                req_pool_entries=graph_index_share.mtp_req_pool_entries,
                 candidate_lens=graph_index_share.mtp_candidate_lens,
-                lidu_cache_tokens=graph_index_share.mtp_lidu_cache_tokens,
             )
             actual_seq_lengths_tensors_by_step = (
                 graph_index_share.mtp_actual_seq_lengths_by_step
@@ -1733,15 +1657,8 @@ class ModelRunner:
                     None
                     if graph_index_share is None
                     else _MtpIndexShareMetadata(
-                        block_tables=graph_index_share.mtp_index_block_tables,
-                        req_pool_entries=(
-                            graph_index_share.mtp_req_pool_entries
-                        ),
                         candidate_lens=(
                             graph_index_share.mtp_candidate_lens
-                        ),
-                        lidu_cache_tokens=(
-                            graph_index_share.mtp_lidu_cache_tokens
                         ),
                     )
                 ),

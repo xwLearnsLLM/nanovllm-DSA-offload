@@ -50,12 +50,6 @@ class Sequence:
         # independent dense HBM cache. Target layers continue to use the LIDU
         # sparse HBM layout in ``hbm_block_table``.
         self.mtp_block_table = []
-        # MTP IndexShare owns a separate LIDU row from the target-layer
-        # IndexShare groups. Its source KV stays resident in the dense MTP
-        # cache, but the row keeps top-k selection stable across draft steps.
-        self.mtp_index_pool_entry = -1
-        self.mtp_lidu_cache_tokens = 0
-        self.mtp_lidu_cache_initialized = False
         self.dram_block_table = []
         self.offload_pool_entry = -1
         self.offload_finalized = False
@@ -202,9 +196,6 @@ class Sequence:
             "index_block_table": self.index_block_table,
             "hbm_block_table": self.hbm_block_table,
             "mtp_block_table": self.mtp_block_table,
-            "mtp_index_pool_entry": self.mtp_index_pool_entry,
-            "mtp_lidu_cache_tokens": self.mtp_lidu_cache_tokens,
-            "mtp_lidu_cache_initialized": self.mtp_lidu_cache_initialized,
             "dram_block_table": self.dram_block_table,
             "offload_pool_entry": self.offload_pool_entry,
             "offload_finalized": self.offload_finalized,
@@ -246,11 +237,6 @@ class Sequence:
         self.index_block_table = state.get("index_block_table", self.block_table)
         self.hbm_block_table = state.get("hbm_block_table", self.block_table)
         self.mtp_block_table = state.get("mtp_block_table", [])
-        self.mtp_index_pool_entry = state.get("mtp_index_pool_entry", -1)
-        self.mtp_lidu_cache_tokens = state.get("mtp_lidu_cache_tokens", 0)
-        self.mtp_lidu_cache_initialized = state.get(
-            "mtp_lidu_cache_initialized", False
-        )
         self.dram_block_table = state.get("dram_block_table", [])
         self.offload_pool_entry = state.get("offload_pool_entry", -1)
         self.offload_finalized = state.get("offload_finalized", False)
@@ -303,9 +289,6 @@ class DecodeSequenceMetadata:
     block_size: int
     hbm_block_table: list[int]
     mtp_block_table: list[int]
-    mtp_index_pool_entry: int
-    mtp_lidu_cache_tokens: int
-    mtp_lidu_cache_initialized: bool
     index_block_table: list[int]
     dram_block_table: list[int]
     offload_pool_entry: int
@@ -334,9 +317,6 @@ class DecodeSequenceMetadata:
             block_size=seq.block_size,
             hbm_block_table=list(seq.hbm_block_table),
             mtp_block_table=list(seq.mtp_block_table),
-            mtp_index_pool_entry=seq.mtp_index_pool_entry,
-            mtp_lidu_cache_tokens=seq.mtp_lidu_cache_tokens,
-            mtp_lidu_cache_initialized=seq.mtp_lidu_cache_initialized,
             index_block_table=list(seq.index_block_table),
             dram_block_table=list(seq.dram_block_table),
             offload_pool_entry=seq.offload_pool_entry,

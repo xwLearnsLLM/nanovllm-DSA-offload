@@ -189,6 +189,16 @@ def test_glm52_mtp0_nonoffload_eager_config_is_loaded(tmp_path):
     )
 
 
+def test_glm_runtime_accepts_256k_and_rejects_longer_context(tmp_path):
+    _write_glm52_config(tmp_path)
+
+    config = _make_config(tmp_path, max_model_len=1 << 18)
+    assert config.max_model_len == 1 << 18
+
+    with pytest.raises(ValueError, match="limited to 256K"):
+        _make_config(tmp_path, max_model_len=(1 << 18) + 1)
+
+
 def test_glm52_stage3_accepts_offload_fuse(tmp_path):
     _write_glm52_config(tmp_path)
 
@@ -504,8 +514,8 @@ def test_glm_8200_prompt_really_crosses_dsa_offload_boundary():
     assert seq.num_prefill_full_blocks == 64
     assert seq.num_prefill_tail_blocks == 1
     assert seq.prefill_tail_len == 8
-    assert seq.num_sparse_blocks == 24
-    assert seq.num_sparse_tokens == 3072
+    assert seq.num_sparse_blocks == 48
+    assert seq.num_sparse_tokens == 6144
     candidate_len = seq.num_prefill_full_blocks * seq.block_size
     assert candidate_len == 8192
     assert candidate_len > 2048

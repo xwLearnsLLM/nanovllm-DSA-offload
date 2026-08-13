@@ -134,6 +134,11 @@ class Config:
                 self.max_model_len,
                 max_position_embeddings,
             )
+        if self.max_model_len > LIDU_MAX_SOURCE_TOKENS:
+            raise ValueError(
+                "GLM-5.1/5.2 runtime max_model_len is limited to 256K "
+                f"tokens, got {self.max_model_len}."
+            )
 
         self._configure_glm_runtime()
         self._validate_glm52_phase1_runtime()
@@ -463,7 +468,7 @@ class Config:
         ) * self.kvcache_block_size
         if max_source_tokens > LIDU_MAX_SOURCE_TOKENS:
             raise ValueError(
-                "LIDU prefill-full-block source must contain fewer than 2^18 "
+                "LIM prefill-full-block source must contain at most 2^18 "
                 f"tokens, got {max_source_tokens}."
             )
         validate_lidu_cache_token_budgets(self.kvcache_block_size)
