@@ -32,10 +32,10 @@ constexpr uint32_t S2_BASE_SIZE = 512;
 constexpr uint32_t GROUP_INNER = 16;
 constexpr uint32_t PAYLOAD_BUF_SLOTS = 4;
 constexpr uint32_t EVICT_CANDIDATE_CAP = BASE_TOPK;
-// The target MTP workload has about 300-400 unique union misses.  Preloading
-// one 512-entry block keeps q3's per-chunk merge at 512+512; atypical larger
-// miss sets retain exact semantics through FinalizeMtpRequest's GM fallback.
-constexpr uint32_t MTP_EVICT_PRELOAD_CAP = S2_BASE_SIZE;
+// Production traces can contain roughly 500 misses per query. Their four-way
+// union can substantially exceed one 512-entry chunk, so keep the complete
+// 2048-entry victim prefix available to the MTP fast path.
+constexpr uint32_t MTP_EVICT_PRELOAD_CAP = EVICT_CANDIDATE_CAP;
 static_assert(MTP_EVICT_PRELOAD_CAP % S2_BASE_SIZE == 0U &&
                   MTP_EVICT_PRELOAD_CAP <= EVICT_CANDIDATE_CAP,
               "MTP eviction preload must fit the shared candidate buffer");
@@ -278,7 +278,7 @@ __aicore__ inline void LIVector<LIT>::InitMtpBuffers(TPipe *pipe)
     // of the single-query LIM UB footprint.
     pipe->InitBuffer(aggregateScoreBuf_, S2_BASE_SIZE * sizeof(float));
     // Accumulate four independently sorted q3 victim blocks before touching
-    // the global 512-entry victim prefix.
+    // the global 2048-entry victim prefix.
     pipe->InitBuffer(evictPendingBuf_,
                      MTP_EVICT_PENDING_FLOATS * sizeof(float));
     evictPendingUb_ = evictPendingBuf_.Get<float>();
@@ -526,7 +526,7 @@ __aicore__ inline void LIVector<LIT>::CollectMtpEvictCandidateChunk(
     // q3 leaves the final max(q0..q3) score in aggregateScoreBuf_. Reuse the
     // cache-slot payload already fetched for this score chunk and retain four
     // independently sorted victim blocks. Only the fourth block (or the tail)
-    // updates the global 512-entry victim prefix.
+    // updates the global 2048-entry victim prefix.
     LocalTensor<float> aggregateScore = aggregateScoreBuf_.Get<float>();
     LocalTensor<float> keyLocal = reduceOutBuf_.Get<float>()[s2BaseSize_];
     LocalTensor<float> chunkPairLocal =
@@ -549,14 +549,16 @@ __aicore__ inline void LIVector<LIT>::CollectMtpEvictCandidateChunk(
     MrgBasicBlock(tmpSortBuf, evictPendingUb_, pendingBlockNum,
                   s2BaseSize_);
     PipeBarrier<PIPE_V>();
-    // MrgBasicBlock is ordered by the same -aggregate key. Its first 512
-    // entries are exactly the only batch prefix that can survive the global
-    // 512-entry merge.
+    // MrgBasicBlock is ordered by the same -aggregate key. Preserve the whole
+    // four-chunk batch: with a 2048-entry global prefix, entries 513..2048 can
+    // still survive and must not be truncated to one chunk.
     LocalTensor<float> batchCandidate = evictPendingUb_;
-    DataCopy(batchCandidate, tmpSortBuf, CHUNK_PAIR_FLOATS);
+    uint32_t batchCandidateCount = pendingBlockNum * S2_BASE_SIZE;
+    DataCopy(batchCandidate, tmpSortBuf,
+             batchCandidateCount * VALUE_AND_INDEX_NUM);
     PipeBarrier<PIPE_V>();
-    MergeEvictCandidateChunk(batchCandidate, MTP_EVICT_PRELOAD_CAP,
-                             tmpSortBuf);
+    MergeSort(evictCandidateUb_, MTP_EVICT_PRELOAD_CAP,
+              batchCandidate, batchCandidateCount, tmpSortBuf);
     PipeBarrier<PIPE_V>();
 }
 
@@ -1085,9 +1087,8 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
         candidateCap = CeilDiv(missCount, S2_BASE_SIZE) * S2_BASE_SIZE;
         candidateCap = Min(candidateCap, MTP_EVICT_PRELOAD_CAP);
         // q3 incrementally retained the global lowest-score cached entries in
-        // evictCandidateUb_.  Finalization consumes at most that 512-entry
-        // prefix; atypical larger miss sets continue through the exact GM
-        // fallback without scanning aggregateScoresGm end to end.
+        // evictCandidateUb_. Finalization consumes the required 512-aligned
+        // prefix up to the complete 2048-entry preload capacity.
     }
 
     uint32_t updateCount = 0;
