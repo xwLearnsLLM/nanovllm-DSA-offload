@@ -46,7 +46,7 @@ def _decode_context(
         candidate_lens=torch.arange(4096, 4096 + batch_size, dtype=torch.int32),
         candidate_query_lens=torch.arange(1, batch_size + 1, dtype=torch.int32),
         lidu_cache_tokens=torch.tensor(
-            [0 if row == 0 else 3072 for row in range(batch_size)],
+            [0 if row == 0 else 6144 for row in range(batch_size)],
             dtype=torch.int32,
         ),
         needs_dsa_update=True,
@@ -327,7 +327,7 @@ def test_static_entry_copies_lidu_tiers_for_mixed_batch():
         offload_mode="offload_split",
     )
 
-    assert entry.lidu_cache_tokens.tolist() == [0, 3072]
+    assert entry.lidu_cache_tokens.tolist() == [0, 6144]
 
 
 def test_static_entry_refreshes_tensor_mla_lengths_every_step():

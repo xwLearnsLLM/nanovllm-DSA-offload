@@ -103,7 +103,7 @@ def run_semantic_check(
         (0, 129),
         (0, 2049),
         (2048, 0),
-        (3072, 257),
+        (6144, 257),
         (5120, 1025),
     )
     generator = torch.Generator().manual_seed(seed)

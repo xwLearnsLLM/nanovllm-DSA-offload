@@ -129,12 +129,12 @@ def test_four_long_prompt_cache_budgets_are_centralized_and_tunable(
 @pytest.mark.parametrize(
     ("budgets", "message"),
     [
-        ((5120, 3072, 8192, 12288), "nondecreasing"),
+        ((8192, 6144, 8192, 12288), "nondecreasing"),
         ((12288, 12288, 12288, 12288), "exceeds the complete source"),
         ((1024, 5120, 8192, 12288), "at least 2048"),
         ((3073, 5120, 8192, 12288), "divisible"),
         ((6144, 8192, 12288, 16384), "at most 16383"),
-        ((3072, 5120, 8192), "exactly four integers"),
+        ((6144, 8192, 12288), "exactly four integers"),
     ],
 )
 def test_invalid_tuned_lidu_budgets_fail_at_startup(
@@ -220,11 +220,11 @@ def test_mixed_short_and_long_requests_get_unique_persistent_pool_rows():
 def test_lidu_state_survives_sequence_and_decode_snapshot_serialization():
     seq = _seq(9000, "serialize")
     seq.offload_pool_entry = 3
-    seq.lidu_cache_tokens = 3072
+    seq.lidu_cache_tokens = 6144
     seq.lidu_cache_initialized = True
     seq.num_prefill_full_blocks = 70
-    seq.num_sparse_blocks = 24
-    seq.num_sparse_tokens = 3072
+    seq.num_sparse_blocks = 48
+    seq.num_sparse_tokens = 6144
     seq.num_prefill_tokens_processed = 9000
     seq.append_token(42)
     seq.lidu_decode_hbm_pending = True
@@ -236,7 +236,7 @@ def test_lidu_state_survives_sequence_and_decode_snapshot_serialization():
     restored.lidu_decode_hbm_pending = False
     snapshot = DecodeSequenceMetadata.from_sequence(restored)
     assert snapshot.offload_pool_entry == 3
-    assert snapshot.lidu_cache_tokens == 3072
+    assert snapshot.lidu_cache_tokens == 6144
     assert snapshot.lidu_cache_initialized
 
 
