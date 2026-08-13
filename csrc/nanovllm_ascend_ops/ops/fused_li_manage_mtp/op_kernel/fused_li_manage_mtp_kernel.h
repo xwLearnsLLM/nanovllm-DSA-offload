@@ -64,7 +64,6 @@ private:
     GlobalTensor<float> aggregateScoresGm;
     GlobalTensor<int32_t> internalTopkPayloadsGm;
     GlobalTensor<float> internalThresholdsGm;
-    GlobalTensor<float> pair01ScoresGm;
 
     uint32_t tmpBlockIdx = 0;
     uint32_t aiCoreIdx = 0;
@@ -143,10 +142,6 @@ __aicore__ inline void LIMtpPreload<LIT>::Init(
         constInfo.batchSize * MAX_UNION_TOKENS * sizeof(int32_t);
     internalThresholdsGm.SetGlobalBuffer(
         (__gm__ float *)(workspace + thresholdOffset));
-    uint64_t pair01Offset = thresholdOffset +
-        constInfo.batchSize * QUERY_COUNT * sizeof(float);
-    pair01ScoresGm.SetGlobalBuffer(
-        (__gm__ float *)(workspace + pair01Offset));
 
     reqPoolEntriesGm.SetGlobalBuffer((__gm__ int32_t *)reqPoolEntries,
                                      constInfo.batchSize);
@@ -173,7 +168,7 @@ __aicore__ inline void LIMtpPreload<LIT>::Init(
             topkSourceIdsGm,
             missSourceIdsGm, missDestinationSlotsGm, missCountsGm,
             aggregateScoresGm, internalTopkPayloadsGm,
-            internalThresholdsGm, pair01ScoresGm);
+            internalThresholdsGm);
         vectorService.InitMtpBuffers(pipe);
     } else {
         matmulService.InitParams(constInfo);
@@ -182,7 +177,6 @@ __aicore__ inline void LIMtpPreload<LIT>::Init(
         blockTableGm.SetGlobalBuffer((__gm__ int32_t *)blockTable);
         matmulService.InitMm1GlobalTensor(blockTableGm, keyGm, queryGm,
                                          mm1ResGm);
-        matmulService.InitPair01GlobalTensor(pair01ScoresGm, scoreStride);
         matmulService.InitBuffers(pipe);
     }
 }
@@ -281,11 +275,7 @@ __aicore__ inline void LIMtpPreload<LIT>::ProcessChunk(const RunInfo &runInfo)
 {
     if ASCEND_IS_AIC {
         CrossCoreWaitFlag(constInfo.syncV1C1);
-        if (runInfo.queryIdx == 0U) {
-            matmulService.ComputeMm1Pair01(runInfo);
-        } else if (runInfo.queryIdx != 1U) {
-            matmulService.ComputeMm1(runInfo);
-        }
+        matmulService.ComputeMm1(runInfo);
         CrossCoreSetFlag<ConstInfo::FIA_SYNC_MODE2, PIPE_FIX>(
             constInfo.syncC1V1);
     } else {

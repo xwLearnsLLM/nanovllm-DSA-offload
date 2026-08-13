@@ -38,7 +38,6 @@ public:
     __aicore__ inline void AllocEventID();
     __aicore__ inline void FreeEventID();
     __aicore__ inline void ComputeMm1(const LICommon::RunInfo &runInfo);
-    __aicore__ inline void ComputeMm1Pair01(const LICommon::RunInfo &runInfo);
 
     static constexpr IsResetLoad3dConfig LOAD3DV2_CONFIG = {true, true}; // isSetFMatrix isSetPadding;
     static constexpr uint64_t KEY_BUF_NUM = 3;
@@ -73,14 +72,12 @@ protected:
     __aicore__ inline void LoadKeyToL0b(uint64_t s2L0Offset, uint64_t s2L1RealSize, uint64_t s2L0RealSize,
                                         const LICommon::RunInfo &runInfo);
     __aicore__ inline void LoadQueryToL0a(const LICommon::RunInfo &runInfo);
-    __aicore__ inline void LoadQueryPair01ToL0a();
     __aicore__ inline void QueryNd2Nz(const LICommon::RunInfo &runInfo);
     __aicore__ inline void KeyNd2NzForPA(uint64_t s2L1RealSize, uint64_t s2GmOffset, const LICommon::RunInfo &runInfo);
     GlobalTensor<int32_t> blkTableGm_;
     GlobalTensor<K_T> keyGm_;
     GlobalTensor<Q_T> queryGm_;
     GlobalTensor<float> mm1ResGm_;
-    GlobalTensor<float> pair01ResGm_;
 
     TBuf<TPosition::A1> bufQL1_;
     LocalTensor<Q_T> queryL1_;
@@ -99,15 +96,6 @@ protected:
     uint64_t l0BufIdx_ = 0;
 
     ConstInfo constInfo_;
-    uint64_t pairScoreStride_ = 0;
-
-public:
-    __aicore__ inline void InitPair01GlobalTensor(
-        const GlobalTensor<float> &pair01ResGm, uint64_t scoreStride)
-    {
-        pair01ResGm_ = pair01ResGm;
-        pairScoreStride_ = scoreStride;
-    }
 };
 
 template <typename LIT>
@@ -197,81 +185,6 @@ __aicore__ inline void LIMatmul<LIT>::ComputeMm1(const LICommon::RunInfo &runInf
     }
 }
 
-template <typename LIT>
-__aicore__ inline void LIMatmul<LIT>::ComputeMm1Pair01(
-    const LICommon::RunInfo &runInfo)
-{
-    uint64_t s2GmBaseOffset = runInfo.s2Idx * constInfo_.s2BaseSize;
-    uint64_t s2ProcessSize = runInfo.actualSingleProcessSInnerSize;
-    uint64_t queryL0LoadCount = 0;
-    for (uint64_t s2GmOffset = 0; s2GmOffset < s2ProcessSize;
-         s2GmOffset += S2_BASIC_BLOCK) {
-        WaitFlag<HardEvent::MTE1_MTE2>(
-            KEY_MTE1_MTE2_EVENT + keyL1BufIdx_ % KEY_BUF_NUM);
-        uint64_t s2L1RealSize = Min(S2_BASIC_BLOCK,
-                                    s2ProcessSize - s2GmOffset);
-        KeyNd2NzForPA(s2L1RealSize, s2GmBaseOffset + s2GmOffset, runInfo);
-        SetFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
-        WaitFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
-        if (runInfo.isFirstS2InnerLoop && s2GmOffset == 0U) {
-            WaitFlag<HardEvent::MTE1_MTE2>(QUERY_MTE1_MTE2_EVENT);
-            QueryNd2Nz(runInfo);
-            SetFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
-            WaitFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
-        }
-        for (uint64_t s2L1Offset = 0; s2L1Offset < s2L1RealSize;
-             s2L1Offset += S2_BASIC_BLOCK_L0) {
-            uint64_t s2L0RealSize = Min(S2_BASIC_BLOCK_L0,
-                                        s2L1RealSize - s2L1Offset);
-            WaitFlag<HardEvent::M_MTE1>(M_MTE1_EVENT +
-                                         l0BufIdx_ % L0_BUF_NUM);
-            if (runInfo.isFirstS2InnerLoop &&
-                queryL0LoadCount < L0_BUF_NUM) {
-                LoadQueryPair01ToL0a();
-                ++queryL0LoadCount;
-            }
-            LoadKeyToL0b(s2L1Offset, s2L1RealSize, s2L0RealSize, runInfo);
-            SetFlag<HardEvent::MTE1_M>(MTE1_M_EVENT);
-            WaitFlag<HardEvent::MTE1_M>(MTE1_M_EVENT);
-            MmadParams params;
-            params.m = M_BASIC_BLOCK_L0;
-            params.n = s2L0RealSize;
-            params.k = constInfo_.headDim;
-            params.cmatrixInitVal = true;
-            params.cmatrixSource = false;
-            params.unitFlag = 0b11;
-            Mmad(cL0_[(l0BufIdx_ % L0_BUF_NUM) * L0C_BUFFER_OFFSET],
-                 queryL0_[(l0BufIdx_ % L0_BUF_NUM) * QUERY_L0_BUFFER_OFFSET],
-                 keyL0_[(l0BufIdx_ % L0_BUF_NUM) * KEY_L0_BUFFER_OFFSET],
-                 params);
-            SetFlag<HardEvent::M_MTE1>(M_MTE1_EVENT +
-                                       l0BufIdx_ % L0_BUF_NUM);
-            AscendC::DataCopyCO12DstParams fixp;
-            fixp.mSize = M_BASIC_BLOCK_L0;
-            fixp.nSize = s2L0RealSize;
-            fixp.dstStride = runInfo.actualSingleProcessSInnerSizeAlign;
-            fixp.srcStride = M_BASIC_BLOCK_L0;
-            fixp.quantPre = QuantMode_t::NoQuant;
-            fixp.nz2ndEn = true;
-            fixp.unitFlag = 0b11;
-            fixp.reluPre = 1;
-            AscendC::SetFixpipeNz2ndFlag(1, 1, 1);
-            uint64_t pairBase = static_cast<uint64_t>(runInfo.bIdx) *
-                                M_BASIC_BLOCK_L0 * pairScoreStride_;
-            AscendC::DataCopy(
-                pair01ResGm_[pairBase +
-                             static_cast<uint64_t>(runInfo.s2Idx) *
-                                 M_BASIC_BLOCK_L0 * constInfo_.s2BaseSize +
-                             s2GmOffset + s2L1Offset],
-                cL0_[(l0BufIdx_ % L0_BUF_NUM) * L0C_BUFFER_OFFSET], fixp);
-            ++l0BufIdx_;
-        }
-        SetFlag<HardEvent::MTE1_MTE2>(
-            KEY_MTE1_MTE2_EVENT + keyL1BufIdx_ % KEY_BUF_NUM);
-        ++keyL1BufIdx_;
-    }
-}
-
 // blkNum, blkSize, N2, D
 template <typename LIT>
 __aicore__ inline void LIMatmul<LIT>::KeyNd2NzForPA(uint64_t s2L1RealSize, uint64_t s2GmOffset,
@@ -315,34 +228,18 @@ __aicore__ inline void LIMatmul<LIT>::KeyNd2NzForPA(uint64_t s2L1RealSize, uint6
 template <typename LIT>
 __aicore__ inline void LIMatmul<LIT>::QueryNd2Nz(const LICommon::RunInfo &runInfo)
 {
-    uint64_t firstQueryRow = static_cast<uint64_t>(runInfo.bIdx) *
-                             MTP_QUERY_COUNT;
-    uint64_t queryElements = constInfo_.qHeadNum * constInfo_.headDim;
-
-    // q0/q1 must be transformed as one M=64 matrix. Concatenating two
-    // independently transformed M=32 NZ matrices gives the wrong K-block
-    // ordering even though their total byte size is identical.
     Nd2NzParams nd2nzPara;
-    nd2nzPara.ndNum = 1;
-    nd2nzPara.nValue = M_BASIC_BLOCK_L0;
+    nd2nzPara.ndNum = MTP_QUERY_COUNT;
+    nd2nzPara.nValue = constInfo_.qHeadNum;
     nd2nzPara.dValue = constInfo_.headDim;
     nd2nzPara.srcDValue = constInfo_.headDim;
-    nd2nzPara.dstNzC0Stride = M_BASIC_BLOCK_L0;
+    nd2nzPara.dstNzC0Stride = CeilAlign(constInfo_.qHeadNum, static_cast<uint64_t>(BLOCK_CUBE));
     nd2nzPara.dstNzNStride = 1;
-    nd2nzPara.srcNdMatrixStride = 0;
-    nd2nzPara.dstNzMatrixStride = 0;
-    DataCopy(queryL1_, queryGm_[firstQueryRow * queryElements], nd2nzPara);
-
-    // q2/q3 retain their validated independent M=32 matrices at the same
-    // byte offsets used by LoadQueryToL0a(queryIdx).
-    nd2nzPara.ndNum = 2;
-    nd2nzPara.nValue = constInfo_.qHeadNum;
-    nd2nzPara.dstNzC0Stride =
-        CeilAlign(constInfo_.qHeadNum, static_cast<uint64_t>(BLOCK_CUBE));
+    uint64_t queryElements = constInfo_.qHeadNum * constInfo_.headDim;
     nd2nzPara.srcNdMatrixStride = queryElements;
     nd2nzPara.dstNzMatrixStride = queryElements;
-    DataCopy(queryL1_[2U * queryElements],
-             queryGm_[(firstQueryRow + 2U) * queryElements], nd2nzPara);
+    uint64_t firstQueryRow = static_cast<uint64_t>(runInfo.bIdx) * MTP_QUERY_COUNT;
+    DataCopy(queryL1_, queryGm_[firstQueryRow * queryElements], nd2nzPara);
 }
 
 template <typename LIT>
@@ -379,36 +276,6 @@ __aicore__ inline void LIMatmul<LIT>::LoadQueryToL0a(
     LoadData<Q_T, LOAD3DV2_CONFIG>(
         queryL0_[(l0BufIdx_ % L0_BUF_NUM) * QUERY_L0_BUFFER_OFFSET],
         queryL1_[queryL1Offset], loadData3DParams);
-}
-
-template <typename LIT>
-__aicore__ inline void LIMatmul<LIT>::LoadQueryPair01ToL0a()
-{
-    LoadData3DParamsV2<Q_T> params;
-    params.l1H = M_BASIC_BLOCK_L0 / BLOCK_CUBE;
-    params.l1W = BLOCK_CUBE;
-    params.channelSize = constInfo_.headDim;
-    params.padList[0] = 0;
-    params.padList[1] = 0;
-    params.padList[2] = 0;
-    params.padList[3] = 255;
-    params.mExtension = M_BASIC_BLOCK_L0;
-    params.kExtension = constInfo_.headDim;
-    params.mStartPt = 0;
-    params.kStartPt = 0;
-    params.strideW = 1;
-    params.strideH = 1;
-    params.filterW = 1;
-    params.filterSizeW = (1 >> 8) & 255;
-    params.filterH = 1;
-    params.filterSizeH = (1 >> 8) & 255;
-    params.dilationFilterW = 1;
-    params.dilationFilterH = 1;
-    params.enTranspose = 0;
-    params.fMatrixCtrl = 0;
-    LoadData<Q_T, LOAD3DV2_CONFIG>(
-        queryL0_[(l0BufIdx_ % L0_BUF_NUM) * QUERY_L0_BUFFER_OFFSET],
-        queryL1_, params);
 }
 
 template <typename LIT>
