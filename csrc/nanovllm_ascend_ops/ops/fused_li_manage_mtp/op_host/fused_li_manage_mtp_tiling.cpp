@@ -220,10 +220,6 @@ ge::graphStatus LIUMtpTiling::DoTiling(LIUMtpTilingInfo *info)
                      MTP_TOPK * sizeof(int32_t);
     workspaceSize += static_cast<uint64_t>(info->batchSize) * MTP_QUERY_COUNT *
                      sizeof(float);
-    // One ping-pong sorted victim chunk per active AIC. The sibling AIV
-    // produces chunk N while the owner AIV consumes chunk N-1.
-    workspaceSize += static_cast<uint64_t>(blockDim) * DOUBLE_BUFFER *
-                     SCORE_CHUNK * 2U * sizeof(float);
     context_->GetWorkspaceSizes(1)[0] = workspaceSize;
 
     tilingData_.set_bSize(info->batchSize);

@@ -64,7 +64,6 @@ private:
     GlobalTensor<float> aggregateScoresGm;
     GlobalTensor<int32_t> internalTopkPayloadsGm;
     GlobalTensor<float> internalThresholdsGm;
-    GlobalTensor<float> internalVictimChunksGm;
 
     uint32_t tmpBlockIdx = 0;
     uint32_t aiCoreIdx = 0;
@@ -143,10 +142,6 @@ __aicore__ inline void LIMtpPreload<LIT>::Init(
         constInfo.batchSize * MAX_UNION_TOKENS * sizeof(int32_t);
     internalThresholdsGm.SetGlobalBuffer(
         (__gm__ float *)(workspace + thresholdOffset));
-    uint64_t victimChunkOffset = thresholdOffset +
-        constInfo.batchSize * QUERY_COUNT * sizeof(float);
-    internalVictimChunksGm.SetGlobalBuffer(
-        (__gm__ float *)(workspace + victimChunkOffset));
 
     reqPoolEntriesGm.SetGlobalBuffer((__gm__ int32_t *)reqPoolEntries,
                                      constInfo.batchSize);
@@ -173,7 +168,7 @@ __aicore__ inline void LIMtpPreload<LIT>::Init(
             topkSourceIdsGm,
             missSourceIdsGm, missDestinationSlotsGm, missCountsGm,
             aggregateScoresGm, internalTopkPayloadsGm,
-            internalThresholdsGm, internalVictimChunksGm);
+            internalThresholdsGm);
         vectorService.InitMtpBuffers(pipe);
     } else {
         matmulService.InitParams(constInfo);
@@ -266,45 +261,6 @@ __aicore__ inline void LIMtpPreload<LIT>::ProcessMain()
                 ProcessChunk(runInfo);
             }
         }
-
-        // The sibling AIV produces the final q3 victim chunk concurrently
-        // with the owner AIV's TopK work. Defer request finalization until the
-        // AIC has observed completion from both vector sub-blocks.
-        RunInfo finalizeInfo{};
-        finalizeInfo.loop = loop - 1U;
-        finalizeInfo.bIdx = bIdx;
-        finalizeInfo.queryRow = bIdx * QUERY_COUNT + QUERY_COUNT - 1U;
-        finalizeInfo.queryIdx = QUERY_COUNT - 1U;
-        finalizeInfo.s2Idx = chunkCount - 1U;
-        finalizeInfo.segmentChunkIdx = chunkCount - 1U;
-        finalizeInfo.actS2Size = candidateLen;
-        finalizeInfo.cacheTokenCount = static_cast<uint32_t>(cacheTokenCount);
-        finalizeInfo.cacheRowIdx = static_cast<uint32_t>(poolEntry);
-        finalizeInfo.actualSingleProcessSInnerSize =
-            candidateLen - finalizeInfo.s2Idx * constInfo.s2BaseSize;
-        finalizeInfo.actualSingleProcessSInnerSizeAlign = LICommon::Align(
-            finalizeInfo.actualSingleProcessSInnerSize,
-            ConstInfo::BUFFER_SIZE_BYTE_32B);
-        finalizeInfo.isFirstS2InnerLoop = chunkCount == 1U;
-        finalizeInfo.isLastS2InnerLoop = true;
-        if ASCEND_IS_AIC {
-            CrossCoreWaitFlag(constInfo.syncV1C1);
-            CrossCoreWaitFlag(constInfo.syncV1C1);
-            CrossCoreSetFlag<ConstInfo::FIA_SYNC_MODE2, PIPE_FIX>(
-                constInfo.syncC1V1);
-            CrossCoreSetFlag<ConstInfo::FIA_SYNC_MODE2, PIPE_FIX>(
-                constInfo.syncC1V1);
-        } else {
-            CrossCoreWaitFlag(constInfo.syncC1V1);
-            vectorService.FinalizeMtpVictimProducer(finalizeInfo);
-            if ((tmpBlockIdx & 1U) == 0U) {
-                CrossCoreSetFlag<ConstInfo::FIA_SYNC_MODE2, PIPE_MTE3>(
-                    constInfo.syncV1C1);
-            } else {
-                CrossCoreSetFlag<ConstInfo::FIA_SYNC_MODE2, PIPE_MTE2>(
-                    constInfo.syncV1C1);
-            }
-        }
     }
 
     if ASCEND_IS_AIC {
@@ -324,18 +280,9 @@ __aicore__ inline void LIMtpPreload<LIT>::ProcessChunk(const RunInfo &runInfo)
             constInfo.syncC1V1);
     } else {
         CrossCoreWaitFlag(constInfo.syncC1V1);
-        if ((tmpBlockIdx & 1U) == 0U) {
-            vectorService.ProcessVecMtp(runInfo);
-        } else {
-            vectorService.ProcessMtpVictimProducer(runInfo);
-        }
-        if ((tmpBlockIdx & 1U) == 0U) {
-            CrossCoreSetFlag<ConstInfo::FIA_SYNC_MODE2, PIPE_MTE3>(
-                constInfo.syncV1C1);
-        } else {
-            CrossCoreSetFlag<ConstInfo::FIA_SYNC_MODE2, PIPE_MTE2>(
-                constInfo.syncV1C1);
-        }
+        vectorService.ProcessVecMtp(runInfo);
+        CrossCoreSetFlag<ConstInfo::FIA_SYNC_MODE2, PIPE_MTE2>(
+            constInfo.syncV1C1);
     }
 }
 
