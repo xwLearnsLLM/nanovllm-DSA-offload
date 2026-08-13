@@ -40,6 +40,7 @@ static_assert(MTP_EVICT_PRELOAD_CAP % S2_BASE_SIZE == 0U &&
                   MTP_EVICT_PRELOAD_CAP <= EVICT_CANDIDATE_CAP,
               "MTP eviction preload must fit the shared candidate buffer");
 constexpr uint32_t SORT_TMP_FLOATS = 512 * 8;
+constexpr uint32_t MTP_TMP_SORT_BANK_PAD_FLOATS = 8;
 constexpr uint32_t CHUNK_PAIR_FLOATS = 512 * VALUE_AND_INDEX_NUM;
 constexpr uint32_t MTP_EVICT_PENDING_FLOATS =
     PAYLOAD_BUF_SLOTS * CHUNK_PAIR_FLOATS;
@@ -248,7 +249,11 @@ __aicore__ inline void LIVector<LIT>::InitBuffers(TPipe *pipe)
 
     pipe->InitBuffer(inQueue_, 2,
                      GROUP_INNER * S2_BASE_SIZE * sizeof(float) + S2_BASE_SIZE * sizeof(float));
-    pipe->InitBuffer(outQueue_, 1, outNeedBufSize);
+    // Reserve one 32-byte bank offset for the MTP sort view. Non-MTP users
+    // continue to use the unshifted queue tensor.
+    pipe->InitBuffer(outQueue_, 1,
+                     outNeedBufSize +
+                         MTP_TMP_SORT_BANK_PAD_FLOATS * sizeof(float));
     pipe->InitBuffer(sortOutBuf_, SORT_BUFFER_FLOATS * sizeof(float));
     pipe->InitBuffer(indexBuf_, S2_BASE_SIZE * sizeof(int32_t));
     pipe->InitBuffer(payloadBuf_, S2_BASE_SIZE * PAYLOAD_BUF_SLOTS * sizeof(int32_t));
@@ -1451,7 +1456,9 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
     WriteMtpAggregateScoreChunk(info.bIdx, info.queryIdx, cuBaseS2Idx,
                                 sortScoreUb, s2BaseSize_);
 
-    LocalTensor<float> tmpSortBuf = outQueue_.AllocTensor<float>();
+    LocalTensor<float> tmpSortStorage = outQueue_.AllocTensor<float>();
+    LocalTensor<float> tmpSortBuf =
+        tmpSortStorage[MTP_TMP_SORT_BANK_PAD_FLOATS];
     uint32_t cachedChunkIdx = info.segmentChunkIdx % PAYLOAD_BUF_SLOTS;
     if (info.queryIdx + 1U == MTP_QUERY_COUNT) {
         CollectMtpEvictCandidateChunk(info, payloadUb, tmpSortBuf,
@@ -1483,7 +1490,7 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
         }
     }
     PipeBarrier<PIPE_V>();
-    outQueue_.FreeTensor(tmpSortBuf);
+    outQueue_.FreeTensor(tmpSortStorage);
 
     if (info.isLastS2InnerLoop) {
         StoreMtpQueryTopK(info);
