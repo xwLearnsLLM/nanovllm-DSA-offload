@@ -1413,7 +1413,6 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
     LocalTensor<float> reduceOutBuff = reduceOutBuf_.Get<float>();
     LocalTensor<float> reduceOutInner = reduceOutBuff[s2BaseSize_];
     LocalTensor<float> brcBuf = brcBuf_.Get<float>();
-    PipeBarrier<PIPE_V>();
     LocalTensor<float> reduceCacheBuf = outQueue_.AllocTensor<float>();
     for (uint32_t outerGidx = 0; outerGidx < outerG_; ++outerGidx) {
         LocalTensor<float> mmInUb = inQueue_.AllocTensor<float>();
@@ -1441,12 +1440,13 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
     outQueue_.FreeTensor(reduceCacheBuf);
 
     LocalTensor<float> sortScoreUb = reduceOutBuff;
-    PipeBarrier<PIPE_V>();
     Duplicate(sortScoreUb.template ReinterpretCast<int32_t>(),
               LIServiceVec::NEG_INF, s2BaseSize_);
+    // The duplicate targets reduceOutBuff[0:512], while DoReduce above writes
+    // reduceOutInner[512:1024]. The barrier after Duplicate orders both before
+    // Adds consumes reduceOutInner, so an earlier full V barrier is redundant.
     PipeBarrier<PIPE_V>();
     Adds(sortScoreUb, reduceOutInner, 0.0f, cuS2Len);
-    PipeBarrier<PIPE_V>();
     FinishPayload(payloadUb, cuBaseS2Idx, cuS2Len);
     WriteMtpAggregateScoreChunk(info.bIdx, info.queryIdx, cuBaseS2Idx,
                                 sortScoreUb, s2BaseSize_);
@@ -1476,8 +1476,8 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
                 DataCopy(SortedBasicBlock_, tmpSortBuf,
                          (cachedChunkIdx + 1U) * s2BaseSize_ *
                              VALUE_AND_INDEX_NUM);
+                PipeBarrier<PIPE_V>();
             }
-            PipeBarrier<PIPE_V>();
             SparseTopK(globalTopkUb_, SortedBasicBlock_, tmpSortBuf, BASE_TOPK,
                        s2BaseSize_ * (cachedChunkIdx + 1U));
         }
