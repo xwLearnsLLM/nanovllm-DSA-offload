@@ -1,12 +1,12 @@
 /**
-  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
-  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
-  * CANN Open Software License Agreement Version 2.0 (the "License").
-  * Please refer to the License for details. You may not use this file except in compliance with the License.
-  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
-  * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
-  * See LICENSE in the root of the software repository for the full text of the License.
-  */
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
 
 /*!
  * \file quant_lightning_indexer_common.h
@@ -17,7 +17,7 @@
 using namespace AscendC;
 namespace QLICommon {
 
-//    tiling   layout            
+// 与tiling的layout保持一致
 enum class LI_LAYOUT : uint32_t {
     BSND = 0,
     TND = 1,
@@ -73,12 +73,12 @@ struct RunInfo {
 };
 
 struct ConstInfo {
-    // CUBE   VEC                     
+    // CUBE与VEC核间同步的模式
     static constexpr uint32_t QLI_SYNC_MODE4 = 4;
     static constexpr uint32_t AIV0_AIV1_OFFSET = 16;
     static constexpr uint32_t CROSS_VC_EVENT = 0;
     static constexpr uint32_t CROSS_CV_EVENT = 2;
-    // BUFFER            
+    // BUFFER的字节数
     static constexpr uint32_t BUFFER_SIZE_BYTE_32B = 32;
     static constexpr uint32_t BUFFER_SIZE_BYTE_64B = 64;
     static constexpr uint32_t BUFFER_SIZE_BYTE_256B = 256;
@@ -89,16 +89,16 @@ struct ConstInfo {
     static constexpr uint32_t BUFFER_SIZE_BYTE_8K = 8192;
     static constexpr uint32_t BUFFER_SIZE_BYTE_16K = 16384;
     static constexpr uint32_t BUFFER_SIZE_BYTE_32K = 32768;
-    //             
+    // 无效索引
     static constexpr int INVALID_IDX = -1;
 
-    // CUBE   VEC               EventID
+    // CUBE和VEC的核间同步EventID
     uint32_t syncC1V1 = 0U;
     uint32_t syncC1V0 = 2U;
     uint32_t syncV1C1 = 0U;
     uint32_t syncV0C1 = 1U;
 
-    //                
+    // 基本块大小
     uint32_t mBaseSize = 1ULL;
     uint32_t s1BaseSize = 1ULL;
     uint32_t s2BaseSize = 1ULL;
@@ -108,33 +108,33 @@ struct ConstInfo {
     uint64_t qHeadNum = 0ULL;
     uint64_t kHeadNum;
     uint64_t headDim;
-    uint64_t sparseCount;              // topK            
-    uint64_t kSeqSize = 0ULL;          // kv      S      
-    uint64_t qSeqSize = 1ULL;          // q      S      
-    uint32_t kCacheBlockSize = 0;      // PA         block size
-    uint32_t maxBlockNumPerBatch = 0;  // PA                  batch block number
-    LI_LAYOUT outputLayout;            //                
+    uint64_t sparseCount;              // topK选取大小
+    uint64_t kSeqSize = 0ULL;          // kv最大S长度
+    uint64_t qSeqSize = 1ULL;          // q最大S长度
+    uint32_t kCacheBlockSize = 0;      // PA场景的block size
+    uint32_t maxBlockNumPerBatch = 0;  // PA场景的最大单batch block number
+    LI_LAYOUT outputLayout;            // 输出的格式
     bool attenMaskFlag = false;
     uint32_t cmpRatio = 1;
-    bool batchSupperFlag = false;      // Qactual_se               B+1
+    bool batchSupperFlag = false;      // Qactual_se长度是否为B+1
     int64_t stride = 1;
     int64_t scaleStride = 1;
 
-    uint32_t actualLenQDims = 0U;  // query   actualSeqLength          
-    uint32_t actualLenDims = 0U;   // KV    actualSeqLength          
-    bool isAccumSeqS1 = false;     //                   
-    bool isAccumSeqS2 = false;     //                   
+    uint32_t actualLenQDims = 0U;  // query的actualSeqLength 的维度
+    uint32_t actualLenDims = 0U;   // KV 的actualSeqLength 的维度
+    bool isAccumSeqS1 = false;     // 是否累加模式
+    bool isAccumSeqS2 = false;     // 是否累加模式
     bool isLDOpen = false;
 };
 
 struct SplitCoreInfo {
-    uint32_t s2Start = 0U;  // S2               
-    uint32_t s2End = 0U;    // S2      index      
+    uint32_t s2Start = 0U;  // S2的起始位置
+    uint32_t s2End = 0U;    // S2循环index上限
     uint32_t bN2Start = 0U;
     uint32_t bN2End = 0U;
     uint32_t gS1Start = 0U;
     uint32_t gS1End = 0U;
-    bool isLD = false;  //                            Decode            
+    bool isLD = false;  // 当前核是否需要进行Decode归约任务
     bool isCoreEnable = false;
 };
 
@@ -163,7 +163,7 @@ __aicore__ inline T CeilDiv(T num, T rnd)
 }
 }  // namespace QLICommon
 
-// bank            
+// bank冲突优化
 // david 256KB bank layout
 // shape  (             bank_depth  (            banks  bank_groups  block))  (512  (  2   8  32))
 // stride (banks*bank_groups*block  (bank_groups*block        block      1))  (512  (256  32   1))

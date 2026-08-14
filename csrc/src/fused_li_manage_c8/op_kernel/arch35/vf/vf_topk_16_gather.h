@@ -1,12 +1,12 @@
 /**
-  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
-  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
-  * CANN Open Software License Agreement Version 2.0 (the "License").
-  * Please refer to the License for details. You may not use this file except in compliance with the License.
-  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
-  * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
-  * See LICENSE in the root of the software repository for the full text of the License.
-  */
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
 
 /*!
 * \file vf_top_k_16_gather.h
@@ -25,7 +25,7 @@ __simd_vf__ void HistogramsHighVFImpl(__ubuf__ uint32_t* histogramsBuf, __ubuf__
     MicroAPI::MaskReg pregB16 = MicroAPI::CreateMask<uint16_t, MicroAPI::MaskPattern::ALL>();
     MicroAPI::MaskReg pregB8 = MicroAPI::CreateMask<uint8_t, MicroAPI::MaskPattern::ALL>();
 
-    //                cout0 0-127 cout1 128-255
+    // 计算直方图cout0 0-127 cout1 128-255
     MicroAPI::RegTensor<uint16_t> cout0;
     MicroAPI::RegTensor<uint16_t> cout1;
     MicroAPI::Duplicate(cout0, 0);
@@ -127,7 +127,7 @@ __simd_vf__ void HistogramsLowVFImpl(__ubuf__ uint32_t* histogramsBuf, __ubuf__ 
 
     MicroAPI::MaskReg pregEQ;
 
-    //                0-127 128-255
+    // 计算直方图0-127 128-255
     MicroAPI::RegTensor<uint16_t> cout0;
     MicroAPI::RegTensor<uint16_t> cout1;
     MicroAPI::Duplicate(cout0, 0);
@@ -219,7 +219,7 @@ __simd_vf__ void FindKthVFImpl(__ubuf__ uint32_t* kValue, __ubuf__ uint32_t* his
 }
 
 /**
-                         kth-value   Index
+    输出所有大于的kth-value的Index
  */
 __simd_vf__ void FindIdxGTOutputVFImpl(__ubuf__ uint16_t* outputIdxBuf, __ubuf__ uint16_t* inputValueBuf, uint16_t beginIdx, __ubuf__ uint32_t* kValue, uint16_t vfLoop)
 {
@@ -252,7 +252,7 @@ __simd_vf__ void FindIdxGTOutputVFImpl(__ubuf__ uint16_t* outputIdxBuf, __ubuf__
 }
 
 /**
-                         kth-value   Index
+    输出所有等于的kth-value的Index
  */
 __simd_vf__ void FindIdxEQOutputVFImpl(__ubuf__ uint16_t* outputIdxBuf, __ubuf__ uint16_t* inputValueBuf, uint16_t beginIdx, __ubuf__ uint32_t* kValue, uint16_t vfLoop)
 {
@@ -283,7 +283,7 @@ __simd_vf__ void FindIdxEQOutputVFImpl(__ubuf__ uint16_t* outputIdxBuf, __ubuf__
 }
 
 /**
-                   Value
+    输出最终的Value
  */
 __simd_vf__ void FindValueOutputVFImpl(__ubuf__ uint16_t* outputValueBuf, __ubuf__ uint16_t* inputValueBuf, __ubuf__ uint16_t* tmpIdxBuf, uint16_t vfLoop)
 {
@@ -302,7 +302,7 @@ __simd_vf__ void FindValueOutputVFImpl(__ubuf__ uint16_t* outputValueBuf, __ubuf
 }
 
 /**
-                   Idx
+    输出最终的Idx
  */
 __simd_vf__ void FindRealIndexVFImpl(__ubuf__ uint32_t* outputIdxBuf, __ubuf__ uint16_t* tmpIdxBuf, __ubuf__ uint32_t* hisIdxBuf, uint32_t topK, uint32_t loopIndex, uint16_t vfLoop)
 {
@@ -331,18 +331,18 @@ __simd_vf__ void FindRealIndexVFImpl(__ubuf__ uint32_t* outputIdxBuf, __ubuf__ u
 }
 
 /**
- * @brief LiTopKVF          validLen               topk               idx_tmp
- * @param tmpIdxLocal Temp               TopKIndex;      s2SeqLen < 16K                   validLen * 2B
- * @param outputValueLocal       s2SeqLen > 16K                     Value topK * 2B
- * @param inputValueLocal       Value validLen * 2B
- * @param histogramsLocal           256 * 4B
- * @param idxHighLocal                    256 * 4B
- * @param idxLowLocal                    256 * 4B
- * @param nkValueLocal       next_k       64 * 4B
- * @param topK topK      
- * @param validLen                   :QLICommon::Align(topkCountAlign256_ + validTrunkLen, (uint32_t)256)
+ * @brief LiTopKVF 对一个validLen的输入进行topk算法，输出idx_tmp
+ * @param tmpIdxLocal Temp阶段输出的TopKIndex;如果s2SeqLen < 16K作为最终输出 validLen * 2B
+ * @param outputValueLocal 如果s2SeqLen > 16K并且是首轮输出Value topK * 2B
+ * @param inputValueLocal 输入Value validLen * 2B
+ * @param histogramsLocal 直方图 256 * 4B
+ * @param idxHighLocal 目标桶高八位 256 * 4B
+ * @param idxLowLocal 目标桶低八位 256 * 4B
+ * @param nkValueLocal 存储next_k的值 64 * 4B
+ * @param topK topK元素
+ * @param validLen 有效元素个数:QLICommon::Align(topkCountAlign256_ + validTrunkLen, (uint32_t)256)
  */
-template<bool ISOUTVALUE> //             VALUE
+template<bool ISOUTVALUE> // 是否输出VALUE
 __aicore__ inline void LiTopKVF(const LocalTensor<uint16_t>& tmpIdxLocal,
                                 const LocalTensor<uint16_t>& outputValueLocal,
                                 const LocalTensor<uint16_t>& inputValueLocal,
@@ -382,27 +382,27 @@ __aicore__ inline void LiTopKVF(const LocalTensor<uint16_t>& tmpIdxLocal,
     FindKthVFImpl(nkValueBuf, histogramsBuf, idxHighBuf, idxLowBuf);
 
     // filter
-    //             k-value      idx
+    // 输出大于k-value的值idx
     FindIdxGTOutputVFImpl(tmpIdxBuf, inputValueBuf, (uint32_t)(0), nkValueBuf, inputLoopNum);
-    //             k-value      idx
+    // 输出等于k-value的值idx
     FindIdxEQOutputVFImpl(tmpIdxBuf, inputValueBuf, (uint32_t)(0), nkValueBuf, inputLoopNum);
 
-    //             Value
+    // 是否输出Value
     if constexpr (ISOUTVALUE) {
         FindValueOutputVFImpl(outputValueBuf, inputValueBuf, tmpIdxBuf, topkLoopNum16);
     }
 }
 
 /**
- * @brief       idx_tmp gather            TopKIndex   s2SeqLen > 16K            
- * @param outputIdxLocal       Idx       :topK * 2B
- * @param outputValueLocal       Value topK * 2B(                        value      )
- * @param inputValueLocal       Value validLen * 2B
- * @param tmpIdxLocal       tmpIdx       validLen * 2B (0 ~ validLen - 1)
- * @param hisIdxLocal                Idx             :topK * 4B
- * @param topK topK            
- * @param loopBasicIdx                                  Index
- * @param validLen                   
+ * @brief 通过idx_tmp gather出实际的TopKIndex，s2SeqLen > 16K才会执行
+ * @param outputIdxLocal 输出Idx 有效:topK * 2B
+ * @param outputValueLocal 输出Value topK * 2B(以后需要输出实际value使用)
+ * @param inputValueLocal 输入Value validLen * 2B
+ * @param tmpIdxLocal 本轮tmpIdx输入 validLen * 2B (0 ~ validLen - 1)
+ * @param hisIdxLocal 上一轮实际Idx输入 有效:topK * 4B
+ * @param topK topK元素个数
+ * @param loopBasicIdx 当前循环需要加上得基准Index
+ * @param validLen 有效元素个数
  */
 __aicore__ inline void LiTopKGatherVF(const LocalTensor<uint32_t>& outputIdxLocal,
                                       const LocalTensor<uint16_t>& outputValueLocal,

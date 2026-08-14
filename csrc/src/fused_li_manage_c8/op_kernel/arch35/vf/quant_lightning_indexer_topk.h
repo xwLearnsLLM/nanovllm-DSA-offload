@@ -1,12 +1,12 @@
 /**
-  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
-  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
-  * CANN Open Software License Agreement Version 2.0 (the "License").
-  * Please refer to the License for details. You may not use this file except in compliance with the License.
-  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
-  * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
-  * See LICENSE in the root of the software repository for the full text of the License.
-  */
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
 
 /*!
  * \file quant_lightning_indexer_topk.h
@@ -67,30 +67,30 @@ public:
                                       LocalTensor<uint32_t>& inputLocal,
                                       uint32_t s2SeqLen)
     {
-        topkb32::LiTopKVF(outputIdxLocal, // filter                  value Buf topK * 4B
-                          outputValueLocal, // filter                   Idx Buf topK * 4B
-                          inputLocal, //        s2SeqLen * 4B
-                          tmpIdxLocal, // filter                  index Buf topK * 4B
-                          tmpValueLocal, // filter                  value Buf topK * 4B
-                          histogramsLocal, //                   Buf 256 * 4B
-                          idx0Local, //                1   8   Buf 256 * 4B
-                          idx1Local, //                2   8   Buf 256 * 4B
-                          idx2Local, //                3   8   Buf 256 * 4B
-                          idx3Local, //                4   8   Buf 256 * 4B
-                          nkValueLocal, // next_k       Buf 64 * 4B
-                          topK,       // topk      
-                          s2SeqLen); //                   
+        topkb32::LiTopKVF(outputIdxLocal, // filter阶段使用输出value Buf topK * 4B
+                          outputValueLocal, // filter阶段使用输出 Idx Buf topK * 4B
+                          inputLocal, // 输入 s2SeqLen * 4B
+                          tmpIdxLocal, // filter阶段使用暂存index Buf topK * 4B
+                          tmpValueLocal, // filter阶段使用暂存value Buf topK * 4B
+                          histogramsLocal, // 直方图的临时Buf 256 * 4B
+                          idx0Local, // 输入数据第1个8位Buf 256 * 4B
+                          idx1Local, // 输入数据第2个8位Buf 256 * 4B
+                          idx2Local, // 输入数据第3个8位Buf 256 * 4B
+                          idx3Local, // 输入数据第4个8位Buf 256 * 4B
+                          nkValueLocal, // next_k 暂存Buf 64 * 4B
+                          topK,       // topk数量
+                          s2SeqLen); // 输入元素总数
     }
 private:
-    LocalTensor<uint32_t> tmpIdxLocal;     // filter                  index Buf topK * 4B
-    LocalTensor<uint32_t> tmpValueLocal;   // filter                  value Buf topK * 4B
-    LocalTensor<uint32_t> histogramsLocal; //                   Buf 256 * 4B
-    LocalTensor<uint32_t> idx0Local;       //                1   8   Buf 256 * 4B
-    LocalTensor<uint32_t> idx1Local;       //                2   8   Buf 256 * 4B
-    LocalTensor<uint32_t> idx2Local;       //                3   8   Buf 256 * 4B
-    LocalTensor<uint32_t> idx3Local;       //                4   8   Buf 256 * 4B
-    LocalTensor<uint32_t> nkValueLocal; // next_k       Buf 64 * 4B
-    LocalTensor<uint32_t> outputValueLocal; //       value tensor
+    LocalTensor<uint32_t> tmpIdxLocal;     // filter阶段使用暂存index Buf topK * 4B
+    LocalTensor<uint32_t> tmpValueLocal;   // filter阶段使用暂存value Buf topK * 4B
+    LocalTensor<uint32_t> histogramsLocal; // 直方图的临时Buf 256 * 4B
+    LocalTensor<uint32_t> idx0Local;       // 输入数据第1个8位Buf 256 * 4B
+    LocalTensor<uint32_t> idx1Local;       // 输入数据第2个8位Buf 256 * 4B
+    LocalTensor<uint32_t> idx2Local;       // 输入数据第3个8位Buf 256 * 4B
+    LocalTensor<uint32_t> idx3Local;       // 输入数据第4个8位Buf 256 * 4B
+    LocalTensor<uint32_t> nkValueLocal; // next_k 暂存Buf 64 * 4B
+    LocalTensor<uint32_t> outputValueLocal; // 输出value tensor
     uint32_t topK;
 };
 
@@ -99,9 +99,9 @@ class LITopk<uint16_t> {
 public:
     __aicore__ inline uint32_t GetSharedTmpBufferSize()
     {
-        // 2 * QLICommon::Align(topK, (uint32_t)256):      hisIndexLocal   3 * 256   histogramsLocal idxHighLocal idxLowLocal   64   nkValueLocal
+        // 2 * QLICommon::Align(topK, (uint32_t)256):两块hisIndexLocal；3 * 256：histogramsLocal idxHighLocal idxLowLocal；64：nkValueLocal
         uint64_t bufferSize1 = (2 * QLICommon::Align(topK, (uint32_t)256) + 3 * 256 + 64)  * sizeof(uint32_t);
-        // QLICommon::Align(topK, (uint32_t)256) + trunkLen   tmpIndexLocal
+        // QLICommon::Align(topK, (uint32_t)256) + trunkLen：tmpIndexLocal
         uint64_t bufferSize2 = (QLICommon::Align(topK, (uint32_t)256) + trunkLen)  * sizeof(uint16_t);
         return bufferSize1 + bufferSize2;
     }
@@ -152,12 +152,12 @@ public:
         }
     }
 private:
-    LocalTensor<uint32_t> hisIndexLocal[2];      //    trunkLen         s2         topK         
-    LocalTensor<uint32_t> histogramsLocal;       //                   Buf 256 * 4B
-    LocalTensor<uint32_t> idxHighLocal;          //                8   Buf 256 * 4B
-    LocalTensor<uint32_t> idxLowLocal;           //                8   Buf 256 * 4B
-    LocalTensor<uint32_t> nkValueLocal;          // next_k       Buf 64 * 4B
-    LocalTensor<uint16_t> tmpIndexLocal;         //    trunkLen + topK         index
+    LocalTensor<uint32_t> hisIndexLocal[2];      // 每trunkLen长度的s2选出的topK个索引
+    LocalTensor<uint32_t> histogramsLocal;       // 直方图的临时Buf 256 * 4B
+    LocalTensor<uint32_t> idxHighLocal;          // 输入数据高8位Buf 256 * 4B
+    LocalTensor<uint32_t> idxLowLocal;           // 输入数据低8位Buf 256 * 4B
+    LocalTensor<uint32_t> nkValueLocal;          // next_k 暂存Buf 64 * 4B
+    LocalTensor<uint16_t> tmpIndexLocal;         // 每trunkLen + topK的临时index
     uint32_t topK = 512;
     uint32_t trunkLen = 16384;
 };
