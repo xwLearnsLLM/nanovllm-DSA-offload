@@ -87,14 +87,6 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run semantic and graph checks without the B=24 benchmark.",
     )
-    parser.add_argument(
-        "--benchmark-only",
-        action="store_true",
-        help=(
-            "Skip all fused-op output validation and run only the timing case. "
-            "Required by LI_MTP_BENCH_SKIP_FINALIZE diagnostic builds."
-        ),
-    )
     return parser.parse_args()
 
 
@@ -1169,7 +1161,6 @@ def run_performance_case(
     iters: int,
     perf_query_miss_count: int,
     perf_query_noise: float,
-    validate_fused_outputs: bool = True,
 ) -> None:
     case = make_case(
         name="performance",
@@ -1226,41 +1217,34 @@ def run_performance_case(
         )
     unique_union_mean = statistics.mean(expected_union_counts)
 
-    if validate_fused_outputs:
-        correctness_cache = case.initial_cache_cpu.to(device)
-        correctness_outputs = call_mtp(case, correctness_cache)
-        torch.npu.synchronize()
-        correctness_counts = validate_result(
-            case,
-            case.initial_cache_cpu,
-            correctness_cache,
-            correctness_outputs,
-            label="performance/correctness",
+    correctness_cache = case.initial_cache_cpu.to(device)
+    correctness_outputs = call_mtp(case, correctness_cache)
+    torch.npu.synchronize()
+    correctness_counts = validate_result(
+        case,
+        case.initial_cache_cpu,
+        correctness_cache,
+        correctness_outputs,
+        label="performance/correctness",
+    )
+    if correctness_counts != expected_union_counts:
+        raise AssertionError(
+            f"MTP LIM miss_counts={correctness_counts}, "
+            f"expected={expected_union_counts}"
         )
-        if correctness_counts != expected_union_counts:
-            raise AssertionError(
-                f"MTP LIM miss_counts={correctness_counts}, "
-                f"expected={expected_union_counts}"
-            )
-        print(
-            "FUSED_LI_MANAGE_MTP_TARGET_BATCH_CHECK "
-            f"batch={batch_size} candidate_len={source_len} "
-            f"cache_tokens={cache_tokens} "
-            f"per_query_misses={perf_query_miss_count} "
-            f"unique_union_misses_min={min(expected_union_counts)} "
-            f"unique_union_misses_mean={unique_union_mean:.2f} "
-            f"unique_union_misses_max={max(expected_union_counts)} "
-            f"per_query_miss_totals={per_query_totals} "
-            f"total_union_misses={sum(correctness_counts)} "
-            "one_request_per_owner=1 ok=1",
-            flush=True,
-        )
-    else:
-        print(
-            "FUSED_LI_MANAGE_MTP_DIAGNOSTIC "
-            "skip_finalize=1 fused_output_validation=0",
-            flush=True,
-        )
+    print(
+        "FUSED_LI_MANAGE_MTP_TARGET_BATCH_CHECK "
+        f"batch={batch_size} candidate_len={source_len} "
+        f"cache_tokens={cache_tokens} "
+        f"per_query_misses={perf_query_miss_count} "
+        f"unique_union_misses_min={min(expected_union_counts)} "
+        f"unique_union_misses_mean={unique_union_mean:.2f} "
+        f"unique_union_misses_max={max(expected_union_counts)} "
+        f"per_query_miss_totals={per_query_totals} "
+        f"total_union_misses={sum(correctness_counts)} "
+        "one_request_per_owner=1 ok=1",
+        flush=True,
+    )
 
     query_view = case.query.view(batch_size, QUERY_COUNT, HEADS, HEAD_DIM)
     weights_view = case.weights.view(batch_size, QUERY_COUNT, HEADS)
@@ -1442,37 +1426,35 @@ def main() -> None:
         f"topk={TOPK} union_capacity={UNION_CAPACITY} seed={args.seed}",
         flush=True,
     )
-    if not args.benchmark_only:
-        run_meta_check()
+    run_meta_check()
 
-    if not args.benchmark_only:
-        mixed = make_case(
-            name="mixed_b6_bf16",
-            device=device,
-            dtype=torch.bfloat16,
-            candidate_lens=(1024, 4096, 8192, 20992, 32768, 65536),
-            cache_tokens=(0, 4096, 8192, 8192, 12288, 12288),
-            miss_fractions=(0.0, 0.0, 0.0, 0.02, 0.5, 1.0),
-            seed=args.seed,
-        )
-        run_semantic_case(mixed)
-        del mixed
-        torch.npu.empty_cache()
+    mixed = make_case(
+        name="mixed_b6_bf16",
+        device=device,
+        dtype=torch.bfloat16,
+        candidate_lens=(1024, 4096, 8192, 20992, 32768, 65536),
+        cache_tokens=(0, 4096, 8192, 8192, 12288, 12288),
+        miss_fractions=(0.0, 0.0, 0.0, 0.02, 0.5, 1.0),
+        seed=args.seed,
+    )
+    run_semantic_case(mixed)
+    del mixed
+    torch.npu.empty_cache()
 
-        fp16 = make_case(
-            name="fp16_b1_full_source",
-            device=device,
-            dtype=torch.float16,
-            candidate_lens=(8192,),
-            cache_tokens=(8192,),
-            miss_fractions=(0.0,),
-            seed=args.seed + 1000,
-        )
-        run_semantic_case(fp16)
-        del fp16
-        torch.npu.empty_cache()
+    fp16 = make_case(
+        name="fp16_b1_full_source",
+        device=device,
+        dtype=torch.float16,
+        candidate_lens=(8192,),
+        cache_tokens=(8192,),
+        miss_fractions=(0.0,),
+        seed=args.seed + 1000,
+    )
+    run_semantic_case(fp16)
+    del fp16
+    torch.npu.empty_cache()
 
-        run_graph_case(device, args.seed, args.graph_replays)
+    run_graph_case(device, args.seed, args.graph_replays)
     if not args.skip_performance:
         run_performance_case(
             device,
@@ -1484,7 +1466,6 @@ def main() -> None:
             iters=args.iters,
             perf_query_miss_count=args.perf_query_miss_count,
             perf_query_noise=args.perf_query_noise,
-            validate_fused_outputs=not args.benchmark_only,
         )
     print("FUSED_LI_MANAGE_MTP_UT_OK", flush=True)
 
