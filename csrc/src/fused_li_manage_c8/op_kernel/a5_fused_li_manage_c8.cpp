@@ -296,7 +296,7 @@ extern "C" __global__ __aicore__ void a5_fused_li_manage_c8(
     TPipe pipe;
     GM_ADDR userWorkspace = GetUserWorkspace(workspace);
 
-    a5_fused_li_manage_c8::QuantLiPhase qli(&pipe, &tilingData);
+    a5_fused_li_manage_c8_impl::QuantLiPhase qli(&pipe, &tilingData);
     qli.Init(
         query, key, weights, queryDequantScale, keyDequantScale,
         cacheTokens, candidateLens, blockTable, sourceIds, userWorkspace);

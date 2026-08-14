@@ -18,7 +18,7 @@
 #include "arch35/quant_lightning_indexer_service_cube.h"
 #include "arch35/quant_lightning_indexer_service_vector.h"
 
-namespace a5_fused_li_manage_c8 {
+namespace a5_fused_li_manage_c8_impl {
 using namespace AscendC;
 using namespace QLICommon;
 using namespace QLIKernel;
@@ -232,6 +232,6 @@ private:
     GlobalTensor<int32_t> candidateLensGm_;
     GlobalTensor<int32_t> topkIndicesGm_;
 };
-} // namespace a5_fused_li_manage_c8
+} // namespace a5_fused_li_manage_c8_impl
 
 #endif
