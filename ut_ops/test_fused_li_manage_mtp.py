@@ -1258,9 +1258,7 @@ def run_performance_case(
     else:
         print(
             "FUSED_LI_MANAGE_MTP_DIAGNOSTIC "
-            "skip_aggregate_gm=1 skip_internal_topk_gm=1 "
-            "skip_victim_collection=1 skip_finalize=1 "
-            "fused_output_validation=0",
+            "skip_finalize=1 fused_output_validation=0",
             flush=True,
         )
 
