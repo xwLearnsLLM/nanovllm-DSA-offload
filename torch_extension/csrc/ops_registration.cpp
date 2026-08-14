@@ -20,18 +20,6 @@ TORCH_LIBRARY(nanovllm_dsa, m) {
       "Tensor actual_seq_lengths_key, Tensor block_table) "
       "-> (Tensor, Tensor, Tensor, Tensor, Tensor)");
   m.def(
-      "_fused_li_manage_c8_cache_update(Tensor topk_indices, Tensor req_pool_entries, "
-      "Tensor(a!) cache_slots_pool, Tensor cache_tokens, "
-      "Tensor candidate_lens) "
-      "-> (Tensor, Tensor, Tensor, Tensor(a!))");
-  m.def(
-      "_fused_li_manage_c8_cache_update_out(Tensor topk_indices, "
-      "Tensor req_pool_entries, Tensor(a!) cache_slots_pool, "
-      "Tensor cache_tokens, Tensor candidate_lens, "
-      "Tensor(b!) source_ids, Tensor(c!) destination_slots, "
-      "Tensor(d!) miss_counts) "
-      "-> (Tensor(b!), Tensor(c!), Tensor(d!), Tensor(a!))");
-  m.def(
       "fused_li_manage_c8(Tensor query, Tensor key, Tensor weights, "
       "Tensor query_dequant_scale, Tensor key_dequant_scale, "
       "Tensor actual_seq_lengths_query, Tensor req_pool_entries, "

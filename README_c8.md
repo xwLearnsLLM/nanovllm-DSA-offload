@@ -2,7 +2,7 @@
 
 本仓库面向 Ascend 950 / CANN 9.1，设计和实现 GLM-5.1/GLM-5.2 W4A4C8 decode KV-cache 卸载算子。当前已有非 MTP C8 链路，以及 MTP1～3 索引选择与 union 管理的功能优先初版。
 
-Torch namespace 固定为 `nanovllm_dsa`，Python 包名为 `nanovllm_dsa_a5`。稳定 `FULL_DECODE_ONLY` 图使用 caller-owned `_out` 入口；allocating 入口用于 eager、单测和调试。
+Torch namespace 固定为 `nanovllm_dsa`，Python 包名为 `nanovllm_dsa_a5`。
 
 ## 实现状态
 
@@ -15,10 +15,10 @@ Torch namespace 固定为 `nanovllm_dsa`，Python 包名为 `nanovllm_dsa_a5`。
 
 | 使用场景 | 公开入口 | 状态 | 当前结论 |
 | --- | --- | --- | --- |
-| 非 MTP 索引选择与管理 | `fused_li_manage_c8` / `fused_li_manage_c8_out` | 初版已实现 | 官方 A5 C8 LightningIndexer + 本地 request-pool update；已覆盖 18-bit 边界、乱序 pool、重复更新和图链路 |
-| 非 MTP / MTP1～3 KV 搬移与 Attention metadata | `kvcache_scatter_copy_c8` / `kvcache_scatter_copy_c8_out` | 初版已实现，统一 ABI 待改造 | 当前源码已验证非 MTP 的真实 DRAM→HBM；需扩展为动态 copy capacity 和 TND 多 query metadata |
+| 非 MTP 索引选择与管理 | `fused_li_manage_c8` | 单算子初版已实现 | 单个仓内 MIX kernel 融合 A5 C8 LightningIndexer 与 request-pool update；已覆盖 18-bit 边界、乱序 pool、重复更新和图链路 |
+| 非 MTP / MTP1～3 KV 搬移与 Attention metadata | `kvcache_scatter_copy_c8` | 初版已实现，统一 ABI 待改造 | 当前源码已验证非 MTP 的真实 DRAM→HBM；需扩展为动态 copy capacity 和 TND 多 query metadata |
 | 非 MTP sparse+tail Attention | `sparse_tail_attention_c8` | 初版已实现 | 复用 A5 原生 C8 QSFA；已验证单 query，当前限制 `1 <= Q_HEAD <= 64` |
-| MTP1～3 多 query 索引选择与 union 管理 | `fused_li_manage_mtp_c8` / `fused_li_manage_mtp_c8_out` | 源码初版，待上机 | 官方 A5 C8 LightningIndexer + 本地 request-pool union/update；优先保证功能正确，尚未做性能优化 |
+| MTP1～3 多 query 索引选择与 union 管理 | `fused_li_manage_mtp_c8` | 源码初版，待上机 | 官方 A5 C8 LightningIndexer + 本地 request-pool union/update；优先保证功能正确，尚未做性能优化 |
 | MTP1～3 sparse+tail Attention | 复用 `sparse_tail_attention_c8` | 复用待验证 | 现有接口形状已经允许 TND 多 query；还需验证 MTP1/2/3 的右下角因果语义与 graph replay |
 
 
@@ -36,7 +36,7 @@ Torch namespace 固定为 `nanovllm_dsa`，Python 包名为 `nanovllm_dsa_a5`。
 - block size 固定为 128，source capacity 当前最大为 `2^18=262144`。
 - 一个 packed C8 KV token 固定为 656 bytes：`512 FP8 E4M3 + 64 BF16 RoPE + 4 FP32 scales`。
 
-Indexer 使用官方 A5 `npu_quant_lightning_indexer`：query/key 为 FP8 E4M3，weights 为 BF16，query/key scale 为 FP32，layout 为 `TND/PA_BSND`，`sparse_count=2048`，`sparse_mode=3`。Attention 使用原生 `npu_kv_quant_sparse_flash_attention`。
+Indexer 的数值与布局语义对齐官方 A5 `npu_quant_lightning_indexer`：query/key 为 FP8 E4M3，weights 为 BF16，query/key scale 为 FP32，layout 为 `TND/PA_BSND`，`sparse_count=2048`，`sparse_mode=3`。非 MTP `fused_li_manage_c8` 已将 LI 和索引管理合入一个仓内 MIX kernel；Attention 使用原生 `npu_kv_quant_sparse_flash_attention`。
 
 ## IndexShare group 共享映射
 
@@ -51,7 +51,7 @@ Indexer 使用官方 A5 `npu_quant_lightning_indexer`：query/key 为 FP8 E4M3�
 
 以 `full layer 6 + shared layer 7/8/9` 为例：
 
-1. Layer 6 调用一次 `fused_li_manage*_c8_out`，更新该 group 的 `cache_slots_pool`。
+1. Layer 6 调用一次 `fused_li_manage*_c8`，更新该 group 的 `cache_slots_pool`。
 2. Layer 6/7/8/9 依次使用同一份 miss 和 slot metadata，分别搬移各自的 packed KV。
 3. 四层分别用各自 query 和 KV 执行 Attention，但使用相同的 top-K slots。
 4. 在整个 group 消费完成前，不得覆盖管理输出 buffer。
@@ -67,14 +67,14 @@ GLM-5.2 的 78 个 target layers 是 21 个 full / 57 个 shared；因此映射�
 非 MTP split 链路为：
 
 ```text
-fused_li_manage_c8_out
-    -> kvcache_scatter_copy_c8_out
+fused_li_manage_c8
+    -> kvcache_scatter_copy_c8
     -> sparse_tail_attention_c8
 ```
 
 ### `fused_li_manage_c8`
 
-该入口是组合算子：先调用官方 A5 Quant LightningIndexer，再调用本仓 request-pool update CANN op。输出前 `miss_counts[b]` 项为 miss-prefix；全部 2048 个 `destination_slots` 都供 Attention 使用。
+该入口是真正的单算子：一个 MIX kernel 内先生成与官方 A5 Quant LightningIndexer 对齐的 top-2048，再原地完成 request-pool update。输出前 `miss_counts[b]` 项为 miss-prefix；全部 2048 个 `destination_slots` 都供 Attention 使用。
 
 ```python
 torch.ops.nanovllm_dsa.fused_li_manage_c8(
@@ -95,21 +95,11 @@ torch.ops.nanovllm_dsa.fused_li_manage_c8(
     miss_counts,              # int32[B]
     cache_slots_alias,
 )
-
-torch.ops.nanovllm_dsa.fused_li_manage_c8_out(
-    query, key, weights, query_dequant_scale, key_dequant_scale,
-    actual_seq_lengths_query, req_pool_entries, cache_slots_pool,
-    cache_tokens, candidate_lens, block_table,
-    source_ids,               # caller-owned int32[B,1,2048]，in/out
-    destination_slots,        # caller-owned int32[B,1,2048]，in/out
-    miss_counts,              # caller-owned int32[B]，in/out
-) -> (source_ids_alias, destination_slots_alias,
-      miss_counts_alias, cache_slots_alias)
 ```
 
 ### `kvcache_scatter_copy_c8`：当前接口与统一目标接口
 
-目标是让同一个算子统一服务非 MTP 和 MTP1～3：搬移每请求的 miss/union-miss，并根据独立的 `topk_destination_slots` 生成每个 query row 的 sparse+tail slots。需要修改当前实现，但保留公开名称 `kvcache_scatter_copy_c8` / `kvcache_scatter_copy_c8_out`。
+目标是让同一个算子统一服务非 MTP 和 MTP1～3：搬移每请求的 miss/union-miss，并根据独立的 `topk_destination_slots` 生成每个 query row 的 sparse+tail slots。需要修改当前实现，但保留公开名称 `kvcache_scatter_copy_c8`。
 
 #### 当前真实接口
 
@@ -133,17 +123,6 @@ torch.ops.nanovllm_dsa.kvcache_scatter_copy_c8(
     attention_slots,          # int32[B,1,2048+max_tail_tokens]
     resident_seq_lengths,     # int32[B]
 )
-
-torch.ops.nanovllm_dsa.kvcache_scatter_copy_c8_out(
-    hbm_packed_kv_bytes, dram_packed_kv_bytes,
-    hbm_block_table, dram_block_table,
-    source_token_ids, destination_slots, copy_counts,
-    cache_tokens, candidate_lens, actual_seq_lengths_kv,
-    max_tail_tokens,
-    attention_slots,          # caller-owned int32[B,1,2048+max_tail_tokens]
-    resident_seq_lengths,     # caller-owned int32[B]
-) -> (hbm_packed_kv_alias, attention_slots_alias,
-      resident_seq_lengths_alias)
 ```
 
 当前限制来自源码，而不是算子语义：C++ wrapper 和 CANN host/kernel 都要求 `COPY_CAP=2048`；metadata 输出第一维固定为 B；算子没有 `actual_seq_lengths_query`，因此无法把 T 个 MTP query rows 映射回 B 个请求。
@@ -172,18 +151,6 @@ torch.ops.nanovllm_dsa.kvcache_scatter_copy_c8(
     attention_slots,          # int32[T,1,2048+max_tail_tokens]
     resident_seq_lengths,     # int32[B]
 )
-
-torch.ops.nanovllm_dsa.kvcache_scatter_copy_c8_out(
-    hbm_packed_kv_bytes, dram_packed_kv_bytes,
-    hbm_block_table, dram_block_table,
-    copy_source_ids, copy_destination_slots, copy_counts,
-    topk_destination_slots, cache_tokens, candidate_lens,
-    actual_seq_lengths_query, actual_seq_lengths_kv,
-    max_tail_tokens,
-    attention_slots,          # caller-owned int32[T,1,2048+max_tail_tokens]
-    resident_seq_lengths,     # caller-owned int32[B]
-) -> (hbm_packed_kv_alias, attention_slots_alias,
-      resident_seq_lengths_alias)
 ```
 
 非 MTP 时，`T=B`，`COPY_CAP=2048`，`copy_destination_slots` 和 `topk_destination_slots` 可以引用同一个 LIDU destination tensor；虽然在参数表中出现两次，但不会复制数据。MTP 时，copy metadata 是按请求去重后的 union miss `[B,8192]`，而 top-K slots 是逐 query 的 `[T,1,2048]`，二者必须分开。
@@ -192,13 +159,13 @@ torch.ops.nanovllm_dsa.kvcache_scatter_copy_c8_out(
 
 #### 后续实现修改
 
-1. Torch schema 增加 `topk_destination_slots` 和 `actual_seq_lengths_query`；allocating 与 `_out` 入口保持一致，mutable alias 只属于 `hbm_packed_kv_bytes` 和 caller-owned outputs。
+1. Torch schema 增加 `topk_destination_slots` 和 `actual_seq_lengths_query`，并正确声明 `hbm_packed_kv_bytes` 的 mutable alias。
 2. C++ wrapper 将 copy metadata 标准化为 `int32[B,COPY_CAP]`；非 MTP 的 `[B,1,2048]` 可用无拷贝 view 传入。校验 `COPY_CAP=2048|8192`、`topk_destination_slots=[T,1,2048]`、`actual_seq_lengths_query=[B]` 且最后一项为 T。
-3. allocating/Meta/Fake 输出从 `[B,1,2048+max_tail_tokens]` 改为 `[T,1,2048+max_tail_tokens]`；`resident_seq_lengths` 仍为 `[B]`。
+3. Meta/Fake 输出从 `[B,1,2048+max_tail_tokens]` 改为 `[T,1,2048+max_tail_tokens]`；`resident_seq_lengths` 仍为 `[B]`。
 4. CANN host tiling 删除写死的 `COPY_CAP=2048`，从输入 shape 读取 copy capacity，并分别下发 B、T、copy capacity 和 attention capacity。
 5. CANN kernel 的搬移阶段仍按 B 行读取 `copy_counts`，但最多扫描 8192 个 union entries；metadata 阶段按 T 行执行，并通过累计 `actual_seq_lengths_query` 找到每个 query 所属请求。
 6. 保留现有非 MTP 行为：`T=B`、`COPY_CAP=2048` 时结果必须逐项等同旧实现。新增 MTP1/2/3、variable `Q_b`、C=0 mixed batch、8192 union、真实 DRAM→HBM 和 graph replay 测试。
-7. 完成统一 ABI 后删除所有 MTP 专用 SCATTER 命名设想；框架只调用 `kvcache_scatter_copy_c8[_out]`。
+7. 完成统一 ABI 后删除所有 MTP 专用 SCATTER 命名设想；框架只调用 `kvcache_scatter_copy_c8`。
 
 ### `sparse_tail_attention_c8`
 
@@ -224,10 +191,10 @@ MTP target verification 使用 `Q_b=K_b+1` 个 query。统一 split 链路为：
 
 ```text
 full layer:
-    fused_li_manage_mtp_c8_out  # 每个 IndexShare group 只调用一次
+    fused_li_manage_mtp_c8  # 每个 IndexShare group 只调用一次
 
 each layer in the group:
-    kvcache_scatter_copy_c8_out
+    kvcache_scatter_copy_c8
         -> sparse_tail_attention_c8
 ```
 
@@ -257,18 +224,6 @@ torch.ops.nanovllm_dsa.fused_li_manage_mtp_c8(
     miss_counts,              # int32[B]
     cache_slots_alias,
 )
-
-torch.ops.nanovllm_dsa.fused_li_manage_mtp_c8_out(
-    query, key, weights, query_dequant_scale, key_dequant_scale,
-    actual_seq_lengths_query, req_pool_entries, cache_slots_pool,
-    cache_tokens, candidate_lens, block_table,
-    topk_destination_slots,   # caller-owned int32[T,1,2048]
-    miss_source_ids,          # caller-owned int32[B,8192]
-    miss_destination_slots,   # caller-owned int32[B,8192]
-    miss_counts,              # caller-owned int32[B]
-) -> (topk_destination_slots_alias, miss_source_ids_alias,
-      miss_destination_slots_alias, miss_counts_alias,
-      cache_slots_alias)
 ```
 
 不输出逐 query 的 `topk_source_ids`：框架后续只需要完整 `topk_destination_slots` 做 Attention，以及按请求去重后的 union miss 做搬移。测试可以单独调用官方 LightningIndexer 获得 source-index golden。
@@ -327,7 +282,7 @@ MTP draft module 自身包含 Attention，因此有独立的 C8 KV cache 和 C8 
 ## MTP 验收要求
 
 - `fused_li_manage_mtp_c8`：覆盖 MTP1/2/3、variable `Q_b`、C=0/C>0 mixed batch、乱序 request pool、零 miss、随机 0～300 miss、最坏 8192 union、重复更新、IndexShare group 复用和 18-bit source boundary。
-- `kvcache_scatter_copy_c8` 统一 ABI：同时覆盖 `T=B/COPY_CAP=2048` 和 `T>B/COPY_CAP=8192`；使用真实 `empty_with_swapped_memory`，每次调用前 poison 目标 HBM，并验证 656 bytes 精确搬移、guard、union 去重、零搬移和 caller-owned 地址稳定。
+- `kvcache_scatter_copy_c8` 统一 ABI：同时覆盖 `T=B/COPY_CAP=2048` 和 `T>B/COPY_CAP=8192`；使用真实 `empty_with_swapped_memory`，每次调用前 poison 目标 HBM，并验证 656 bytes 精确搬移、guard、union 去重和零搬移。
 - `sparse_tail_attention_c8` MTP 用法：分别覆盖 Q=2/3/4、不同 tail、每个 query 不同 top-K，并与逐行 CPU FP32 右下角因果 golden 对比。
 - graph chain：capture 使用零 miss，replay 切换到非零 union miss；验证 cache state、数据搬移、Attention、输出地址和 IndexShare group 共享结果。
 - full/shared 对照：共享一份映射的结果必须与“每层从相同初始状态独立执行相同管理”完全一致；shared 层不得再次调用管理算子。
@@ -378,7 +333,7 @@ python3 tests/test_c8_graph.py --device npu:0 --case mixed --batch-size 2 --head
 
 ## MTP1～3 C8 索引管理测试
 
-以下命令覆盖 32/64 index heads、MTP1/2/3 混合 batch、`C=0`、乱序 request pool、union miss 去重、hit slot 保持、重复零 miss、allocating/out 地址语义，以及最坏 8192 union：
+以下命令覆盖 32/64 index heads、MTP1/2/3 混合 batch、`C=0`、乱序 request pool、union miss 去重、hit slot 保持、重复零 miss以及最坏 8192 union：
 
 ```bash
 python3 tests/test_fused_li_manage_mtp_c8.py --device npu:0 --batch-size 6 --heads 32,64 --source-len 20096 --queries-per-request 0 --miss-min 0 --miss-max 300 --pool-extra 7 --seed 7

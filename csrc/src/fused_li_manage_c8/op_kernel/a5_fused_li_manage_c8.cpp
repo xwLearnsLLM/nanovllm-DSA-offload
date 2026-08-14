@@ -1,14 +1,15 @@
 /**
- * Request-pool update stage for the Ascend 950 C8 LightningIndexer path.
+ * One-kernel Ascend 950 C8 LightningIndexer + request-pool management.
  *
- * Native A5 Quant LightningIndexer produces the exact C8 top-2048 set. This
- * AIV kernel classifies it into a miss prefix and hit suffix, selects one
- * unprotected resident slot per miss, updates token->slot request state, and
- * publishes the complete HBM slot row consumed by sparse attention.
+ * The MIX phase computes the native C8 top-2048 set. The even AIV then resets
+ * its TPipe and, without another host launch, classifies hits/misses, selects
+ * victims, updates source-token -> HBM-slot state and publishes the complete
+ * miss-prefix/hit-suffix result required by nano-vLLM.
  */
 
 #include "kernel_operator.h"
-#include "a5_fused_li_manage_c8_cache_update_tiling.h"
+#include "a5_fused_li_manage_c8_tiling.h"
+#include "a5_fused_li_manage_c8_qli.h"
 
 namespace {
 using namespace AscendC;
@@ -17,11 +18,11 @@ constexpr uint32_t SPARSE_COUNT = 2048;
 constexpr uint32_t MAX_CACHE_TOKENS = 16256;
 constexpr uint32_t CACHE_CHUNK = 2048;
 
-class A5FusedLiManageC8CacheUpdateKernel {
+class A5FusedLiManageC8RequestPoolManager {
 public:
-    __aicore__ inline A5FusedLiManageC8CacheUpdateKernel(
+    __aicore__ inline A5FusedLiManageC8RequestPoolManager(
         TPipe *pipe,
-        const A5FusedLiManageC8CacheUpdateTilingData *tiling)
+        const A5FusedLiManageC8TilingData *tiling)
         : pipe_(pipe), tiling_(tiling)
     {}
 
@@ -35,7 +36,8 @@ public:
         GM_ADDR destinationSlots,
         GM_ADDR missCounts)
     {
-        coreIdx_ = GetBlockIdx();
+        // This manager runs only on the first AIV of each MIX_AIC_1_2 group.
+        coreIdx_ = GetBlockIdx() / 2U;
         topkIndicesGm_.SetGlobalBuffer((__gm__ int32_t *)topkIndices);
         reqPoolEntriesGm_.SetGlobalBuffer((__gm__ int32_t *)reqPoolEntries);
         cacheSlotsPoolGm_.SetGlobalBuffer((__gm__ int32_t *)cacheSlotsPool);
@@ -247,7 +249,7 @@ private:
 
 private:
     TPipe *pipe_;
-    const A5FusedLiManageC8CacheUpdateTilingData *tiling_;
+    const A5FusedLiManageC8TilingData *tiling_;
     uint32_t coreIdx_ = 0;
     GlobalTensor<int32_t> topkIndicesGm_;
     GlobalTensor<int32_t> reqPoolEntriesGm_;
@@ -267,12 +269,18 @@ private:
 };
 } // namespace
 
-extern "C" __global__ __aicore__ void a5_fused_li_manage_c8_cache_update(
-    GM_ADDR topkIndices,
+extern "C" __global__ __aicore__ void a5_fused_li_manage_c8(
+    GM_ADDR query,
+    GM_ADDR key,
+    GM_ADDR weights,
+    GM_ADDR queryDequantScale,
+    GM_ADDR keyDequantScale,
+    GM_ADDR actualSeqLengthsQuery,
     GM_ADDR reqPoolEntries,
     GM_ADDR cacheSlotsPool,
     GM_ADDR cacheTokens,
     GM_ADDR candidateLens,
+    GM_ADDR blockTable,
     GM_ADDR sourceIds,
     GM_ADDR destinationSlots,
     GM_ADDR missCounts,
@@ -280,15 +288,30 @@ extern "C" __global__ __aicore__ void a5_fused_li_manage_c8_cache_update(
     GM_ADDR workspace,
     GM_ADDR tiling)
 {
+    (void)actualSeqLengthsQuery;
     (void)cacheSlotsAlias;
-    (void)workspace;
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-    REGISTER_TILING_DEFAULT(A5FusedLiManageC8CacheUpdateTilingData);
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    REGISTER_TILING_DEFAULT(A5FusedLiManageC8TilingData);
     GET_TILING_DATA(tilingData, tiling);
     TPipe pipe;
-    A5FusedLiManageC8CacheUpdateKernel op(&pipe, &tilingData);
-    op.Init(
-        topkIndices, reqPoolEntries, cacheSlotsPool, cacheTokens,
-        candidateLens, sourceIds, destinationSlots, missCounts);
-    op.Process();
+    GM_ADDR userWorkspace = GetUserWorkspace(workspace);
+
+    a5_fused_li_manage_c8::QuantLiPhase qli(&pipe, &tilingData);
+    qli.Init(
+        query, key, weights, queryDequantScale, keyDequantScale,
+        cacheTokens, candidateLens, blockTable, sourceIds, userWorkspace);
+    qli.Process();
+
+    pipe.Reset();
+    if ASCEND_IS_AIV {
+        if ((GetBlockIdx() & 1U) == 0U) {
+            A5FusedLiManageC8RequestPoolManager manager(&pipe, &tilingData);
+            // The LI phase wrote top-K into sourceIds. The manager consumes
+            // that row before replacing it with miss-prefix/hit-suffix IDs.
+            manager.Init(
+                sourceIds, reqPoolEntries, cacheSlotsPool, cacheTokens,
+                candidateLens, sourceIds, destinationSlots, missCounts);
+            manager.Process();
+        }
+    }
 }

@@ -61,7 +61,7 @@ echo "[nanovllm_a5_ops] jobs: ${BUILD_JOBS}"
 OP_NAMES=(
     A5FusedLiManage
     A5FusedLiManageMtp
-    A5FusedLiManageC8CacheUpdate
+    A5FusedLiManageC8
     A5FusedLiManageMtpC8CacheUpdate
     A5KvcacheScatterCopy
     A5KvcacheScatterCopyC8
@@ -70,9 +70,9 @@ OP_NAMES=(
 )
 
 # These directories provide the BF16 and C8 operators visible to the framework.
-# C8 LIDU is composed from the official quant LightningIndexer and
-# repository-local single-query / MTP request-pool update kernels; C8
-# Attention is an adapter over the native A5 QSFA implementation.
+# Non-MTP C8 LIDU is one repository-local MIX kernel. MTP C8 currently uses
+# the official quant LightningIndexer plus a repository-local union/update
+# kernel; C8 Attention is an adapter over the native A5 QSFA implementation.
 FRAMEWORK_OP_DIRS=(
     fused_li_manage
     fused_li_manage_mtp

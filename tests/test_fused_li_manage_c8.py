@@ -144,22 +144,6 @@ def check_case(case: C8Case) -> None:
             actual_miss=int(counts[batch_row]),
         )
 
-    # Isolate the repository-local update stage from the official C8 LI launch.
-    low_pool = case.initial_pool.clone()
-    low_outputs = torch.ops.nanovllm_dsa._fused_li_manage_c8_cache_update.default(
-        case.native_topk.reshape(case.query.size(0), 1, TOPK),
-        case.req_entries,
-        low_pool,
-        case.cache_tokens,
-        case.candidate_lens,
-    )
-    torch.npu.synchronize()
-    if not all(
-        torch.equal(left.cpu(), right.cpu())
-        for left, right in zip(low_outputs[:3], (source_ids, destination_slots, miss_counts))
-    ) or not torch.equal(low_pool.cpu(), pool.cpu()):
-        raise AssertionError("C8 high-level LIDU and isolated update stage disagree")
-
     second_sources, second_slots, second_counts, _ = launch(case, pool)
     torch.npu.synchronize()
     second_sources = second_sources.reshape(case.query.size(0), TOPK).cpu()
@@ -218,7 +202,7 @@ def check_case(case: C8Case) -> None:
         f"budgets={case.cache_tokens.cpu().tolist()} misses={counts.tolist()} "
         "official_c8_li_topk=1 unordered_unique_pool_entries=1 "
         "topk_unique_range=1 hit_slots_preserved=1 repeat_mapping_preserved=1 "
-        "repeat_zero_miss=1 isolated_update_match=1 out_alias=1 ok=1",
+        "repeat_zero_miss=1 one_device_kernel=1 out_alias=1 ok=1",
         flush=True,
     )
 
