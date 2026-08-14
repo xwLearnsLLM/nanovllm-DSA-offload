@@ -54,6 +54,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--device", default="npu:0")
     parser.add_argument("--batch-size", type=int, default=24)
+    parser.add_argument(
+        "--q-heads",
+        type=int,
+        choices=(32, 64),
+        default=32,
+        help="Number of query heads per packed MTP query.",
+    )
     parser.add_argument("--source-len", type=int, default=20992)
     parser.add_argument("--cache-tokens", type=int, default=8192)
     parser.add_argument("--seed", type=int, default=7)
@@ -1399,7 +1406,9 @@ def _apply_scatter_reference(
 
 
 def main() -> None:
+    global HEADS
     args = parse_args()
+    HEADS = args.q_heads
     _validate_cli(args)
     device = torch.device(args.device)
     if device.type != "npu":

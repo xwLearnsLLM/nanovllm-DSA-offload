@@ -128,6 +128,7 @@ ge::graphStatus LIUMtpTiling::CheckShapes(LIUMtpTilingInfo &info) const
                OPS_LOG_E(info.opName, "invalid MTP LIM input ranks."),
                return ge::GRAPH_FAILED);
     info.tokenRows = static_cast<uint32_t>(q.GetDim(0));
+    info.queryHeads = static_cast<uint32_t>(q.GetDim(1));
     info.batchSize = static_cast<uint32_t>(req.GetDim(0));
     info.poolSize = static_cast<uint32_t>(cache.GetDim(0));
     info.sourceCapacity = static_cast<uint32_t>(cache.GetDim(1));
@@ -138,9 +139,13 @@ ge::graphStatus LIUMtpTiling::CheckShapes(LIUMtpTilingInfo &info) const
                    info.maxBlocks == 0 || info.tokenRows != info.batchSize * MTP_QUERY_COUNT,
                OPS_LOG_E(info.opName, "require T=4*B and non-empty pool/table."),
                return ge::GRAPH_FAILED);
-    OPS_ERR_IF(q.GetDim(1) != MTP_HEADS || q.GetDim(2) != MTP_HEAD_DIM ||
-                   w.GetDim(0) != info.tokenRows || w.GetDim(1) != MTP_HEADS,
-               OPS_LOG_E(info.opName, "query must be [4B,32,128] and weights [4B,32]."),
+    OPS_ERR_IF((info.queryHeads != MTP_HEADS_MIN &&
+                    info.queryHeads != MTP_HEADS_MAX) ||
+                   q.GetDim(2) != MTP_HEAD_DIM ||
+                   w.GetDim(0) != info.tokenRows ||
+                   w.GetDim(1) != info.queryHeads,
+               OPS_LOG_E(info.opName,
+                         "query must be [4B,H,128] and weights [4B,H], H=32 or 64."),
                return ge::GRAPH_FAILED);
     OPS_ERR_IF(k.GetDim(0) == 0 || k.GetDim(1) != MTP_BLOCK_SIZE ||
                    k.GetDim(2) != MTP_KEY_HEADS || k.GetDim(3) != MTP_HEAD_DIM,
@@ -210,7 +215,7 @@ ge::graphStatus LIUMtpTiling::DoTiling(LIUMtpTilingInfo *info)
     constexpr uint64_t SCORE_CHUNK = 512;
     uint64_t workspaceSize = platform.GetLibApiWorkSpaceSize();
     workspaceSize += static_cast<uint64_t>(blockDim) * DOUBLE_BUFFER *
-                     MTP_HEADS * SCORE_CHUNK * sizeof(float);
+                     info->queryHeads * SCORE_CHUNK * sizeof(float);
     uint64_t scoreStride =
         (static_cast<uint64_t>(info->sourceCapacity) + SCORE_CHUNK - 1U) /
         SCORE_CHUNK * SCORE_CHUNK;
@@ -228,7 +233,7 @@ ge::graphStatus LIUMtpTiling::DoTiling(LIUMtpTilingInfo *info)
     tilingData_.set_blockSize(info->blockSize);
     tilingData_.set_maxBlockNumPerBatch(info->maxBlocks);
     tilingData_.set_poolSize(info->poolSize);
-    tilingData_.set_n1Size(MTP_HEADS);
+    tilingData_.set_n1Size(info->queryHeads);
     tilingData_.set_cacheSlotsSize(info->sourceCapacity);
     tilingData_.SaveToBuffer(context_->GetRawTilingData()->GetData(),
                              context_->GetRawTilingData()->GetCapacity());

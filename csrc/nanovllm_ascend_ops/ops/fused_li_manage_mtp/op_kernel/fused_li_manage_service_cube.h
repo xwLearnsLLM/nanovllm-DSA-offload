@@ -63,7 +63,9 @@ public:
     static constexpr uint64_t KEY_L0_BUFFER_OFFSET = S2_BASIC_BLOCK_L0 * D_BASIC_BLOCK_L0;
     static constexpr uint64_t L0C_BUFFER_OFFSET = M_BASIC_BLOCK_L0 * S2_BASIC_BLOCK_L0;
     static constexpr uint64_t MTP_QUERY_COUNT = 4;
-    static constexpr uint64_t MTP_QUERY_ROWS = MTP_QUERY_COUNT * 32;
+    static constexpr uint64_t MTP_MAX_QUERY_HEADS = 64;
+    static constexpr uint64_t MTP_QUERY_ROWS =
+        MTP_QUERY_COUNT * MTP_MAX_QUERY_HEADS;
 
 protected:
     __aicore__ inline void Fixp(uint64_t s2GmOffset, uint64_t s2L0RealSize,
@@ -107,8 +109,8 @@ __aicore__ inline void LIMatmul<LIT>::InitParams(const ConstInfo &constInfo)
 template <typename LIT>
 __aicore__ inline void LIMatmul<LIT>::InitBuffers(TPipe *pipe)
 {
-    // Keep all four query rows for one request resident while preserving the
-    // original query-major execution and M=32 Cube path.
+    // Keep all four query rows for one request resident. Reserve for H=64;
+    // H=32 uses the same query-major path with half of this L1 region.
     pipe->InitBuffer(bufQL1_, MTP_QUERY_ROWS * D_BASIC_BLOCK * sizeof(Q_T));
     queryL1_ = bufQL1_.Get<Q_T>();
     pipe->InitBuffer(bufKeyL1_, KEY_BUF_NUM * S2_BASIC_BLOCK * D_BASIC_BLOCK * sizeof(K_T));

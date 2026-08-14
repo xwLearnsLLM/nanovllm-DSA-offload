@@ -18,11 +18,15 @@ inline void npu_fused_li_manage_mtp(
     at::Tensor miss_dst_slots,
     at::Tensor miss_counts) {
   constexpr int64_t kQueryCount = 4;
+  constexpr int64_t kMinQueryHeads = 32;
+  constexpr int64_t kMaxQueryHeads = 64;
   constexpr int64_t kTopK = 2048;
   constexpr int64_t kUnionCapacity = 8192;
-  TORCH_CHECK(query.dim() == 3 && query.size(1) == 32 &&
+  TORCH_CHECK(query.dim() == 3 &&
+                  (query.size(1) == kMinQueryHeads ||
+                   query.size(1) == kMaxQueryHeads) &&
                   query.size(2) == 128,
-              "MTP LIM query must be [4B, 32, 128].");
+              "MTP LIM query must be [4B, H, 128], H=32 or 64.");
   TORCH_CHECK(query.device().is_privateuseone(),
               "MTP LIM inputs must be on NPU.");
   TORCH_CHECK(req_pool_entries.dim() == 1,
@@ -37,8 +41,8 @@ inline void npu_fused_li_manage_mtp(
               "MTP LIM key must be [blocks, 128, 1, 128].");
   TORCH_CHECK(index_weights.dim() == 2 &&
                   index_weights.size(0) == query.size(0) &&
-                  index_weights.size(1) == 32,
-              "MTP LIM weights must be [4B, 32].");
+                  index_weights.size(1) == query.size(1),
+              "MTP LIM weights must be [4B, H] and match query heads.");
   TORCH_CHECK(cache_slots_pool.dim() == 2 &&
                   cache_slots_pool.size(0) > 0 &&
                   num_cache_tokens.dim() == 1 &&
