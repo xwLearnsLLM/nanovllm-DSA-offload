@@ -15,10 +15,11 @@
 #ifndef FUSED_LI_MANAGE_SERVICE_VECTOR_H
 #define FUSED_LI_MANAGE_SERVICE_VECTOR_H
 
-// Benchmark-only diagnostic: retain the four-query LI score/TopK path while
-// skipping union construction, eviction, cache updates, and caller-visible
-// output patching. Outputs and cache state are intentionally invalid in this
-// build; use ut_ops/test_fused_li_manage_mtp.py --benchmark-only.
+// Benchmark-only diagnostic: retain the four-query LI score/reduce/TopK path
+// while skipping aggregate-score and internal-TopK GM writes, union
+// construction, eviction, cache updates, and caller-visible output patching.
+// Outputs and cache state are intentionally invalid in this build; use
+// ut_ops/test_fused_li_manage_mtp.py --benchmark-only.
 #define LI_MTP_BENCH_SKIP_FINALIZE 1
 
 #include "kernel_operator.h"
@@ -1455,15 +1456,19 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
     PipeBarrier<PIPE_V>();
     Adds(sortScoreUb, reduceOutInner, 0.0f, cuS2Len);
     FinishPayload(payloadUb, cuBaseS2Idx, cuS2Len);
+#if !LI_MTP_BENCH_SKIP_FINALIZE
     WriteMtpAggregateScoreChunk(info.bIdx, info.queryIdx, cuBaseS2Idx,
                                 sortScoreUb, s2BaseSize_);
+#endif
 
     LocalTensor<float> tmpSortBuf = outQueue_.AllocTensor<float>();
     uint32_t cachedChunkIdx = info.segmentChunkIdx % PAYLOAD_BUF_SLOTS;
+#if !LI_MTP_BENCH_SKIP_FINALIZE
     if (info.queryIdx + 1U == MTP_QUERY_COUNT) {
         CollectMtpEvictCandidateChunk(info, payloadUb, tmpSortBuf,
                                       cachedChunkIdx);
     }
+#endif
     Sort<float, true>(
         SortedBasicBlock_[cachedChunkIdx * s2BaseSize_ * VALUE_AND_INDEX_NUM],
         reduceOutBuff, payloadUb.template ReinterpretCast<uint32_t>(),
@@ -1493,8 +1498,8 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
     outQueue_.FreeTensor(tmpSortBuf);
 
     if (info.isLastS2InnerLoop) {
-        StoreMtpQueryTopK(info);
 #if !LI_MTP_BENCH_SKIP_FINALIZE
+        StoreMtpQueryTopK(info);
         if (info.queryIdx + 1U == MTP_QUERY_COUNT) {
             FinalizeMtpRequest(info);
         }
