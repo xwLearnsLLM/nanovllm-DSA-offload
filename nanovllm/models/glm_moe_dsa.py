@@ -1068,14 +1068,24 @@ class GlmMoeDsaForCausalLM(nn.Module):
             mtp_prefix = (
                 f"model.layers.{int(self.config.num_hidden_layers)}."
             )
-            is_mtp_indexer = (
+            is_mtp_checkpoint_indexer = (
                 self.mtp is not None and weight_name.startswith(mtp_prefix)
             )
+            uses_mtp_index_share = bool(
+                is_mtp_checkpoint_indexer
+                and self.mtp.mtp_block.self_attn.uses_mtp_index_share
+            )
+            # GLM-5.1 checkpoints can include layer-78 Indexer tensors even
+            # though its dense non-offload MTP layer does not instantiate an
+            # Indexer.  Load those tensors only when the MTP IndexShare path
+            # actually created the matching parameters (GLM-5.2).
+            if is_mtp_checkpoint_indexer and not uses_mtp_index_share:
+                return None
             if (
                 getattr(
                     self.config, "nanovllm_offload_mode", OFFLOAD_NONE
                 ) == OFFLOAD_NONE
-                and not is_mtp_indexer
+                and not uses_mtp_index_share
             ):
                 return None
             # GLM-5.2 IndexShare: shared layers don't carry indexer weights.

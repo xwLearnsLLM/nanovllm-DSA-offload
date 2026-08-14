@@ -379,16 +379,27 @@ def test_glm52_config_accepts_fuse_graph_in_stage4(tmp_path):
 class _MockModelForWeightMapping:
     """Minimal stand-in for GlmMoeDsaForCausalLM.weight_name_mapping."""
 
-    def __init__(self, config):
+    def __init__(self, config, mtp=None):
         self.config = config
-        self.mtp = None
+        self.mtp = mtp
 
     def weight_name_mapping(self, weight_name):
         if ".self_attn.indexer." in weight_name:
+            mtp_prefix = f"model.layers.{int(self.config.num_hidden_layers)}."
+            is_mtp_checkpoint_indexer = (
+                self.mtp is not None and weight_name.startswith(mtp_prefix)
+            )
+            uses_mtp_index_share = bool(
+                is_mtp_checkpoint_indexer
+                and self.mtp.mtp_block.self_attn.uses_mtp_index_share
+            )
+            if is_mtp_checkpoint_indexer and not uses_mtp_index_share:
+                return None
             if (
                 getattr(
                     self.config, "nanovllm_offload_mode", OFFLOAD_NONE
                 ) == OFFLOAD_NONE
+                and not uses_mtp_index_share
             ):
                 return None
             index_share_groups = getattr(
@@ -467,6 +478,28 @@ def test_weight_mapping_skips_all_indexer_weights_when_offload_none(tmp_path):
     for layer_idx in [0, 3, 6, 77]:
         name = f"model.layers.{layer_idx}.self_attn.indexer.wq_b.weight"
         assert model.weight_name_mapping(name) is None
+
+
+def test_glm51_mtp_indexer_weights_are_skipped_without_mtp_index_share(
+    tmp_path,
+):
+    _write_glm_config(tmp_path)
+    config = _make_config(
+        tmp_path,
+        offload_mode="none",
+        num_dram_kvcache_blocks=-1,
+        enforce_eager=True,
+    )
+    mtp = SimpleNamespace(
+        mtp_block=SimpleNamespace(
+            self_attn=SimpleNamespace(uses_mtp_index_share=False)
+        )
+    )
+    model = _MockModelForWeightMapping(config.hf_config, mtp=mtp)
+
+    assert model.weight_name_mapping(
+        "model.layers.78.self_attn.indexer.k_norm.bias"
+    ) is None
 
 
 # ---------------------------------------------------------------------------
