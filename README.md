@@ -8,7 +8,7 @@
 
 ## 支持范围
 
-### GLM-5.1 MTP
+### GLM-5.1 / GLM-5.2 MTP
 
 `NANOVLLM_NUM_SPECULATIVE_TOKENS` 只接受 `0` 或 `3`。图模式只针对后续稳定 decode。Prefill、首次 decode、卸载缓存初始化和首次 lazy capture 允许走 eager；稳定且 batch size 与 capture size 完全一致后才 replay。
 
@@ -20,6 +20,21 @@
 | 3 | `none` | 支持 | 支持 | MTP3 + Dense MLA |
 | 3 | `offload_split` | 支持 | 支持 | `fused_li_manage_mtp → scatter_copy → sparse_tail_attention_mtp` |
 | 3 | `offload_fuse` | 支持 | 支持 | `fused_li_manage_mtp → fused_copy_sfa_mtp`；后者内部按序执行 union SCATTER 与 MTP-SFA |
+
+　
+
+### DSA decode 卸载
+
+设置 `NANOVLLM_OFFLOAD_MODE` 可以将 target layer 的历史 KV 从 HBM 卸载到 DRAM；`none` 保持 dense MLA，不使用 DRAM KV 池。卸载只覆盖稳定 decode，prefill 仍会写入完整 KV，首次需要卸载的 decode 会初始化 LIDU 缓存，因此不应将这些阶段纳入 TPOT 对比。
+
+- `offload_split`：LIM 先根据 LightningIndexer 选出 top-2048 token，随后分别执行 DRAM→HBM `scatter_copy` 和 top-2048 + dense tail Attention。
+- `offload_fuse`：在稳定 decode 将搬移与 Attention 合并为 `fused_copy_sfa` / `fused_copy_sfa_mtp`；首次 LIDU 初始化仍安全地走 split 路径。
+- GLM-5.2 target layer 采用官方 IndexShare schedule：21 个 full layer 运行 LIM，57 个 shared layer 复用 owner 的 token/slot/miss 元数据；78 层仍分别使用自己的 KV payload 执行 Attention，绝不跨层复用 KV 或 Attention 输出。
+- MTP3 的 target verification 每请求以四路因果 query 执行；MTP LIM 管理四路 top-2048 的并集，MTP Attention 仍为每个 query 使用其对应的因果可见 KV 长度。MTP draft layer 使用独立的 dense KV source，并在 draft iteration 间复用首次选择结果。
+
+`offload_split` 与 `offload_fuse` 是等价的卸载编排，应该在相同请求和采样设置下输出一致。它们与 `none` 分别使用稀疏 top-2048 + dense-tail 和 dense MLA，长序列生成可能因稀疏近似出现分叉；验收应以任务质量、稳定性以及 split/fuse 一致性为准。
+
+当前卸载配置要求 `NANOVLLM_KVCACHE_BLOCK_SIZE=128`、`kv_lora_rank=512`、`qk_rope_head_dim=64`、`index_topk=2048` 与 `index_n_heads/index_head_dim=32/128`。支持范围为常用 20K～64K 序列，不面向 1M 上下文。七个内置算子的接口与边界见 [`README_ops.md`](README_ops.md)。
 
 　
 

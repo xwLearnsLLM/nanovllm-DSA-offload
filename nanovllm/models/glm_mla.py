@@ -833,6 +833,20 @@ class GlmMLAAttention(nn.Module):
             raise RuntimeError("Explicit cache writes require flat_slot_mapping.")
         return context.flat_slot_mapping
 
+    def _sparse_tail_output(self, query: torch.Tensor) -> torch.Tensor:
+        """Return the persistent sparse-Attention output buffer for ``query``."""
+
+        output_key = tuple(query.shape)
+        attention_out = self._sparse_tail_outputs.get(output_key)
+        if (
+            attention_out is None
+            or attention_out.dtype != query.dtype
+            or attention_out.device != query.device
+        ):
+            attention_out = torch.empty_like(query)
+            self._sparse_tail_outputs[output_key] = attention_out
+        return attention_out
+
     def finalize_prefill_offload(
         self,
         seq,
@@ -1633,15 +1647,7 @@ class GlmMLAAttention(nn.Module):
             miss_counts,
         ) = self._lidu_update_mtp(q_index, weights, batch_size)
         use_fused_copy_attention = self._can_use_fused_copy_sfa()
-        output_key = tuple(ql_nope.shape)
-        attention_out = self._sparse_tail_outputs.get(output_key)
-        if (
-            attention_out is None
-            or attention_out.dtype != ql_nope.dtype
-            or attention_out.device != ql_nope.device
-        ):
-            attention_out = torch.empty_like(ql_nope)
-            self._sparse_tail_outputs[output_key] = attention_out
+        attention_out = self._sparse_tail_output(ql_nope)
         hbm_ckv = ckv_cache.view(
             -1, self.block_size, 1, self.kv_lora_rank
         )
@@ -1809,15 +1815,7 @@ class GlmMLAAttention(nn.Module):
             hbm_kpe = kpe_cache.view(
                 -1, self.block_size, 1, self.qk_rope_head_dim
             )
-            output_key = tuple(ql_nope.shape)
-            attention_out = self._sparse_tail_outputs.get(output_key)
-            if (
-                attention_out is None
-                or attention_out.dtype != ql_nope.dtype
-                or attention_out.device != ql_nope.device
-            ):
-                attention_out = torch.empty_like(ql_nope)
-                self._sparse_tail_outputs[output_key] = attention_out
+            attention_out = self._sparse_tail_output(ql_nope)
             if (
                 self._can_use_fused_copy_sfa()
                 and topk_src_ids is not None
