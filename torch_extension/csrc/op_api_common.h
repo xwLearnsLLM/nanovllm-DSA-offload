@@ -48,40 +48,9 @@
 #include "torch_npu/csrc/flopcount/FlopCounter.h"
 // #include "torch_npu/csrc/custom_dtype/Init.h"
 
-// CANN 8.5.x exposes some experimental float dtype enum names as C_DT_*,
-// while newer headers may refer to the ACL_* aliases. Keep this bridge local
-// to this GatherSelectionKvCache extension.
-#ifndef ACL_FLOAT8_E5M2
-#ifdef C_DT_FLOAT8_E5M2
-#define ACL_FLOAT8_E5M2 C_DT_FLOAT8_E5M2
-#else
-#define ACL_FLOAT8_E5M2 ACL_DT_UNDEFINED
-#endif
-#endif
-
-#ifndef ACL_FLOAT8_E4M3FN
-#ifdef C_DT_FLOAT8_E4M3FN
-#define ACL_FLOAT8_E4M3FN C_DT_FLOAT8_E4M3FN
-#else
-#define ACL_FLOAT8_E4M3FN ACL_DT_UNDEFINED
-#endif
-#endif
-
-#ifndef ACL_FLOAT8_E8M0
-#ifdef C_DT_FLOAT8_E8M0
-#define ACL_FLOAT8_E8M0 C_DT_FLOAT8_E8M0
-#else
-#define ACL_FLOAT8_E8M0 ACL_DT_UNDEFINED
-#endif
-#endif
-
-#ifndef ACL_FLOAT4_E2M1
-#ifdef C_DT_FLOAT4_E2M1
-#define ACL_FLOAT4_E2M1 C_DT_FLOAT4_E2M1
-#else
-#define ACL_FLOAT4_E2M1 ACL_DT_UNDEFINED
-#endif
-#endif
+// This repository targets Ascend 950/CANN 9.1. FP8/FP4 data types are
+// aclDataType enum values, not preprocessor macros. Testing them with
+// #ifdef would silently replace valid A5 types with ACL_DT_UNDEFINED.
 
 
 typedef struct aclOpExecutor aclOpExecutor;
@@ -242,6 +211,11 @@ constexpr aclDataType kATenScalarTypeToAclDataTypeTable
         AT_ALL_SCALAR_TYPE_AND_ACL_DATATYPE_PAIR(DEFINE_ENUM)
 #undef DEFINE_ENUM
 };
+static_assert(
+    kATenScalarTypeToAclDataTypeTable[
+        static_cast<int64_t>(at::ScalarType::Float8_e4m3fn)] !=
+        ACL_DT_UNDEFINED,
+    "Ascend 950 custom ops require ACL FP8 E4M3FN support.");
 
 // load aclnn api so
 static std::vector<std::string> split_str(std::string s, const std::string &del)
