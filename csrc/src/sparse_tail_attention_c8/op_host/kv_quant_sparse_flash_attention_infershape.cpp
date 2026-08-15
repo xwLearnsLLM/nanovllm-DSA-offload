@@ -15,7 +15,7 @@
 
 #include <graph/utils/type_utils.h>
 #include <register/op_impl_registry.h>
-#include "err/ops_err.h"
+#include "a5_sfa_shared/ops_log_compat.h"
 
 using namespace ge;
 

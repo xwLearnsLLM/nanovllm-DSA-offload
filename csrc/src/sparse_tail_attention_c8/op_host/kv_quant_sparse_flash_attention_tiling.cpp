@@ -19,7 +19,7 @@
 #include <algorithm>
 #include <sstream>
 #include <graph/utils/type_utils.h>
-#include "err/ops_err.h"
+#include "a5_sfa_shared/ops_log_compat.h"
 #include "register/op_def_registry.h"
 #include "../op_kernel/a5_qsfa/kv_quant_sparse_flash_attention_template_tiling_key.h"
 #include "kv_quant_sparse_flash_attention_tiling.h"

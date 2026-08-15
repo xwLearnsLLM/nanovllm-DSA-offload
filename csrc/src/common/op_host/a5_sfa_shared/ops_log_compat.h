@@ -47,6 +47,17 @@
     } while (0)
 #endif
 
+#ifndef OP_CHECK_NULL_WITH_CONTEXT
+#define OP_CHECK_NULL_WITH_CONTEXT(context, value)                  \
+    do {                                                            \
+        (void)(context);                                            \
+        if ((value) == nullptr) {                                   \
+            OP_LOGE("standalone_op", "%s is nullptr.", #value); \
+            return ge::GRAPH_FAILED;                                \
+        }                                                           \
+    } while (0)
+#endif
+
 // Some reference kernels use the older OPS_* spellings from
 // error/ops_error.h.  That private header is not shipped by every CANN 9.1
 // Ascend 950 package, so keep the small subset needed by this standalone
