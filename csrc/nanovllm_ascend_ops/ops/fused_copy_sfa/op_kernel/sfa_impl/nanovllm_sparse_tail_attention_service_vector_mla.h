@@ -83,6 +83,10 @@ public:
         const RunInfo &runInfo, int64_t s2GmStartOffset,
         int64_t s2GmLimit, uint32_t validSizePart,
         int32_t missCount, int64_t sourceTileStart);
+    template <bool LOAD_SOURCE_IDS>
+    __aicore__ inline void LoadSourceAwareMetadata(
+        int64_t topkGmBaseOffset, int64_t sourceRangeStart,
+        int64_t rangeSize);
     __aicore__ inline void FinishMergeKvRange(
         const RunInfo &runInfo, int64_t s2GmStartOffset,
         int64_t s2GmLimit, uint32_t validSizePart,
@@ -208,6 +212,18 @@ private:
     static constexpr T LN2 = 0.6931471805599453094172;
     static constexpr T RECIP_OF_LN2 = 1 / LN2;
     static constexpr T SOFTMAX_MIN_NUM = -2e38;
+    static constexpr uint32_t SOURCE_METADATA_CAPACITY = 512;
+    static constexpr uint32_t ROPE_MERGE_BUFFER_BYTES =
+        2 * 32 * 64 * sizeof(KV_T);
+    static constexpr uint32_t SOURCE_METADATA_UB_OFFSET =
+        ROPE_MERGE_BUFFER_BYTES / sizeof(int32_t);
+    static constexpr uint32_t DEST_METADATA_UB_OFFSET =
+        SOURCE_METADATA_UB_OFFSET + SOURCE_METADATA_CAPACITY;
+    static_assert(
+        (DEST_METADATA_UB_OFFSET + SOURCE_METADATA_CAPACITY) *
+                sizeof(int32_t) <=
+            ConstInfo::BUFFER_SIZE_BYTE_8K * 2,
+        "source-aware metadata must fit in inputBuff2.");
 
     const NanovllmSparseTailAttentionTilingDataMla *__restrict tilingData;
 
@@ -279,6 +295,8 @@ private:
     LocalTensor<KV_T> kvMergUb_;
     LocalTensor<KV_T> ropeMergUb_;
     LocalTensor<int32_t> v0ValidSizeUb_;
+    LocalTensor<int32_t> sourceTokenIdsUb_;
+    LocalTensor<int32_t> topkDestSlotsUb_;
 };
 
 template <typename SFAT> __aicore__ inline void SFAVectorService<SFAT>::InitBuffers(TPipe *pipe)
@@ -316,8 +334,52 @@ template <typename SFAT> __aicore__ inline void SFAVectorService<SFAT>::InitBuff
 
     kvMergUb_ = inputBuff1.Get<KV_T>();
     ropeMergUb_ = inputBuff2.Get<KV_T>();
+    // Vec0 uses only the first 8 KiB of inputBuff2 for the ping-pong RoPE
+    // gather (2 * 32 * 64 * sizeof(KV_T)).  Reuse part of the otherwise idle
+    // upper half for one 512-token source/destination metadata tile.  Later
+    // vector stages may reuse inputBuff2 after Vec0 has completed.
+    sourceTokenIdsUb_ =
+        inputBuff2.Get<int32_t>()[SOURCE_METADATA_UB_OFFSET];
+    topkDestSlotsUb_ =
+        inputBuff2.Get<int32_t>()[DEST_METADATA_UB_OFFSET];
 
     v0ValidSizeUb_ = v0ValidSizeBuff.Get<int32_t>();
+}
+
+template <typename SFAT>
+template <bool LOAD_SOURCE_IDS>
+__aicore__ inline void
+SFAVectorService<SFAT>::LoadSourceAwareMetadata(
+    int64_t topkGmBaseOffset, int64_t sourceRangeStart,
+    int64_t rangeSize)
+{
+    ASSERT_MSG(
+        rangeSize > 0 &&
+            rangeSize <= static_cast<int64_t>(SOURCE_METADATA_CAPACITY),
+        "source-aware metadata range exceeds the UB tile capacity.");
+    if (rangeSize <= 0 ||
+        rangeSize > static_cast<int64_t>(SOURCE_METADATA_CAPACITY)) {
+        return;
+    }
+
+    DataCopyExtParams copyParams;
+    copyParams.blockCount = 1;
+    copyParams.blockLen = rangeSize * sizeof(int32_t);
+    copyParams.srcStride = 0;
+    copyParams.dstStride = 0;
+    DataCopyPadExtParams<int32_t> padParams;
+    const int64_t metadataGmOffset =
+        topkGmBaseOffset + sourceRangeStart;
+    if constexpr (LOAD_SOURCE_IDS) {
+        DataCopyPad(
+            sourceTokenIdsUb_, sourceTokenIdsGm_[metadataGmOffset],
+            copyParams, padParams);
+    }
+    DataCopyPad(
+        topkDestSlotsUb_, topkGm_[metadataGmOffset],
+        copyParams, padParams);
+    SetFlag<AscendC::HardEvent::MTE2_S>(0);
+    WaitFlag<AscendC::HardEvent::MTE2_S>(0);
 }
 
 template <typename SFAT>
@@ -1389,6 +1451,11 @@ __aicore__ inline void SFAVectorService<SFAT>::MergeKvRange(
         missBase =
             static_cast<int64_t>(runInfo.bIdx) * copyCap_;
     }
+    if constexpr (SOURCE_ORDER && SFAT::mtp3Mode) {
+        LoadSourceAwareMetadata<HAS_MISS && ALIGNED_MISS>(
+            topkGmBaseOffset, sourceRangeStart,
+            s2GmLimit - s2GmStartOffset);
+    }
 
     int64_t mergeMte3Idx = 0;
     int64_t mte2Size = 0;
@@ -1415,16 +1482,16 @@ __aicore__ inline void SFAVectorService<SFAT>::MergeKvRange(
             const int64_t sourceIndex1 = sourceIndex0 + 1;
             if constexpr (HAS_MISS) {
                 if constexpr (ALIGNED_MISS) {
-                    const int32_t sourceToken0 = sourceTokenIdsGm_.GetValue(
-                        topkGmBaseOffset + sourceIndex0);
-                    const int32_t sourceToken1 = sourceTokenIdsGm_.GetValue(
-                        topkGmBaseOffset + sourceIndex1);
+                    const int32_t sourceToken0 =
+                        sourceTokenIdsUb_.GetValue(rangeOffset);
+                    const int32_t sourceToken1 =
+                        sourceTokenIdsUb_.GetValue(rangeOffset + 1);
                     const bool source0FromDram = sourceToken0 >= 0;
                     const bool source1FromDram = sourceToken1 >= 0;
-                    realS2Idx0 = topkGm_.GetValue(
-                        topkGmBaseOffset + sourceIndex0);
-                    realS2Idx1 = topkGm_.GetValue(
-                        topkGmBaseOffset + sourceIndex1);
+                    realS2Idx0 =
+                        topkDestSlotsUb_.GetValue(rangeOffset);
+                    realS2Idx1 =
+                        topkDestSlotsUb_.GetValue(rangeOffset + 1);
                     flushHasActualMiss = flushHasActualMiss ||
                         source0FromDram || source1FromDram;
                     const int64_t pairRowStart = mte2Size - mte3Size;
@@ -1489,12 +1556,19 @@ __aicore__ inline void SFAVectorService<SFAT>::MergeKvRange(
                     }
                 }
             } else {
-                realS2Idx0 =
-                    topkGm_.GetValue(
-                        topkGmBaseOffset + sourceIndex0);
-                realS2Idx1 =
-                    topkGm_.GetValue(
-                        topkGmBaseOffset + sourceIndex1);
+                if constexpr (SFAT::mtp3Mode) {
+                    realS2Idx0 =
+                        topkDestSlotsUb_.GetValue(rangeOffset);
+                    realS2Idx1 =
+                        topkDestSlotsUb_.GetValue(rangeOffset + 1);
+                } else {
+                    realS2Idx0 =
+                        topkGm_.GetValue(
+                            topkGmBaseOffset + sourceIndex0);
+                    realS2Idx1 =
+                        topkGm_.GetValue(
+                            topkGmBaseOffset + sourceIndex1);
+                }
                 CopyInHbmKvPair(
                     mte2Size, mte3Size, mergeMte3Idx,
                     realS2Idx0, realS2Idx1,
