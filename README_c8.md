@@ -119,4 +119,5 @@ python3 tests/test_fused_li_manage_c8.py --device npu:0 --heads 32,64 --batch-si
 python3 tests/test_fused_li_manage_mtp_c8.py --device npu:0 --batch-size 6 --heads 32,64 --source-len 20096 --queries-per-request 0 --miss-min 0 --miss-max 300 --pool-extra 7 --warmup 3 --iters 20 --seed 7
 python3 tests/test_kvcache_scatter_copy_c8.py --device npu:0 --batch-size 24 --source-len 20096 --cache-tokens 6144 --tail-tokens 64 --max-tail-tokens 512 --copy-min 0 --copy-max 300 --warmup 3 --iters 20 --seed 7
 python3 tests/test_sparse_tail_attention_c8.py --device npu:0 --heads 8 --batch-sizes 24 --cache-tokens 6144 --tail-tokens 64 --max-tail-tokens 512 --warmup 3 --iters 20 --seed 7
+python3 tests/test_offload_split_c8_graph.py --device npu:0 --replays 4 --seed 7
 ```

@@ -126,4 +126,6 @@ python3 tests/test_fused_li_manage_mtp.py --device npu:0 --bs 24 --min-seqlen 32
 python3 tests/test_kvcache_scatter_copy.py --device npu:0 --batch-size 24 --source-len 65536 --hbm-slots 4096 --copy-cap 2048 --copy-min 0 --copy-max 300 --warmup 3 --iters 20 --seed 7
 python3 tests/test_sparse_tail_attention.py --device npu:0 --heads 8 --batch-sizes 24 --source-lens 20096 --cache-tokens 6144 --tail-tokens 64 --warmup 3 --iters 20 --seed 7
 python3 tests/test_fused_copy_sparse_tail_attention.py --device npu:0 --batch-size 24 --heads 8 --source-len 65536 --cache-tokens 8192 --tail-tokens 64 --miss-min 0 --miss-max 300 --warmup 10 --iters 100 --seed 7
+python3 tests/test_offload_split_graph.py --device npu:0 --replays 4 --seed 7
+python3 tests/test_offload_fused_graph.py --device npu:0 --replays 4 --seed 7
 ```
