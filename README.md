@@ -81,7 +81,7 @@ miss 重合率定义为：
                  3 * unique union misses
 ```
 
-取值 `0` 表示各 query 的 miss 完全不重复，`1` 表示每个 miss 都出现在 4 个 query 中；默认 `1/3` 表示每个 unique miss 平均出现在 2 个 query 中。因 token 数取整，日志会同时打印请求值、实际值和各 query 的实际 miss 数。
+取值 `0` 表示各 query 的 miss 完全不重复，`1` 表示每个 miss 都出现在 4 个 query 中；默认 `1/3` 表示每个 unique miss 平均出现在 2 个 query 中。因 token 数取整，日志会同时打印请求值、实际值和各 query 的实际 miss 数，并分别打印 split 路径的 `kvcache_scatter_copy`、`sparse_tail_attention_mtp` 及二者整体时延。
 
 　
 

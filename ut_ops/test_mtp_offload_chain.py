@@ -1039,7 +1039,7 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
         fused_perf_ckv = perf_initial_ckv_cpu.to(device)
         fused_perf_out = torch.empty_like(eager_attention_buffer)
 
-        def split_copy_attention() -> torch.Tensor:
+        def scatter_copy_only() -> None:
             torch.ops.nanovllm_dsa.scatter_copy.default(
                 perf_outputs[2],
                 perf_outputs[3],
@@ -1051,6 +1051,8 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
                 dram_kpe,
                 dram_ckv,
             )
+
+        def sparse_attention_only() -> torch.Tensor:
             return call_attention_out(
                 query=query,
                 query_rope=query_rope,
@@ -1064,6 +1066,10 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
                 scale=scale,
                 output=split_perf_out,
             )
+
+        def split_copy_attention() -> torch.Tensor:
+            scatter_copy_only()
+            return sparse_attention_only()
 
         def fused_copy_attention() -> torch.Tensor:
             torch.ops.nanovllm_dsa.fused_copy_sfa_mtp.default(
@@ -1103,6 +1109,9 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
 
         split_ms = elapsed_ms(split_copy_attention)
         fused_ms = elapsed_ms(fused_copy_attention)
+        scatter_ms = elapsed_ms(scatter_copy_only)
+        sfa_ms = elapsed_ms(sparse_attention_only)
+        split_component_sum_ms = scatter_ms + sfa_ms
         print(
             "FUSED_COPY_SFA_MTP_PERF_RESULT "
             f"batch={batch_size} "
@@ -1114,7 +1123,11 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
             f"query_miss_occurrences_by_query=[{formatted_query_miss_means}] "
             f"miss_overlap_rate_requested={args.perf_miss_overlap_rate:.6f} "
             f"miss_overlap_rate_actual={actual_overlap_rate:.6f} "
-            f"split_ms={split_ms:.6f} fused_ms={fused_ms:.6f} "
+            f"split_ms={split_ms:.6f} "
+            f"kvcache_scatter_copy_ms={scatter_ms:.6f} "
+            f"sparse_tail_attention_mtp_ms={sfa_ms:.6f} "
+            f"split_component_sum_ms={split_component_sum_ms:.6f} "
+            f"fused_ms={fused_ms:.6f} "
             f"speedup={split_ms / fused_ms:.4f} "
             "query_gather_writeback=1 performance_assert=0 "
             "implementation=source_aware_reuse_v4 "
