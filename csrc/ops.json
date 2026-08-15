@@ -66,15 +66,20 @@
         "attr": []
     },
     {
-        "op": "A5FusedLiManageMtpC8CacheUpdate",
+        "op": "A5FusedLiManageMtpC8",
         "language": "cpp",
         "input_desc": [
-            {"name": "topk_indices", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "query", "param_type": "required", "format": ["ND"], "type": ["uint8"]},
+            {"name": "key", "param_type": "required", "format": ["ND"], "type": ["uint8"]},
+            {"name": "weights", "param_type": "required", "format": ["ND"], "type": ["bf16"]},
+            {"name": "query_dequant_scale", "param_type": "required", "format": ["ND"], "type": ["float"]},
+            {"name": "key_dequant_scale", "param_type": "required", "format": ["ND"], "type": ["float"]},
             {"name": "actual_seq_lengths_query", "param_type": "required", "format": ["ND"], "type": ["int32"]},
             {"name": "req_pool_entries", "param_type": "required", "format": ["ND"], "type": ["int32"]},
             {"name": "cache_slots_pool", "param_type": "required", "format": ["ND"], "type": ["int32"]},
             {"name": "cache_tokens", "param_type": "required", "format": ["ND"], "type": ["int32"]},
-            {"name": "candidate_lens", "param_type": "required", "format": ["ND"], "type": ["int32"]}
+            {"name": "candidate_lens", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "block_table", "param_type": "required", "format": ["ND"], "type": ["int32"]}
         ],
         "output_desc": [
             {"name": "topk_destination_slots", "param_type": "required", "format": ["ND"], "type": ["int32"]},

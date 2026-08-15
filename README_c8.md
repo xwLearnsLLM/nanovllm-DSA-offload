@@ -18,7 +18,7 @@ Torch namespace 固定为 `nanovllm_dsa`，Python 包名为 `nanovllm_dsa_a5`。
 | 非 MTP 索引选择与管理 | `fused_li_manage_c8` | 单算子初版已实现 | 单个仓内 MIX kernel 融合 A5 C8 LightningIndexer 与 request-pool update；已覆盖 18-bit 边界、乱序 pool、重复更新和图链路 |
 | 非 MTP / MTP1～3 KV 搬移与 Attention metadata | `kvcache_scatter_copy_c8` | 初版已实现，统一 ABI 待改造 | 当前源码已验证非 MTP 的真实 DRAM→HBM；需扩展为动态 copy capacity 和 TND 多 query metadata |
 | 非 MTP sparse+tail Attention | `sparse_tail_attention_c8` | 初版已实现 | 复用 A5 原生 C8 QSFA；已验证单 query，当前限制 `1 <= Q_HEAD <= 64` |
-| MTP1～3 多 query 索引选择与 union 管理 | `fused_li_manage_mtp_c8` | 源码初版，待上机 | 官方 A5 C8 LightningIndexer + 本地 request-pool union/update；优先保证功能正确，尚未做性能优化 |
+| MTP1～3 多 query 索引选择与 union 管理 | `fused_li_manage_mtp_c8` | 单算子源码初版，待上机 | 单个仓内 MIX kernel 融合官方 A5 C8 LightningIndexer 语义与 request-pool union/update；优先保证功能正确，尚未做性能优化 |
 | MTP1～3 sparse+tail Attention | 复用 `sparse_tail_attention_c8` | 复用待验证 | 现有接口形状已经允许 TND 多 query；还需验证 MTP1/2/3 的右下角因果语义与 graph replay |
 
 
@@ -200,9 +200,9 @@ each layer in the group:
 
 shared 层不调用任何索引管理算子，只复用 full 层输出。
 
-### `fused_li_manage_mtp_c8`（功能优先源码初版，待上机）
+### `fused_li_manage_mtp_c8`（单算子功能优先初版，待上机）
 
-该算子对 TND packed 的 2～4 路 query 调用官方 C8 LightningIndexer，然后按请求求各路 top-2048 的并集，只更新一次 group-shared `cache_slots_pool`。
+该算子在一个仓内 `MIX_AIC_1_2` kernel 中对 TND packed 的 2～4 路 query 执行与官方 A5 C8 LightningIndexer 一致的 `sparse_mode=3` 选择，然后按请求求各路 top-2048 的并集，只更新一次 group-shared `cache_slots_pool`。公开接口一次调用只产生一个设备 kernel launch，便于直接纳入 full-decode-only graph。
 
 ```python
 torch.ops.nanovllm_dsa.fused_li_manage_mtp_c8(
@@ -230,7 +230,7 @@ torch.ops.nanovllm_dsa.fused_li_manage_mtp_c8(
 
 管理行为必须满足：原 hit 保持 slot、union miss 去重、所有 query 的 top-K 在更新后均能通过共享映射得到 slot、有效 slot 仍唯一覆盖 `[0,C)`、相同输入重复更新时第二次 union miss 为零。
 
-当前实现由两部分组成：Python custom op 调用官方 A5 C8 `npu_quant_lightning_indexer` 生成 `[T,1,2048]`；仓内 `A5FusedLiManageMtpC8CacheUpdate` AIV kernel 按请求完成 union 去重、victim 选择、一次 request-pool 更新和逐 query slot 发布。当前没有时延门禁。
+当前实现中，同一 MIX core group 先完成 Quant LightningIndexer，再由 AIV0 完成 union 去重、victim 选择、一次 request-pool 更新和逐 query slot 发布。官方 `npu_quant_lightning_indexer` 仅作为单测 golden，不在公开算子的运行路径中；当前没有时延门禁。
 
 统一 `kvcache_scatter_copy_c8` 的 MTP 用法是：`copy_source_ids/copy_destination_slots` 接收 `[B,8192]` union miss buffers，`topk_destination_slots` 接收 `[T,1,2048]`，输出 `[T,1,2048+max_tail_tokens]`。tail 使用该请求最终可见的连续 HBM tail slots；`sparse_tail_attention_c8` 通过 `actual_seq_lengths_query`、`resident_seq_lengths` 与 `sparse_mode=3` 对较早 verification query 屏蔽未来 token。
 
@@ -333,7 +333,7 @@ python3 tests/test_c8_graph.py --device npu:0 --case mixed --batch-size 2 --head
 
 ## MTP1～3 C8 索引管理测试
 
-以下命令覆盖 32/64 index heads、MTP1/2/3 混合 batch、`C=0`、乱序 request pool、union miss 去重、hit slot 保持、重复零 miss以及最坏 8192 union：
+以下命令覆盖 32/64 index heads、MTP1/2/3 混合 batch、`C=0`、乱序 request pool、union miss 去重、hit slot 保持、重复零 miss、最坏 8192 union及公开接口单设备 kernel：
 
 ```bash
 python3 tests/test_fused_li_manage_mtp_c8.py --device npu:0 --batch-size 6 --heads 32,64 --source-len 20096 --queries-per-request 0 --miss-min 0 --miss-max 300 --pool-extra 7 --seed 7

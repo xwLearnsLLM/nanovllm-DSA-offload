@@ -62,7 +62,7 @@ OP_NAMES=(
     A5FusedLiManage
     A5FusedLiManageMtp
     A5FusedLiManageC8
-    A5FusedLiManageMtpC8CacheUpdate
+    A5FusedLiManageMtpC8
     A5KvcacheScatterCopy
     A5KvcacheScatterCopyC8
     A5SparseTailAttention
@@ -70,9 +70,8 @@ OP_NAMES=(
 )
 
 # These directories provide the BF16 and C8 operators visible to the framework.
-# Non-MTP C8 LIDU is one repository-local MIX kernel. MTP C8 currently uses
-# the official quant LightningIndexer plus a repository-local union/update
-# kernel; C8 Attention is an adapter over the native A5 QSFA implementation.
+# Both non-MTP and MTP C8 LIDU paths are repository-local MIX kernels. C8
+# Attention remains an adapter over the native A5 QSFA implementation.
 FRAMEWORK_OP_DIRS=(
     fused_li_manage
     fused_li_manage_mtp

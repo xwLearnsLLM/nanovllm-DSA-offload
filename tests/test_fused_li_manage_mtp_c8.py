@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Correctness test for the A5 C8 MTP LightningIndexer cache manager."""
+"""Correctness test for one-kernel A5 C8 MTP LI + cache management."""
 
 from __future__ import annotations
 
@@ -419,46 +419,26 @@ def check_case(case: MtpC8Case) -> None:
     torch.npu.synchronize()
     validate_case(case, old_pool, pool, outputs)
 
-    isolated_pool = case.initial_pool.clone()
-    isolated = torch.ops.nanovllm_dsa._fused_li_manage_mtp_c8_cache_update.default(
-        case.native_topk.reshape(case.query.size(0), 1, TOPK),
-        case.actual_q,
-        case.req_entries,
-        isolated_pool,
-        case.cache_tokens,
-        case.candidate_lens,
-    )
-    torch.npu.synchronize()
-    if (
-        not torch.equal(isolated[0].cpu(), outputs[0].cpu())
-        or not torch.equal(isolated[3].cpu(), outputs[3].cpu())
-        or not torch.equal(isolated_pool.cpu(), pool.cpu())
-    ):
-        raise AssertionError("high-level C8 MTP op and isolated manager disagree")
-    for batch_row, count in enumerate(outputs[3].cpu().tolist()):
-        if not torch.equal(
-            isolated[1][batch_row, :count].cpu(),
-            outputs[1][batch_row, :count].cpu(),
-        ) or not torch.equal(
-            isolated[2][batch_row, :count].cpu(),
-            outputs[2][batch_row, :count].cpu(),
-        ):
-            raise AssertionError("isolated manager changed a valid miss prefix")
-
     # Run every request alone from the same initial pool. This catches any
-    # accidental dependence on neighboring batch rows or packed-query offsets.
+    # accidental dependence on neighboring batch rows or packed-query offsets,
+    # while exercising the same public one-kernel LI + manager implementation.
     for batch_row, (begin, end) in enumerate(query_ranges(case.actual_q_cpu)):
         single_pool = case.initial_pool.clone()
         single_actual_q = torch.tensor(
             [end - begin], dtype=torch.int32, device=case.query.device
         )
-        single = torch.ops.nanovllm_dsa._fused_li_manage_mtp_c8_cache_update.default(
-            case.native_topk[begin:end].reshape(end - begin, 1, TOPK),
+        single = torch.ops.nanovllm_dsa.fused_li_manage_mtp_c8.default(
+            case.query[begin:end].contiguous(),
+            case.key,
+            case.weights[begin:end].contiguous(),
+            case.query_scale[begin:end].contiguous(),
+            case.key_scale,
             single_actual_q,
             case.req_entries[batch_row : batch_row + 1],
             single_pool,
             case.cache_tokens[batch_row : batch_row + 1],
             case.candidate_lens[batch_row : batch_row + 1],
+            case.block_table[batch_row : batch_row + 1].contiguous(),
         )
         torch.npu.synchronize()
         count = int(outputs[3].cpu()[batch_row])
@@ -544,19 +524,38 @@ def check_case(case: MtpC8Case) -> None:
         "official_c8_li_topk=1 source_range=1 union_dedup=1 "
         "unordered_unique_pool_entries=1 hit_slots_preserved=1 "
         "single_request_update=1 isolated_request_match=1 repeat_zero_miss=1 "
-        "isolated_update_match=1 out_alias=1 ok=1",
+        "one_device_kernel=1 out_alias=1 ok=1",
         flush=True,
     )
 
 
 def check_worst_union(device: torch.device) -> None:
-    topk = torch.arange(
-        UNION_CAPACITY, dtype=torch.int32, device=device
-    ).reshape(4, 1, TOPK)
+    heads = 32
+    source_len = UNION_CAPACITY * 2
+    blocks = source_len // BLOCK_SIZE
+    query_fp = torch.zeros(
+        (4, heads, 128), dtype=torch.bfloat16, device=device
+    )
+    key_fp = torch.zeros(
+        (blocks, BLOCK_SIZE, 1, 128),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    key_rows = key_fp.reshape(source_len, 1, 128)
+    key_rows[:, 0, 4] = 0.25
+    for query_row in range(4):
+        query_fp[query_row, :, query_row] = 1
+        begin = query_row * TOPK
+        key_rows[begin : begin + TOPK, 0, query_row] = 1
+    query, query_scale = quantize_fp8(query_fp)
+    key, key_scale = quantize_fp8(key_fp)
+    weights = torch.ones(
+        (4, heads), dtype=torch.bfloat16, device=device
+    )
     actual_q = torch.tensor([4], dtype=torch.int32, device=device)
     req = torch.tensor([1], dtype=torch.int32, device=device)
     pool_cpu = torch.full(
-        (3, UNION_CAPACITY * 2), -1, dtype=torch.int32
+        (3, source_len), -1, dtype=torch.int32
     )
     pool_cpu[1, UNION_CAPACITY:] = torch.arange(
         UNION_CAPACITY, dtype=torch.int32
@@ -566,10 +565,42 @@ def check_worst_union(device: torch.device) -> None:
         [UNION_CAPACITY], dtype=torch.int32, device=device
     )
     candidate = torch.tensor(
-        [UNION_CAPACITY * 2], dtype=torch.int32, device=device
+        [source_len], dtype=torch.int32, device=device
     )
-    outputs = torch.ops.nanovllm_dsa._fused_li_manage_mtp_c8_cache_update.default(
-        topk, actual_q, req, pool, budget, candidate
+    block_table = torch.arange(
+        blocks, dtype=torch.int32, device=device
+    ).reshape(1, blocks)
+    native_topk = official_c8_lightning_indexer(
+        query,
+        key,
+        weights,
+        query_scale,
+        key_scale,
+        actual_q,
+        candidate,
+        block_table,
+    ).reshape(4, TOPK)
+    expected = torch.arange(UNION_CAPACITY, dtype=torch.int32).reshape(
+        4, TOPK
+    )
+    if any(
+        set(native_topk[row].cpu().tolist())
+        != set(expected[row].tolist())
+        for row in range(4)
+    ):
+        raise AssertionError("synthetic C8 MTP queries did not form an 8192 union")
+    outputs = torch.ops.nanovllm_dsa.fused_li_manage_mtp_c8.default(
+        query,
+        key,
+        weights,
+        query_scale,
+        key_scale,
+        actual_q,
+        req,
+        pool,
+        budget,
+        candidate,
+        block_table,
     )
     torch.npu.synchronize()
     if int(outputs[3].cpu()[0]) != UNION_CAPACITY:
@@ -590,7 +621,9 @@ def check_worst_union(device: torch.device) -> None:
         (updated[UNION_CAPACITY:] >= 0).any()
     ):
         raise AssertionError("worst-case union cache update is incomplete")
-    expected_slots = updated[:UNION_CAPACITY].reshape(4, 1, TOPK)
+    expected_slots = updated.gather(
+        0, native_topk.cpu().reshape(-1).long()
+    ).reshape(4, 1, TOPK)
     if not torch.equal(outputs[0].cpu(), expected_slots):
         raise AssertionError("worst-case per-query slots are incorrect")
     print(

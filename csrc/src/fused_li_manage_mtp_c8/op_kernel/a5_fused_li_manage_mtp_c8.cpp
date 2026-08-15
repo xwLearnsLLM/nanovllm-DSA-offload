@@ -1,15 +1,16 @@
 /**
- * Request-level union/update stage for the Ascend 950 C8 MTP path.
+ * One-kernel Ascend 950 C8 MTP LightningIndexer + request-pool manager.
  *
- * The official Quant LightningIndexer has already produced one top-2048 row
- * per verification query. One AIV worker owns one request: it deduplicates
- * the 2--4 rows, protects every union hit, selects safe victims, updates the
- * request-pool row once, and finally publishes every query's complete HBM
- * slot row.
+ * The MIX phase first computes official sparse-mode-3 top-2048 rows for all
+ * 2--4 packed verification queries.  The even AIV then resets its TPipe and,
+ * within the same device launch, forms the request union, preserves hits,
+ * selects victims, updates one request-pool row and publishes every query's
+ * complete HBM slot row.
  */
 
 #include "kernel_operator.h"
-#include "a5_fused_li_manage_mtp_c8_cache_update_tiling.h"
+#include "a5_fused_li_manage_mtp_c8_tiling.h"
+#include "a5_fused_li_manage_mtp_c8_qli.h"
 
 namespace {
 using namespace AscendC;
@@ -26,11 +27,11 @@ constexpr uint32_t CACHE_CHUNK = 2048;
 constexpr uint32_t TOKEN_MASK = (1U << 18) - 1U;
 constexpr uint32_t SLOT_SHIFT = 18;
 
-class A5FusedLiManageMtpC8CacheUpdateKernel {
+class A5FusedLiManageMtpC8RequestPoolManager {
 public:
-    __aicore__ inline A5FusedLiManageMtpC8CacheUpdateKernel(
+    __aicore__ inline A5FusedLiManageMtpC8RequestPoolManager(
         TPipe *pipe,
-        const A5FusedLiManageMtpC8CacheUpdateTilingData *tiling)
+        const A5FusedLiManageMtpC8TilingData *tiling)
         : pipe_(pipe), tiling_(tiling)
     {}
 
@@ -46,7 +47,8 @@ public:
         GM_ADDR missDestinationSlots,
         GM_ADDR missCounts)
     {
-        coreIdx_ = GetBlockIdx();
+        // This manager runs only on AIV0 of each MIX_AIC_1_2 group.
+        coreIdx_ = GetBlockIdx() / 2U;
         topkIndicesGm_.SetGlobalBuffer((__gm__ int32_t *)topkIndices);
         actualSeqLengthsQueryGm_.SetGlobalBuffer(
             (__gm__ int32_t *)actualSeqLengthsQuery);
@@ -375,7 +377,7 @@ private:
 
 private:
     TPipe *pipe_;
-    const A5FusedLiManageMtpC8CacheUpdateTilingData *tiling_;
+    const A5FusedLiManageMtpC8TilingData *tiling_;
     uint32_t coreIdx_ = 0;
     GlobalTensor<int32_t> topkIndicesGm_;
     GlobalTensor<int32_t> actualSeqLengthsQueryGm_;
@@ -397,13 +399,18 @@ private:
 }  // namespace
 
 extern "C" __global__ __aicore__ void
-a5_fused_li_manage_mtp_c8_cache_update(
-    GM_ADDR topkIndices,
+a5_fused_li_manage_mtp_c8(
+    GM_ADDR query,
+    GM_ADDR key,
+    GM_ADDR weights,
+    GM_ADDR queryDequantScale,
+    GM_ADDR keyDequantScale,
     GM_ADDR actualSeqLengthsQuery,
     GM_ADDR reqPoolEntries,
     GM_ADDR cacheSlotsPool,
     GM_ADDR cacheTokens,
     GM_ADDR candidateLens,
+    GM_ADDR blockTable,
     GM_ADDR topkDestinationSlots,
     GM_ADDR missSourceIds,
     GM_ADDR missDestinationSlots,
@@ -413,23 +420,39 @@ a5_fused_li_manage_mtp_c8_cache_update(
     GM_ADDR tiling)
 {
     (void)cacheSlotsAlias;
-    (void)workspace;
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-    REGISTER_TILING_DEFAULT(
-        A5FusedLiManageMtpC8CacheUpdateTilingData);
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    REGISTER_TILING_DEFAULT(A5FusedLiManageMtpC8TilingData);
     GET_TILING_DATA(tilingData, tiling);
     TPipe pipe;
-    A5FusedLiManageMtpC8CacheUpdateKernel op(&pipe, &tilingData);
-    op.Init(
-        topkIndices,
-        actualSeqLengthsQuery,
-        reqPoolEntries,
-        cacheSlotsPool,
-        cacheTokens,
-        candidateLens,
-        topkDestinationSlots,
-        missSourceIds,
-        missDestinationSlots,
-        missCounts);
-    op.Process();
+    GM_ADDR userWorkspace = GetUserWorkspace(workspace);
+
+    a5_fused_li_manage_mtp_c8_impl::QuantLiMtpPhase qli(
+        &pipe, &tilingData);
+    // The LI phase uses topkDestinationSlots as temporary top-K token-ID
+    // storage. The manager overwrites it with the public slot result.
+    qli.Init(
+        query, key, weights, queryDequantScale, keyDequantScale,
+        actualSeqLengthsQuery, cacheTokens, candidateLens, blockTable,
+        topkDestinationSlots, userWorkspace);
+    qli.Process();
+
+    pipe.Reset();
+    if ASCEND_IS_AIV {
+        if ((GetBlockIdx() & 1U) == 0U) {
+            A5FusedLiManageMtpC8RequestPoolManager manager(
+                &pipe, &tilingData);
+            manager.Init(
+                topkDestinationSlots,
+                actualSeqLengthsQuery,
+                reqPoolEntries,
+                cacheSlotsPool,
+                cacheTokens,
+                candidateLens,
+                topkDestinationSlots,
+                missSourceIds,
+                missDestinationSlots,
+                missCounts);
+            manager.Process();
+        }
+    }
 }
