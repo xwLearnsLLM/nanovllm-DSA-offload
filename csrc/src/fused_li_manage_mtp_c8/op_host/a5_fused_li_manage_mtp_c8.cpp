@@ -175,9 +175,13 @@ static ge::graphStatus TilingA5FusedLiManageMtpC8(
     tiling->scaleStride = BLOCK_SIZE;
     tiling->scoreWorkspaceStride = static_cast<uint32_t>(scoreStride64);
 
+    const uint64_t topkWorkspaceBytes =
+        static_cast<uint64_t>(packedQueries) * SPARSE_COUNT *
+        sizeof(int32_t);
     context->GetWorkspaceSizes(1)[0] =
         platform.GetLibApiWorkSpaceSize() +
-        scoreStride64 * static_cast<uint64_t>(usedCoreNum);
+        scoreStride64 * static_cast<uint64_t>(usedCoreNum) +
+        topkWorkspaceBytes;
     context->SetBlockDim(platform.CalcTschBlockDim(
         usedCoreNum * 2U, usedCoreNum, usedCoreNum * 2U));
     context->SetScheduleMode(1);

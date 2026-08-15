@@ -8,9 +8,7 @@ import random
 from dataclasses import dataclass
 
 import torch
-import torch_npu  # type: ignore
-
-import nanovllm_dsa_a5  # noqa: F401
+import nanovllm_dsa_a5
 
 from _c8_lidu_case import (
     normalized_hadamard_128,
@@ -687,6 +685,11 @@ def main() -> None:
     torch.npu.config.allow_internal_format = False
     require_a5(device, args.allow_non_a5)
     check_meta()
+    print(
+        "A5_FUSED_LI_MANAGE_MTP_C8_CONFIG "
+        f"opapi={nanovllm_dsa_a5.local_opapi_path()}",
+        flush=True,
+    )
 
     for heads in args.heads:
         if args.queries_per_request:

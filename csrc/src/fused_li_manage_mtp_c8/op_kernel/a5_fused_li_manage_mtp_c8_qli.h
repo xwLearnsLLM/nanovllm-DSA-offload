@@ -2,10 +2,11 @@
  * Quantized LightningIndexer phase embedded in fused_li_manage_mtp_c8.
  *
  * One MIX core group owns one request.  Its 2--4 packed verification
- * queries are processed together, preserving the official sparse-mode-3
- * causal prefixes.  Native top-2048 token IDs are written directly into
- * the caller-owned topk_destination_slots buffer and consumed in place by
- * the request-level union/update phase that follows in the same kernel.
+ * queries are deliberately processed one row at a time in this
+ * correctness-first implementation.  Each row keeps the official
+ * sparse-mode-3 causal prefix.  Native top-2048 token IDs are written into
+ * a dedicated workspace and consumed by the request-level union/update
+ * phase that follows in the same kernel.
  */
 
 #ifndef A5_FUSED_LI_MANAGE_MTP_C8_QLI_H
@@ -29,8 +30,6 @@ constexpr uint32_t QLI_TOPK = 2048;
 constexpr uint32_t MIN_QUERY_COUNT = 2;
 constexpr uint32_t MAX_QUERY_COUNT = 4;
 constexpr uint32_t REQUEST_DONE_EVENT = 6;
-constexpr uint32_t OUTPUT_DONE_EVENT = 7;
-constexpr uint32_t PHASE_DONE_EVENT = 8;
 
 using C8MtpQliType = QLIType<
     fp8_e4m3fn_t, fp8_e4m3fn_t, float, uint16_t, int32_t, true,
@@ -70,12 +69,15 @@ public:
         constInfo_.headDim = QLI_HEAD_DIM;
         constInfo_.sparseCount = QLI_TOPK;
         constInfo_.kSeqSize = tiling_->maxCandidateLen;
-        constInfo_.qSeqSize = MAX_QUERY_COUNT;
+        // Each packed query is submitted to the official QLI services as a
+        // single row.  This keeps all TopK generation on AIV0 and avoids a
+        // cross-AIV output hand-off before request-pool management.
+        constInfo_.qSeqSize = 1;
         constInfo_.kCacheBlockSize = QLI_BLOCK_SIZE;
         constInfo_.maxBlockNumPerBatch = tiling_->maxBlockNumPerBatch;
         constInfo_.outputLayout = LI_LAYOUT::TND;
-        // Matches npu_quant_lightning_indexer(..., sparse_mode=3): query i
-        // sees candidate_len - query_count + i + 1 source tokens.
+        // ProcessTopK uses actS2SizeOrig below to reproduce sparse_mode=3
+        // for each serial row.
         constInfo_.attenMaskFlag = true;
         constInfo_.cmpRatio = 1;
         constInfo_.batchSupperFlag = false;
@@ -150,85 +152,77 @@ public:
             const uint32_t candidate = static_cast<uint32_t>(
                 candidateLensGm_.GetValue(batch));
             const uint32_t loopCount = candidate / QLI_BLOCK_SIZE;
-            for (uint32_t s2 = 0; s2 < loopCount; ++s2, ++globalLoop) {
-                RunInfo run{};
-                run.loop = globalLoop;
-                run.bN2Idx = batch;
-                run.bIdx = batch;
-                run.n2Idx = 0;
-                run.gS1Idx = 0;
-                run.s2Idx = s2;
-                run.actS1Size = queryCount;
-                run.actS2Size = candidate;
-                run.actS2SizeOrig = candidate;
-                run.actMBaseSize = queryCount * tiling_->indexHeads;
-                run.actualSingleProcessSInnerSize = QLI_BLOCK_SIZE;
-                run.actualSingleProcessSInnerSizeAlign = QLI_BLOCK_SIZE;
-                run.tensorQueryOffset =
-                    static_cast<uint64_t>(queryBegin) *
-                    tiling_->indexHeads * QLI_HEAD_DIM;
-                run.tensorKeyOffset =
-                    static_cast<uint64_t>(s2) * QLI_BLOCK_SIZE *
-                    QLI_HEAD_DIM;
-                run.tensorKeyScaleOffset =
-                    static_cast<uint64_t>(s2) * QLI_BLOCK_SIZE;
-                run.tensorWeightsOffset =
-                    static_cast<uint64_t>(queryBegin) *
-                    tiling_->indexHeads;
-                run.indiceOutOffset =
-                    static_cast<uint64_t>(queryBegin) * QLI_TOPK;
-                run.isFirstS2InnerLoop = s2 == 0;
-                run.isLastS2InnerLoop = s2 + 1U == loopCount;
-                run.isAllLoopEnd = false;
-                run.isValid = true;
+            for (uint32_t queryRow = queryBegin;
+                 queryRow < queryEnd; ++queryRow) {
+                const uint32_t localQuery = queryRow - queryBegin;
+                const uint32_t causalPrefix =
+                    candidate - queryCount + localQuery + 1U;
+                for (uint32_t s2 = 0; s2 < loopCount;
+                     ++s2, ++globalLoop) {
+                    RunInfo run{};
+                    run.loop = globalLoop;
+                    run.bN2Idx = batch;
+                    run.bIdx = batch;
+                    run.n2Idx = 0;
+                    run.gS1Idx = 0;
+                    run.s2Idx = s2;
+                    run.actS1Size = 1;
+                    run.actS2Size = candidate;
+                    // With actS1Size=1, the official causal formula becomes
+                    // validS2Len = actS2SizeOrig.  Supplying the per-row
+                    // prefix therefore exactly matches sparse_mode=3.
+                    run.actS2SizeOrig = causalPrefix;
+                    run.actMBaseSize = tiling_->indexHeads;
+                    run.actualSingleProcessSInnerSize = QLI_BLOCK_SIZE;
+                    run.actualSingleProcessSInnerSizeAlign = QLI_BLOCK_SIZE;
+                    run.tensorQueryOffset =
+                        static_cast<uint64_t>(queryRow) *
+                        tiling_->indexHeads * QLI_HEAD_DIM;
+                    run.tensorKeyOffset =
+                        static_cast<uint64_t>(s2) * QLI_BLOCK_SIZE *
+                        QLI_HEAD_DIM;
+                    run.tensorKeyScaleOffset =
+                        static_cast<uint64_t>(s2) * QLI_BLOCK_SIZE;
+                    run.tensorWeightsOffset =
+                        static_cast<uint64_t>(queryRow) *
+                        tiling_->indexHeads;
+                    run.indiceOutOffset =
+                        static_cast<uint64_t>(queryRow) * QLI_TOPK;
+                    run.isFirstS2InnerLoop = s2 == 0;
+                    run.isLastS2InnerLoop = s2 + 1U == loopCount;
+                    run.isAllLoopEnd = false;
+                    run.isValid = true;
 
-                if ASCEND_IS_AIC {
-                    matmulService_.ComputeMm1(run);
-                } else {
-                    vectorService_.ProcessVec1(run);
-                    if (run.isLastS2InnerLoop) {
-                        vectorService_.ProcessTopK(run);
+                    if ASCEND_IS_AIC {
+                        matmulService_.ComputeMm1(run);
+                    } else {
+                        vectorService_.ProcessVec1(run);
+                        if (run.isLastS2InnerLoop) {
+                            vectorService_.ProcessTopK(run);
+                        }
                     }
                 }
-            }
 
-            // Both AIVs may own packed query rows.  Wait for AIV0 and AIV1
-            // before the Cube reuses this core group's score workspace.
-            if ASCEND_IS_AIC {
-                CrossCoreWaitFlag<ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(
-                    REQUEST_DONE_EVENT);
-                CrossCoreWaitFlag<ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(
-                    REQUEST_DONE_EVENT + ConstInfo::AIV0_AIV1_OFFSET);
-            } else {
-                CrossCoreSetFlag<ConstInfo::QLI_SYNC_MODE4, PIPE_V>(
-                    REQUEST_DONE_EVENT);
+                // AIV0 owns the only active row and must finish consuming
+                // the score workspace before the next query reuses it.
+                if ASCEND_IS_AIC {
+                    CrossCoreWaitFlag<ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(
+                        REQUEST_DONE_EVENT);
+                } else if ((subBlockIdx_ & 1U) == 0U) {
+                    CrossCoreSetFlag<ConstInfo::QLI_SYNC_MODE4, PIPE_V>(
+                        REQUEST_DONE_EVENT);
+                }
             }
         }
 
         if ASCEND_IS_AIV {
             vectorService_.FreeEventID();
-            // FreeEventID waits for the final TopK MTE3 write.  The
-            // per-request REQUEST_DONE_EVENT above only protects score-
-            // workspace reuse; it is deliberately too early for the
-            // manager to consume AIV1-owned output rows.
-            CrossCoreSetFlag<ConstInfo::QLI_SYNC_MODE4, PIPE_V>(
-                OUTPUT_DONE_EVENT);
-            CrossCoreWaitFlag<ConstInfo::QLI_SYNC_MODE4, PIPE_V>(
-                PHASE_DONE_EVENT);
         } else {
             matmulService_.FreeEventID();
             CrossCoreWaitFlag<ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(
                 ConstInfo::CROSS_VC_EVENT);
             CrossCoreWaitFlag<ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(
                 ConstInfo::CROSS_VC_EVENT + 1U);
-            CrossCoreWaitFlag<ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(
-                OUTPUT_DONE_EVENT);
-            CrossCoreWaitFlag<ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(
-                OUTPUT_DONE_EVENT + ConstInfo::AIV0_AIV1_OFFSET);
-            CrossCoreSetFlag<ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(
-                PHASE_DONE_EVENT);
-            CrossCoreSetFlag<ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(
-                PHASE_DONE_EVENT + ConstInfo::AIV0_AIV1_OFFSET);
         }
     }
 

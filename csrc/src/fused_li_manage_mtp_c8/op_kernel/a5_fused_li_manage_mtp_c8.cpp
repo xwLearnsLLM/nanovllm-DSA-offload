@@ -2,10 +2,11 @@
  * One-kernel Ascend 950 C8 MTP LightningIndexer + request-pool manager.
  *
  * The MIX phase first computes official sparse-mode-3 top-2048 rows for all
- * 2--4 packed verification queries.  The even AIV then resets its TPipe and,
- * within the same device launch, forms the request union, preserves hits,
- * selects victims, updates one request-pool row and publishes every query's
- * complete HBM slot row.
+ * 2--4 packed verification queries.  Queries are intentionally serialized
+ * within each request in this correctness-first version.  The even AIV then
+ * resets its TPipe and, within the same device launch, forms the request
+ * union, preserves hits, selects victims, updates one request-pool row and
+ * publishes every query's complete HBM slot row.
  */
 
 #include "kernel_operator.h"
@@ -425,15 +426,19 @@ a5_fused_li_manage_mtp_c8(
     GET_TILING_DATA(tilingData, tiling);
     TPipe pipe;
     GM_ADDR userWorkspace = GetUserWorkspace(workspace);
+    GM_ADDR topkWorkspace = userWorkspace +
+        static_cast<uint64_t>(tilingData.scoreWorkspaceStride) *
+            tilingData.usedCoreNum;
 
     a5_fused_li_manage_mtp_c8_impl::QuantLiMtpPhase qli(
         &pipe, &tilingData);
-    // The LI phase uses topkDestinationSlots as temporary top-K token-ID
-    // storage. The manager overwrites it with the public slot result.
+    // Keep native token IDs in a dedicated workspace.  The public slot
+    // output is written only by the manager, which avoids read/write aliasing
+    // between packed query rows in this correctness-first implementation.
     qli.Init(
         query, key, weights, queryDequantScale, keyDequantScale,
         actualSeqLengthsQuery, cacheTokens, candidateLens, blockTable,
-        topkDestinationSlots, userWorkspace);
+        topkWorkspace, userWorkspace);
     qli.Process();
 
     pipe.Reset();
@@ -442,7 +447,7 @@ a5_fused_li_manage_mtp_c8(
             A5FusedLiManageMtpC8RequestPoolManager manager(
                 &pipe, &tilingData);
             manager.Init(
-                topkDestinationSlots,
+                topkWorkspace,
                 actualSeqLengthsQuery,
                 reqPoolEntries,
                 cacheSlotsPool,
