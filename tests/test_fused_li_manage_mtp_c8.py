@@ -122,9 +122,34 @@ def make_case(
     miss_range: tuple[int, int],
     pool_extra: int,
     seed: int,
+    candidate_lens_cpu: list[int] | None = None,
 ) -> MtpC8Case:
     if len(query_counts) != batch or len(budgets) != batch:
         raise ValueError("query-count and budget lists must match batch")
+    if candidate_lens_cpu is None:
+        candidate_lens_cpu = [source_len] * batch
+    if len(candidate_lens_cpu) != batch:
+        raise ValueError("candidate-length list must match batch")
+    if any(
+        length < TOPK or length > source_len or length % BLOCK_SIZE
+        for length in candidate_lens_cpu
+    ):
+        raise ValueError(
+            "candidate lengths must be block-aligned values in "
+            "[2048,source_len]"
+        )
+    if any(
+        budget != 0
+        and (
+            budget < TOPK
+            or budget > MAX_CACHE_TOKENS
+            or budget % BLOCK_SIZE
+        )
+        for budget in budgets
+    ):
+        raise ValueError(
+            "cache budgets must be 0 or block-aligned values in [2048,16256]"
+        )
     torch.manual_seed(seed)
     torch.npu.manual_seed_all(seed)
     generator = torch.Generator().manual_seed(seed + 1)
@@ -164,8 +189,8 @@ def make_case(
     actual_q = torch.tensor(
         actual_q_cpu, dtype=torch.int32, device=device
     )
-    candidate_lens = torch.full(
-        (batch,), source_len, dtype=torch.int32, device=device
+    candidate_lens = torch.tensor(
+        candidate_lens_cpu, dtype=torch.int32, device=device
     )
     block_table = block_table_cpu.to(device)
     native_topk = official_c8_lightning_indexer(
@@ -190,8 +215,8 @@ def make_case(
     )
     target_misses: list[int] = []
     ranges = query_ranges(actual_q_cpu)
-    for batch_row, ((begin, end), budget) in enumerate(
-        zip(ranges, budgets)
+    for batch_row, ((begin, end), budget, candidate_len) in enumerate(
+        zip(ranges, budgets, candidate_lens_cpu)
     ):
         pool_row = int(req_entries_cpu[batch_row])
         if budget == 0:
@@ -202,8 +227,13 @@ def make_case(
             raise ValueError(
                 f"request {batch_row}: union={len(union)} exceeds C={budget}"
             )
+        if budget > candidate_len:
+            raise ValueError(
+                f"request {batch_row}: C={budget} exceeds "
+                f"candidate_len={candidate_len}"
+            )
         feasible_max = min(
-            miss_range[1], len(union), source_len - budget
+            miss_range[1], len(union), candidate_len - budget
         )
         if miss_range[0] > feasible_max:
             raise ValueError(
@@ -221,9 +251,9 @@ def make_case(
         hit_ids = union_tensor[
             torch.randperm(len(union), generator=generator)[:hit_count]
         ]
-        outside_mask = torch.ones(source_len, dtype=torch.bool)
+        outside_mask = torch.ones(candidate_len, dtype=torch.bool)
         outside_mask[union_tensor] = False
-        outside = torch.arange(source_len, dtype=torch.int64)[outside_mask]
+        outside = torch.arange(candidate_len, dtype=torch.int64)[outside_mask]
         victim_count = budget - hit_count
         victim_ids = outside[
             torch.randperm(outside.numel(), generator=generator)[:victim_count]
@@ -370,6 +400,14 @@ def validate_case(
                 )
             if bool((expected_slots < 0).any()):
                 raise AssertionError("updated cache does not contain a query top-K")
+            if (
+                bool((topk_slots_cpu[row] >= budget).any())
+                or torch.unique(topk_slots_cpu[row]).numel() != TOPK
+            ):
+                raise AssertionError(
+                    f"request {batch_row} query {local_query}: "
+                    "published top-K slots are not unique values in [0,C)"
+                )
 
         union = set(ordered_union(native_cpu[begin:end]))
         expected_misses = {
@@ -398,16 +436,24 @@ def validate_case(
         old_valid = (old_cpu[pool_row] >= 0).nonzero().flatten()
         old_owner = torch.empty(budget, dtype=torch.long)
         old_owner[old_cpu[pool_row, old_valid].long()] = old_valid
+        expected_new_row = old_cpu[pool_row].clone()
         for token, slot in zip(emitted_tokens.tolist(), emitted_slots.tolist()):
             if int(new_cpu[pool_row, token]) != slot:
                 raise AssertionError("miss token was not assigned its output slot")
             victim = int(old_owner[slot])
             if victim in union or int(new_cpu[pool_row, victim]) != -1:
                 raise AssertionError("MTP manager evicted a protected union token")
+            expected_new_row[victim] = -1
+            expected_new_row[token] = slot
         for token in union:
             old_slot = int(old_cpu[pool_row, token])
             if old_slot >= 0 and int(new_cpu[pool_row, token]) != old_slot:
                 raise AssertionError("an existing union hit changed its slot")
+        if not torch.equal(new_cpu[pool_row], expected_new_row):
+            raise AssertionError(
+                f"request {batch_row}: cache update changed entries other than "
+                "the published miss/victim pairs"
+            )
 
 
 def check_case(case: MtpC8Case) -> None:
@@ -521,8 +567,56 @@ def check_case(case: MtpC8Case) -> None:
         f"misses={outputs[3].cpu().tolist()} "
         "official_c8_li_topk=1 source_range=1 union_dedup=1 "
         "unordered_unique_pool_entries=1 hit_slots_preserved=1 "
+        "per_query_slots_unique=1 exact_cache_delta=1 "
         "single_request_update=1 isolated_request_match=1 repeat_zero_miss=1 "
         "one_device_kernel=1 out_alias=1 ok=1",
+        flush=True,
+    )
+
+
+def check_heterogeneous_candidates_and_budgets(device: torch.device) -> None:
+    case = make_case(
+        device=device,
+        batch=6,
+        heads=32,
+        source_len=20096,
+        query_counts=[2, 3, 4, 2, 3, 4],
+        budgets=[0, 8192, 12288, 6144, 12288, MAX_CACHE_TOKENS],
+        candidate_lens_cpu=[4096, 12288, 20096, 8192, 16384, 19968],
+        miss_range=(0, 300),
+        pool_extra=7,
+        seed=1707,
+    )
+    check_case(case)
+    print(
+        "A5_FUSED_LI_MANAGE_MTP_C8_HETEROGENEOUS_CHECK "
+        f"candidates={case.candidate_lens.cpu().tolist()} "
+        f"budgets={case.cache_tokens.cpu().tolist()} "
+        "candidate_tail_unchanged=1 max_cache_budget=16256 ok=1",
+        flush=True,
+    )
+
+
+def check_overlapping_union_zero_miss(device: torch.device) -> None:
+    case = make_case(
+        device=device,
+        batch=1,
+        heads=32,
+        source_len=4096,
+        query_counts=[4],
+        budgets=[4096],
+        miss_range=(0, 0),
+        pool_extra=2,
+        seed=2707,
+    )
+    union_size = len(ordered_union(case.native_topk.cpu()))
+    if union_size >= 4 * TOPK:
+        raise AssertionError("overlap case did not exercise union deduplication")
+    check_case(case)
+    print(
+        "A5_FUSED_LI_MANAGE_MTP_C8_OVERLAP_ZERO_MISS_CHECK "
+        f"queries=4 raw_topk_entries={4 * TOPK} union={union_size} "
+        "first_update_zero_miss=1 union_dedup=1 ok=1",
         flush=True,
     )
 
@@ -712,6 +806,8 @@ def main() -> None:
         )
         check_case(case)
 
+    check_heterogeneous_candidates_and_budgets(device)
+    check_overlapping_union_zero_miss(device)
     check_worst_union(device)
     if args.check_18bit_boundary:
         boundary = make_case(

@@ -339,7 +339,7 @@ python3 tests/test_c8_graph.py --device npu:0 --case mixed --batch-size 2 --head
 
 ## MTP1～3 C8 索引管理测试
 
-以下命令覆盖 32/64 index heads、MTP1/2/3 混合 batch、`C=0`、乱序 request pool、union miss 去重、hit slot 保持、重复零 miss、最坏 8192 union及公开接口单设备 kernel：
+以下命令覆盖 32/64 index heads、MTP1/2/3 混合 batch、异构 candidate length、`C=0`、首次零 miss、大于 union 的缓存预算、乱序 request pool、union miss 去重、精确 cache delta、重复零 miss、最坏 8192 union 及公开接口单设备 kernel：
 
 ```bash
 python3 tests/test_fused_li_manage_mtp_c8.py --device npu:0 --batch-size 6 --heads 32,64 --source-len 20096 --queries-per-request 0 --miss-min 0 --miss-max 300 --pool-extra 7 --seed 7
