@@ -401,7 +401,7 @@ __aicore__ inline void KvQuantSparseFlashAttentionMla<CubeBlockType, VecBlockTyp
     constInfo.sparseBlockCount = sharedParams.sparseBlockCount;
     constInfo.sparseBlockSize = 1;
 
-    constInfo.sparseMode = sharedParams.maskMode;
+    constInfo.sparseMode = sharedParams.oriMaskMode;
     constInfo.n2G = constInfo.n2Size * constInfo.gSize;
 
     constInfo.s1Dv = constInfo.s1Size * constInfo.dSizeV;
@@ -437,9 +437,9 @@ __aicore__ inline void KvQuantSparseFlashAttentionMla<CubeBlockType, VecBlockTyp
     }
 
     if ASCEND_IS_AIV {
-        constInfo.blockSize = sharedParams.blockSize;
+        constInfo.oriBlockSize = sharedParams.oriBlockSize;
         constInfo.softmaxScale = sharedParams.softmaxScale;
-        constInfo.maxBlockNumPerBatch = sharedParams.maxBlockNumPerBatch;
+        constInfo.oriMaxBlockNumPerBatch = sharedParams.oriMaxBlockNumPerBatch;
     }
 
     InitUniqueConstInfo();

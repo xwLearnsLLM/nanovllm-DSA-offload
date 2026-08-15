@@ -462,8 +462,8 @@ __aicore__ inline void QSFAVectorService<TEMPLATE_ARGS>::ProcessVec0(
     const RunInfo &runInfo, ConstInfo &constInfo)
 {
     outputL1.WaitCrossCore(); // 核间同步
-    blockSize = constInfo.blockSize;
-    maxBlockNumPerBatch = constInfo.maxBlockNumPerBatch;
+    blockSize = constInfo.oriBlockSize;
+    maxBlockNumPerBatch = constInfo.oriMaxBlockNumPerBatch;
 
     CalSparseCalSize(runInfo, constInfo);
     ProcessSparseKv(outputL1, v0ResGm, runInfo, constInfo);
@@ -790,7 +790,7 @@ TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void QSFAVectorService<TEMPLATE_ARGS>
     sharedParams.gSize = sparseAttnSharedkvBaseParams.nNumOfQInOneGroup;
 
     sharedParams.sparseBlockCount = sparseAttnSharedkvBaseParams.sparseBlockCount;
-    sharedParams.maskMode = sparseAttnSharedkvBaseParams.sparseMode;
+    sharedParams.oriMaskMode = sparseAttnSharedkvBaseParams.sparseMode;
     sharedParams.layoutType = sparseAttnSharedkvBaseParams.outputLayout;
     sharedParams.dSizeRope = 64; // 64: 编码维度
     sharedParams.softmaxScale = sparseAttnSharedkvBaseParams.scaleValue;
@@ -798,8 +798,8 @@ TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void QSFAVectorService<TEMPLATE_ARGS>
     sharedParams.dSizeVInput = sparseAttnSharedkvBaseParams.dSizeVInput;
     sharedParams.usedCoreNum = this->tilingData->singleCoreParams.usedCoreNum;
     if constexpr (isPa) {
-        sharedParams.blockSize = sparseAttnSharedkvBaseParams.blockSize;
-        sharedParams.maxBlockNumPerBatch = sparseAttnSharedkvBaseParams.maxBlockNumPerBatch;
+        sharedParams.oriBlockSize = sparseAttnSharedkvBaseParams.blockSize;
+        sharedParams.oriMaxBlockNumPerBatch = sparseAttnSharedkvBaseParams.maxBlockNumPerBatch;
     }
 
     sharedParams.isActualSeqLengthsNull = sparseAttnSharedkvBaseParams.isActualLenDimsNull;

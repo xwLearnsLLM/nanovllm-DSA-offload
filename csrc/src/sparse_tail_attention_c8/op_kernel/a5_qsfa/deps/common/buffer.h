@@ -135,6 +135,11 @@ public:
         }
     }
 
+    __aicore__ inline void SetCrossCoreID(uint32_t id0, uint32_t id1) {
+        id0_ = id0;
+        id1_ = id1;
+    }
+
     __aicore__ inline void Init() {
         if ASCEND_IS_AIC {
             if constexpr (syncType == SyncType::INNER_CORE_SYNC) {
