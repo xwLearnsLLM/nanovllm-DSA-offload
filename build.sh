@@ -7,6 +7,7 @@ OP_SPEC="${CSRC}/ops.json"
 OP_SOURCE_ROOT="${CSRC}/src"
 BUILD_ROOT="${ROOT}/build"
 GENERATED="${BUILD_ROOT}/custom_op"
+INCREMENTAL_BUILD_ROOT="${BUILD_ROOT}/fused_li_manage_mtp_c8"
 LOCAL_OPP="${ROOT}/_custom_opp"
 TORCH_EXTENSION="${ROOT}/torch_extension"
 
@@ -149,6 +150,11 @@ rm -rf "${LOCAL_OPP}"
 mkdir -p "${LOCAL_OPP}"
 chmod +x "${RUN_PKG}"
 "${RUN_PKG}" --quiet --install-path="${LOCAL_OPP}"
+
+# A complete build supersedes the optional one-op overlay.  Remove it only
+# after the new full OPP has installed successfully, so a failed full build
+# does not destroy the last usable incremental package.
+rm -rf "${INCREMENTAL_BUILD_ROOT}"
 
 mapfile -t OPAPI_LIBS < <(find "${LOCAL_OPP}/vendors" -type f -path '*/op_api/lib/libcust_opapi.so')
 if [[ "${#OPAPI_LIBS[@]}" -ne 1 ]]; then

@@ -312,6 +312,12 @@ export NANOVLLM_A5_OPS_BUILD_JOBS=64
 bash build.sh
 ```
 
+完成过一次全量构建后，只修改 `fused_li_manage_mtp_c8` 的 host、tiling 或 kernel 源码时可执行单算子增量构建；它不会重编译其余算子和 Torch extension，新 Python 进程会自动优先加载增量 OPP。若修改了公开 Torch schema/C++ wrapper，仍须执行全量 `bash build.sh`。全量构建成功后会自动清除增量覆盖层。
+
+```bash
+bash build_fused_li_manage_mtp_c8.sh
+```
+
 ## 当前非 MTP C8 测试
 
 ```bash
