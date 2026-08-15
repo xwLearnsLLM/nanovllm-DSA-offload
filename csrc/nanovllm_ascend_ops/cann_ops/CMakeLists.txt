@@ -240,7 +240,7 @@ op_add_subdirectory(OP_LIST OP_DIR_LIST)
 # to include the kernels in binary_info_config.json.
 set(fused_li_manage_kernel_aliases nanovllm_fused_li_manage)
 set(fused_li_manage_mtp_kernel_aliases nanovllm_fused_li_manage_mtp)
-# MTP-LIDU reuses the qlen=1 cube/vector services. Make the shared headers
+# MTP-LIM reuses the qlen=1 cube/vector services. Make the shared headers
 # available to OPC while keeping the MTP kernel and its 18-bit state separate.
 set(fused_li_manage_mtp_depends
     ../ops/fused_li_manage)
@@ -256,6 +256,11 @@ set(sparse_tail_attention_mtp_depends
 set(nanovllm_sparse_tail_attention_mtp_depends
     ../ops/sparse_tail_attention)
 set(fused_copy_sfa_kernel_aliases nanovllm_fused_copy_sfa)
+set(fused_copy_sfa_mtp_kernel_aliases nanovllm_fused_copy_sfa_mtp)
+set(fused_copy_sfa_mtp_depends
+    ../ops/fused_copy_sfa)
+set(nanovllm_fused_copy_sfa_mtp_depends
+    ../ops/fused_copy_sfa)
 
 foreach (OP_DIR ${OP_DIR_LIST})
     get_filename_component(_op_name "${OP_DIR}" NAME)

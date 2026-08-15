@@ -118,7 +118,7 @@ ge::graphStatus CheckFusedInputs(
     OPS_ERR_IF(copyCap != SPARSE_COUNT ||
                    hbmMaxBlocks == 0 || dramMaxBlocks == 0,
                OPS_LOG_E(context->GetNodeName(),
-                         "source IDs must have LIDU capacity 2048 and block tables must be non-empty."),
+                         "source IDs must have top-k capacity 2048 and block tables must be non-empty."),
                return ge::GRAPH_FAILED);
 
     const ge::DataType floatingType = context->GetInputDesc(QUERY)->GetDataType();

@@ -890,7 +890,7 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
             f"total_misses={sum(perf_counts)} "
             f"split_ms={split_ms:.6f} fused_ms={fused_ms:.6f} "
             f"speedup={split_ms / fused_ms:.4f} "
-            "performance_assert=0 implementation=functional_v0 "
+            "performance_assert=0 implementation=source_aware_all_hit_pair_v6 "
             f"warmup={args.warmup} iters={args.iters}",
             flush=True,
         )
