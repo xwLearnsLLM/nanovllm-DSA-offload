@@ -87,8 +87,6 @@ public:
     __aicore__ inline void LoadSourceAwareMetadata(
         int64_t topkGmBaseOffset, int64_t sourceRangeStart,
         int64_t rangeSize);
-    __aicore__ inline void EnsureHbmBlockTableCached(
-        const RunInfo &runInfo);
     __aicore__ inline void FinishMergeKvRange(
         const RunInfo &runInfo, int64_t s2GmStartOffset,
         int64_t s2GmLimit, uint32_t validSizePart,
@@ -222,14 +220,11 @@ private:
         ROPE_MERGE_BUFFER_BYTES / sizeof(int32_t);
     static constexpr uint32_t DEST_METADATA_UB_OFFSET =
         SOURCE_METADATA_UB_OFFSET + SOURCE_METADATA_CAPACITY;
-    static constexpr uint32_t HBM_BLOCK_TABLE_CAPACITY = 256;
-    static constexpr uint32_t HBM_BLOCK_TABLE_UB_OFFSET =
-        DEST_METADATA_UB_OFFSET + SOURCE_METADATA_CAPACITY;
     static_assert(
-        (HBM_BLOCK_TABLE_UB_OFFSET + HBM_BLOCK_TABLE_CAPACITY) *
+        (DEST_METADATA_UB_OFFSET + SOURCE_METADATA_CAPACITY) *
                 sizeof(int32_t) <=
             ConstInfo::BUFFER_SIZE_BYTE_8K * 2,
-        "source-aware metadata and HBM block table must fit in inputBuff2.");
+        "source-aware metadata must fit in inputBuff2.");
 
     const NanovllmSparseTailAttentionTilingDataMla *__restrict tilingData;
 
@@ -270,8 +265,6 @@ private:
     uint32_t dramMaxBlockNum_ = 0;
     int32_t copyCountBatch_ = -1;
     int32_t cachedCopyCount_ = 0;
-    int32_t hbmBlockTableBatch_ = -1;
-    bool hbmBlockTableCached_ = false;
 
     // ================================Local Buffer====================================
     TBuf<> inputBuff1;            // 32K
@@ -305,7 +298,6 @@ private:
     LocalTensor<int32_t> v0ValidSizeUb_;
     LocalTensor<int32_t> sourceTokenIdsUb_;
     LocalTensor<int32_t> topkDestSlotsUb_;
-    LocalTensor<int32_t> hbmBlockTableUb_;
 };
 
 template <typename SFAT> __aicore__ inline void SFAVectorService<SFAT>::InitBuffers(TPipe *pipe)
@@ -345,16 +337,12 @@ template <typename SFAT> __aicore__ inline void SFAVectorService<SFAT>::InitBuff
     ropeMergUb_ = inputBuff2.Get<KV_T>();
     // Vec0 uses only the first 8 KiB of inputBuff2 for the ping-pong RoPE
     // gather (2 * 32 * 64 * sizeof(KV_T)).  Reuse part of the otherwise idle
-    // upper half for one 512-token source/destination metadata tile and the
-    // request's compact HBM block table.  This cache is enabled only by the
-    // normal-stage MTP3 kernel; stage2 may reuse inputBuff2 and falls back to
-    // the original GM block-table lookup.
+    // upper half for one 512-token source/destination metadata tile.  Later
+    // vector stages may reuse inputBuff2 after Vec0 has completed.
     sourceTokenIdsUb_ =
         inputBuff2.Get<int32_t>()[SOURCE_METADATA_UB_OFFSET];
     topkDestSlotsUb_ =
         inputBuff2.Get<int32_t>()[DEST_METADATA_UB_OFFSET];
-    hbmBlockTableUb_ =
-        inputBuff2.Get<int32_t>()[HBM_BLOCK_TABLE_UB_OFFSET];
 
     v0ValidSizeUb_ = v0ValidSizeBuff.Get<int32_t>();
 }
@@ -397,41 +385,6 @@ SFAVectorService<SFAT>::LoadSourceAwareMetadata(
 
 template <typename SFAT>
 __aicore__ inline void
-SFAVectorService<SFAT>::EnsureHbmBlockTableCached(
-    const RunInfo &runInfo)
-{
-    if constexpr (!(SFAT::sourceAwareGather && SFAT::mtp3Mode &&
-                    PAGE_ATTENTION && STAGE_MODE == SFA_STAGE_NORMAL)) {
-        return;
-    }
-    const int32_t batch = static_cast<int32_t>(runInfo.bIdx);
-    if (hbmBlockTableBatch_ == batch) {
-        return;
-    }
-    hbmBlockTableBatch_ = batch;
-    hbmBlockTableCached_ = false;
-    const uint32_t blockCount = constInfo.maxBlockNumPerBatch;
-    if (blockCount == 0 || blockCount > HBM_BLOCK_TABLE_CAPACITY) {
-        return;
-    }
-
-    DataCopyExtParams copyParams;
-    copyParams.blockCount = 1;
-    copyParams.blockLen = blockCount * sizeof(int32_t);
-    copyParams.srcStride = 0;
-    copyParams.dstStride = 0;
-    DataCopyPadExtParams<int32_t> padParams;
-    DataCopyPad(
-        hbmBlockTableUb_,
-        blkTableGm_[static_cast<int64_t>(batch) * blockCount],
-        copyParams, padParams);
-    SetFlag<AscendC::HardEvent::MTE2_S>(0);
-    WaitFlag<AscendC::HardEvent::MTE2_S>(0);
-    hbmBlockTableCached_ = true;
-}
-
-template <typename SFAT>
-__aicore__ inline void
 SFAVectorService<SFAT>::InitParams(const struct ConstInfo &constInfo,
                                                  const NanovllmSparseTailAttentionTilingDataMla *__restrict tilingData)
 {
@@ -456,8 +409,6 @@ __aicore__ inline void SFAVectorService<SFAT>::InitVec0GlobalTensor(
     this->keyGm_ = keyGm;
     this->blkTableGm_ = blkTableGm;
     this->kvValidSizeGm_ = kvValidSizeGm;
-    this->hbmBlockTableBatch_ = -1;
-    this->hbmBlockTableCached_ = false;
 }
 
 template <typename SFAT>
@@ -1057,20 +1008,7 @@ __aicore__ inline int64_t SFAVectorService<SFAT>::GetKeyGmOffset(int64_t realS2I
     if constexpr (PAGE_ATTENTION) {
         int64_t blkTableIdx = realS2Idx / constInfo.kvCacheBlockSize;
         int64_t blkTableOffset = realS2Idx % constInfo.kvCacheBlockSize;
-        int32_t physicalBlock = 0;
-        if constexpr (SFAT::sourceAwareGather && SFAT::mtp3Mode &&
-                      STAGE_MODE == SFA_STAGE_NORMAL) {
-            physicalBlock = hbmBlockTableCached_
-                ? hbmBlockTableUb_.GetValue(blkTableIdx)
-                : blkTableGm_.GetValue(
-                      runInfo.bIdx * constInfo.maxBlockNumPerBatch +
-                      blkTableIdx);
-        } else {
-            physicalBlock = blkTableGm_.GetValue(
-                runInfo.bIdx * constInfo.maxBlockNumPerBatch +
-                blkTableIdx);
-        }
-        realKeyGmOffset = static_cast<int64_t>(physicalBlock) *
+        realKeyGmOffset = blkTableGm_.GetValue(runInfo.bIdx * constInfo.maxBlockNumPerBatch + blkTableIdx) *
                                 static_cast<int64_t>(constInfo.kvCacheBlockSize) *
                                 static_cast<int64_t>(constInfo.kvHeadNum) +
                                 blkTableOffset;
@@ -1802,7 +1740,6 @@ __aicore__ inline void SFAVectorService<SFAT>::FinishMergeKvRange(
 template <typename SFAT>
 __aicore__ inline void SFAVectorService<SFAT>::MergeKv(const RunInfo &runInfo)
 {
-    EnsureHbmBlockTableCached(runInfo);
     int64_t s2ProcessSize = runInfo.actualSingleProcessSInnerSize;
     int64_t s2Pair = CeilDiv(s2ProcessSize, 2L * constInfo.sparseBlockSize);
     int64_t s2Mid =
