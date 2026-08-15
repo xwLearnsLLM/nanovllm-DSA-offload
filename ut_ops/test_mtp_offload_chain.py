@@ -1130,7 +1130,7 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
             f"fused_ms={fused_ms:.6f} "
             f"speedup={split_ms / fused_ms:.4f} "
             "query_gather_writeback=1 performance_assert=0 "
-            "implementation=source_aware_metadata_ub_v5 "
+            "implementation=source_aware_all_hit_pair_v6 "
             f"warmup={args.warmup} iters={args.iters}",
             flush=True,
         )
