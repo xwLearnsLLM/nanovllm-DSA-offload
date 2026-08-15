@@ -29,7 +29,8 @@ constexpr uint32_t QLI_TOPK = 2048;
 constexpr uint32_t MIN_QUERY_COUNT = 2;
 constexpr uint32_t MAX_QUERY_COUNT = 4;
 constexpr uint32_t REQUEST_DONE_EVENT = 6;
-constexpr uint32_t PHASE_DONE_EVENT = 7;
+constexpr uint32_t OUTPUT_DONE_EVENT = 7;
+constexpr uint32_t PHASE_DONE_EVENT = 8;
 
 using C8MtpQliType = QLIType<
     fp8_e4m3fn_t, fp8_e4m3fn_t, float, uint16_t, int32_t, true,
@@ -206,8 +207,12 @@ public:
 
         if ASCEND_IS_AIV {
             vectorService_.FreeEventID();
-            // AIV0 must not let the manager consume AIV1-owned query rows
-            // until the Cube has observed both request-completion flags.
+            // FreeEventID waits for the final TopK MTE3 write.  The
+            // per-request REQUEST_DONE_EVENT above only protects score-
+            // workspace reuse; it is deliberately too early for the
+            // manager to consume AIV1-owned output rows.
+            CrossCoreSetFlag<ConstInfo::QLI_SYNC_MODE4, PIPE_V>(
+                OUTPUT_DONE_EVENT);
             CrossCoreWaitFlag<ConstInfo::QLI_SYNC_MODE4, PIPE_V>(
                 PHASE_DONE_EVENT);
         } else {
@@ -216,6 +221,10 @@ public:
                 ConstInfo::CROSS_VC_EVENT);
             CrossCoreWaitFlag<ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(
                 ConstInfo::CROSS_VC_EVENT + 1U);
+            CrossCoreWaitFlag<ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(
+                OUTPUT_DONE_EVENT);
+            CrossCoreWaitFlag<ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(
+                OUTPUT_DONE_EVENT + ConstInfo::AIV0_AIV1_OFFSET);
             CrossCoreSetFlag<ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(
                 PHASE_DONE_EVENT);
             CrossCoreSetFlag<ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(
