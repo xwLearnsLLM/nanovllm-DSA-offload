@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON_BIN="${PYTHON:-python}"
 RAW_SOC_VERSION="${SOC_VERSION:-ascend910_9391}"
 ASCEND_HOME_PATH="${ASCEND_HOME_PATH:-/usr/local/Ascend/ascend-toolkit/latest}"
-CUSTOM_OPS="fused_li_manage_mtp;kvcache_scatter_copy;sparse_tail_attention_mtp;fused_copy_sfa_mtp"
+CUSTOM_OPS="kvcache_scatter_copy;sparse_tail_attention_mtp;fused_copy_sfa_mtp"
 EXT_BUILD_JOBS="${NANOVLLM_EXT_BUILD_JOBS:-1}"
 
 case "${RAW_SOC_VERSION}" in
@@ -17,19 +17,19 @@ esac
 
 export ASCEND_HOME_PATH
 
-echo "[mtp-ops] root: ${ROOT_DIR}"
-echo "[mtp-ops] python: $(${PYTHON_BIN} -c 'import sys; print(sys.executable)')"
-echo "[mtp-ops] soc: raw=${RAW_SOC_VERSION}, cann_opp=${CANN_SOC_VERSION}"
-echo "[mtp-ops] ascend: ${ASCEND_HOME_PATH}"
-echo "[mtp-ops] extension build jobs: ${EXT_BUILD_JOBS}"
+echo "[copysfa-mtp] root: ${ROOT_DIR}"
+echo "[copysfa-mtp] python: $(${PYTHON_BIN} -c 'import sys; print(sys.executable)')"
+echo "[copysfa-mtp] soc: raw=${RAW_SOC_VERSION}, cann_opp=${CANN_SOC_VERSION}"
+echo "[copysfa-mtp] ascend: ${ASCEND_HOME_PATH}"
+echo "[copysfa-mtp] extension build jobs: ${EXT_BUILD_JOBS}"
 
-echo "[mtp-ops] normalize build script line endings"
+echo "[copysfa-mtp] normalize build script line endings"
 find "${ROOT_DIR}/csrc/nanovllm_ascend_ops" -type f \
   \( -name "*.sh" -o -name "*.cmake" -o -name "CMakeLists.txt" \) \
   -exec sed -i 's/\r$//' {} +
 
 if [[ "${NANOVLLM_SKIP_CANN_OPP_BUILD:-0}" == "1" ]]; then
-  echo "[mtp-ops] skip CANN custom OPP build"
+  echo "[copysfa-mtp] skip CANN custom OPP build"
 else
   pushd "${ROOT_DIR}/csrc/nanovllm_ascend_ops/cann_ops" >/dev/null
   rm -rf build output
@@ -43,17 +43,16 @@ else
       -name binary_info_config.json -print -quit
   )"
   for op_type in \
-    NanovllmFusedLiManageMtp \
     NanovllmKvcacheScatterCopy \
     NanovllmSparseTailAttentionMtp \
     NanovllmFusedCopySfaMtp; do
     if [[ -z "${BINARY_INFO_CONFIG}" ]] || \
        ! grep -q "${op_type}" "${BINARY_INFO_CONFIG}"; then
-      echo "[mtp-ops] ERROR: ${op_type} is missing from installed OPP." >&2
+      echo "[copysfa-mtp] ERROR: ${op_type} is missing from installed OPP." >&2
       exit 1
     fi
   done
-  echo "[mtp-ops] verified MTP offloading kernels in ${BINARY_INFO_CONFIG}"
+  echo "[copysfa-mtp] verified target and split kernels in ${BINARY_INFO_CONFIG}"
   popd >/dev/null
 fi
 
@@ -64,23 +63,23 @@ print(os.path.dirname(torch_npu.__file__))
 PY
 )"
 
-rm -rf "${ROOT_DIR}/build/ops_lim_mtp"
+rm -rf "${ROOT_DIR}/build/ops_copysfa_mtp"
 cmake -S "${ROOT_DIR}/csrc/nanovllm_ascend_ops" \
-  -B "${ROOT_DIR}/build/ops_lim_mtp" \
+  -B "${ROOT_DIR}/build/ops_copysfa_mtp" \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INSTALL_PREFIX="${ROOT_DIR}/nanovllm" \
   -DPYTHON_EXECUTABLE="$(${PYTHON_BIN} -c 'import sys; print(sys.executable)')" \
   -DTORCH_NPU_PATH="${TORCH_NPU_PATH}" \
   -DASCEND_HOME_PATH="${ASCEND_HOME_PATH}"
 
-cmake --build "${ROOT_DIR}/build/ops_lim_mtp" \
+cmake --build "${ROOT_DIR}/build/ops_copysfa_mtp" \
   --target install -j"${EXT_BUILD_JOBS}"
 
 EXTENSION="$(
-  find "${ROOT_DIR}/build/ops_lim_mtp" -maxdepth 1 -name "_C*.so" -print -quit
+  find "${ROOT_DIR}/build/ops_copysfa_mtp" -maxdepth 1 -name "_C*.so" -print -quit
 )"
 if [[ -z "${EXTENSION}" ]]; then
-  echo "[mtp-ops] ERROR: built extension _C*.so was not found." >&2
+  echo "[copysfa-mtp] ERROR: built extension _C*.so was not found." >&2
   exit 1
 fi
 cp -f "${EXTENSION}" "${ROOT_DIR}/nanovllm/"
@@ -91,4 +90,4 @@ if [[ -f "${OPAPI_DIR}/libcust_opapi.so" ]]; then
 fi
 
 ls -lh "${ROOT_DIR}/nanovllm"/_C*.so
-echo "[mtp-ops] built the standalone MTP offloading extension and local OPP"
+echo "[copysfa-mtp] built COPYSFA-MTP and its split baselines"

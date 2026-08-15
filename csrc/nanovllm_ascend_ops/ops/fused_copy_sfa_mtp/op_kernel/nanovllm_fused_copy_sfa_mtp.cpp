@@ -41,7 +41,7 @@ __aicore__ inline void RunFusedMtp(
 {
     // The source-aware SFA path reuses each query-level DRAM gather for the
     // persistent HBM update.  Compact union metadata remains part of the ABI
-    // for LIM/COPYSFA composition but needs no separate pre-copy pass.
+    // for metadata/COPYSFA composition but needs no separate pre-copy pass.
     (void)missSourceIds;
     (void)missDestinationSlots;
 

@@ -1,30 +1,6 @@
-# GLM MTP3 offloading operators
+# COPYSFA-MTP 单算子调优工程
 
-这是 GLM MTP3 decode offloading 算子的独立调优工程，不包含 nanovllm 推理框架，也不依赖 `nanovllm-DSA-offload-mtp` 的源码或编译产物。当前公开并测试 `fused_li_manage_mtp`、`scatter_copy`、`sparse_tail_attention_mtp` 和实验性的 `fused_copy_sfa_mtp`。
-
-　
-
-## 算子接口
-
-```python
-torch.ops.nanovllm_dsa.fused_li_manage_mtp(
-    query,                    # bf16/fp16 [B*4, 32, 128]，只读
-    index_weights,            # bf16/fp16 [B*4, 32]，只读
-    index_key_cache,          # bf16/fp16 [blocks, 128, 1, 128]，只读
-    index_block_table,        # int32 [B, max_source_blocks]，只读
-    num_candidate_tokens,     # int32 [B]，只读
-    num_cache_tokens,         # int32 [B]，只读
-    req_pool_entries,         # int32 [B]，只读
-    cache_slots_pool,         # int32 [pool_size, source_capacity]，读写
-    topk_src_ids,             # int32 [B*4, 1, 2048]，只写
-    topk_dst_slots,           # int32 [B*4, 1, 2048]，只写
-    miss_src_ids,             # int32 [B, 8192]，只写
-    miss_dst_slots,           # int32 [B, 8192]，只写
-    miss_counts,              # int32 [B]，只写
-) -> None
-```
-
-固定语义：GLM MTP3、每请求 4 个 query、每个 query 独立 top2048，再对四路并集执行一次命中、淘汰和 cache state 更新。`topk_src_ids` 的 HBM hit 位置为 `-1`；`miss_src_ids` 和 `miss_dst_slots` 每行只有前 `miss_counts[b]` 个元素有效。
+这是 GLM MTP3 `fused_copy_sfa_mtp` 的独立调优工程，不包含 nanovllm 推理框架，也不依赖 `nanovllm-DSA-offload-mtp` 的源码或编译产物。`scatter_copy` 和 `sparse_tail_attention_mtp` 仅作为 split 性能与精度基线保留。
 
 　
 
@@ -62,9 +38,6 @@ export ASCEND_HOME_PATH=/usr/local/Ascend/cann-8.5.1
 export SOC_VERSION=ascend910_9391
 export NANOVLLM_CANN_BUILD_JOBS=64
 
-bash scripts/rebuild_nanovllm_cann_kernel.sh fused_li_manage_mtp
-
-# 仅重编实验性的 source-aware COPYSFA-MTP 内核
 bash scripts/rebuild_nanovllm_cann_kernel.sh fused_copy_sfa_mtp
 ```
 
@@ -83,30 +56,36 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export ASCEND_LAUNCH_BLOCKING=0
 export ASCEND_RT_VISIBLE_DEVICES=4
 
-python3 ut_ops/test_fused_li_manage_mtp.py \
+python3 ut_ops/test_fused_copy_sfa_mtp.py \
   --device npu:0 \
   --batch-size 24 \
-  --source-len 20992 \
+  --heads 8 \
+  --source-len 65536 \
   --cache-tokens 8192 \
-  --perf-query-miss-count 200 \
-  --perf-query-noise 0.25 \
-  --graph-replays 3 \
+  --tail-tokens 64 \
+  --perf-miss-count 300 \
+  --perf-miss-overlap-rate 0.3333333333333333 \
+  --graph-replays 2 \
   --warmup 10 \
   --iters 100 \
   --seed 7
 ```
 
-UT 覆盖 BF16/FP16 语义、乱序 request-pool、动态 ACLGraph replay，以及 `B=24` 典型负载时延。性能日志中的 `index_management_mtp3_us` 定义为：
+UT 直接构造语义一致的 TopK/miss/slot metadata。语义压力场景覆盖最高 8192 个 union misses；性能场景用 `--perf-miss-count` 指定每请求的 unique union misses，用 `--perf-miss-overlap-rate` 指定这些 miss 在 4 个 query 间的重合率，并与 `scatter_copy + sparse_tail_attention_mtp` 比较。完整 top2048 的重合度不是性能场景的约束。
+
+miss 重合率定义为：
 
 ```text
-fused_lim_mtp3_us - official_li_mtp3_us
+(4 个 query 的 miss occurrence 总数 - unique union misses)
+----------------------------------------------------------
+                 3 * unique union misses
 ```
 
-非 MTP 的单 query LIM 基准不属于本单算子工程，跨版本对比时使用主仓库已记录的基线。
+取值 `0` 表示各 query 的 miss 完全不重复，`1` 表示每个 miss 都出现在 4 个 query 中；默认 `1/3` 表示每个 unique miss 平均出现在 2 个 query 中。因 token 数取整，日志会同时打印请求值、实际值和各 query 的实际 miss 数。
 
 　
 
-## 实验性 COPYSFA-MTP
+## 算子接口
 
 `fused_copy_sfa_mtp` 保持 nanovllm 的固定 ABI：调用方提供输出 buffer，HBM cache 原地更新，算子不返回 alias。当前实现是 source-aware 单内核研究版本。
 
@@ -151,4 +130,4 @@ python3 ut_ops/test_fused_copy_sfa_mtp.py \
   --diagnose-attention
 ```
 
-当前精度问题及后续约束记录在 `TODO.md`；在精度与时延都验收通过前，不合回 nanovllm。
+后续优化约束记录在 `TODO.md`；在典型负载时延验收完成前，不合回 nanovllm。

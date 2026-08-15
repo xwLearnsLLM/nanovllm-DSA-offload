@@ -39,7 +39,6 @@ except ImportError as exc:
     ) from exc
 
 
-fused_li_manage_mtp = torch.ops.nanovllm_dsa.fused_li_manage_mtp.default
 scatter_copy = torch.ops.nanovllm_dsa.scatter_copy.default
 sparse_tail_attention_mtp = (
     torch.ops.nanovllm_dsa.sparse_tail_attention_mtp.default
@@ -47,7 +46,6 @@ sparse_tail_attention_mtp = (
 fused_copy_sfa_mtp = torch.ops.nanovllm_dsa.fused_copy_sfa_mtp.default
 
 __all__ = [
-    "fused_li_manage_mtp",
     "scatter_copy",
     "sparse_tail_attention_mtp",
     "fused_copy_sfa_mtp",

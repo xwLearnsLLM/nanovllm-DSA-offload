@@ -1,33 +1,32 @@
-"""End-to-end MTP3 LIM -> SCATTER -> sparse-and-tail Attention UT."""
+"""COPYSFA-MTP semantic, graph, and split-baseline checks."""
 
 from __future__ import annotations
 
 import argparse
 import math
-from dataclasses import replace
 
 import torch
 import torch_npu  # type: ignore
 
 import nanovllm.ops  # noqa: F401  # Load repository-local custom operators.
 from ut_ops._op_utils import require_local_opapi
-import test_fused_li_manage_mtp as lim_ut
+import _mtp_fixture as fixture
 
 
-QUERY_COUNT = lim_ut.QUERY_COUNT
-BLOCK_SIZE = lim_ut.BLOCK_SIZE
-TOPK = lim_ut.TOPK
-UNION_CAPACITY = lim_ut.UNION_CAPACITY
-CKV_DIM = lim_ut.CKV_DIM
-KPE_DIM = lim_ut.KPE_DIM
+QUERY_COUNT = fixture.QUERY_COUNT
+BLOCK_SIZE = fixture.BLOCK_SIZE
+TOPK = fixture.TOPK
+UNION_CAPACITY = fixture.UNION_CAPACITY
+CKV_DIM = fixture.CKV_DIM
+KPE_DIM = fixture.KPE_DIM
 KNOWN_FUSED_ATTENTION_ATOL = 0.1
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Validate the real MTP LIM outputs through SCATTER and MTP3 "
-            "sparse-and-tail Attention on one NPU."
+            "Validate COPYSFA-MTP against SCATTER plus MTP3 sparse-and-tail "
+            "Attention on one NPU."
         )
     )
     parser.add_argument("--device", default="npu:0")
@@ -46,6 +45,18 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Exact miss count per request in the performance-only case. "
             "Semantic and graph checks retain broad miss coverage."
+        ),
+    )
+    parser.add_argument(
+        "--perf-miss-overlap-rate",
+        type=float,
+        default=1.0 / 3.0,
+        help=(
+            "Normalized overlap of unique misses across four queries: "
+            "(query-level miss occurrences - unique misses) / "
+            "(3 * unique misses). 0 means no repeated source read; 1 means "
+            "every miss appears in all four queries. Default 1/3 makes each "
+            "miss appear in two queries on average."
         ),
     )
     parser.add_argument(
@@ -76,7 +87,7 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--heads must be a power of two in [1,128]")
     if (
         args.source_len < UNION_CAPACITY
-        or args.source_len > lim_ut.MAX_SOURCE_CAPACITY
+        or args.source_len > fixture.MAX_SOURCE_CAPACITY
         or args.source_len % BLOCK_SIZE
     ):
         raise ValueError("--source-len must be block aligned and in [8192,2^18]")
@@ -94,6 +105,21 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--warmup must be >=0 and --iters must be positive")
     if not 0 <= args.perf_miss_count <= UNION_CAPACITY:
         raise ValueError("--perf-miss-count must be in [0,8192]")
+    if not 0.0 <= args.perf_miss_overlap_rate <= 1.0:
+        raise ValueError("--perf-miss-overlap-rate must be in [0,1]")
+    query_miss_occurrences = args.perf_miss_count + round(
+        3 * args.perf_miss_count * args.perf_miss_overlap_rate
+    )
+    if query_miss_occurrences > UNION_CAPACITY:
+        raise ValueError(
+            "the requested miss count/overlap needs more than four TopK2048 "
+            "rows; reduce --perf-miss-count or --perf-miss-overlap-rate"
+        )
+    if args.perf_miss_count > args.source_len - args.cache_tokens:
+        raise ValueError(
+            "the performance fixture needs at least --perf-miss-count source "
+            "tokens outside the initial cache"
+        )
 
 
 def logical_rows(
@@ -115,7 +141,7 @@ def make_miss_fractions(batch_size: int) -> tuple[float, ...]:
 
 def initialize_hbm(
     *,
-    case: lim_ut.MtpCase,
+    case: fixture.MtpCase,
     cache_tokens: int,
     final_kv_len: int,
     dram_kpe: torch.Tensor,
@@ -125,7 +151,7 @@ def initialize_hbm(
     hbm_blocks: int,
     generator: torch.Generator,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Materialize the pre-update LIM token-to-slot state in HBM."""
+    """Materialize the pre-update token-to-slot state in HBM."""
 
     initial_kpe = torch.zeros(
         hbm_blocks, BLOCK_SIZE, KPE_DIM, dtype=torch.bfloat16
@@ -143,11 +169,11 @@ def initialize_hbm(
         sources = torch.nonzero(state >= 0).flatten()
         if sources.numel() != cache_tokens:
             raise AssertionError(
-                f"request={request}: initial LIM state does not contain C tokens"
+                f"request={request}: initial cache state does not contain C tokens"
             )
         source_ids[request] = sources.to(torch.int32)
         destination_slots[request] = state[sources]
-    lim_ut._apply_scatter_reference(
+    fixture.apply_scatter_reference(
         initial_kpe,
         initial_ckv,
         dram_kpe,
@@ -193,20 +219,20 @@ def expected_after_scatter(
     dram_ckv: torch.Tensor,
     hbm_table: torch.Tensor,
     dram_table: torch.Tensor,
-    lim_outputs: tuple[torch.Tensor, ...],
+    metadata: tuple[torch.Tensor, ...],
 ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
     expected_kpe = initial_kpe.clone()
     expected_ckv = initial_ckv.clone()
-    counts = lim_outputs[4].cpu()
-    lim_ut._apply_scatter_reference(
+    counts = metadata[4].cpu()
+    fixture.apply_scatter_reference(
         expected_kpe,
         expected_ckv,
         dram_kpe,
         dram_ckv,
         hbm_table,
         dram_table,
-        lim_outputs[2].cpu(),
-        lim_outputs[3].cpu(),
+        metadata[2].cpu(),
+        metadata[3].cpu(),
         counts,
     )
     return (
@@ -225,7 +251,7 @@ def cache_mismatch_diagnostic(
     hbm_table: torch.Tensor,
     dram_cache: torch.Tensor,
     dram_table: torch.Tensor,
-    lim_outputs: tuple[torch.Tensor, ...],
+    metadata: tuple[torch.Tensor, ...],
 ) -> str:
     mismatch = actual != expected
     mismatch_elements = int(mismatch.sum())
@@ -249,9 +275,9 @@ def cache_mismatch_diagnostic(
         request = int(table_match[0, 0])
         block_column = int(table_match[0, 1])
         logical_slot = block_column * BLOCK_SIZE + block_offset
-        counts = lim_outputs[4].cpu().to(torch.int64)
-        destinations = lim_outputs[3].cpu().to(torch.int64)
-        sources = lim_outputs[2].cpu().to(torch.int64)
+        counts = metadata[4].cpu().to(torch.int64)
+        destinations = metadata[3].cpu().to(torch.int64)
+        sources = metadata[2].cpu().to(torch.int64)
         count = int(counts[request])
         destination_match = torch.nonzero(
             destinations[request, :count] == logical_slot,
@@ -275,10 +301,10 @@ def cache_mismatch_diagnostic(
         )
         if source_match.numel():
             actual_source = int(source_match[0, 0])
-        aligned_sources = lim_outputs[1].reshape(
+        aligned_sources = metadata[1].reshape(
             -1, QUERY_COUNT, TOPK
         )[request].cpu().to(torch.int64)
-        aligned_slots = lim_outputs[0].reshape(
+        aligned_slots = metadata[0].reshape(
             -1, QUERY_COUNT, TOPK
         )[request].cpu().to(torch.int64)
 
@@ -445,21 +471,21 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
     )
     final_kv_len = cache_tokens + tail_tokens + QUERY_COUNT
     hbm_capacity = math.ceil(final_kv_len / BLOCK_SIZE) * BLOCK_SIZE
-    case = lim_ut.make_case(
+    case = fixture.make_case(
         name="mtp_offload_chain",
         device=device,
-        dtype=torch.bfloat16,
-        candidate_lens=(args.source_len,) * batch_size,
-        cache_tokens=(cache_tokens,) * batch_size,
-        miss_fractions=make_miss_fractions(batch_size),
+        batch_size=batch_size,
         source_capacity=args.source_len,
+        cache_tokens=cache_tokens,
+        miss_fractions=make_miss_fractions(batch_size),
         seed=args.seed + 5000,
+        topk_profile="broad",
     )
     generator = torch.Generator().manual_seed(args.seed + 5017)
-    dram_table_cpu, dram_blocks = lim_ut._random_block_table(
+    dram_table_cpu, dram_blocks = fixture.random_block_table(
         batch_size, args.source_len // BLOCK_SIZE, generator
     )
-    hbm_table_cpu, hbm_blocks = lim_ut._random_block_table(
+    hbm_table_cpu, hbm_blocks = fixture.random_block_table(
         batch_size, hbm_capacity // BLOCK_SIZE, generator
     )
     dram_kpe_cpu = torch.randn(
@@ -504,8 +530,8 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
     ).mul_(0.25).to(torch.bfloat16)
     query = query_cpu.to(device)
     query_rope = query_rope_cpu.to(device)
-    dram_kpe = lim_ut._swapped_from_cpu(dram_kpe_cpu, device)
-    dram_ckv = lim_ut._swapped_from_cpu(dram_ckv_cpu, device)
+    dram_kpe = fixture.swapped_from_cpu(dram_kpe_cpu, device)
+    dram_ckv = fixture.swapped_from_cpu(dram_ckv_cpu, device)
     dram_table = dram_table_cpu.to(device)
     hbm_table = hbm_table_cpu.to(device)
     actual_q = torch.arange(
@@ -521,19 +547,15 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
     scale = 1.0 / math.sqrt(CKV_DIM + KPE_DIM)
 
     def launch(
-        cache_slots: torch.Tensor,
         hbm_kpe: torch.Tensor,
         hbm_ckv: torch.Tensor,
-        lim_buffers: tuple[torch.Tensor, ...],
+        metadata: tuple[torch.Tensor, ...],
         attention_output: torch.Tensor,
-    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
-        lim_outputs = lim_ut.call_mtp_with_buffers(
-            case, cache_slots, *lim_buffers
-        )
+    ) -> torch.Tensor:
         torch.ops.nanovllm_dsa.scatter_copy.default(
-            lim_outputs[2],
-            lim_outputs[3],
-            lim_outputs[4],
+            metadata[2],
+            metadata[3],
+            metadata[4],
             hbm_table,
             dram_table,
             hbm_kpe,
@@ -546,7 +568,7 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
             query_rope=query_rope,
             kpe=hbm_kpe,
             ckv=hbm_ckv,
-            sparse_slots=lim_outputs[0],
+            sparse_slots=metadata[0],
             cache_tokens=case.cache_tokens,
             hbm_table=hbm_table,
             actual_q=actual_q,
@@ -554,29 +576,25 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
             scale=scale,
             output=attention_output,
         )
-        return lim_outputs, attention
+        return attention
 
     def launch_fused(
-        cache_slots: torch.Tensor,
         hbm_kpe: torch.Tensor,
         hbm_ckv: torch.Tensor,
-        lim_buffers: tuple[torch.Tensor, ...],
+        metadata: tuple[torch.Tensor, ...],
         attention_output: torch.Tensor,
-    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
-        lim_outputs = lim_ut.call_mtp_with_buffers(
-            case, cache_slots, *lim_buffers
-        )
+    ) -> torch.Tensor:
         torch.ops.nanovllm_dsa.fused_copy_sfa_mtp.default(
             query_rope,
             query,
             actual_q,
             actual_kv,
             case.cache_tokens,
-            lim_outputs[0],
-            lim_outputs[1],
-            lim_outputs[2],
-            lim_outputs[3],
-            lim_outputs[4],
+            metadata[0],
+            metadata[1],
+            metadata[2],
+            metadata[3],
+            metadata[4],
             hbm_table,
             dram_table,
             hbm_kpe.view(-1, BLOCK_SIZE, 1, KPE_DIM),
@@ -586,25 +604,17 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
             scale,
             attention_output,
         )
-        return lim_outputs, attention_output
+        return attention_output
 
     def validate_chain(
         *,
         label: str,
-        before_cache: torch.Tensor,
-        cache_slots: torch.Tensor,
         hbm_kpe: torch.Tensor,
         hbm_ckv: torch.Tensor,
-        lim_outputs: tuple[torch.Tensor, ...],
+        metadata: tuple[torch.Tensor, ...],
         attention: torch.Tensor,
     ) -> tuple[list[int], float]:
-        counts = lim_ut.validate_result(
-            case,
-            before_cache,
-            cache_slots,
-            lim_outputs,
-            label=label,
-        )
+        counts = [int(value) for value in metadata[4].cpu().tolist()]
         expected_kpe, expected_ckv, payload_counts = expected_after_scatter(
             initial_kpe=initial_kpe_cpu,
             initial_ckv=initial_ckv_cpu,
@@ -612,10 +622,10 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
             dram_ckv=dram_ckv_cpu,
             hbm_table=hbm_table_cpu,
             dram_table=dram_table_cpu,
-            lim_outputs=lim_outputs,
+            metadata=metadata,
         )
         if counts != payload_counts:
-            raise AssertionError(f"{label}: LIM and SCATTER counts differ")
+            raise AssertionError(f"{label}: metadata and SCATTER counts differ")
         actual_kpe = hbm_kpe.cpu()
         actual_ckv = hbm_ckv.cpu()
         if not torch.equal(actual_kpe, expected_kpe):
@@ -629,7 +639,7 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
                     hbm_table=hbm_table_cpu,
                     dram_cache=dram_kpe_cpu,
                     dram_table=dram_table_cpu,
-                    lim_outputs=lim_outputs,
+                    metadata=metadata,
                 )
             )
         if not torch.equal(actual_ckv, expected_ckv):
@@ -643,7 +653,7 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
                     hbm_table=hbm_table_cpu,
                     dram_cache=dram_ckv_cpu,
                     dram_table=dram_table_cpu,
-                    lim_outputs=lim_outputs,
+                    metadata=metadata,
                 )
             )
         golden = attention_golden(
@@ -652,7 +662,7 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
             kpe=expected_kpe,
             ckv=expected_ckv,
             hbm_table=hbm_table_cpu,
-            sparse_slots=lim_outputs[0].cpu(),
+            sparse_slots=metadata[0].cpu(),
             cache_tokens=cache_tokens,
             tail_tokens=tail_tokens,
             scale=scale,
@@ -662,7 +672,7 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
         torch.testing.assert_close(actual, golden, rtol=0.08, atol=golden_atol)
         return counts, float((actual - golden).abs().max())
 
-    eager_cache = case.initial_cache_cpu.to(device)
+    eager_outputs = fixture.materialize_metadata(case)
     eager_kpe = initial_kpe_cpu.to(device)
     eager_ckv = initial_ckv_cpu.to(device)
     eager_attention_buffer = torch.empty(
@@ -672,21 +682,18 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
         dtype=torch.bfloat16,
         device=device,
     )
-    eager_outputs, eager_attention = launch(
-        eager_cache,
+    eager_attention = launch(
         eager_kpe,
         eager_ckv,
-        lim_ut.make_outputs(case),
+        eager_outputs,
         eager_attention_buffer,
     )
     torch.npu.synchronize()
     eager_counts, eager_max_abs = validate_chain(
         label="mtp_offload_chain/eager",
-        before_cache=case.initial_cache_cpu,
-        cache_slots=eager_cache,
         hbm_kpe=eager_kpe,
         hbm_ckv=eager_ckv,
-        lim_outputs=eager_outputs,
+        metadata=eager_outputs,
         attention=eager_attention,
     )
     if max(eager_counts) <= TOPK or max(eager_counts) > UNION_CAPACITY:
@@ -702,37 +709,25 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
         flush=True,
     )
 
-    fused_cache = case.initial_cache_cpu.to(device)
     fused_kpe = initial_kpe_cpu.to(device)
     fused_ckv = initial_ckv_cpu.to(device)
     fused_attention_buffer = torch.empty_like(eager_attention_buffer)
-    fused_outputs, fused_attention = launch_fused(
-        fused_cache,
+    fused_attention = launch_fused(
         fused_kpe,
         fused_ckv,
-        lim_ut.make_outputs(case),
+        eager_outputs,
         fused_attention_buffer,
     )
     torch.npu.synchronize()
     fused_counts, fused_max_abs = validate_chain(
         label="mtp_offload_chain/fused_eager",
-        before_cache=case.initial_cache_cpu,
-        cache_slots=fused_cache,
         hbm_kpe=fused_kpe,
         hbm_ckv=fused_ckv,
-        lim_outputs=fused_outputs,
+        metadata=eager_outputs,
         attention=fused_attention,
     )
     if fused_counts != eager_counts:
         raise AssertionError("split and fused eager miss counts differ")
-    lim_ut._compare_valid_outputs(
-        case,
-        fused_outputs,
-        eager_outputs,
-        label="mtp_offload_chain/split_fused",
-    )
-    if not torch.equal(fused_cache.cpu(), eager_cache.cpu()):
-        raise AssertionError("split and fused LIM states differ")
     if not torch.equal(fused_kpe.cpu(), eager_kpe.cpu()) or not torch.equal(
         fused_ckv.cpu(), eager_ckv.cpu()
     ):
@@ -897,39 +892,34 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
             flush=True,
         )
 
-    # Warm up LIM plus the caller-owned fused interface on disposable state.
-    warm_cache = case.initial_cache_cpu.to(device)
+    # Warm up the caller-owned fused interface on disposable state.
     warm_kpe = initial_kpe_cpu.to(device)
     warm_ckv = initial_ckv_cpu.to(device)
     warm_attention = torch.empty_like(eager_attention_buffer)
     launch_fused(
-        warm_cache,
         warm_kpe,
         warm_ckv,
-        lim_ut.make_outputs(case),
+        eager_outputs,
         warm_attention,
     )
     torch.npu.synchronize()
 
-    graph_cache = case.initial_cache_cpu.to(device)
     graph_kpe = initial_kpe_cpu.to(device)
     graph_ckv = initial_ckv_cpu.to(device)
-    graph_buffers = lim_ut.make_outputs(case)
+    graph_metadata = tuple(tensor.clone() for tensor in eager_outputs)
     graph_attention_buffer = torch.empty_like(eager_attention_buffer)
     graph = torch.npu.NPUGraph()
     pool = torch.npu.graph_pool_handle()
     with torch.npu.graph(graph, pool=pool):
-        graph_outputs, graph_attention = launch_fused(
-            graph_cache,
+        graph_attention = launch_fused(
             graph_kpe,
             graph_ckv,
-            graph_buffers,
+            graph_metadata,
             graph_attention_buffer,
         )
     torch.npu.synchronize()
 
     # Capture may execute.  Replay from the exact pre-update cache state.
-    graph_cache.copy_(case.initial_cache_cpu.to(device))
     graph_kpe.copy_(initial_kpe_cpu.to(device))
     graph_ckv.copy_(initial_ckv_cpu.to(device))
     torch.npu.synchronize()
@@ -937,47 +927,30 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
     torch.npu.synchronize()
     graph_counts, graph_max_abs = validate_chain(
         label="mtp_offload_chain/graph",
-        before_cache=case.initial_cache_cpu,
-        cache_slots=graph_cache,
         hbm_kpe=graph_kpe,
         hbm_ckv=graph_ckv,
-        lim_outputs=graph_outputs,
+        metadata=graph_metadata,
         attention=graph_attention,
     )
     if graph_counts != fused_counts:
         raise AssertionError("eager and graph chain miss counts differ")
-    lim_ut._compare_valid_outputs(
-        case, graph_outputs, fused_outputs, label="mtp_offload_chain/eager_graph"
-    )
-    if not torch.equal(graph_cache.cpu(), fused_cache.cpu()):
-        raise AssertionError("eager and graph LIM states differ")
     if not torch.equal(graph_kpe.cpu(), fused_kpe.cpu()) or not torch.equal(
         graph_ckv.cpu(), fused_ckv.cpu()
     ):
         raise AssertionError("eager and graph HBM cache payloads differ")
     torch.testing.assert_close(graph_attention, fused_attention, rtol=0, atol=0)
 
-    # Identical replay must be zero-miss; SCATTER must leave HBM unchanged and
-    # Attention must remain deterministic while consuming the same top-k slots.
-    repeat_cache_before = graph_cache.cpu()
+    # Reapplying identical copy metadata must be idempotent and Attention must
+    # remain deterministic while consuming the same TopK slots.
     repeat_kpe_before = graph_kpe.cpu()
     repeat_ckv_before = graph_ckv.cpu()
     repeat_attention_before = graph_attention.cpu()
     graph.replay()
     torch.npu.synchronize()
-    repeat_counts = lim_ut.validate_result(
-        case,
-        repeat_cache_before,
-        graph_cache,
-        graph_outputs,
-        label="mtp_offload_chain/graph_repeat",
-    )
-    if any(repeat_counts):
-        raise AssertionError("identical full-chain replay must be zero miss")
     if not torch.equal(graph_kpe.cpu(), repeat_kpe_before) or not torch.equal(
         graph_ckv.cpu(), repeat_ckv_before
     ):
-        raise AssertionError("zero-miss full-chain replay modified HBM cache")
+        raise AssertionError("identical metadata replay changed HBM cache")
     repeat_attention = graph_attention.cpu()
     repeat_attention_max_abs = float(
         (repeat_attention.float() - repeat_attention_before.float()).abs().max()
@@ -985,15 +958,15 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
     if allow_known_fused_diff:
         if repeat_attention_max_abs > KNOWN_FUSED_ATTENTION_ATOL:
             raise AssertionError(
-                "zero-miss full-chain replay Attention difference exceeds "
+                "identical metadata replay Attention difference exceeds "
                 f"{KNOWN_FUSED_ATTENTION_ATOL}: max_abs={repeat_attention_max_abs}"
             )
     elif not torch.equal(repeat_attention, repeat_attention_before):
-        raise AssertionError("zero-miss full-chain replay changed Attention output")
+        raise AssertionError("identical metadata replay changed Attention output")
     print(
         "MTP_OFFLOAD_CHAIN_GRAPH_CHECK "
         f"replays={args.graph_replays} first_nonzero_miss=1 "
-        "repeat_zero_miss=1 lim_to_scatter_dependency=1 "
+        "repeat_copy_idempotent=1 metadata_to_copy_dependency=1 "
         "scatter_to_attention_dependency=1 out_buffer=1 "
         f"attention_max_abs={graph_max_abs:.6f} "
         f"repeat_attention_max_abs={repeat_attention_max_abs:.6f} "
@@ -1002,21 +975,17 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
     )
 
     if not args.skip_performance:
-        perf_initial_cache_cpu, _ = lim_ut._make_cache_state(
-            topk_rows=case.topk_cpu,
-            candidate_lens=(args.source_len,) * batch_size,
-            cache_tokens=(cache_tokens,) * batch_size,
-            req_pool_entries=case.req_pool_entries_cpu,
-            source_capacity=case.source_capacity,
-            miss_fractions=(0.0,) * batch_size,
-            exact_miss_counts=(args.perf_miss_count,) * batch_size,
-            generator=torch.Generator().manual_seed(args.seed + 8000),
-            pool_size=batch_size + 3,
-        )
-        perf_case = replace(
-            case,
+        perf_case = fixture.make_case(
             name="mtp_offload_chain_typical_perf",
-            initial_cache_cpu=perf_initial_cache_cpu,
+            device=device,
+            batch_size=batch_size,
+            source_capacity=case.source_capacity,
+            cache_tokens=cache_tokens,
+            miss_fractions=(0.0,) * batch_size,
+            exact_miss_count=args.perf_miss_count,
+            miss_overlap_rate=args.perf_miss_overlap_rate,
+            seed=args.seed + 8000,
+            topk_profile="miss_overlap",
         )
         perf_initial_kpe_cpu, perf_initial_ckv_cpu = initialize_hbm(
             case=perf_case,
@@ -1029,19 +998,39 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
             hbm_blocks=hbm_blocks,
             generator=torch.Generator().manual_seed(args.seed + 8017),
         )
-        perf_cache = perf_initial_cache_cpu.to(device)
-        perf_outputs = lim_ut.call_mtp_with_buffers(
-            perf_case, perf_cache, *lim_ut.make_outputs(perf_case)
-        )
-        torch.npu.synchronize()
+        perf_outputs = fixture.materialize_metadata(perf_case)
         perf_counts = [int(value) for value in perf_outputs[4].cpu().tolist()]
-        aligned_dram_reads = int((perf_outputs[1] >= 0).sum().cpu())
+        query_miss_occurrences = int((perf_outputs[1] >= 0).sum().cpu())
+        (
+            query_miss_occurrences_mean,
+            actual_overlap_rate,
+        ) = fixture.metadata_stats(perf_case, perf_outputs)
+        query_miss_means = (
+            (perf_outputs[1].view(batch_size, QUERY_COUNT, TOPK) >= 0)
+            .sum(dim=2)
+            .float()
+            .mean(dim=0)
+            .cpu()
+            .tolist()
+        )
         expected_perf_counts = [args.perf_miss_count] * batch_size
         if perf_counts != expected_perf_counts:
             raise AssertionError(
                 f"typical performance miss counts={perf_counts}, "
                 f"expected={expected_perf_counts}"
             )
+        expected_query_misses = args.perf_miss_count + round(
+            3 * args.perf_miss_count * args.perf_miss_overlap_rate
+        )
+        if query_miss_occurrences != batch_size * expected_query_misses:
+            raise AssertionError(
+                "constructed query-level miss occurrences="
+                f"{query_miss_occurrences}, expected="
+                f"{batch_size * expected_query_misses}"
+            )
+        formatted_query_miss_means = ",".join(
+            f"{value:.2f}" for value in query_miss_means
+        )
 
         split_perf_kpe = perf_initial_kpe_cpu.to(device)
         split_perf_ckv = perf_initial_ckv_cpu.to(device)
@@ -1116,9 +1105,15 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
         fused_ms = elapsed_ms(fused_copy_attention)
         print(
             "FUSED_COPY_SFA_MTP_PERF_RESULT "
-            f"batch={batch_size} miss_per_request={args.perf_miss_count} "
-            f"total_misses={sum(perf_counts)} "
-            f"aligned_dram_reads={aligned_dram_reads} "
+            f"batch={batch_size} "
+            f"unique_misses_per_request={args.perf_miss_count} "
+            f"total_unique_misses={sum(perf_counts)} "
+            f"query_miss_occurrences_total={query_miss_occurrences} "
+            "query_miss_occurrences_per_request="
+            f"{query_miss_occurrences_mean:.2f} "
+            f"query_miss_occurrences_by_query=[{formatted_query_miss_means}] "
+            f"miss_overlap_rate_requested={args.perf_miss_overlap_rate:.6f} "
+            f"miss_overlap_rate_actual={actual_overlap_rate:.6f} "
             f"split_ms={split_ms:.6f} fused_ms={fused_ms:.6f} "
             f"speedup={split_ms / fused_ms:.4f} "
             "query_gather_writeback=1 performance_assert=0 "
@@ -1153,6 +1148,8 @@ def main() -> None:
         f"device={device} query_len={QUERY_COUNT} batch={args.batch_size} "
         f"heads={args.heads} source_len={args.source_len} "
         f"cache_tokens={args.cache_tokens} tail_tokens={args.tail_tokens} "
+        f"perf_unique_misses={args.perf_miss_count} "
+        f"perf_miss_overlap_rate={args.perf_miss_overlap_rate:.6f} "
         f"graph_replays={args.graph_replays} seed={args.seed}",
         flush=True,
     )

@@ -9,7 +9,6 @@ OP_NAME="${1:-}"
 usage() {
   cat <<'EOF'
 Usage:
-  bash scripts/rebuild_nanovllm_cann_kernel.sh fused_li_manage_mtp
   bash scripts/rebuild_nanovllm_cann_kernel.sh fused_copy_sfa_mtp
 
 This incremental path requires one successful full build first. It is only
@@ -24,11 +23,6 @@ if [[ $# -ne 1 ]]; then
 fi
 
 case "${OP_NAME}" in
-  fused_li_manage_mtp)
-    KERNEL_NAME="nanovllm_fused_li_manage_mtp"
-    OP_TYPE="NanovllmFusedLiManageMtp"
-    DEPEND_OP_NAMES=()
-    ;;
   fused_copy_sfa_mtp)
     KERNEL_NAME="nanovllm_fused_copy_sfa_mtp"
     OP_TYPE="NanovllmFusedCopySfaMtp"

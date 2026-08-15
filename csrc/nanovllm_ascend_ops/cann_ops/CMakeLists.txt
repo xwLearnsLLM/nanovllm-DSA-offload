@@ -238,7 +238,6 @@ op_add_subdirectory(OP_LIST OP_DIR_LIST)
 # Map framework-facing operator directories to their registered kernel entry
 # names.  The aliases are also used to install the generated dynamic Python and
 # to include the kernels in binary_info_config.json.
-set(fused_li_manage_mtp_kernel_aliases nanovllm_fused_li_manage_mtp)
 set(kvcache_scatter_copy_kernel_aliases nanovllm_kvcache_scatter_copy)
 set(sparse_tail_attention_mtp_kernel_aliases
     nanovllm_sparse_tail_attention_mtp)

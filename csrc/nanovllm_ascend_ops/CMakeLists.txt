@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(ops_lim_mtp)
+project(ops_copysfa_mtp)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -74,7 +74,6 @@ target_include_directories(_C BEFORE PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/common/torch_adapter
   ${CMAKE_CURRENT_SOURCE_DIR}/cann_ops
   ${CMAKE_CURRENT_SOURCE_DIR}/ops/fused_copy_sfa_mtp
-  ${CMAKE_CURRENT_SOURCE_DIR}/ops/fused_li_manage_mtp
   ${CMAKE_CURRENT_SOURCE_DIR}/ops/kvcache_scatter_copy
   ${CMAKE_CURRENT_SOURCE_DIR}/ops/sparse_tail_attention_mtp)
 
