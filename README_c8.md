@@ -17,7 +17,7 @@ Torch namespace 固定为 `nanovllm_dsa`，Python 包名为 `nanovllm_dsa_a5`。
 | --- | --- | --- | --- |
 | 非 MTP 索引选择与管理 | `fused_li_manage_c8` | 单算子初版已实现 | 单个仓内 MIX kernel 融合 A5 C8 LightningIndexer 与 request-pool update；已覆盖 18-bit 边界、乱序 pool、重复更新和图链路 |
 | 非 MTP / MTP1～3 KV 搬移与 Attention metadata | `kvcache_scatter_copy_c8` | 初版已实现，统一 ABI 待改造 | 当前源码已验证非 MTP 的真实 DRAM→HBM；需扩展为动态 copy capacity 和 TND 多 query metadata |
-| 非 MTP sparse+tail Attention | `sparse_tail_attention_c8` | 初版已实现 | 复用 A5 原生 C8 QSFA；已验证单 query，当前限制 `1 <= Q_HEAD <= 64` |
+| 非 MTP sparse+tail Attention | `sparse_tail_attention_c8` | 单算子源码初版，待上机 | 仓内 `A5SparseTailAttentionC8` MIX kernel；计算 sparse top-2048 + dense tail，当前限制 `1 <= Q_HEAD <= 64` |
 | MTP1～3 多 query 索引选择与 union 管理 | `fused_li_manage_mtp_c8` | 单算子源码初版，待上机 | 单个仓内 MIX kernel 融合官方 A5 C8 LightningIndexer 语义与 request-pool union/update；优先保证功能正确，尚未做性能优化 |
 | MTP1～3 sparse+tail Attention | 复用 `sparse_tail_attention_c8` | 复用待验证 | 现有接口形状已经允许 TND 多 query；还需验证 MTP1/2/3 的右下角因果语义与 graph replay |
 
@@ -36,7 +36,7 @@ Torch namespace 固定为 `nanovllm_dsa`，Python 包名为 `nanovllm_dsa_a5`。
 - block size 固定为 128，source capacity 当前最大为 `2^18=262144`。
 - 一个 packed C8 KV token 固定为 656 bytes：`512 FP8 E4M3 + 64 BF16 RoPE + 4 FP32 scales`。
 
-Indexer 的数值与布局语义对齐官方 A5 `npu_quant_lightning_indexer`：query/key 为 FP8 E4M3，weights 为 BF16，query/key scale 为 FP32，layout 为 `TND/PA_BSND`，`sparse_count=2048`，`sparse_mode=3`。非 MTP `fused_li_manage_c8` 已将 LI 和索引管理合入一个仓内 MIX kernel；Attention 使用原生 `npu_kv_quant_sparse_flash_attention`。
+Indexer 的数值与布局语义对齐官方 A5 `npu_quant_lightning_indexer`：query/key 为 FP8 E4M3，weights 为 BF16，query/key scale 为 FP32，layout 为 `TND/PA_BSND`，`sparse_count=2048`，`sparse_mode=3`。非 MTP `fused_li_manage_c8` 已将 LI 和索引管理合入一个仓内 MIX kernel；Attention 也由仓内 `A5SparseTailAttentionC8` 单 kernel 实现。
 
 ## IndexShare group 共享映射
 
@@ -169,7 +169,7 @@ torch.ops.nanovllm_dsa.kvcache_scatter_copy_c8(
 
 ### `sparse_tail_attention_c8`
 
-该入口是 Python custom op，内部直接调用 A5 原生 C8 QSFA，没有重复维护 Attention CANN kernel。
+该入口直接注册到仓内 `A5SparseTailAttentionC8` CANN kernel；Python 只导出 `torch.ops` 句柄，不再调用 `_C_ascend` 或 `torch_npu` 的原生 QSFA。`C>0` 时计算 `2048` 个 sparse slots 与 tail slots，`C=0` 时计算全部有效 resident KV。
 
 ```python
 torch.ops.nanovllm_dsa.sparse_tail_attention_c8(
@@ -250,7 +250,7 @@ torch.ops.nanovllm_dsa.sparse_tail_attention_c8(
 ) -> attention_out            # bf16/fp16[T,Q_HEAD,512]
 ```
 
-必须分别用 MTP1、MTP2、MTP3 与逐 query CPU FP32 causal golden 对比，不能仅凭 native QSFA 接口支持 TND 就判定正确。
+必须分别用 MTP1、MTP2、MTP3 与逐 query CPU FP32 causal golden 对比，不能仅凭算子接口支持 TND 就判定正确。
 
 ## MTP union cache 的硬约束
 
@@ -275,7 +275,7 @@ C_b >= U_b
 
 MTP draft module 自身包含 Attention，因此有独立的 C8 KV cache 和 C8 IndexCache。它与 target verification 的 78 层缓存不是同一套状态。
 
-当前建议：MTP draft layer 数量很少，优先让其完整 C8 KV/Index cache 常驻 HBM；每个 draft step 调用官方 C8 LightningIndexer 和原生 QSFA，不引入新的卸载算子。若后续确认必须卸载 draft layer，则每次递归都是 `query_len=1`，可直接复用现有非 MTP 三算子链路，并使用独立的 request pool、block tables 与 `cache_slots_pool`。
+当前建议：MTP draft layer 数量很少，优先让其完整 C8 KV/Index cache 常驻 HBM；每个 draft step 调用官方 C8 LightningIndexer 和本仓 `sparse_tail_attention_c8`，不引入新的卸载算子。若后续确认必须卸载 draft layer，则每次递归都是 `query_len=1`，可直接复用现有非 MTP 三算子链路，并使用独立的 request pool、block tables 与 `cache_slots_pool`。
 
 该部分属于 nano-vLLM 框架接入策略，本仓库目前没有端到端实现。
 

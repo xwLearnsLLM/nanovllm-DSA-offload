@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Semantic/performance test for native A5 packed-C8 topK+tail QSFA."""
+"""Semantic/performance test for local A5 packed-C8 topK+tail attention."""
 
 from __future__ import annotations
 
 import argparse
 import statistics
+from pathlib import Path
 
 import torch
 
@@ -22,6 +23,7 @@ TILE_SIZE = 128
 SCALE_COUNT = NOPE_DIM // TILE_SIZE
 PACKED_DIM = 656
 TOPK = 2048
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def parse_args() -> argparse.Namespace:
@@ -290,6 +292,35 @@ def check_meta(heads: int, max_tail_tokens: int) -> None:
     )
 
 
+def check_local_kernel_registration() -> None:
+    metadata = tuple(
+        (ROOT / "_custom_opp" / "vendors").glob(
+            "*/op_impl/ai_core/tbe/kernel/config/**/binary_info_config.json"
+        )
+    )
+    if not metadata or not any(
+        "A5SparseTailAttentionC8" in path.read_text(
+            encoding="utf-8", errors="ignore"
+        )
+        for path in metadata
+    ):
+        raise AssertionError(
+            "local A5SparseTailAttentionC8 kernel metadata is missing; "
+            "run bash build.sh"
+        )
+    if not torch._C._dispatch_has_kernel_for_dispatch_key(
+        "nanovllm_dsa::sparse_tail_attention_c8", "PrivateUse1"
+    ):
+        raise AssertionError(
+            "sparse_tail_attention_c8 has no C++ PrivateUse1 kernel"
+        )
+    print(
+        "A5_SPARSE_TAIL_ATTENTION_C8_LOCAL_KERNEL_CHECK "
+        "cann_op=A5SparseTailAttentionC8 privateuse1=1 python_custom_op=0 ok=1",
+        flush=True,
+    )
+
+
 def main() -> None:
     args = parse_args()
     validate_args(args)
@@ -300,6 +331,7 @@ def main() -> None:
     torch.npu.config.allow_internal_format = False
     device_name = require_a5(device, args.allow_non_a5)
     check_meta(args.heads, args.max_tail_tokens)
+    check_local_kernel_registration()
     print(
         "A5_SPARSE_TAIL_ATTENTION_C8_CONFIG "
         f"device={device} device_name={device_name!r} heads={args.heads} "

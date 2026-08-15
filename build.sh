@@ -67,12 +67,13 @@ OP_NAMES=(
     A5KvcacheScatterCopy
     A5KvcacheScatterCopyC8
     A5SparseTailAttention
+    A5SparseTailAttentionC8
     A5FusedCopySparseTailAttention
 )
 
 # These directories provide the BF16 and C8 operators visible to the framework.
-# Both non-MTP and MTP C8 LIDU paths are repository-local MIX kernels. C8
-# Attention remains an adapter over the native A5 QSFA implementation.
+# The BF16 and C8 paths are repository-local device kernels. In particular,
+# sparse_tail_attention_c8 no longer depends on the runtime's native QSFA.
 FRAMEWORK_OP_DIRS=(
     fused_li_manage
     fused_li_manage_mtp

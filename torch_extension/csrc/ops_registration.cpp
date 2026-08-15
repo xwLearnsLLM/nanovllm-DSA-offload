@@ -82,6 +82,11 @@ TORCH_LIBRARY(nanovllm_dsa, m) {
       "Tensor actual_seq_lengths_query, Tensor actual_seq_lengths_kv, "
       "Tensor query_rope, Tensor key_rope, float scale_value) -> Tensor");
   m.def(
+      "sparse_tail_attention_c8("
+      "Tensor query, Tensor packed_kv, Tensor sparse_and_tail_slots, "
+      "Tensor block_table, Tensor actual_seq_lengths_query, "
+      "Tensor resident_seq_lengths, float scale_value) -> Tensor");
+  m.def(
       "fused_copy_sparse_tail_attention("
       "Tensor query, Tensor(a!) hbm_ckv, Tensor sparse_slots, "
       "Tensor cache_tokens, Tensor hbm_block_table, "

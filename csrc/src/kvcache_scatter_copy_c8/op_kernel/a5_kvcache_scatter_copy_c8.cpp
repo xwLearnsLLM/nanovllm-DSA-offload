@@ -3,7 +3,7 @@
  *
  * The row is copied byte-for-byte so FP8 latent values, BF16 RoPE values,
  * and FP32 per-tile scales always move together.  The same launch also emits
- * the resident topK+tail index rows consumed by native A5 C8 QSFA.
+ * the resident topK+tail index rows consumed by A5SparseTailAttentionC8.
  */
 
 #include "kernel_operator.h"

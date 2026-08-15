@@ -7,5 +7,5 @@
 - `fused_li_manage_c8`：W4A4C8 非 MTP LIDU；单个本地 MIX kernel 融合 Quant LightningIndexer 与 request-pool update。
 - `fused_li_manage_mtp_c8`：W4A4C8 MTP1～3 LIDU；单个本地 MIX kernel 融合多 query Quant LightningIndexer、request union 与 request-pool update。
 - `kvcache_scatter_copy_c8`：W4A4C8 packed-KV SCATTER，本地 CANN op。
-- `sparse_tail_attention_c8`：W4A4C8 sparse+tail MLA，直接复用 A5 原生 QSFA，没有本地 CANN kernel。
+- `sparse_tail_attention_c8`：W4A4C8 sparse top-2048 + dense tail MLA，本地 CANN MIX op。
 - `common`：多个本地 CANN op 共享的头文件，不是框架算子。
