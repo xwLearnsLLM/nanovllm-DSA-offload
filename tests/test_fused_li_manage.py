@@ -31,43 +31,6 @@ from _lidu_utils import (
 BLOCK_SIZE = 128
 HEAD_DIM = 128
 
-# Incremental latency (fused LI management minus native LightningIndexer),
-# measured by ops_li_update_a5 on Ascend 950DT with C=12288,
-# miss_count=100..200, warmup=10 and iters=1000.  Exact-matrix runs below
-# print the delta to this historical baseline; it is intentionally not a
-# hard gate because firmware, frequency and native-LI versions affect events.
-REFERENCE_INDEX_MANAGEMENT_US = {
-    (32, 65536, 1): 14.085,
-    (32, 65536, 8): 20.456,
-    (32, 65536, 16): 7.251,
-    (32, 65536, 24): 26.989,
-    (32, 65536, 32): 34.647,
-    (32, 65536, 48): 47.612,
-    (32, 65536, 64): 62.598,
-    (32, 131072, 1): 15.937,
-    (32, 131072, 8): 11.348,
-    (32, 131072, 16): -5.229,
-    (32, 131072, 24): 26.841,
-    (32, 131072, 32): 36.176,
-    (32, 131072, 48): 83.341,
-    (32, 131072, 64): 85.670,
-    (64, 65536, 1): 6.362,
-    (64, 65536, 8): 16.484,
-    (64, 65536, 16): 15.985,
-    (64, 65536, 24): 17.960,
-    (64, 65536, 32): 25.426,
-    (64, 65536, 48): 65.220,
-    (64, 65536, 64): 63.823,
-    (64, 131072, 1): 19.587,
-    (64, 131072, 8): 26.534,
-    (64, 131072, 16): 20.949,
-    (64, 131072, 24): 32.315,
-    (64, 131072, 32): 33.766,
-    (64, 131072, 48): 85.174,
-    (64, 131072, 64): 90.316,
-}
-
-
 @dataclass
 class Case:
     query: torch.Tensor
@@ -112,8 +75,8 @@ def check_args(args: argparse.Namespace) -> None:
     valid_budgets = lambda c: c == 0 or (TOPK <= c <= MAX_CACHE_TOKENS and c % BLOCK_SIZE == 0)
     if any(not valid_budgets(tokens) for tokens in args.cache_tokens):
         raise ValueError("cache tokens must be 0 or a block-aligned value in [2048,16256]")
-    if args.pool_extra < 0 or args.warmup < 0 or args.iters < 0:
-        raise ValueError("pool-extra/warmup/iters must be non-negative")
+    if args.pool_extra < 0 or args.warmup < 0 or args.iters <= 0:
+        raise ValueError("pool-extra/warmup must be non-negative and iters positive")
 
 
 def native_lightning_indexer(
@@ -436,25 +399,6 @@ def event_benchmark(
     )
 
 
-def reference_comparison(
-    heads: int,
-    source_len: int,
-    batch: int,
-    budget: int,
-    miss_range: tuple[int, int],
-    measured_extra_us: float,
-) -> str:
-    if budget != 12288 or miss_range != (100, 200):
-        return ""
-    reference = REFERENCE_INDEX_MANAGEMENT_US.get((heads, source_len, batch))
-    if reference is None:
-        return ""
-    return (
-        f" reference_index_management_us={reference:+.3f}"
-        f" delta_vs_reference_us={measured_extra_us - reference:+.3f}"
-    )
-
-
 def check_meta() -> None:
     query = torch.empty((3, 32, HEAD_DIM), dtype=torch.bfloat16, device="meta")
     key = torch.empty((96, BLOCK_SIZE, 1, HEAD_DIM), dtype=torch.bfloat16, device="meta")
@@ -555,24 +499,19 @@ def main() -> None:
                             args.seed,
                         )
                         check_case(case)
-                        if args.iters > 0:
-                            native_us, lidu_us, extra_us = event_benchmark(
-                                case, args.warmup, args.iters, args.seed
-                            )
-                            comparison = reference_comparison(
-                                heads, source_len, batch, budget,
-                                miss_range, extra_us,
-                            )
-                            print(
-                                "A5_FUSED_LI_MANAGE_RESULT "
-                                f"heads={heads} batch={batch} source_len={source_len} C={budget} "
-                                f"miss_range={miss_range[0]}:{miss_range[1]} "
-                                f"actual_miss_mean={statistics.mean(case.target_misses):.3f} "
-                                f"native_li_us={native_us:.3f} lidu_us={lidu_us:.3f} "
-                                f"index_management_us={extra_us:+.3f} paired=1"
-                                f"{comparison} warmup={args.warmup} iters={args.iters}",
-                                flush=True,
-                            )
+                        native_us, lidu_us, extra_us = event_benchmark(
+                            case, args.warmup, args.iters, args.seed
+                        )
+                        print(
+                            "A5_FUSED_LI_MANAGE_RESULT "
+                            f"heads={heads} batch={batch} source_len={source_len} C={budget} "
+                            f"miss_range={miss_range[0]}:{miss_range[1]} "
+                            f"actual_miss_mean={statistics.mean(case.target_misses):.3f} "
+                            f"native_li_us={native_us:.3f} lidu_us={lidu_us:.3f} "
+                            f"index_management_us={extra_us:+.3f} paired=1 "
+                            f"warmup={args.warmup} iters={args.iters}",
+                            flush=True,
+                        )
     print("A5_FUSED_LI_MANAGE_UT_OK", flush=True)
 
 

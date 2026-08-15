@@ -59,8 +59,8 @@ def check_args(args: argparse.Namespace) -> None:
     )
     if any(not valid_budget(value) for value in args.cache_tokens):
         raise ValueError("cache tokens must be 0 or block aligned in [2048,16256]")
-    if args.pool_extra < 0 or args.warmup < 0 or args.iters < 0:
-        raise ValueError("pool-extra/warmup/iters must be non-negative")
+    if args.pool_extra < 0 or args.warmup < 0 or args.iters <= 0:
+        raise ValueError("pool-extra/warmup must be non-negative and iters positive")
 
 
 def launch(case: C8Case, pool: torch.Tensor):
@@ -365,22 +365,21 @@ def main() -> None:
                         )
                         case_index += 1
                         check_case(case)
-                        if args.iters > 0:
-                            native_us, lidu_us = event_benchmark(
-                                case, args.warmup, args.iters
-                            )
-                            print(
-                                "A5_FUSED_LI_MANAGE_C8_RESULT "
-                                f"device_name={device_name!r} heads={heads} "
-                                f"batch={batch} source_len={source_len} C={budget} "
-                                f"miss_range={miss_range[0]}:{miss_range[1]} "
-                                f"actual_miss_mean={statistics.mean(case.target_misses):.3f} "
-                                f"official_c8_li_us={native_us:.3f} "
-                                f"c8_lidu_us={lidu_us:.3f} "
-                                f"update_overhead_us={lidu_us - native_us:+.3f} "
-                                f"warmup={args.warmup} iters={args.iters}",
-                                flush=True,
-                            )
+                        native_us, lidu_us = event_benchmark(
+                            case, args.warmup, args.iters
+                        )
+                        print(
+                            "A5_FUSED_LI_MANAGE_C8_RESULT "
+                            f"device_name={device_name!r} heads={heads} "
+                            f"batch={batch} source_len={source_len} C={budget} "
+                            f"miss_range={miss_range[0]}:{miss_range[1]} "
+                            f"actual_miss_mean={statistics.mean(case.target_misses):.3f} "
+                            f"official_c8_li_us={native_us:.3f} "
+                            f"c8_lidu_us={lidu_us:.3f} "
+                            f"update_overhead_us={lidu_us - native_us:+.3f} "
+                            f"warmup={args.warmup} iters={args.iters}",
+                            flush=True,
+                        )
     print("A5_FUSED_LI_MANAGE_C8_UT_OK", flush=True)
 
 

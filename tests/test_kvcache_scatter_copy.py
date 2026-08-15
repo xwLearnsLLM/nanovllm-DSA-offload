@@ -439,7 +439,7 @@ def run(args: argparse.Namespace) -> None:
         else 0.0
     )
     print(
-        "A5_SCATTER_RESULT "
+        "A5_KVCACHE_SCATTER_COPY_RESULT "
         f"copy_min={args.copy_min} copy_max={args.copy_max} "
         f"copied_tokens={copied_tokens} avg_us={avg_us:.3f} "
         f"payload_gbps={payload_gbps:.3f} timer=npu_event "

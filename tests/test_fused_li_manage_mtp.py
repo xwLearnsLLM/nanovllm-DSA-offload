@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Correctness test for the BF16/FP16 fused MTP LI manager."""
+"""Behavior and latency test for the BF16/FP16 fused MTP LI manager."""
 
 import argparse
 import random
+import statistics
 
 import torch
 import torch_npu  # type: ignore  # noqa: F401
@@ -38,6 +39,8 @@ def parse_args():
     parser.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")
     parser.add_argument("--min-miss-count", type=int, default=0)
     parser.add_argument("--max-miss-count", type=int, default=300)
+    parser.add_argument("--warmup", type=int, default=3)
+    parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--allow-non-a5", action="store_true")
     return parser.parse_args()
@@ -56,6 +59,8 @@ def validate_args(args):
         raise ValueError("block-size must be a positive multiple of 16")
     if not (0 <= args.min_miss_count <= args.max_miss_count <= CACHE_SIZE):
         raise ValueError("require 0 <= min_miss_count <= max_miss_count <= 8192")
+    if args.warmup < 0 or args.iters <= 0:
+        raise ValueError("warmup must be non-negative and iters positive")
 
 
 def find_native_op():
@@ -230,6 +235,31 @@ def run_mtp(case, cache):
     )
 
 
+def benchmark(case, initial_cache, warmup, iters):
+    cache = initial_cache.clone()
+    for _ in range(warmup):
+        cache.copy_(initial_cache)
+        run_mtp(case, cache)
+    torch.npu.synchronize()
+
+    starts = [torch.npu.Event(enable_timing=True) for _ in range(iters)]
+    ends = [torch.npu.Event(enable_timing=True) for _ in range(iters)]
+    retained = []
+    for start, end in zip(starts, ends):
+        # The manager mutates cache state. Restore it before every sample, but
+        # insert the timing event after the restore so only the operator is timed.
+        cache.copy_(initial_cache)
+        start.record()
+        retained.append(run_mtp(case, cache))
+        end.record()
+    ends[-1].synchronize()
+    if not retained:
+        raise AssertionError("timed MTP outputs were not retained")
+    return statistics.mean(
+        start.elapsed_time(end) for start, end in zip(starts, ends)
+    ) * 1000.0
+
+
 def check_meta():
     query = torch.empty((7, 32, 128), dtype=torch.bfloat16, device="meta")
     key = torch.empty((96, 128, 1, 128), dtype=torch.bfloat16, device="meta")
@@ -381,6 +411,7 @@ def main():
     torch.npu.synchronize()
     reference_cpu = reference.cpu()
     cache, targets, reference_unions = make_cache(args, case, reference_cpu)
+    initial_cache = cache.clone()
     old_cache = cache.cpu()
     output = run_mtp(case, cache)
     torch.npu.synchronize()
@@ -400,6 +431,16 @@ def main():
     print("request_union_dedup_check=passed")
     print("union_miss_index_and_slot_check=passed")
     print("single_cache_update_check=passed")
+    avg_us = benchmark(case, initial_cache, args.warmup, args.iters)
+    print(
+        "A5_FUSED_LI_MANAGE_MTP_RESULT "
+        f"batch={args.bs} packed_t={case['packed_tokens']} "
+        f"q_heads={args.q_heads} min_seqlen={min(case['final_seqlens'])} "
+        f"max_seqlen={max(case['final_seqlens'])} "
+        f"miss_mean={statistics.mean(targets):.3f} avg_us={avg_us:.3f} "
+        f"warmup={args.warmup} iters={args.iters}",
+        flush=True,
+    )
     print("A5_FUSED_LI_MANAGE_MTP_UT_OK")
 
 

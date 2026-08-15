@@ -73,8 +73,8 @@ def check_args(args: argparse.Namespace) -> None:
         raise ValueError("tail token counts must be non-negative")
     if not 1 <= args.heads <= 64:
         raise ValueError("heads must be in [1,64]")
-    if args.warmup < 0 or args.iters < 0:
-        raise ValueError("warmup and iters must be non-negative")
+    if args.warmup < 0 or args.iters <= 0:
+        raise ValueError("warmup must be non-negative and iters positive")
 
 
 def make_case(
@@ -229,7 +229,7 @@ def benchmark(case: Case, warmup: int, iters: int) -> float:
         raise AssertionError("timed outputs were not retained")
     avg_us = statistics.mean(start.elapsed_time(end) for start, end in zip(starts, ends)) * 1000
     print(
-        "A5_SPARSE_TAIL_RESULT "
+        "A5_SPARSE_TAIL_ATTENTION_RESULT "
         f"heads={case.query.size(1)} batch={case.query.size(0)} "
         f"source_len={case.source_len} C={case.cache_budget} tail={case.tail_tokens} "
         f"attended_tokens={logical_tokens(case, 0).numel()} avg_us={avg_us:.3f} "
@@ -307,8 +307,7 @@ def main() -> None:
                         args.seed + 1000 + case_index,
                     )
                     check_case(case)
-                    if args.iters > 0:
-                        benchmark(case, args.warmup, args.iters)
+                    benchmark(case, args.warmup, args.iters)
                     case_index += 1
     print("A5_SPARSE_TAIL_ATTENTION_UT_OK", flush=True)
 

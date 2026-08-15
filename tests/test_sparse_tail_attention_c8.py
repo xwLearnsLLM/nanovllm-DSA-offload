@@ -23,7 +23,6 @@ TILE_SIZE = 128
 SCALE_COUNT = NOPE_DIM // TILE_SIZE
 PACKED_DIM = 656
 TOPK = 2048
-ROOT = Path(__file__).resolve().parents[1]
 
 
 def parse_args() -> argparse.Namespace:
@@ -61,8 +60,8 @@ def validate_args(args: argparse.Namespace) -> None:
            for cache_tokens in args.cache_tokens
            for tail_tokens in args.tail_tokens):
         raise ValueError("dense C=0 test requires at least one resident token")
-    if args.warmup < 0 or args.iters < 0:
-        raise ValueError("warmup and iters must be non-negative")
+    if args.warmup < 0 or args.iters <= 0:
+        raise ValueError("warmup must be non-negative and iters positive")
 
 
 def case_args(
@@ -293,9 +292,10 @@ def check_meta(heads: int, max_tail_tokens: int) -> None:
 
 
 def check_local_kernel_registration() -> None:
+    vendor = Path(nanovllm_dsa_a5.local_opapi_path()).resolve().parents[2]
     metadata = tuple(
-        (ROOT / "_custom_opp" / "vendors").glob(
-            "*/op_impl/ai_core/tbe/kernel/config/**/binary_info_config.json"
+        vendor.glob(
+            "op_impl/ai_core/tbe/kernel/config/**/binary_info_config.json"
         )
     )
     if not metadata or not any(
@@ -306,7 +306,7 @@ def check_local_kernel_registration() -> None:
     ):
         raise AssertionError(
             "local A5SparseTailAttentionC8 kernel metadata is missing; "
-            "run bash build.sh"
+            "run bash build_c8.sh"
         )
     if not torch._C._dispatch_has_kernel_for_dispatch_key(
         "nanovllm_dsa::sparse_tail_attention_c8", "PrivateUse1"
@@ -373,8 +373,7 @@ def main() -> None:
                 )
                 inputs = make_inputs(current)
                 check(inputs, current)
-                if args.iters > 0:
-                    benchmark(inputs, current)
+                benchmark(inputs, current)
                 case_index += 1
     print("A5_SPARSE_TAIL_ATTENTION_C8_UT_OK", flush=True)
 

@@ -720,22 +720,22 @@ def event_benchmark(fn, warmup: int, iters: int) -> float:
     end.synchronize()
     if len(outputs) != iters:
         raise AssertionError("Timed output retention failed.")
-    return float(start.elapsed_time(end)) / iters
+    return float(start.elapsed_time(end)) * 1000.0 / iters
 
 
 def benchmark(case: Case, warmup: int, iters: int) -> None:
     batch = case.query.size(0)
     strategy = "a5_mte_pipeline_default_prefetch5"
-    serial_ms = event_benchmark(lambda: launch_serial(case), warmup, iters)
-    fused_ms = event_benchmark(lambda: launch_fused(case), warmup, iters)
+    serial_us = event_benchmark(lambda: launch_serial(case), warmup, iters)
+    fused_us = event_benchmark(lambda: launch_fused(case), warmup, iters)
     # Keep serial/fused first so component timing cannot perturb their values.
-    scatter_ms = event_benchmark(
+    scatter_us = event_benchmark(
         lambda: launch_scatter_only(case), warmup, iters
     )
-    sfa_ms = event_benchmark(
+    sfa_us = event_benchmark(
         lambda: launch_sfa_only(case), warmup, iters
     )
-    speedup = serial_ms / fused_ms
+    speedup = serial_us / fused_us
     print(
         "A5_FUSED_COPY_SPARSE_TAIL_ATTENTION_RESULT "
         f"batch={batch} heads={case.query.size(1)} strategy={strategy} "
@@ -744,10 +744,10 @@ def benchmark(case: Case, warmup: int, iters: int) -> None:
         f"miss_min={int(case.copy_counts.min())} "
         f"miss_max={int(case.copy_counts.max())} "
         f"miss_mean={float(case.copy_counts.float().mean()):.3f} "
-        f"serial_ms={serial_ms:.6f} "
-        f"scatter_ms={scatter_ms:.6f} sfa_ms={sfa_ms:.6f} "
-        f"fused_ms={fused_ms:.6f} "
-        f"speedup={speedup:.4f} fused_faster={int(fused_ms < serial_ms)} "
+        f"serial_us={serial_us:.3f} "
+        f"scatter_us={scatter_us:.3f} sfa_us={sfa_us:.3f} "
+        f"fused_us={fused_us:.3f} "
+        f"speedup={speedup:.4f} fused_faster={int(fused_us < serial_us)} "
         f"warmup={warmup} iters={iters}",
         flush=True,
     )
@@ -755,8 +755,8 @@ def benchmark(case: Case, warmup: int, iters: int) -> None:
 
 def main() -> None:
     args = parse_args()
-    if args.warmup < 0 or args.iters < 0:
-        raise ValueError("warmup and iters must be non-negative")
+    if args.warmup < 0 or args.iters <= 0:
+        raise ValueError("warmup must be non-negative and iters positive")
     device = torch.device(args.device)
     if device.type != "npu":
         raise ValueError("--device must select an NPU")
@@ -780,8 +780,7 @@ def main() -> None:
         flush=True,
     )
     check_semantics(case)
-    if args.iters > 0:
-        benchmark(case, args.warmup, args.iters)
+    benchmark(case, args.warmup, args.iters)
     print("A5_FUSED_COPY_SPARSE_TAIL_ATTENTION_UT_OK", flush=True)
 
 

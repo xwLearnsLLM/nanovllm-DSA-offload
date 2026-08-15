@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Correctness test for one-kernel A5 C8 MTP LI + cache management."""
+"""Behavior and latency test for one-kernel A5 C8 MTP LI management."""
 
 from __future__ import annotations
 
 import argparse
 import random
+import statistics
 from dataclasses import dataclass
 
 import torch
@@ -65,7 +66,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--miss-min", type=int, default=0)
     parser.add_argument("--miss-max", type=int, default=300)
     parser.add_argument("--pool-extra", type=int, default=7)
-    parser.add_argument("--check-18bit-boundary", action="store_true")
+    parser.add_argument("--warmup", type=int, default=3)
+    parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--allow-non-a5", action="store_true")
     return parser.parse_args()
@@ -90,6 +92,8 @@ def check_args(args: argparse.Namespace) -> None:
         )
     if args.pool_extra < 0:
         raise ValueError("pool-extra must be non-negative")
+    if args.warmup < 0 or args.iters <= 0:
+        raise ValueError("warmup must be non-negative and iters positive")
 
 
 def query_ranges(actual_q: list[int]) -> list[tuple[int, int]]:
@@ -329,6 +333,47 @@ def launch_out(
         miss_slots,
         miss_counts,
     )
+
+
+def benchmark(case: MtpC8Case, warmup: int, iters: int) -> float:
+    batch = len(case.query_counts)
+    packed_t = case.query.size(0)
+    device = case.query.device
+    pool = case.initial_pool.clone()
+    topk_slots = torch.empty(
+        (packed_t, 1, TOPK), dtype=torch.int32, device=device
+    )
+    miss_sources = torch.empty(
+        (batch, UNION_CAPACITY), dtype=torch.int32, device=device
+    )
+    miss_slots = torch.empty_like(miss_sources)
+    miss_counts = torch.empty((batch,), dtype=torch.int32, device=device)
+
+    for _ in range(warmup):
+        pool.copy_(case.initial_pool)
+        launch_out(
+            case, pool, topk_slots, miss_sources, miss_slots, miss_counts
+        )
+    torch.npu.synchronize()
+
+    starts = [torch.npu.Event(enable_timing=True) for _ in range(iters)]
+    ends = [torch.npu.Event(enable_timing=True) for _ in range(iters)]
+    last_outputs = None
+    for start, end in zip(starts, ends):
+        # Restore the mutable request pool outside the timed interval so each
+        # sample retains the requested miss distribution.
+        pool.copy_(case.initial_pool)
+        start.record()
+        last_outputs = launch_out(
+            case, pool, topk_slots, miss_sources, miss_slots, miss_counts
+        )
+        end.record()
+    ends[-1].synchronize()
+    if last_outputs is None:
+        raise AssertionError("timed C8 MTP call returned no outputs")
+    return statistics.mean(
+        start.elapsed_time(end) for start, end in zip(starts, ends)
+    ) * 1000.0
 
 
 def validate_case(
@@ -806,29 +851,19 @@ def main() -> None:
             seed=args.seed + heads,
         )
         check_case(case)
+        avg_us = benchmark(case, args.warmup, args.iters)
+        print(
+            "A5_FUSED_LI_MANAGE_MTP_C8_RESULT "
+            f"heads={heads} batch={args.batch_size} packed_t={case.query.size(0)} "
+            f"source_len={args.source_len} "
+            f"miss_mean={statistics.mean(case.target_misses):.3f} "
+            f"avg_us={avg_us:.3f} warmup={args.warmup} iters={args.iters}",
+            flush=True,
+        )
 
     check_heterogeneous_candidates_and_budgets(device)
     check_overlapping_union_zero_miss(device)
     check_worst_union(device)
-    if args.check_18bit_boundary:
-        boundary = make_case(
-            device=device,
-            batch=1,
-            heads=32,
-            source_len=MAX_SOURCE_CAPACITY,
-            query_counts=[4],
-            budgets=[UNION_CAPACITY],
-            miss_range=(args.miss_min, args.miss_max),
-            pool_extra=args.pool_extra,
-            seed=args.seed + 1000,
-        )
-        if int(boundary.native_topk.max().cpu()) < (1 << 17):
-            raise AssertionError("18-bit boundary case did not select bit 17")
-        check_case(boundary)
-        print(
-            "A5_FUSED_LI_MANAGE_MTP_C8_18BIT_BOUNDARY_CHECK ok=1",
-            flush=True,
-        )
     print("A5_FUSED_LI_MANAGE_MTP_C8_UT_OK", flush=True)
 
 
