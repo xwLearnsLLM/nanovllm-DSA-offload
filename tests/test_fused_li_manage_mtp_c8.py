@@ -16,6 +16,7 @@ from _c8_lidu_case import (
     quantize_fp8,
 )
 from _lidu_utils import (
+    MAX_CACHE_TOKENS,
     MAX_SOURCE_CAPACITY,
     TOPK,
     assert_pool_row,
