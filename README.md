@@ -145,10 +145,10 @@ export NANOVLLM_NUM_SPECULATIVE_TOKENS=3          # set to 0 to disable MTP
 PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_OFFLOAD_MODE=offload_fuse NANOVLLM_HBM_NUM_BLOCKS=600 NANOVLLM_DRAM_NUM_BLOCKS=2600 python3 example/test_dureader.py --prompt_len 65800 --prompt_count 5
 ```
 
-运行 seqlen=64k，bs=18
+运行 seqlen=64k，bs=16
 
 ```bash
-PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_OFFLOAD_MODE=offload_fuse NANOVLLM_HBM_NUM_BLOCKS=1800 NANOVLLM_DRAM_NUM_BLOCKS=9300 python3 example/test_dureader.py --prompt_len 65800 --prompt_count 18
+PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_OFFLOAD_MODE=offload_fuse NANOVLLM_HBM_NUM_BLOCKS=1584 NANOVLLM_DRAM_NUM_BLOCKS=8300 python3 example/test_dureader.py --prompt_len 65800 --prompt_count 16
 ```
 
 　
