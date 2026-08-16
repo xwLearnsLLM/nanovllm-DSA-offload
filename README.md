@@ -92,8 +92,6 @@ flowchart LR
 
 `ModelRunner.prepare_decode` 会把 HBM/DRAM/Index block table、候选长度、LIDU 预算和 request-pool entry 打包到运行时 context。FULL_DECODE_ONLY 复用这些 caller-owned、固定地址的 metadata/output buffer；只有首次初始化完成且运行 batch 与 capture size 精确一致时，才进入稳定 graph replay。
 
-　
-
 ### HBM缓存预算
 
 修改 `nanovllm/engine/dsa_offload.py` 的 `LIDU_CACHE_TOKEN_BUDGETS` 可以修改缓存预算。默认如下：
@@ -109,7 +107,7 @@ flowchart LR
 
 　
 
-## 编译
+## 编译算子
 
 首次部署或修改 C++、host tiling、AscendC kernel 后必须重新编译：
 
@@ -128,43 +126,29 @@ PYTHONPATH=$PWD:$PYTHONPATH PYTHONUNBUFFERED=1 SOC_VERSION=ascend910_9391 NANOVL
 先设置一些公共环境变量
 
 ```bash
+export PYTHONUNBUFFERED=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export ASCEND_LAUNCH_BLOCKING=0
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
-export NANOVLLM_MODEL=/mnt/models/GLM-5.1-w4a8/
+export NANOVLLM_MODEL=/home/models/GLM-5.2-w4a8/  # set model path here, support GLM-5.1-w4a8 and GLM-5.2-w4a8 
 export NANOVLLM_TP_SIZE=16
-export NANOVLLM_ENABLE_EXPERT_PARALLEL=1
 export NANOVLLM_ENFORCE_EAGER=0
-export NANOVLLM_KVCACHE_BLOCK_SIZE=128
-export NANOVLLM_PREFILL_CHUNK_SIZE=1024
 export NANOVLLM_IGNORE_EOS=1
 export NANOVLLM_MAX_STEPS=20
+export NANOVLLM_PREFILL_CHUNK_SIZE=4096           # support 0 (no chunk prefill), 1024, 2048, 4096, 8192 
+export NANOVLLM_NUM_SPECULATIVE_TOKENS=3          # set to 0 to disable MTP
 ```
 
-`NANOVLLM_PREFILL_CHUNK_SIZE` 支持 `0`（关闭）、`1024`、`2048`、`4096` 和 `8192`。
-
-不开MTP，bs=12，seqlen=40k
+运行 seqlen=64k，bs=5
 
 ```bash
-PYTHONPATH=$PWD:$PYTHONPATH PYTHONUNBUFFERED=1 NANOVLLM_OFFLOAD_MODE=offload_fuse NANOVLLM_NUM_SPECULATIVE_TOKENS=0 NANOVLLM_HBM_NUM_BLOCKS=800 NANOVLLM_DRAM_NUM_BLOCKS=3900 NANOVLLM_PROMPT_LENGTHS=40000,40001,40002,40003,40004,40005,40006,40007,40008,40009,40010,40011 python3 example/test.py
+PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_OFFLOAD_MODE=offload_fuse NANOVLLM_HBM_NUM_BLOCKS=600 NANOVLLM_DRAM_NUM_BLOCKS=2600 python3 example/test_dureader.py --prompt_len 65800 --prompt_count 5
 ```
 
-开MTP，bs=12，seqlen=40k
+运行 seqlen=64k，bs=18
 
 ```bash
-PYTHONPATH=$PWD:$PYTHONPATH PYTHONUNBUFFERED=1 NANOVLLM_OFFLOAD_MODE=offload_split NANOVLLM_NUM_SPECULATIVE_TOKENS=3 NANOVLLM_HBM_NUM_BLOCKS=800 NANOVLLM_DRAM_NUM_BLOCKS=3900 NANOVLLM_PROMPT_LENGTHS=40000,40001,40002,40003,40004,40005,40006,40007,40008,40009,40010,40011 python3 example/test.py
-```
-
-不开MTP，bs=12，longbench/dureader最长的12条（序列长度17k左右）
-
-```bash
-NANOVLLM_PREFILL_CHUNK_SIZE=0 PYTHONPATH=$PWD:$PYTHONPATH PYTHONUNBUFFERED=1 NANOVLLM_OFFLOAD_MODE=offload_fuse NANOVLLM_NUM_SPECULATIVE_TOKENS=0 NANOVLLM_HBM_NUM_BLOCKS=800 NANOVLLM_DRAM_NUM_BLOCKS=1500 python3 example/test_dureader.py --prompt_count 12
-```
-
-开MTP，bs=12，longbench/dureader最长的12条（序列长度17k左右）
-
-```bash
-NANOVLLM_PREFILL_CHUNK_SIZE=0 PYTHONPATH=$PWD:$PYTHONPATH PYTHONUNBUFFERED=1 NANOVLLM_OFFLOAD_MODE=offload_split NANOVLLM_NUM_SPECULATIVE_TOKENS=3 NANOVLLM_HBM_NUM_BLOCKS=800 NANOVLLM_DRAM_NUM_BLOCKS=1500 python3 example/test_dureader.py --prompt_count 12
+PYTHONPATH=$PWD:$PYTHONPATH NANOVLLM_OFFLOAD_MODE=offload_fuse NANOVLLM_HBM_NUM_BLOCKS=1800 NANOVLLM_DRAM_NUM_BLOCKS=9300 python3 example/test_dureader.py --prompt_len 65800 --prompt_count 18
 ```
 
 　
@@ -174,7 +158,7 @@ NANOVLLM_PREFILL_CHUNK_SIZE=0 PYTHONPATH=$PWD:$PYTHONPATH PYTHONUNBUFFERED=1 NAN
 只采集 TP rank 0、从首次 decode 到程序结束，加上 `NANOVLLM_PROFILE_DECODE_OUTPUT` 环境变量就行
 
 ```bash
-NANOVLLM_PROFILE_DECODE_OUTPUT=./profile <你要运行的命令>
+NANOVLLM_PROFILE_DECODE_OUTPUT=./<profile输出路径>  <你要运行的命令>
 ```
 
 　
