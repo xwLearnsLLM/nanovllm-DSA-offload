@@ -1,6 +1,6 @@
-# GLM MTP3 offloading operators
+# fused_li_manage_mtp
 
-这是 GLM MTP3 decode offloading 算子的独立调优工程，不包含 nanovllm 推理框架，也不依赖 `nanovllm-DSA-offload-mtp` 的源码或编译产物。当前公开并测试 `fused_li_manage_mtp`、`scatter_copy`、`sparse_tail_attention_mtp` 和实验性的 `fused_copy_sfa_mtp`。
+这是 GLM MTP3 `fused_li_manage_mtp` 的独立调优工程，不包含 nanovllm 推理框架，也不依赖其它仓库的源码、算子或编译产物。
 
 　
 
@@ -8,8 +8,8 @@
 
 ```python
 torch.ops.nanovllm_dsa.fused_li_manage_mtp(
-    query,                    # bf16/fp16 [B*4, 32, 128]，只读
-    index_weights,            # bf16/fp16 [B*4, 32]，只读
+    query,                    # bf16/fp16 [B*4, H, 128]，只读，H=32/64
+    index_weights,            # bf16/fp16 [B*4, H]，只读
     index_key_cache,          # bf16/fp16 [blocks, 128, 1, 128]，只读
     index_block_table,        # int32 [B, max_source_blocks]，只读
     num_candidate_tokens,     # int32 [B]，只读
@@ -24,13 +24,11 @@ torch.ops.nanovllm_dsa.fused_li_manage_mtp(
 ) -> None
 ```
 
-固定语义：GLM MTP3、每请求 4 个 query、每个 query 独立 top2048，再对四路并集执行一次命中、淘汰和 cache state 更新。`topk_src_ids` 的 HBM hit 位置为 `-1`；`miss_src_ids` 和 `miss_dst_slots` 每行只有前 `miss_counts[b]` 个元素有效。
+固定语义：每请求 4 个 query，每个 query 独立执行 top2048，再对四路并集执行一次命中判断、淘汰和 cache state 更新。`topk_src_ids` 的 HBM hit 位置为 `-1`；`miss_src_ids` 和 `miss_dst_slots` 每行只有前 `miss_counts[b]` 个元素有效。
 
 　
 
-## 全量编译
-
-修改 host tiling、op-api、Torch binding、CMake 或首次部署时运行：
+## 编译
 
 ```bash
 export ASCEND_HOME_PATH=/usr/local/Ascend/cann-8.5.1
@@ -44,29 +42,12 @@ export NANOVLLM_EXT_BUILD_JOBS=1
 bash scripts/build_nanovllm_ops.sh
 ```
 
-产物只写入本仓库：
+每次都全量重新编译 `fused_li_manage_mtp`。产物只写入本仓库：
 
 - `nanovllm/_C*.so`
 - `nanovllm/_cann_ops_custom/`
 
 工程不会安装或覆盖系统级自定义算子。
-
-　
-
-## 增量编译
-
-至少成功完成一次全量编译后，如果只修改 AscendC device kernel 或其本地 device header，可以运行：
-
-```bash
-export ASCEND_HOME_PATH=/usr/local/Ascend/cann-8.5.1
-export SOC_VERSION=ascend910_9391
-export NANOVLLM_CANN_BUILD_JOBS=64
-
-bash scripts/rebuild_nanovllm_cann_kernel.sh fused_li_manage_mtp
-
-# 仅重编实验性的 source-aware COPYSFA-MTP 内核
-bash scripts/rebuild_nanovllm_cann_kernel.sh fused_copy_sfa_mtp
-```
 
 　
 
@@ -96,59 +77,15 @@ python3 ut_ops/test_fused_li_manage_mtp.py \
   --seed 7
 ```
 
-UT 覆盖 BF16/FP16 语义、乱序 request-pool、动态 ACLGraph replay，以及 `B=24` 典型负载时延。性能日志中的 `index_management_mtp3_us` 定义为：
+UT 只验证两类内容：
+
+1. 算子语义正确，包括 BF16/FP16、乱序 request pool、重复更新和 ACLGraph replay。
+2. 与官方 `torch_npu.npu_lightning_indexer` 的 MTP3 路径比较时延。
+
+性能日志中的索引管理额外时延定义为：
 
 ```text
-fused_lim_mtp3_us - official_li_mtp3_us
+index_management_mtp3_us = fused_lim_mtp3_us - official_li_mtp3_us
 ```
 
-非 MTP 的单 query LIM 基准不属于本单算子工程，跨版本对比时使用主仓库已记录的基线。
-
-　
-
-## 实验性 COPYSFA-MTP
-
-`fused_copy_sfa_mtp` 保持 nanovllm 的固定 ABI：调用方提供输出 buffer，HBM cache 原地更新，算子不返回 alias。当前实现是 source-aware 单内核研究版本。
-
-```python
-torch.ops.nanovllm_dsa.fused_copy_sfa_mtp(
-    query_rope,
-    query,
-    actual_seq_lengths_query,
-    actual_seq_lengths_kv,
-    num_cache_tokens,
-    topk_dst_slots,
-    topk_src_ids,
-    miss_src_ids,
-    miss_dst_slots,
-    miss_counts,
-    hbm_block_table,
-    dram_block_table,
-    hbm_k_rope,              # mutable
-    hbm_kv_cache,            # mutable
-    dram_k_rope,
-    dram_kv_cache,
-    scale_value,
-    attention_out,           # output
-) -> None
-```
-
-诊断测试：
-
-```bash
-python3 ut_ops/test_fused_copy_sfa_mtp.py \
-  --device npu:0 \
-  --batch-size 4 \
-  --heads 2 \
-  --source-len 20992 \
-  --cache-tokens 8192 \
-  --tail-tokens 64 \
-  --perf-miss-count 300 \
-  --graph-replays 2 \
-  --warmup 0 \
-  --iters 1 \
-  --skip-performance \
-  --diagnose-attention
-```
-
-当前精度问题及后续约束记录在 `TODO.md`；在精度与时延都验收通过前，不合回 nanovllm。
+官方 MTP3 时延基线使用 TND query、累计 query 长度 `[4, 8, ..., 4B]` 和 `sparse_mode=3`。语义 golden 使用四路独立 qlen=1 官方 LightningIndexer，因为 LIM-MTP 的四路 query 均搜索同一份固定 prefill source。

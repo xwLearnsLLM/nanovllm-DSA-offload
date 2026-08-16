@@ -73,10 +73,7 @@ target_include_directories(_C BEFORE PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}
   ${CMAKE_CURRENT_SOURCE_DIR}/common/torch_adapter
   ${CMAKE_CURRENT_SOURCE_DIR}/cann_ops
-  ${CMAKE_CURRENT_SOURCE_DIR}/ops/fused_copy_sfa_mtp
-  ${CMAKE_CURRENT_SOURCE_DIR}/ops/fused_li_manage_mtp
-  ${CMAKE_CURRENT_SOURCE_DIR}/ops/kvcache_scatter_copy
-  ${CMAKE_CURRENT_SOURCE_DIR}/ops/sparse_tail_attention_mtp)
+  ${CMAKE_CURRENT_SOURCE_DIR}/ops/fused_li_manage_mtp)
 
 target_link_directories(_C PRIVATE
   ${TORCH_LIBRARY_DIRS}

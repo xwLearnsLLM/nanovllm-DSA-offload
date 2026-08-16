@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON_BIN="${PYTHON:-python}"
 RAW_SOC_VERSION="${SOC_VERSION:-ascend910_9391}"
 ASCEND_HOME_PATH="${ASCEND_HOME_PATH:-/usr/local/Ascend/ascend-toolkit/latest}"
-CUSTOM_OPS="fused_li_manage_mtp;kvcache_scatter_copy;sparse_tail_attention_mtp;fused_copy_sfa_mtp"
+CUSTOM_OPS="fused_li_manage_mtp"
 EXT_BUILD_JOBS="${NANOVLLM_EXT_BUILD_JOBS:-1}"
 
 case "${RAW_SOC_VERSION}" in
@@ -42,18 +42,12 @@ else
     find "${ROOT_DIR}/nanovllm/_cann_ops_custom" \
       -name binary_info_config.json -print -quit
   )"
-  for op_type in \
-    NanovllmFusedLiManageMtp \
-    NanovllmKvcacheScatterCopy \
-    NanovllmSparseTailAttentionMtp \
-    NanovllmFusedCopySfaMtp; do
-    if [[ -z "${BINARY_INFO_CONFIG}" ]] || \
-       ! grep -q "${op_type}" "${BINARY_INFO_CONFIG}"; then
-      echo "[mtp-ops] ERROR: ${op_type} is missing from installed OPP." >&2
-      exit 1
-    fi
-  done
-  echo "[mtp-ops] verified MTP offloading kernels in ${BINARY_INFO_CONFIG}"
+  if [[ -z "${BINARY_INFO_CONFIG}" ]] || \
+     ! grep -q "NanovllmFusedLiManageMtp" "${BINARY_INFO_CONFIG}"; then
+    echo "[mtp-ops] ERROR: NanovllmFusedLiManageMtp is missing from installed OPP." >&2
+    exit 1
+  fi
+  echo "[mtp-ops] verified fused_li_manage_mtp in ${BINARY_INFO_CONFIG}"
   popd >/dev/null
 fi
 
@@ -91,4 +85,4 @@ if [[ -f "${OPAPI_DIR}/libcust_opapi.so" ]]; then
 fi
 
 ls -lh "${ROOT_DIR}/nanovllm"/_C*.so
-echo "[mtp-ops] built the standalone MTP offloading extension and local OPP"
+echo "[mtp-ops] built standalone fused_li_manage_mtp and local OPP"

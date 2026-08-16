@@ -1,4 +1,4 @@
-"""Semantic, graph, and latency checks for the bundled GLM MTP3 LIM op."""
+"""Correctness and official-LightningIndexer latency checks for LIM-MTP."""
 
 from __future__ import annotations
 
@@ -21,8 +21,6 @@ BLOCK_SIZE = 128
 TOPK = 2048
 UNION_CAPACITY = QUERY_COUNT * TOPK
 MAX_SOURCE_CAPACITY = 1 << 18
-KPE_DIM = 64
-CKV_DIM = 512
 
 
 @dataclass
@@ -82,11 +80,6 @@ def parse_args() -> argparse.Namespace:
             "should be about 3000-4000 tokens per request."
         ),
     )
-    parser.add_argument(
-        "--skip-performance",
-        action="store_true",
-        help="Run semantic and graph checks without the B=24 benchmark.",
-    )
     return parser.parse_args()
 
 
@@ -112,8 +105,7 @@ def _validate_cli(args: argparse.Namespace) -> None:
     if args.perf_query_noise <= 0:
         raise ValueError("--perf-query-noise must be positive.")
     if (
-        not args.skip_performance
-        and args.cache_tokens == args.source_len
+        args.cache_tokens == args.source_len
         and args.perf_query_miss_count != 0
     ):
         raise ValueError(
@@ -1119,21 +1111,6 @@ def _event_us(
     return statistics.mean(samples_ms) * 1000.0
 
 
-def _assert_topk_sets(
-    actual: torch.Tensor,
-    expected_rows: list[torch.Tensor],
-    *,
-    label: str,
-) -> None:
-    actual_cpu = actual.reshape(-1, TOPK).cpu().to(torch.int64)
-    expected = torch.stack(expected_rows)
-    if not torch.equal(
-        torch.sort(actual_cpu, dim=1).values,
-        torch.sort(expected, dim=1).values,
-    ):
-        raise AssertionError(f"{label}: TopK sets differ from native golden")
-
-
 def _query_miss_counts(case: MtpCase) -> tuple[list[int], list[int]]:
     per_query_totals = [0] * QUERY_COUNT
     union_counts: list[int] = []
@@ -1246,13 +1223,6 @@ def run_performance_case(
         flush=True,
     )
 
-    query_view = case.query.view(batch_size, QUERY_COUNT, HEADS, HEAD_DIM)
-    weights_view = case.weights.view(batch_size, QUERY_COUNT, HEADS)
-    single_query = query_view[:, 0].contiguous()
-    single_weights = weights_view[:, 0].contiguous()
-    single_query_ends = torch.arange(
-        1, batch_size + 1, dtype=torch.int32, device=device
-    )
     mtp_query_ends = torch.arange(
         QUERY_COUNT,
         batch_size * QUERY_COUNT + 1,
@@ -1261,14 +1231,6 @@ def run_performance_case(
         device=device,
     )
 
-    native_single = _call_native_li(
-        single_query,
-        case.key,
-        single_weights,
-        case.block_table,
-        case.candidate_lens,
-        single_query_ends,
-    )
     native_mtp = _call_native_li(
         case.query,
         case.key,
@@ -1278,11 +1240,6 @@ def run_performance_case(
         mtp_query_ends,
     )
     torch.npu.synchronize()
-    _assert_topk_sets(
-        native_single,
-        [case.topk_cpu[request * QUERY_COUNT] for request in range(batch_size)],
-        label="official_li_single",
-    )
     expected_native_mtp_shape = (batch_size * QUERY_COUNT, 1, TOPK)
     if tuple(native_mtp.shape) != expected_native_mtp_shape:
         raise AssertionError(
@@ -1305,16 +1262,6 @@ def run_performance_case(
     mtp_cache = torch.empty_like(mtp_initial)
     mtp_buffers = make_outputs(case)
 
-    def native_single_step() -> object:
-        return _call_native_li(
-            single_query,
-            case.key,
-            single_weights,
-            case.block_table,
-            case.candidate_lens,
-            single_query_ends,
-        )
-
     def native_mtp_step() -> object:
         return _call_native_li(
             case.query,
@@ -1328,9 +1275,6 @@ def run_performance_case(
     def fused_mtp_step() -> object:
         return call_mtp_with_buffers(case, mtp_cache, *mtp_buffers)
 
-    official_li_single_us = _event_us(
-        native_single_step, warmup=warmup, iters=iters
-    )
     official_li_mtp3_us = _event_us(
         native_mtp_step, warmup=warmup, iters=iters
     )
@@ -1348,61 +1292,15 @@ def run_performance_case(
         f"per_query_misses={perf_query_miss_count} "
         f"unique_union_misses_mean={unique_union_mean:.2f} "
         f"topk_union_mean={union_mean:.2f} "
-        f"official_li_single_us={official_li_single_us:.3f} "
         f"official_li_mtp3_us={official_li_mtp3_us:.3f} "
         "official_li_mtp3_layout=TND_qlen4_sparse3 "
         f"fused_lim_mtp3_us={fused_lim_mtp3_us:.3f} "
         f"index_management_mtp3_us={management_mtp3_us:+.3f} "
-        "single_lim_baseline=external "
         f"timer=npu_event performance_assert=0 warmup={warmup} iters={iters}",
         flush=True,
     )
     del case
     torch.npu.empty_cache()
-
-
-def _swapped_from_cpu(cpu: torch.Tensor, device: torch.device) -> torch.Tensor:
-    tensor = torch_npu.empty_with_swapped_memory(
-        cpu.shape,
-        dtype=cpu.dtype,
-        device=device,
-    )
-    tensor.fill_(0)
-    tensor.add_(cpu.to(device))
-    return tensor
-
-
-def _apply_scatter_reference(
-    expected_kpe: torch.Tensor,
-    expected_ckv: torch.Tensor,
-    dram_kpe: torch.Tensor,
-    dram_ckv: torch.Tensor,
-    hbm_block_table: torch.Tensor,
-    dram_block_table: torch.Tensor,
-    source_ids: torch.Tensor,
-    destination_slots: torch.Tensor,
-    copy_counts: torch.Tensor,
-) -> None:
-    for request, count_value in enumerate(copy_counts.tolist()):
-        count = int(count_value)
-        if count == 0:
-            continue
-        sources = source_ids[request, :count].to(torch.int64)
-        destinations = destination_slots[request, :count].to(torch.int64)
-        src_blocks = dram_block_table[
-            request, sources // BLOCK_SIZE
-        ].to(torch.int64)
-        src_offsets = sources % BLOCK_SIZE
-        dst_blocks = hbm_block_table[
-            request, destinations // BLOCK_SIZE
-        ].to(torch.int64)
-        dst_offsets = destinations % BLOCK_SIZE
-        expected_kpe[dst_blocks, dst_offsets] = dram_kpe[
-            src_blocks, src_offsets
-        ]
-        expected_ckv[dst_blocks, dst_offsets] = dram_ckv[
-            src_blocks, src_offsets
-        ]
 
 
 def main() -> None:
@@ -1455,18 +1353,17 @@ def main() -> None:
     torch.npu.empty_cache()
 
     run_graph_case(device, args.seed, args.graph_replays)
-    if not args.skip_performance:
-        run_performance_case(
-            device,
-            batch_size=args.batch_size,
-            source_len=args.source_len,
-            cache_tokens=args.cache_tokens,
-            seed=args.seed,
-            warmup=args.warmup,
-            iters=args.iters,
-            perf_query_miss_count=args.perf_query_miss_count,
-            perf_query_noise=args.perf_query_noise,
-        )
+    run_performance_case(
+        device,
+        batch_size=args.batch_size,
+        source_len=args.source_len,
+        cache_tokens=args.cache_tokens,
+        seed=args.seed,
+        warmup=args.warmup,
+        iters=args.iters,
+        perf_query_miss_count=args.perf_query_miss_count,
+        perf_query_noise=args.perf_query_noise,
+    )
     print("FUSED_LI_MANAGE_MTP_UT_OK", flush=True)
 
 
