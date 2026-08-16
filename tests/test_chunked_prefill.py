@@ -51,25 +51,30 @@ def make_sequence(
     )
 
 
-@pytest.mark.parametrize("value", [0, 1024])
+@pytest.mark.parametrize("value", [0, 1024, 2048, 4096, 8192])
 def test_prefill_chunk_size_accepts_only_supported_values(value):
     Config._validate_prefill_chunking(value, 1)
 
 
-@pytest.mark.parametrize("value", [-1, 1, 512, 2048, True, 1024.0])
+@pytest.mark.parametrize(
+    "value",
+    [-1, 1, 512, 1536, 8191, 16384, True, 1024.0],
+)
 def test_prefill_chunk_size_rejects_other_values(value):
     with pytest.raises((TypeError, ValueError)):
         Config._validate_prefill_chunking(value, 1)
 
 
-def test_chunk_prefill_requires_one_prefill_sequence_per_step():
+@pytest.mark.parametrize("chunk_size", [1024, 2048, 4096, 8192])
+def test_chunk_prefill_requires_one_prefill_sequence_per_step(chunk_size):
     with pytest.raises(ValueError, match="max_num_prefill_seqs_per_step=1"):
-        Config._validate_prefill_chunking(1024, 2)
+        Config._validate_prefill_chunking(chunk_size, 2)
     Config._validate_prefill_chunking(0, 2)
 
 
-def test_ten_thousand_token_prompt_is_chunked_and_samples_once():
-    scheduler = Scheduler(make_config())
+@pytest.mark.parametrize("chunk_size", [1024, 2048, 4096, 8192])
+def test_ten_thousand_token_prompt_is_chunked_and_samples_once(chunk_size):
+    scheduler = Scheduler(make_config(prefill_chunk_size=chunk_size))
     seq = make_sequence(10_000)
     scheduler.add(seq)
 
@@ -94,7 +99,11 @@ def test_ten_thousand_token_prompt_is_chunked_and_samples_once():
             sample_calls += 1
             scheduler.postprocess(seqs, [42], is_prefill=True)
 
-    assert chunk_sizes == [1024] * 9 + [784]
+    full_chunks, remainder = divmod(10_000, chunk_size)
+    expected_chunk_sizes = [chunk_size] * full_chunks
+    if remainder:
+        expected_chunk_sizes.append(remainder)
+    assert chunk_sizes == expected_chunk_sizes
     assert sample_calls == 1
     assert seq.completion_token_ids == [42]
     assert seq.is_first_decode_after_prefill

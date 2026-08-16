@@ -141,6 +141,8 @@ export NANOVLLM_IGNORE_EOS=1
 export NANOVLLM_MAX_STEPS=20
 ```
 
+`NANOVLLM_PREFILL_CHUNK_SIZE` 支持 `0`（关闭）、`1024`、`2048`、`4096` 和 `8192`。
+
 不开MTP，bs=12，seqlen=40k
 
 ```bash

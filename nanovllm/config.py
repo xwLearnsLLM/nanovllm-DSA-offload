@@ -20,6 +20,7 @@ from nanovllm.engine.full_decode_graph import normalize_capture_sizes
 
 GLM_VERSION_51 = "5.1"
 GLM_VERSION_52 = "5.2"
+SUPPORTED_PREFILL_CHUNK_SIZES = (0, 1024, 2048, 4096, 8192)
 
 
 def glm52_indexer_types(num_hidden_layers: int) -> tuple[str, ...]:
@@ -156,8 +157,11 @@ class Config:
     ) -> None:
         if type(prefill_chunk_size) is not int:
             raise TypeError("prefill_chunk_size must be an int.")
-        if prefill_chunk_size not in (0, 1024):
-            raise ValueError("prefill_chunk_size must be either 0 or 1024.")
+        if prefill_chunk_size not in SUPPORTED_PREFILL_CHUNK_SIZES:
+            raise ValueError(
+                "prefill_chunk_size must be one of "
+                f"{SUPPORTED_PREFILL_CHUNK_SIZES}."
+            )
         if prefill_chunk_size and max_num_prefill_seqs_per_step != 1:
             raise ValueError(
                 "Chunk prefill requires max_num_prefill_seqs_per_step=1."

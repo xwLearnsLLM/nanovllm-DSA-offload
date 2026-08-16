@@ -119,11 +119,14 @@ def test_materialize_accepted_tokens_commits_prefix_then_target():
     ) == [[4, 5, 6, 7], [9], [4, 9]]
 
 
-def test_mtp_prefill_shift_crosses_chunks_without_losing_boundary_token():
+@pytest.mark.parametrize("chunk_size", [1024, 2048, 4096, 8192])
+def test_mtp_prefill_shift_crosses_chunks_without_losing_boundary_token(
+    chunk_size,
+):
     tokens = list(range(10_000))
     shifted = []
-    for start in range(0, len(tokens), 1024):
-        end = min(start + 1024, len(tokens))
+    for start in range(0, len(tokens), chunk_size):
+        end = min(start + chunk_size, len(tokens))
         shifted.extend(
             shifted_mtp_prefill_tokens(
                 tokens,
