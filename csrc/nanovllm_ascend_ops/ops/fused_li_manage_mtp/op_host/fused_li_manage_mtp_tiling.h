@@ -37,7 +37,8 @@ constexpr uint32_t MTP_MISS_COUNTS_OUT = 4;
 constexpr uint32_t MTP_CACHE_SLOTS_OUT = 5;
 
 constexpr uint32_t MTP_QUERY_COUNT = 4;
-constexpr uint32_t MTP_HEADS = 32;
+constexpr uint32_t MTP_HEADS_MIN = 32;
+constexpr uint32_t MTP_HEADS_MAX = 64;
 constexpr uint32_t MTP_KEY_HEADS = 1;
 constexpr uint32_t MTP_HEAD_DIM = 128;
 constexpr uint32_t MTP_BLOCK_SIZE = 128;
@@ -84,6 +85,7 @@ public:
     LIUMtpTensors tensors;
     uint32_t batchSize = 0;
     uint32_t tokenRows = 0;
+    uint32_t queryHeads = 0;
     uint32_t sourceCapacity = 0;
     uint32_t blockSize = 0;
     uint32_t maxBlocks = 0;
