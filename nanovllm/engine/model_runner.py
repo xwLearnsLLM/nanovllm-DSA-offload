@@ -563,7 +563,25 @@ class ModelRunner:
                 ),
             )
 
-        index_shape = (num_target_layers, config.num_dram_kvcache_blocks, self.block_size, 1, index_dim)
+        index_share_groups = getattr(
+            self.hf_config, "nanovllm_index_share_groups", None
+        )
+        if index_share_groups is None:
+            num_index_cache_layers = num_target_layers
+            num_shared_index_layers = 0
+        else:
+            num_index_cache_layers = len(index_share_groups.owner_layer_idxs)
+            num_shared_index_layers = len(index_share_groups.shared_layer_idxs)
+        index_layer_shape = (
+            config.num_dram_kvcache_blocks,
+            self.block_size,
+            1,
+            index_dim,
+        )
+        # This is the aggregate physical allocation across owner layers.  A
+        # GLM-5.2 shared layer has no private index cache and consumes its
+        # owner's LIM output instead; GLM-5.1 keeps one owner per model layer.
+        index_shape = (num_index_cache_layers, *index_layer_shape)
         dram_ckv_shape = (num_target_layers, config.num_dram_kvcache_blocks, self.block_size, 1, kv_lora_rank)
         dram_kpe_shape = (num_target_layers, config.num_dram_kvcache_blocks, self.block_size, 1, rope_dim)
         max_source_tokens = max(
@@ -580,6 +598,12 @@ class ModelRunner:
         )
         if self.rank == 0:
             logger.info(f"Single HBM KV Block Size: {hbm_kv_block_bytes / 1024 ** 2:.2f} MB")
+            logger.info(
+                "DSA index cache layers: allocated=%d, shared=%d, model=%d",
+                num_index_cache_layers,
+                num_shared_index_layers,
+                num_target_layers,
+            )
             for name, shape in [
                 ("DSA CKV cache", ckv_shape),
                 ("DSA KPE cache", kpe_shape),
@@ -595,12 +619,9 @@ class ModelRunner:
         layer_shapes = (
             ckv_shape[1:],
             kpe_shape[1:],
-            index_shape[1:],
+            index_layer_shape,
             dram_ckv_shape[1:],
             dram_kpe_shape[1:],
-        )
-        index_share_groups = getattr(
-            self.hf_config, "nanovllm_index_share_groups", None
         )
         # GLM-5.2 IndexShare: one cache_slots_pool per group, shared by all
         # member layers.  GLM-5.1 (no indexer_types) gives every layer its
