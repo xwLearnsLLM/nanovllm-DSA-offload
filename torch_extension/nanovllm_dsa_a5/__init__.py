@@ -62,6 +62,7 @@ from .ops import (  # noqa: E402
     kvcache_scatter_copy_c8_out,
     sparse_tail_attention,
     sparse_tail_attention_c8,
+    sparse_tail_attention_mtp_c8,
 )
 
 
@@ -83,5 +84,6 @@ __all__ = [
     "sparse_tail_attention",
     "fused_copy_sparse_tail_attention",
     "sparse_tail_attention_c8",
+    "sparse_tail_attention_mtp_c8",
     "local_opapi_path",
 ]
