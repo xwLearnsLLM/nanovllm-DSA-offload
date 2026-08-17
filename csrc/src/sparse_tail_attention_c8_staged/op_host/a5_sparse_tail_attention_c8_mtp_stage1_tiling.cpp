@@ -2225,8 +2225,10 @@ ge::graphStatus QSFAInfoParser::Parse(QSFATilingInfo &qsfaInfo)
     return ge::GRAPH_SUCCESS;
 }
 
-IMPL_OP_OPTILING(A5SparseTailAttentionC8MtpStage1)
-    .Tiling(TilingKvQuantSparseFlashAttention)
-    .TilingParse<KvQuantSparseFlashAttentionCompileInfo>(TilingPrepareForKvQuantSparseFlashAttention);
 } // namespace c8_mtp
+
+IMPL_OP_OPTILING(A5SparseTailAttentionC8MtpStage1)
+    .Tiling(c8_mtp::TilingKvQuantSparseFlashAttention)
+    .TilingParse<c8_mtp::KvQuantSparseFlashAttentionCompileInfo>(
+        c8_mtp::TilingPrepareForKvQuantSparseFlashAttention);
 } // namespace optiling

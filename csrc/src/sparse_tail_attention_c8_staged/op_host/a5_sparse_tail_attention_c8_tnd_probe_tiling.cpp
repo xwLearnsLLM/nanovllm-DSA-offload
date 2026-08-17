@@ -7,10 +7,10 @@ namespace c8_mtp {
 ge::graphStatus TilingKvQuantSparseFlashAttention(gert::TilingContext *context);
 ge::graphStatus TilingPrepareForKvQuantSparseFlashAttention(
     gert::TilingParseContext *context);
+} // namespace c8_mtp
 
 IMPL_OP_OPTILING(A5SparseTailAttentionC8TndProbe)
-    .Tiling(TilingKvQuantSparseFlashAttention)
-    .TilingParse<KvQuantSparseFlashAttentionCompileInfo>(
-        TilingPrepareForKvQuantSparseFlashAttention);
-} // namespace c8_mtp
+    .Tiling(c8_mtp::TilingKvQuantSparseFlashAttention)
+    .TilingParse<c8_mtp::KvQuantSparseFlashAttentionCompileInfo>(
+        c8_mtp::TilingPrepareForKvQuantSparseFlashAttention);
 } // namespace optiling
