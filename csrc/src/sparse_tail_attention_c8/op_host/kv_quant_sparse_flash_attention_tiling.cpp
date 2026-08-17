@@ -201,10 +201,6 @@ const std::map<ge::DataType, std::string> DATATYPE_TO_STRING_MAP = {
     {ge::DT_UINT1, "DT_UINT1"}                    // dt_variant type
 };
 
-struct KvQuantSparseFlashAttentionCompileInfo {
-    int64_t coreNum;
-};
-
 static const std::map<QSFALayout, std::vector<QSFAAxis>> QSFA_LAYOUT_AXIS_MAP = {
     {QSFALayout::BSND, {QSFAAxis::B, QSFAAxis::S, QSFAAxis::N, QSFAAxis::D}},
     {QSFALayout::TND, {QSFAAxis::T, QSFAAxis::N, QSFAAxis::D}},

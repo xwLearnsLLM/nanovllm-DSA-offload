@@ -94,6 +94,10 @@ enum class QSFAPerfMode : uint32_t {
     V_TEMPLATE_MODE
 };
 
+struct KvQuantSparseFlashAttentionCompileInfo {
+    int64_t coreNum;
+};
+
 enum class QSFAAxis : uint32_t {
     B = 0,
     S = 1,
