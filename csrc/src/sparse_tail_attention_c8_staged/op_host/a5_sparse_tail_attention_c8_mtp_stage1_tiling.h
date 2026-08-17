@@ -12,8 +12,8 @@
  * \file kv_quant_sparse_flash_attention_tiling.h
  * \brief
  */
-#ifndef KV_QUANT_SPARSE_FLASH_ATTENTION_TILING_H
-#define KV_QUANT_SPARSE_FLASH_ATTENTION_TILING_H
+#ifndef A5_SPARSE_TAIL_ATTENTION_C8_MTP_STAGE1_TILING_H
+#define A5_SPARSE_TAIL_ATTENTION_C8_MTP_STAGE1_TILING_H
 
 #include <cstdint>
 #include <sstream>
@@ -24,6 +24,7 @@
 #include "exe_graph/runtime/tiling_context.h"
 #include "platform/soc_spec.h"
 namespace optiling {
+namespace c8_mtp {
 // ------------------算子原型索引常量定义----------------
 // Inputs Index
 constexpr uint32_t QUERY_INPUT_INDEX = 0;
@@ -624,5 +625,6 @@ public:
     gert::Shape valueShape_{};
     gert::Shape sparseIndicesShape_{};
 };
+} // namespace c8_mtp
 } // namespace optiling
-#endif // KV_QUANT_SPARSE_FLASH_ATTENTION_TILING_H
+#endif // A5_SPARSE_TAIL_ATTENTION_C8_MTP_STAGE1_TILING_H

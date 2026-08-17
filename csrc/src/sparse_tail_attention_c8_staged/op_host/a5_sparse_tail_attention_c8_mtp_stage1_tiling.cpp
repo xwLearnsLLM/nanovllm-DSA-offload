@@ -30,6 +30,7 @@ using std::pair;
 using namespace ge;
 using namespace AscendC;
 namespace optiling {
+namespace c8_mtp {
 
 constexpr uint32_t PRE_LOAD_NUM = 2;
 constexpr uint32_t BLOCK_TABLE_ELEM_BYTE = 4;
@@ -2227,4 +2228,5 @@ ge::graphStatus QSFAInfoParser::Parse(QSFATilingInfo &qsfaInfo)
 IMPL_OP_OPTILING(A5SparseTailAttentionC8MtpStage1)
     .Tiling(TilingKvQuantSparseFlashAttention)
     .TilingParse<KvQuantSparseFlashAttentionCompileInfo>(TilingPrepareForKvQuantSparseFlashAttention);
+} // namespace c8_mtp
 } // namespace optiling
