@@ -1,5 +1,6 @@
 #ifndef NANOVLLM_FUSED_LI_MANAGE_MTP_TORCH_ADPT_H_
 #define NANOVLLM_FUSED_LI_MANAGE_MTP_TORCH_ADPT_H_
+#include <array>
 namespace vllm_ascend {
 inline void npu_fused_li_manage_mtp(
     const at::Tensor& weights, const at::Tensor& query_scale,
@@ -31,9 +32,10 @@ inline void npu_fused_li_manage_mtp(
                 "request lengths/valid must be int32[B]");
   TORCH_CHECK(cache_state.dim() == 1 && cache_slots.dim() == 2 && cache_state.size(0) == cache_slots.size(0),
               "cache state/pool mismatch");
-  for (const auto* x : {&block_table, &req_pool, &cache_state, &cache_slots,
-                         &topk_src, &topk_dst, &miss_src, &miss_dst,
-                         &miss_counts})
+  const std::array<const at::Tensor*, 9> int_tensors = {
+      &block_table, &req_pool, &cache_state, &cache_slots, &topk_src,
+      &topk_dst, &miss_src, &miss_dst, &miss_counts};
+  for (const auto* x : int_tensors)
     TORCH_CHECK(x->scalar_type() == at::kInt, "metadata and outputs must be int32");
   TORCH_CHECK(query_scale.scalar_type() == at::kFloat && key_scale.scalar_type() == at::kFloat,
               "dequant scales must be fp32");
@@ -44,10 +46,11 @@ inline void npu_fused_li_manage_mtp(
                   key_scale.size(1) == 128 && key_scale.size(2) == 1,
               "index_key_dequant_scale must be [blocks,128,1]");
   const auto device = query.device();
-  for (const auto* x : {&weights, &query_scale, &key_scale, &key, &block_table,
-                         &actual_query, &actual_key, &offload_key, &req_valid,
-                         &req_pool, &cache_state, &cache_slots, &topk_src,
-                         &topk_dst, &miss_src, &miss_dst, &miss_counts})
+  const std::array<const at::Tensor*, 17> device_tensors = {
+      &weights, &query_scale, &key_scale, &key, &block_table, &actual_query,
+      &actual_key, &offload_key, &req_valid, &req_pool, &cache_state,
+      &cache_slots, &topk_src, &topk_dst, &miss_src, &miss_dst, &miss_counts};
+  for (const auto* x : device_tensors)
     TORCH_CHECK(x->device() == device, "all tensors must be on the same NPU");
   TORCH_CHECK(topk_src.sizes() == at::IntArrayRef({t, 1, K}) && topk_dst.sizes() == topk_src.sizes(),
               "topk outputs must be [T,1,2048]");
