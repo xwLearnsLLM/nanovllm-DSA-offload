@@ -1033,6 +1033,7 @@ __aicore__ inline void LIVector<LIT>::FinalizePlainLiRequest(
         SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
         DataCopyPad(topkSlotsGm[rowOffset], tokens, copyOut);
         DataCopyPad(mtpTopkSourceIdsGm[rowOffset], tokens, copyOut);
+        SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
         payloads.SetValue(0, 0);
         SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
         LIServiceVec::CopyOut(
