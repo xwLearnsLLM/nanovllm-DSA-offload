@@ -339,6 +339,10 @@ def check_graph(inputs: dict[str, object], replays: int = 3) -> None:
     with torch.npu.graph(graph, pool=pool):
         graph_out = launch(inputs)
     torch.npu.synchronize()
+    # Capture only records; the private-pool output stays unwritten until
+    # the first replay executes the graph.
+    graph.replay()
+    torch.npu.synchronize()
     torch.testing.assert_close(graph_out, eager_static, rtol=0, atol=0)
 
     slots: torch.Tensor = inputs["slots"]
