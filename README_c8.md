@@ -10,6 +10,9 @@
 | `fused_li_manage_mtp_c8` | `A5FusedLiManageMtpC8` | MTP1～3 packed query 的 C8 top-k union 与一次性缓存更新 |
 | `kvcache_scatter_copy_c8` | `A5KvcacheScatterCopyC8` | packed C8 KV 的 swapped-memory DRAM → HBM 搬运并生成 attention metadata |
 | `sparse_tail_attention_c8` | `A5SparseTailAttentionC8` | packed C8 KV 上的 top-2048 sparse + dense tail MLA |
+| `sparse_tail_attention_c8_stage1` | `A5SparseTailAttentionC8Stage1` | 非 MTP hit + tail，输出 FP32 P/M/L |
+| `sparse_tail_attention_c8_stage2` | `A5SparseTailAttentionC8Stage2` | 非 MTP miss，并在 UB 中合并 Stage1 P/M/L |
+| `sparse_tail_attention_c8_mtp_stage1/2` | `A5SparseTailAttentionC8MtpStage1/2` | 既有 packed-MTP 两阶段实现 |
 
 ## 接口
 
@@ -80,7 +83,30 @@ torch.ops.nanovllm_dsa.sparse_tail_attention_c8(
     resident_seq_lengths,
     scale_value,
 ) -> attention_out          # bf16[B,Q_HEAD,512]
+
+# 两阶段非 MTP 路径复用上面完全相同的 7 个 SFA 参数；只额外传入
+# LI 已有的 miss_counts，以及跨阶段 P/M/L。所有输出均由 caller 分配。
+torch.ops.nanovllm_dsa.sparse_tail_attention_c8_stage1(
+    query, packed_kv, sparse_and_tail_slots, block_table,
+    actual_seq_lengths_query, resident_seq_lengths,
+    miss_counts, scale_value,
+    partial_out,             # fp32[B,Q_HEAD,512]
+    softmax_max,             # fp32[1,B,Q_HEAD]
+    softmax_sum,             # fp32[1,B,Q_HEAD]
+) -> None
+
+torch.ops.nanovllm_dsa.sparse_tail_attention_c8_stage2(
+    query, packed_kv, sparse_and_tail_slots, block_table,
+    actual_seq_lengths_query, resident_seq_lengths,
+    miss_counts, scale_value,
+    partial_out, softmax_max, softmax_sum,
+    attention_out,           # bf16/fp16[B,Q_HEAD,512]
+) -> None
 ```
+
+非 MTP staged 路径不构造新 slot：两阶段都读取 scatter/copy 生成的完整
+`sparse_and_tail_slots`。Stage1 读取 `[miss_count, valid_end)`，Stage2 读取
+`[0, miss_count)`；Stage2 在 UB 中执行 stable merge 并直接写最终输出。
 
 固定约束：block size 128，index head dim 128，packed KV row 656 bytes，`Q_HEAD<=64`，单请求 MTP query 数为 2～4，MTP union 容量为 8192，source token ID 为 18 bit，source capacity 不超过 `262144`。两种 manager 的 `C=0` 请求严格 no-op；活跃 `req_pool_entries` 必须唯一。
 
@@ -119,5 +145,6 @@ python3 tests/test_fused_li_manage_c8.py --device npu:0 --heads 32,64 --batch-si
 python3 tests/test_fused_li_manage_mtp_c8.py --device npu:0 --batch-size 6 --heads 32,64 --source-len 20096 --queries-per-request 0 --miss-min 0 --miss-max 300 --pool-extra 7 --warmup 3 --iters 20 --seed 7
 python3 tests/test_kvcache_scatter_copy_c8.py --device npu:0 --batch-size 24 --source-len 20096 --cache-tokens 6144 --tail-tokens 64 --max-tail-tokens 512 --copy-min 0 --copy-max 300 --warmup 3 --iters 20 --seed 7
 python3 tests/test_sparse_tail_attention_c8.py --device npu:0 --heads 8 --batch-sizes 24 --cache-tokens 6144 --tail-tokens 64 --max-tail-tokens 512 --warmup 3 --iters 20 --seed 7
+python3 tests/test_sparse_tail_attention_c8_staged_nomtp.py --device npu:0 --heads 8 --batch-sizes 1,4,16,64 --graph --warmup 3 --iters 20 --seed 31
 python3 tests/test_offload_split_c8_graph.py --device npu:0 --replays 4 --seed 7
 ```

@@ -19,7 +19,7 @@
 #elif defined(A5_C8_TND_PROBE_ONLY)
 #include "a5_sparse_tail_attention_c8_tnd_probe_template_tiling_key.h"
 #elif defined(A5_C8_STAGE2_ONLY)
-#include "a5_sparse_tail_attention_c8_stage2_template_tiling_key.h"
+#include "a5_sparse_tail_attention_c8_mtp_stage2_template_tiling_key.h"
 #else
 #include "c8_vendor/attention/kv_quant_sparse_flash_attention/op_kernel/kv_quant_sparse_flash_attention_template_tiling_key.h"
 #endif
@@ -125,7 +125,7 @@ __aicore__ inline void DispatchKernelDtype310(
 template<int FLASH_DECODE, int PAGE_ATTENTION, int LAYOUT_T, int KV_LAYOUT_T,
     int TEMPLATE_MODE, int IS_SPLIT_G, bool PROBE_ENABLED>
  __global__ __aicore__ void
-a5_sparse_tail_attention_c8_state(__gm__ uint8_t *query, __gm__ uint8_t *key, __gm__ uint8_t *value,
+a5_sparse_tail_attention_c8_mtp_stage1(__gm__ uint8_t *query, __gm__ uint8_t *key, __gm__ uint8_t *value,
                        __gm__ uint8_t *sparseIndices, __gm__ uint8_t* keyScale, __gm__ uint8_t* valueScale,
                        __gm__ uint8_t *blocktable, __gm__ uint8_t *actualSeqLengthsQuery,
                        __gm__ uint8_t *actualSeqLengthsKV, __gm__ uint8_t *missCounts,
@@ -161,7 +161,7 @@ a5_sparse_tail_attention_c8_state(__gm__ uint8_t *query, __gm__ uint8_t *key, __
 #ifdef A5_C8_STAGE2_ONLY
 template<int FLASH_DECODE, int PAGE_ATTENTION, int LAYOUT_T, int KV_LAYOUT_T,
     int TEMPLATE_MODE, int IS_SPLIT_G, bool PROBE_ENABLED>
-__global__ __aicore__ void a5_sparse_tail_attention_c8_stage2(
+__global__ __aicore__ void a5_sparse_tail_attention_c8_mtp_stage2(
     __gm__ uint8_t *query, __gm__ uint8_t *key, __gm__ uint8_t *value,
     __gm__ uint8_t *sparseIndices, __gm__ uint8_t *keyScale,
     __gm__ uint8_t *valueScale, __gm__ uint8_t *blocktable,

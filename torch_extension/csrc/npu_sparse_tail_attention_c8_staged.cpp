@@ -87,7 +87,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> C8StateOutNpu(
       miss_counts, cache_tokens, partial_out, softmax_max, softmax_sum);
   auto launch = [&](const auto& packed_kv_arg) {
     EXEC_NPU_CMD_ORDERED(
-        aclnnA5SparseTailAttentionC8State,
+        aclnnA5SparseTailAttentionC8MtpStage1,
         keepalive,
         query,
         packed_kv_arg,
@@ -221,7 +221,7 @@ at::Tensor C8Stage2OutNpu(
       attention_out);
   auto launch = [&](const auto& packed_kv_arg) {
     EXEC_NPU_CMD_ORDERED(
-        aclnnA5SparseTailAttentionC8Stage2,
+        aclnnA5SparseTailAttentionC8MtpStage2,
         keepalive,
         query,
         packed_kv_arg,
@@ -472,8 +472,8 @@ void C8TndProbeOutNpu(
 } // namespace nanovllm_dsa_a5_impl
 
 TORCH_LIBRARY_IMPL(nanovllm_dsa, PrivateUse1, m) {
-  m.impl("_sparse_tail_attention_c8_state_out", &nanovllm_dsa_a5_impl::C8StateOutNpu);
-  m.impl("_sparse_tail_attention_c8_stage2_out", &nanovllm_dsa_a5_impl::C8Stage2OutNpu);
+  m.impl("_sparse_tail_attention_c8_mtp_stage1_out", &nanovllm_dsa_a5_impl::C8StateOutNpu);
+  m.impl("_sparse_tail_attention_c8_mtp_stage2", &nanovllm_dsa_a5_impl::C8Stage2OutNpu);
   m.impl("_sparse_tail_attention_c8_pml_probe_out", &nanovllm_dsa_a5_impl::C8PmlProbeOutNpu);
   m.impl("_sparse_tail_attention_c8_tnd_probe_out", &nanovllm_dsa_a5_impl::C8TndProbeOutNpu);
 }

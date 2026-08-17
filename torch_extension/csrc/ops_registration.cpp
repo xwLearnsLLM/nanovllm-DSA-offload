@@ -87,7 +87,21 @@ TORCH_LIBRARY(nanovllm_dsa, m) {
       "Tensor block_table, Tensor actual_seq_lengths_query, "
       "Tensor resident_seq_lengths, float scale_value) -> Tensor");
   m.def(
-      "sparse_tail_attention_c8_stage1_out("
+      "sparse_tail_attention_c8_stage1("
+      "Tensor query, Tensor packed_kv, Tensor sparse_and_tail_slots, "
+      "Tensor block_table, Tensor actual_seq_lengths_query, "
+      "Tensor resident_seq_lengths, Tensor miss_counts, float scale_value, "
+      "Tensor(a!) partial_out, Tensor(b!) softmax_max, "
+      "Tensor(c!) softmax_sum) -> ()");
+  m.def(
+      "sparse_tail_attention_c8_stage2("
+      "Tensor query, Tensor packed_kv, Tensor sparse_and_tail_slots, "
+      "Tensor block_table, Tensor actual_seq_lengths_query, "
+      "Tensor resident_seq_lengths, Tensor miss_counts, float scale_value, "
+      "Tensor previous_p, Tensor previous_m, Tensor previous_l, "
+      "Tensor(a!) attention_out) -> ()");
+  m.def(
+      "sparse_tail_attention_c8_mtp_stage1("
       "Tensor query, Tensor packed_kv, "
       "Tensor actual_seq_lengths_query, Tensor resident_seq_lengths, "
       "Tensor cache_tokens, Tensor hbm_block_table, "
@@ -97,7 +111,7 @@ TORCH_LIBRARY(nanovllm_dsa, m) {
       "int? kv_dtype=None) "
       "-> ()");
   m.def(
-      "sparse_tail_attention_c8_stage2_out("
+      "sparse_tail_attention_c8_mtp_stage2("
       "Tensor query, Tensor packed_kv, "
       "Tensor actual_seq_lengths_query, Tensor resident_seq_lengths, "
       "Tensor hbm_block_table, "
@@ -107,7 +121,7 @@ TORCH_LIBRARY(nanovllm_dsa, m) {
       "Tensor(a!) attention_out, "
       "int? kv_dtype=None) -> ()");
   m.def(
-      "_sparse_tail_attention_c8_state_out("
+      "_sparse_tail_attention_c8_mtp_stage1_out("
       "Tensor query, Tensor packed_kv, Tensor topk_slots, "
       "Tensor block_table, Tensor actual_q, Tensor actual_kv, "
       "Tensor miss_counts, Tensor cache_tokens, "
@@ -116,7 +130,7 @@ TORCH_LIBRARY(nanovllm_dsa, m) {
       "int? kv_dtype=None) "
       "-> (Tensor(a!), Tensor(b!), Tensor(c!))");
   m.def(
-      "_sparse_tail_attention_c8_stage2_out("
+      "_sparse_tail_attention_c8_mtp_stage2("
       "Tensor query, Tensor packed_kv, Tensor topk_slots, "
       "Tensor block_table, Tensor actual_q, Tensor actual_kv, "
       "Tensor miss_counts, Tensor cache_tokens, float scale_value, "

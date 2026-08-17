@@ -210,7 +210,7 @@ def run_case(
         device=device,
     )
 
-    nanovllm_dsa_a5.sparse_tail_attention_c8_stage1_out(
+    nanovllm_dsa_a5.sparse_tail_attention_c8_mtp_stage1(
         case.query,
         case.packed,
         actual_q,
@@ -224,7 +224,7 @@ def run_case(
         maximum,
         denominator,
     )
-    returned = nanovllm_dsa_a5.sparse_tail_attention_c8_stage2_out(
+    returned = nanovllm_dsa_a5.sparse_tail_attention_c8_mtp_stage2(
         case.query,
         case.packed,
         actual_q,

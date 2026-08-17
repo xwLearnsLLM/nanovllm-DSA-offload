@@ -56,7 +56,7 @@ def main() -> None:
         dtype=case.query.dtype,
         device=device,
     )
-    nanovllm_dsa_a5.sparse_tail_attention_c8_stage1_out(
+    nanovllm_dsa_a5.sparse_tail_attention_c8_mtp_stage1(
         case.query,
         case.packed,
         case.actual_q,
@@ -71,7 +71,7 @@ def main() -> None:
         denominator,
     )
     output_ptr = output.data_ptr()
-    returned = nanovllm_dsa_a5.sparse_tail_attention_c8_stage2_out(
+    returned = nanovllm_dsa_a5.sparse_tail_attention_c8_mtp_stage2(
         case.query,
         case.packed,
         case.actual_q,
@@ -130,7 +130,7 @@ def main() -> None:
         dtype=variable_c_case.query.dtype,
         device=device,
     )
-    nanovllm_dsa_a5.sparse_tail_attention_c8_stage1_out(
+    nanovllm_dsa_a5.sparse_tail_attention_c8_mtp_stage1(
         variable_c_case.query,
         variable_c_case.packed,
         variable_c_case.actual_q,
@@ -144,7 +144,7 @@ def main() -> None:
         variable_m,
         variable_l,
     )
-    nanovllm_dsa_a5.sparse_tail_attention_c8_stage2_out(
+    nanovllm_dsa_a5.sparse_tail_attention_c8_mtp_stage2(
         variable_c_case.query,
         variable_c_case.packed,
         variable_c_case.actual_q,
@@ -182,7 +182,7 @@ def main() -> None:
     )
 
     replay = output.clone()
-    nanovllm_dsa_a5.sparse_tail_attention_c8_stage2_out(
+    nanovllm_dsa_a5.sparse_tail_attention_c8_mtp_stage2(
         case.query,
         case.packed,
         case.actual_q,
@@ -217,7 +217,7 @@ def main() -> None:
         (1, 1, args.heads), dtype=torch.float32, device=device
     )
     poison_l = torch.empty_like(poison_m)
-    nanovllm_dsa_a5.sparse_tail_attention_c8_stage1_out(
+    nanovllm_dsa_a5.sparse_tail_attention_c8_mtp_stage1(
         poison_case.query,
         poison_case.packed,
         poison_case.actual_q,
@@ -246,7 +246,7 @@ def main() -> None:
         device=device,
     )
     poison_replay = torch.empty_like(poison_original)
-    nanovllm_dsa_a5.sparse_tail_attention_c8_stage2_out(
+    nanovllm_dsa_a5.sparse_tail_attention_c8_mtp_stage2(
         poison_case.query,
         poison_case.packed,
         poison_case.actual_q,
@@ -260,7 +260,7 @@ def main() -> None:
         poison_l,
         poison_original,
     )
-    nanovllm_dsa_a5.sparse_tail_attention_c8_stage2_out(
+    nanovllm_dsa_a5.sparse_tail_attention_c8_mtp_stage2(
         poison_case.query,
         poisoned_cpu.to(device),
         poison_case.actual_q,

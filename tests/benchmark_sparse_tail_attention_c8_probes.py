@@ -159,7 +159,7 @@ def stage1_step(
     denominator: torch.Tensor,
     scale: float,
 ) -> torch.Tensor:
-    torch.ops.nanovllm_dsa.sparse_tail_attention_c8_stage1_out.default(
+    torch.ops.nanovllm_dsa.sparse_tail_attention_c8_mtp_stage1.default(
         query,
         packed_kv,
         actual_q,

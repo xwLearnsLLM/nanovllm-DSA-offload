@@ -222,9 +222,9 @@ REGISTER_TILING_DATA_CLASS(A5SparseTailAttentionC8PmlProbe, KvQuantSparseFlashAt
 #elif defined(A5_C8_TND_PROBE_TILING_ONLY)
 REGISTER_TILING_DATA_CLASS(A5SparseTailAttentionC8TndProbe, KvQuantSparseFlashAttentionTilingDataMla)
 #elif !defined(A5_C8_STAGE2_TILING_ONLY)
-REGISTER_TILING_DATA_CLASS(A5SparseTailAttentionC8State, KvQuantSparseFlashAttentionTilingDataMla)
+REGISTER_TILING_DATA_CLASS(A5SparseTailAttentionC8MtpStage1, KvQuantSparseFlashAttentionTilingDataMla)
 #else
-REGISTER_TILING_DATA_CLASS(A5SparseTailAttentionC8Stage2, KvQuantSparseFlashAttentionTilingDataMla)
+REGISTER_TILING_DATA_CLASS(A5SparseTailAttentionC8MtpStage2, KvQuantSparseFlashAttentionTilingDataMla)
 #endif
 
 template <typename T> inline T Align(T num, T rnd)

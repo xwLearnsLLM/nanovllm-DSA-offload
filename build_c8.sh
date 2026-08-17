@@ -30,8 +30,10 @@ OP_NAMES=(
     A5FusedLiManageMtpC8
     A5KvcacheScatterCopyC8
     A5SparseTailAttentionC8
-    A5SparseTailAttentionC8State
+    A5SparseTailAttentionC8Stage1
     A5SparseTailAttentionC8Stage2
+    A5SparseTailAttentionC8MtpStage1
+    A5SparseTailAttentionC8MtpStage2
     A5SparseTailAttentionC8PmlProbe
     A5SparseTailAttentionC8TndProbe
 )

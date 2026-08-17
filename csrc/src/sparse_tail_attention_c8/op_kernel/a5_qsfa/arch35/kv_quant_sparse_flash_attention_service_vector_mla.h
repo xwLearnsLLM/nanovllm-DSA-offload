@@ -66,12 +66,19 @@ public:
     }
 
     // 初始化LocalTensor
+    template <C8StageMode STAGE_MODE>
     __aicore__ inline void InitLocalBuffer(TPipe *pipe, ConstInfo &constInfo);
     // 初始化attentionOutGM
     __aicore__ inline void CleanOutput(__gm__ uint8_t *attentionOut, ConstInfo &constInfo);
+    template <C8StageMode STAGE_MODE>
+    __aicore__ inline void InitStageOutputs(
+        __gm__ uint8_t *missCounts, __gm__ uint8_t *partialOut,
+        __gm__ uint8_t *softmaxMax, __gm__ uint8_t *softmaxSum,
+        __gm__ uint8_t *attentionOut, ConstInfo &constInfo);
     __aicore__ inline void InitGlobalBuffer(__gm__ uint8_t *key, __gm__ uint8_t *value, __gm__ uint8_t *sparseIndices,
         __gm__ uint8_t *blockTable);
     __aicore__ inline void InitOutputSingleCore(ConstInfo &constInfo);
+    template <C8StageMode STAGE_MODE>
     __aicore__ inline void ProcessVec0(Buffer<BufferType::L1, SyncType::CROSS_CORE_SYNC_FORWARD> &outputL1,
         Buffer<BufferType::GM, SyncType::CROSS_CORE_SYNC_BACKWARD> &v0ResGm,
         const RunInfo &runInfo, ConstInfo &constInfo);
@@ -79,6 +86,7 @@ public:
         Buffer<BufferType::UB, SyncType::CROSS_CORE_SYNC_BOTH> &bmm1ResBuf, RunInfo &runInfo,
         ConstInfo &constInfo);
     using mm2ResPos = Buffer<BufferType::UB, SyncType::CROSS_CORE_SYNC_BOTH>;
+    template <C8StageMode STAGE_MODE>
     __aicore__ inline void ProcessVec2(mm2ResPos &bmm2ResBuf, RunInfo &runInfo,
         ConstInfo &constInfo);
 
@@ -86,11 +94,13 @@ private:
     __aicore__ inline void ProcessVec1SoftmaxDispatchQSFA(LocalTensor<Q_T> &stage1CastTensor,
         LocalTensor<T> &mmRes, LocalTensor<float> &sumUb, LocalTensor<float> &maxUb,
         LocalTensor<T> &apiTmpBuffer, RunInfo &runInfo, ConstInfo &constInfo);
+    template <C8StageMode STAGE_MODE>
     __aicore__ inline void ProcessSparseKv(Buffer<BufferType::L1, SyncType::CROSS_CORE_SYNC_FORWARD> &outputL1,
         Buffer<BufferType::GM, SyncType::CROSS_CORE_SYNC_BACKWARD> &v0ResGm,
         const RunInfo &runInfo, ConstInfo &constInfo);
     __aicore__ inline void CalSparseCalSize(const RunInfo &runInfo, ConstInfo &constInfo);
     __aicore__ inline int64_t GetkeyOffset(int64_t s2Idx, const RunInfo &runInfo, ConstInfo &constInfo);
+    template <C8StageMode STAGE_MODE>
     __aicore__ inline void GetRealCmpS2Idx(int64_t &token0Idx, int64_t &token1Idx, int64_t s2IdxInBase,
         const RunInfo &runInfo, ConstInfo &constInfo);
     __aicore__ inline void CopyInKvNotSparse(LocalTensor<KV_T> kvMergUb, int64_t v0Loop, int64_t dealRow,
@@ -118,6 +128,13 @@ private:
     __aicore__ inline void CopyOutAttentionOut(
         RunInfo &runInfo, ConstInfo &constInfo, LocalTensor<VEC2_RES_T> &vec2ResUb, int64_t vec2S1Idx,
         int64_t qsfaVec2CalcSize);
+    __aicore__ inline void CopyOutState(
+        RunInfo &runInfo, ConstInfo &constInfo, LocalTensor<T> &partialUb,
+        LocalTensor<float> &maxUb, LocalTensor<float> &sumUb);
+    __aicore__ inline void MergePreviousStateAndCopyOut(
+        RunInfo &runInfo, ConstInfo &constInfo, LocalTensor<T> &currentP,
+        LocalTensor<float> &currentM, LocalTensor<float> &currentL,
+        int64_t calcSize);
     __aicore__ inline void SoftmaxInitBuffer();
     __aicore__ inline void InitCubeVecSharedParams(CVSharedParams &sharedParams, int32_t aicIdx, uint8_t subBlockIdx);
     __aicore__ inline void ComputeNeedInitQSFA(CVSharedParams &sharedParams) const;
@@ -127,6 +144,9 @@ private:
     const KvQuantSparseFlashAttentionTilingDataMla *__restrict tilingData;
 
     GlobalTensor<OUTPUT_T> attentionOutGm;
+    GlobalTensor<float> partialOutGm;
+    GlobalTensor<float> softmaxMaxGm;
+    GlobalTensor<float> softmaxSumGm;
     GlobalTensor<KV_T> keyGm;
     GlobalTensor<int32_t> SparseIndicesGm;
     GlobalTensor<int32_t> blockTableGm;
@@ -137,9 +157,11 @@ private:
     TQue<QuePosition::VECOUT, 1> stage1OutQue[2]; // 2份表示可能存在pingpong
     TQue<QuePosition::VECIN, 2> stage0InQue; // for v0 input, 2份表示可能存在pingpong
     TQue<QuePosition::VECOUT, 2> stage0OutQue; // for v0 output, 2份表示可能存在pingpong
+    TQue<QuePosition::VECIN, 2> previousPQue;
     TBuf<> stage2OutBuf;
     TEventID mte3ToVId[2]; // 存放MTE3_V的eventId, 2份表示可能存在pingpong
     TEventID vToMte3Id[2]; // 存放V_MTE3的eventId, 2份表示可能存在pingpong
+    TEventID mte2ToVId;
     TBuf<> softmaxMaxBuf[2];
     TBuf<> softmaxSumBuf[2];
     TBuf<> softmaxExpBuf[2];
@@ -153,11 +175,15 @@ private:
 };
 
 
-TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void QSFAVectorService<TEMPLATE_ARGS>::GetRealCmpS2Idx(int64_t &token0Idx, int64_t &token1Idx,
+TEMPLATES_DEF_NO_DEFAULT
+template <C8StageMode STAGE_MODE>
+__aicore__ inline void QSFAVectorService<TEMPLATE_ARGS>::GetRealCmpS2Idx(int64_t &token0Idx, int64_t &token1Idx,
     int64_t s2IdxInBase, const RunInfo &runInfo, ConstInfo &constInfo)
 {
     int64_t topkBS1Idx = 0;
-    if constexpr (LAYOUT_T == QSFA_LAYOUT::TND) {
+    if constexpr (STAGE_MODE != C8StageMode::NATIVE) {
+        topkBS1Idx = runInfo.stagedSlotRowOffset;
+    } else if constexpr (LAYOUT_T == QSFA_LAYOUT::TND) {
         uint64_t actualSeqQPrefixSum = runInfo.boIdx == 0 ? 0 : cuSeqlensQGm.GetValue(runInfo.boIdx - 1);
         topkBS1Idx += (actualSeqQPrefixSum + runInfo.s1oIdx) * constInfo.sparseBlockCount; // T, N2(1), K
     } else {
@@ -168,13 +194,36 @@ TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void QSFAVectorService<TEMPLATE_ARGS>
     int64_t qsfaCmpS2LoopCnt = runInfo.s2LoopCount;
     int64_t qsfaTopkIdx = s2IdxInBase + qsfaCmpS2LoopCnt * constInfo.s2BaseSize;
 
-    if (unlikely(qsfaTopkIdx >= constInfo.sparseBlockCount)) {
+    const int64_t stagedOffset =
+        STAGE_MODE == C8StageMode::STAGE1_STATE
+        ? runInfo.stagedMissCount
+        : 0;
+    if constexpr (STAGE_MODE != C8StageMode::NATIVE) {
+        if (unlikely(runInfo.stagedSlotSetEmpty ||
+                     qsfaTopkIdx >= runInfo.stagedValidCount)) {
+            token0Idx = 0;
+        } else {
+            token0Idx = SparseIndicesGm.GetValue(
+                topkBS1Idx + stagedOffset + qsfaTopkIdx) +
+                runInfo.s2StartIdx;
+        }
+    } else if (unlikely(qsfaTopkIdx >= constInfo.sparseBlockCount)) {
         token0Idx = -1;
     } else {
         token0Idx = SparseIndicesGm.GetValue(topkBS1Idx + qsfaTopkIdx) + runInfo.s2StartIdx;
     }
     qsfaTopkIdx += 1;
-    if (unlikely((qsfaTopkIdx >= constInfo.sparseBlockCount) || (s2IdxInBase + 1 >= sparseS2End))) {
+    if constexpr (STAGE_MODE != C8StageMode::NATIVE) {
+        if (unlikely(runInfo.stagedSlotSetEmpty ||
+                     qsfaTopkIdx >= runInfo.stagedValidCount ||
+                     s2IdxInBase + 1 >= sparseS2End)) {
+            token1Idx = -1;
+        } else {
+            token1Idx = SparseIndicesGm.GetValue(
+                topkBS1Idx + stagedOffset + qsfaTopkIdx) +
+                runInfo.s2StartIdx;
+        }
+    } else if (unlikely((qsfaTopkIdx >= constInfo.sparseBlockCount) || (s2IdxInBase + 1 >= sparseS2End))) {
         token1Idx = -1;
     } else {
         token1Idx = SparseIndicesGm.GetValue(topkBS1Idx + qsfaTopkIdx) + runInfo.s2StartIdx;
@@ -456,6 +505,7 @@ __aicore__ inline void QSFAVectorService<TEMPLATE_ARGS>::CalSparseCalSize(const 
 }
 
 TEMPLATES_DEF_NO_DEFAULT
+template <C8StageMode STAGE_MODE>
 __aicore__ inline void QSFAVectorService<TEMPLATE_ARGS>::ProcessVec0(
     Buffer<BufferType::L1, SyncType::CROSS_CORE_SYNC_FORWARD> &outputL1,
     Buffer<BufferType::GM, SyncType::CROSS_CORE_SYNC_BACKWARD> &v0ResGm,
@@ -466,7 +516,7 @@ __aicore__ inline void QSFAVectorService<TEMPLATE_ARGS>::ProcessVec0(
     maxBlockNumPerBatch = constInfo.oriMaxBlockNumPerBatch;
 
     CalSparseCalSize(runInfo, constInfo);
-    ProcessSparseKv(outputL1, v0ResGm, runInfo, constInfo);
+    ProcessSparseKv<STAGE_MODE>(outputL1, v0ResGm, runInfo, constInfo);
 
     if constexpr (IS_SPLIT_G) {
         CrossCoreSetFlag<QSFA_SYNC_MODE0, PIPE_MTE3>(15); // 15: 跨核同步标志位值
@@ -480,6 +530,7 @@ __aicore__ inline void QSFAVectorService<TEMPLATE_ARGS>::ProcessVec0(
 }
 
 TEMPLATES_DEF_NO_DEFAULT
+template <C8StageMode STAGE_MODE>
 __aicore__ inline void QSFAVectorService<TEMPLATE_ARGS>::ProcessSparseKv(
     Buffer<BufferType::L1, SyncType::CROSS_CORE_SYNC_FORWARD> &outputL1,
     Buffer<BufferType::GM, SyncType::CROSS_CORE_SYNC_BACKWARD> &v0ResGm, const RunInfo &runInfo, ConstInfo &constInfo)
@@ -502,7 +553,8 @@ __aicore__ inline void QSFAVectorService<TEMPLATE_ARGS>::ProcessSparseKv(
         // 1、copy kv in, gm ->ub
         LocalTensor<KV_T> kvInUb = stage0InQue.AllocTensor<KV_T>();
         while (dealRow < Min(16, qsfaSparseCalSize) && s2<sparseS2End) { // 拷贝满16行或者遇到-1
-            GetRealCmpS2Idx(token0Idx, token1Idx, s2, runInfo, constInfo);
+            GetRealCmpS2Idx<STAGE_MODE>(
+                token0Idx, token1Idx, s2, runInfo, constInfo);
             s2 += 2; // 每次搬运2行
             if (token0Idx== -1 && token1Idx == -1) {
                 meetEnd = true;
@@ -619,6 +671,7 @@ __aicore__ inline void QSFAVectorService<TEMPLATE_ARGS>::ProcessVec1SoftmaxDispa
 }
 
 TEMPLATES_DEF_NO_DEFAULT
+template <C8StageMode STAGE_MODE>
 __aicore__ inline void QSFAVectorService<TEMPLATE_ARGS>::ProcessVec2(
     Buffer<BufferType::UB, SyncType::CROSS_CORE_SYNC_BOTH> &bmm2ResBuf, RunInfo &runInfo,
     ConstInfo &constInfo)
@@ -641,10 +694,14 @@ __aicore__ inline void QSFAVectorService<TEMPLATE_ARGS>::ProcessVec2(
         DataCopy(vec2ResUb, mmRes, qsfaVec2CalcSize);
     } else {
         LocalTensor<T> qsfaExpUb = softmaxExpBuf[runInfo.taskIdMod2].template Get<T>();
-        if (runInfo.s2LoopCount < runInfo.s2LoopLimit) {
+        if constexpr (STAGE_MODE != C8StageMode::NATIVE) {
             FlashUpdateNew<T, Q_T, OUTPUT_T, qsfaDTemplateAlign64, false, false>(
                 vec2ResUb, mmRes, vec2ResUb, qsfaExpUb, qsfaExpUb, runInfo.vec2MRealSize,
                 qsfaDTemplateAlign64, 1.0, 1.0);
+        } else if (runInfo.s2LoopCount < runInfo.s2LoopLimit) {
+            FlashUpdateNew<T, Q_T, OUTPUT_T, qsfaDTemplateAlign64, false, false>(
+                vec2ResUb, mmRes, vec2ResUb, qsfaExpUb, qsfaExpUb,
+                runInfo.vec2MRealSize, qsfaDTemplateAlign64, 1.0, 1.0);
         } else {
             LocalTensor<float> sumUb = this->softmaxSumBuf[runInfo.multiCoreIdxMod2].template Get<float>();
             FlashUpdateLastNew<T, Q_T, OUTPUT_T, qsfaDTemplateAlign64, false, false>(
@@ -655,15 +712,182 @@ __aicore__ inline void QSFAVectorService<TEMPLATE_ARGS>::ProcessVec2(
 
     bmm2ResBuf.SetCrossCore();
     if (runInfo.s2LoopCount == runInfo.s2LoopLimit) {
-        if (unlikely(runInfo.s2LoopCount == 0)) {
-            LocalTensor<float> sumUb = this->softmaxSumBuf[runInfo.multiCoreIdxMod2].template Get<float>();
-            LastDivNew<T, Q_T, OUTPUT_T, qsfaDTemplateAlign64, false>(
-                vec2ResUb, vec2ResUb, sumUb, runInfo.vec2MRealSize, qsfaDTemplateAlign64, 1.0);
+        LocalTensor<float> sumUb =
+            this->softmaxSumBuf[runInfo.multiCoreIdxMod2].template Get<float>();
+        LocalTensor<float> maxUb =
+            this->softmaxMaxBuf[runInfo.multiCoreIdxMod2].template Get<float>();
+        if constexpr (STAGE_MODE == C8StageMode::NATIVE) {
+            if (unlikely(runInfo.s2LoopCount == 0)) {
+                LastDivNew<T, Q_T, OUTPUT_T, qsfaDTemplateAlign64, false>(
+                    vec2ResUb, vec2ResUb, sumUb, runInfo.vec2MRealSize,
+                    qsfaDTemplateAlign64, 1.0);
+            }
+            this->CopyOutAttentionOut(
+                runInfo, constInfo, vec2ResUb, 0, qsfaVec2CalcSize);
+        } else {
+            if (unlikely(runInfo.stagedSlotSetEmpty)) {
+                Duplicate(vec2ResUb, 0.0f, qsfaVec2CalcSize);
+                Duplicate(sumUb, 0.0f, runInfo.vec2MRealSize);
+                LocalTensor<uint32_t> maxBits =
+                    maxUb.template ReinterpretCast<uint32_t>();
+                Duplicate(maxBits, 0xFF800000U, runInfo.vec2MRealSize);
+            }
+            if constexpr (STAGE_MODE == C8StageMode::STAGE2_MERGE) {
+                this->MergePreviousStateAndCopyOut(
+                    runInfo, constInfo, vec2ResUb, maxUb, sumUb,
+                    qsfaVec2CalcSize);
+            } else {
+                this->CopyOutState(
+                    runInfo, constInfo, vec2ResUb, maxUb, sumUb);
+            }
         }
-
-        this->CopyOutAttentionOut(runInfo, constInfo, vec2ResUb, 0, qsfaVec2CalcSize);
     }
     SetFlag<HardEvent::MTE3_V>(mte3ToVId[0]);
+}
+
+TEMPLATES_DEF_NO_DEFAULT
+__aicore__ inline void QSFAVectorService<TEMPLATE_ARGS>::MergePreviousStateAndCopyOut(
+    RunInfo &runInfo, ConstInfo &constInfo, LocalTensor<T> &currentP,
+    LocalTensor<float> &currentM, LocalTensor<float> &currentL,
+    int64_t calcSize)
+{
+    constexpr int64_t stateD = 512;
+    constexpr int64_t scalarStride = 64;
+    const int64_t scalarOffset =
+        runInfo.attentionOutOffset / constInfo.dSizeV;
+    LocalTensor<float> scalarUb = commonTBuf.template Get<float>();
+    LocalTensor<float> previousMUb = scalarUb;
+    LocalTensor<float> previousLUb = scalarUb[scalarStride];
+    LocalTensor<float> mergeTmpUb = scalarUb[scalarStride * 2];
+    LocalTensor<float> previousDiffUb = scalarUb[scalarStride * 3];
+    LocalTensor<float> currentDiffUb = scalarUb[scalarStride * 4];
+    LocalTensor<float> previousWeightUb = scalarUb[scalarStride * 5];
+    LocalTensor<float> currentWeightUb = scalarUb[scalarStride * 6];
+    LocalTensor<float> mergedLUb = scalarUb[scalarStride * 7];
+
+    DataCopyExtParams scalarParams;
+    scalarParams.blockCount = 1;
+    scalarParams.blockLen = runInfo.vec2MRealSize * sizeof(float);
+    scalarParams.srcStride = 0;
+    scalarParams.dstStride = 0;
+    DataCopyPadExtParams<float> scalarPadParams{false, 0, 0, 0};
+    DataCopyPad(previousMUb, softmaxMaxGm[scalarOffset], scalarParams,
+        scalarPadParams);
+    DataCopyPad(previousLUb, softmaxSumGm[scalarOffset], scalarParams,
+        scalarPadParams);
+    SetFlag<HardEvent::MTE2_V>(mte2ToVId);
+    WaitFlag<HardEvent::MTE2_V>(mte2ToVId);
+
+    LocalTensor<float> firstPreviousP =
+        previousPQue.AllocTensor<float>();
+    DataCopy(firstPreviousP,
+        partialOutGm[runInfo.attentionOutOffset], stateD);
+    previousPQue.EnQue(firstPreviousP);
+
+    Max(mergeTmpUb, previousMUb, currentM, runInfo.vec2MRealSize);
+    Sub(previousDiffUb, previousMUb, mergeTmpUb,
+        runInfo.vec2MRealSize);
+    Sub(currentDiffUb, currentM, mergeTmpUb,
+        runInfo.vec2MRealSize);
+    Exp(previousWeightUb, previousDiffUb, runInfo.vec2MRealSize);
+    Exp(currentWeightUb, currentDiffUb, runInfo.vec2MRealSize);
+    Mul(mergeTmpUb, previousWeightUb, previousLUb,
+        runInfo.vec2MRealSize);
+    Mul(mergedLUb, currentWeightUb, currentL,
+        runInfo.vec2MRealSize);
+    Add(mergedLUb, mergeTmpUb, mergedLUb, runInfo.vec2MRealSize);
+    PipeBarrier<PIPE_V>();
+
+    for (int64_t row = 0; row < runInfo.vec2MRealSize; ++row) {
+        const int64_t rowPBase =
+            runInfo.attentionOutOffset + row * stateD;
+        LocalTensor<float> previousP = previousPQue.DeQue<float>();
+        if (row + 1 < runInfo.vec2MRealSize) {
+            LocalTensor<float> nextPreviousP =
+                previousPQue.AllocTensor<float>();
+            DataCopy(nextPreviousP, partialOutGm[rowPBase + stateD],
+                stateD);
+            previousPQue.EnQue(nextPreviousP);
+        }
+
+        const float previousL = previousLUb.GetValue(row);
+        const float currentLValue = currentL.GetValue(row);
+        const bool hasPrevious = previousL > 0.0f;
+        const bool hasCurrent = currentLValue > 0.0f;
+        float previousWeight = 0.0f;
+        float currentWeight = 0.0f;
+        float mergedL = 0.0f;
+        bool scalePrevious = false;
+        bool scaleCurrent = false;
+        if (hasPrevious && hasCurrent) {
+            const float previousM = previousMUb.GetValue(row);
+            const float currentMValue = currentM.GetValue(row);
+            previousWeight = previousWeightUb.GetValue(row);
+            currentWeight = currentWeightUb.GetValue(row);
+            mergedL = mergedLUb.GetValue(row);
+            scalePrevious = currentMValue > previousM;
+            scaleCurrent = previousM > currentMValue;
+        } else if (hasPrevious) {
+            previousWeight = 1.0f;
+            mergedL = previousL;
+        } else if (hasCurrent) {
+            currentWeight = 1.0f;
+            mergedL = currentLValue;
+        }
+
+        LocalTensor<T> currentPRow =
+            currentP[row * qsfaDTemplateAlign64];
+        if (hasPrevious && hasCurrent) {
+            if (scalePrevious) {
+                Muls(previousP, previousP, previousWeight, stateD);
+            }
+            if (scaleCurrent) {
+                Muls(currentPRow, currentPRow, currentWeight, stateD);
+            }
+            Add(currentPRow, previousP, currentPRow, stateD);
+        } else if (hasPrevious) {
+            Adds(currentPRow, previousP, 0.0f, stateD);
+        } else if (!hasCurrent) {
+            Duplicate(currentPRow, 0.0f, stateD);
+        }
+        if (mergedL > 0.0f) {
+            Muls(currentPRow, currentPRow, 1.0f / mergedL, stateD);
+        }
+        previousPQue.FreeTensor(previousP);
+    }
+    PipeBarrier<PIPE_ALL>();
+    this->Bmm2DataCopyOut(
+        runInfo, constInfo, currentP, 0, calcSize);
+}
+
+TEMPLATES_DEF_NO_DEFAULT
+__aicore__ inline void QSFAVectorService<TEMPLATE_ARGS>::CopyOutState(
+    RunInfo &runInfo, ConstInfo &constInfo, LocalTensor<T> &partialUb,
+    LocalTensor<float> &maxUb, LocalTensor<float> &sumUb)
+{
+    const int64_t stateOffset =
+        runInfo.attentionOutOffset / constInfo.dSizeV;
+    SetFlag<HardEvent::V_MTE3>(vToMte3Id[0]);
+    WaitFlag<HardEvent::V_MTE3>(vToMte3Id[0]);
+
+    DataCopyExtParams partialParams;
+    partialParams.blockCount = runInfo.vec2MRealSize;
+    partialParams.blockLen = constInfo.dSizeV * sizeof(float);
+    partialParams.srcStride =
+        (qsfaDTemplateAlign64 - constInfo.dSizeV) * sizeof(float);
+    partialParams.dstStride =
+        (constInfo.n2G - constInfo.gSize) * constInfo.dSizeV *
+        sizeof(float);
+    DataCopyPad(partialOutGm[runInfo.attentionOutOffset], partialUb,
+        partialParams);
+
+    DataCopyExtParams scalarParams;
+    scalarParams.blockCount = 1;
+    scalarParams.blockLen = runInfo.vec2MRealSize * sizeof(float);
+    scalarParams.srcStride = 0;
+    scalarParams.dstStride = 0;
+    DataCopyPad(softmaxMaxGm[stateOffset], maxUb, scalarParams);
+    DataCopyPad(softmaxSumGm[stateOffset], sumUb, scalarParams);
 }
 
 TEMPLATES_DEF_NO_DEFAULT
@@ -733,6 +957,30 @@ __aicore__ inline void QSFAVectorService<TEMPLATE_ARGS>::CleanOutput(__gm__ uint
 }
 
 TEMPLATES_DEF_NO_DEFAULT
+template <C8StageMode STAGE_MODE>
+__aicore__ inline void QSFAVectorService<TEMPLATE_ARGS>::InitStageOutputs(
+    __gm__ uint8_t *missCounts, __gm__ uint8_t *partialOut,
+    __gm__ uint8_t *softmaxMax, __gm__ uint8_t *softmaxSum,
+    __gm__ uint8_t *attentionOut, ConstInfo &constInfo)
+{
+    if ASCEND_IS_AIV {
+        if constexpr (STAGE_MODE == C8StageMode::NATIVE) {
+            this->CleanOutput(attentionOut, constInfo);
+        } else {
+            partialOutGm.SetGlobalBuffer((__gm__ float *)partialOut);
+            softmaxMaxGm.SetGlobalBuffer((__gm__ float *)softmaxMax);
+            softmaxSumGm.SetGlobalBuffer((__gm__ float *)softmaxSum);
+            if constexpr (STAGE_MODE == C8StageMode::STAGE2_MERGE) {
+                attentionOutGm.SetGlobalBuffer((__gm__ OUTPUT_T *)attentionOut);
+                if (constInfo.needInit == 1) {
+                    InitOutputSingleCore(constInfo);
+                }
+            }
+        }
+    }
+}
+
+TEMPLATES_DEF_NO_DEFAULT
 __aicore__ inline void QSFAVectorService<TEMPLATE_ARGS>::InitGlobalBuffer(__gm__ uint8_t *key,
 __gm__ uint8_t *value, __gm__ uint8_t *sparseIndices, __gm__ uint8_t *blockTable)
 {
@@ -756,12 +1004,19 @@ __aicore__ inline void QSFAVectorService<TEMPLATE_ARGS>::SoftmaxInitBuffer()
 }
 
 TEMPLATES_DEF_NO_DEFAULT
+template <C8StageMode STAGE_MODE>
 __aicore__ inline void QSFAVectorService<TEMPLATE_ARGS>::InitLocalBuffer(TPipe *pipe, ConstInfo &constInfo)
 {
     // ub buffer
     SoftmaxInitBuffer();
 
-    tPipe->InitBuffer(commonTBuf, 512); // commonTBuf内存申请512B
+    if constexpr (STAGE_MODE == C8StageMode::STAGE2_MERGE) {
+        tPipe->InitBuffer(commonTBuf, 8 * 64 * sizeof(float));
+        tPipe->InitBuffer(previousPQue, 2, dVTemplateType * sizeof(float));
+        mte2ToVId = GetTPipePtr()->AllocEventID<HardEvent::MTE2_V>();
+    } else {
+        tPipe->InitBuffer(commonTBuf, 512); // commonTBuf内存申请512B
+    }
     tPipe->InitBuffer(stage0InQue, 2, dVTemplateTypeInput * 16 * sizeof(KV_T)); // V0阶段每次处理16个seq, 开2 buffer
     // 576: 模型特征维度(dSize)
     tPipe->InitBuffer(stage0OutQue, 2, 576 * (16 + 1) * sizeof(Q_T)); // kv输入D轴640, V0阶段每次处理16个seq, 开2 buffer
@@ -868,17 +1123,29 @@ TEMPLATES_DEF class QSFAVectorServiceDummy {
 public:
     __aicore__ inline QSFAVectorServiceDummy() {};
     __aicore__ inline void CleanOutput(__gm__ uint8_t *attentionOut, ConstInfo &constInfo) {}
+    template <C8StageMode STAGE_MODE>
+    __aicore__ inline void InitStageOutputs(
+        __gm__ uint8_t *missCounts, __gm__ uint8_t *partialOut,
+        __gm__ uint8_t *softmaxMax, __gm__ uint8_t *softmaxSum,
+        __gm__ uint8_t *attentionOut, ConstInfo &constInfo) {}
     __aicore__ inline void InitGlobalBuffer(__gm__ uint8_t *key, __gm__ uint8_t *value, __gm__ uint8_t *sparseIndices,
         __gm__ uint8_t *blockTable) {}
     __aicore__ inline void InitVecBlock(TPipe *pipe, const KvQuantSparseFlashAttentionTilingDataMla *__restrict tiling,
         CVSharedParams &sharedParams, int32_t aicIdx, uint8_t subBlockIdx, __gm__ uint8_t *actualSeqLengthsQ, __gm__ uint8_t *actualSeqLengths) {};
+    template <C8StageMode STAGE_MODE>
     __aicore__ inline void InitLocalBuffer(TPipe *pipe, ConstInfo &constInfo) {}
+
+    template <C8StageMode STAGE_MODE>
+    __aicore__ inline void ProcessVec0(Buffer<BufferType::L1, SyncType::CROSS_CORE_SYNC_FORWARD> &outputL1,
+        Buffer<BufferType::GM, SyncType::CROSS_CORE_SYNC_BACKWARD> &v0ResGm,
+        const RunInfo &runInfo, ConstInfo &constInfo) {}
 
     __aicore__ inline void ProcessVec1(Buffer<BufferType::L1, SyncType::CROSS_CORE_SYNC_FORWARD> &outputBuf,
         Buffer<BufferType::UB, SyncType::CROSS_CORE_SYNC_BOTH> &bmm1ResBuf,
         RunInfo &runInfo,
         ConstInfo &constInfo) {}
     using mm2ResPos = Buffer<BufferType::UB, SyncType::CROSS_CORE_SYNC_BOTH>;
+    template <C8StageMode STAGE_MODE>
     __aicore__ inline void ProcessVec2(mm2ResPos &bmm2ResBuf, RunInfo &runInfo,
         ConstInfo &constInfo) {}
 };

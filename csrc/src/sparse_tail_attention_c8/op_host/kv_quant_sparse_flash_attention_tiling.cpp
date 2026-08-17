@@ -1024,8 +1024,12 @@ ge::graphStatus QSFATilingCheck::CheckAttenOutShape()
 
 ge::graphStatus QSFATilingCheck::CheckAttenOut()
 {
-    if (ge::GRAPH_SUCCESS != CheckDTypeConsistency(opParamInfo_.attenOut.desc->GetDataType(),
-        inputQType_, ATTEN_OUT_NAME) ||
+    const ge::DataType outputType = opParamInfo_.attenOut.desc->GetDataType();
+    // Stage1 exposes the unnormalized P state as output 0.  Its shape is the
+    // normal attention shape, but its storage type is intentionally FP32.
+    const bool isStageState = outputType == ge::DT_FLOAT;
+    if ((!isStageState && ge::GRAPH_SUCCESS != CheckDTypeConsistency(
+            outputType, inputQType_, ATTEN_OUT_NAME)) ||
         ge::GRAPH_SUCCESS != CheckAttenOutShape()) {
         return ge::GRAPH_FAILED;
     }
@@ -1687,6 +1691,9 @@ ge::graphStatus QSFAInfoParser::GetInOutDataType()
     inputQType_ = opParamInfo_.query.desc->GetDataType();
     inputKvType_ = opParamInfo_.key.desc->GetDataType();
     outputType_ = opParamInfo_.attenOut.desc->GetDataType();
+    if (outputType_ == ge::DT_FLOAT) {
+        outputType_ = inputQType_;
+    }
     return ge::GRAPH_SUCCESS;
 }
 

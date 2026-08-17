@@ -75,9 +75,9 @@ static ge::graphStatus InferAttentionDtype(gert::InferDataTypeContext *context)
 }
 
 #ifndef A5_C8_STAGE2_HOST_ONLY
-class A5SparseTailAttentionC8State : public OpDef {
+class A5SparseTailAttentionC8MtpStage1 : public OpDef {
 public:
-    explicit A5SparseTailAttentionC8State(const char *name) : OpDef(name)
+    explicit A5SparseTailAttentionC8MtpStage1(const char *name) : OpDef(name)
     {
         const std::vector<ge::DataType> baseQueryTypes = {
             ge::DT_BF16, ge::DT_FLOAT16};
@@ -166,9 +166,9 @@ public:
 #endif
 
 #ifdef A5_C8_STAGE2_HOST_ONLY
-class A5SparseTailAttentionC8Stage2 : public OpDef {
+class A5SparseTailAttentionC8MtpStage2 : public OpDef {
 public:
-    explicit A5SparseTailAttentionC8Stage2(const char *name) : OpDef(name)
+    explicit A5SparseTailAttentionC8MtpStage2(const char *name) : OpDef(name)
     {
         const std::vector<ge::DataType> queryTypes = {
             ge::DT_BF16, ge::DT_FLOAT16};
@@ -248,13 +248,13 @@ public:
 #endif
 
 #ifndef A5_C8_STAGE2_HOST_ONLY
-OP_ADD(A5SparseTailAttentionC8State);
-IMPL_OP_INFERSHAPE(A5SparseTailAttentionC8State)
+OP_ADD(A5SparseTailAttentionC8MtpStage1);
+IMPL_OP_INFERSHAPE(A5SparseTailAttentionC8MtpStage1)
     .InferShape(InferStateShape)
     .InferDataType(InferStateDtype);
 #else
-OP_ADD(A5SparseTailAttentionC8Stage2);
-IMPL_OP_INFERSHAPE(A5SparseTailAttentionC8Stage2)
+OP_ADD(A5SparseTailAttentionC8MtpStage2);
+IMPL_OP_INFERSHAPE(A5SparseTailAttentionC8MtpStage2)
     .InferShape(InferAttentionShape)
     .InferDataType(InferAttentionDtype);
 #endif

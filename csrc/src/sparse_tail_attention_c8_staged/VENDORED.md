@@ -1,7 +1,7 @@
 # Vendored C8 QSFA
 
 The QSFA compute/tiling sources in `op_kernel/c8_vendor` and
-`op_host/a5_sparse_tail_attention_c8_state_tiling.*` come from:
+`op_host/a5_sparse_tail_attention_c8_mtp_stage1_tiling.*` come from:
 
 - repository: `https://gitcode.com/cann/ops-transformer.git`
 - branch: `9.1.0`

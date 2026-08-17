@@ -21,7 +21,7 @@
 #include "a5_sfa_shared/ops_log_compat.h"
 #include "register/op_def_registry.h"
 #include "../op_kernel/c8_vendor/attention/kv_quant_sparse_flash_attention/op_kernel/kv_quant_sparse_flash_attention_template_tiling_key.h"
-#include "a5_sparse_tail_attention_c8_state_tiling.h"
+#include "a5_sparse_tail_attention_c8_mtp_stage1_tiling.h"
 
 using std::map;
 using std::string;
@@ -2224,7 +2224,7 @@ ge::graphStatus QSFAInfoParser::Parse(QSFATilingInfo &qsfaInfo)
     return ge::GRAPH_SUCCESS;
 }
 
-IMPL_OP_OPTILING(A5SparseTailAttentionC8State)
+IMPL_OP_OPTILING(A5SparseTailAttentionC8MtpStage1)
     .Tiling(TilingKvQuantSparseFlashAttention)
     .TilingParse<KvQuantSparseFlashAttentionCompileInfo>(TilingPrepareForKvQuantSparseFlashAttention);
 } // namespace optiling

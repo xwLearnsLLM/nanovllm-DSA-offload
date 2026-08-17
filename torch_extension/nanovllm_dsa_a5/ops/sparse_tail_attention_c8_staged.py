@@ -143,7 +143,7 @@ def _local_state_out(
     softmax_sum: torch.Tensor,
     kv_dtype: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return torch.ops.nanovllm_dsa._sparse_tail_attention_c8_state_out(
+    return torch.ops.nanovllm_dsa._sparse_tail_attention_c8_mtp_stage1_out(
         query,
         packed_kv,
         topk_slots,
@@ -258,7 +258,7 @@ def _stage2_impl(
         softmax_sum,
         attention_out,
     )
-    torch.ops.nanovllm_dsa._sparse_tail_attention_c8_stage2_out(
+    torch.ops.nanovllm_dsa._sparse_tail_attention_c8_mtp_stage2(
         query,
         packed_kv,
         topk_destination_slots,
@@ -406,19 +406,19 @@ def _tnd_probe_meta(
 
 
 torch.library.impl(
-    "nanovllm_dsa::sparse_tail_attention_c8_stage1_out",
+    "nanovllm_dsa::sparse_tail_attention_c8_mtp_stage1",
     "PrivateUse1",
 )(_stage1_impl)
 torch.library.impl(
-    "nanovllm_dsa::sparse_tail_attention_c8_stage1_out",
+    "nanovllm_dsa::sparse_tail_attention_c8_mtp_stage1",
     "Meta",
 )(_stage1_meta)
 torch.library.impl(
-    "nanovllm_dsa::sparse_tail_attention_c8_stage2_out",
+    "nanovllm_dsa::sparse_tail_attention_c8_mtp_stage2",
     "PrivateUse1",
 )(_stage2_impl)
 torch.library.impl(
-    "nanovllm_dsa::sparse_tail_attention_c8_stage2_out",
+    "nanovllm_dsa::sparse_tail_attention_c8_mtp_stage2",
     "Meta",
 )(_stage2_meta)
 torch.library.impl(
@@ -431,7 +431,7 @@ torch.library.impl(
 )(_tnd_probe_meta)
 
 
-def sparse_tail_attention_c8_stage1_out(
+def sparse_tail_attention_c8_mtp_stage1(
     query: torch.Tensor,
     packed_kv: torch.Tensor,
     actual_seq_lengths_query: torch.Tensor,
@@ -446,7 +446,7 @@ def sparse_tail_attention_c8_stage1_out(
     softmax_sum: torch.Tensor,
     kv_dtype: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    torch.ops.nanovllm_dsa.sparse_tail_attention_c8_stage1_out.default(
+    torch.ops.nanovllm_dsa.sparse_tail_attention_c8_mtp_stage1.default(
         query,
         packed_kv,
         actual_seq_lengths_query,
@@ -464,7 +464,7 @@ def sparse_tail_attention_c8_stage1_out(
     return partial_out, softmax_max, softmax_sum
 
 
-def sparse_tail_attention_c8_stage2_out(
+def sparse_tail_attention_c8_mtp_stage2(
     query: torch.Tensor,
     packed_kv: torch.Tensor,
     actual_seq_lengths_query: torch.Tensor,
@@ -479,7 +479,7 @@ def sparse_tail_attention_c8_stage2_out(
     attention_out: torch.Tensor,
     kv_dtype: int | None = None,
 ) -> torch.Tensor:
-    torch.ops.nanovllm_dsa.sparse_tail_attention_c8_stage2_out.default(
+    torch.ops.nanovllm_dsa.sparse_tail_attention_c8_mtp_stage2.default(
         query,
         packed_kv,
         actual_seq_lengths_query,
@@ -498,6 +498,6 @@ def sparse_tail_attention_c8_stage2_out(
 
 
 __all__ = [
-    "sparse_tail_attention_c8_stage1_out",
-    "sparse_tail_attention_c8_stage2_out",
+    "sparse_tail_attention_c8_mtp_stage1",
+    "sparse_tail_attention_c8_mtp_stage2",
 ]

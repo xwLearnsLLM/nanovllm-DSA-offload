@@ -50,6 +50,12 @@ enum class QSFATemplateMode {
 };
 
 namespace BaseApi {
+enum class C8StageMode : int {
+    NATIVE = 0,
+    STAGE1_STATE = 1,
+    STAGE2_MERGE = 2,
+};
+
 __aicore__ constexpr uint64_t Align2Func(uint64_t data) {
     return (data + 1UL) >> 1UL << 1UL; // 向上2对齐, +1移位2
 }

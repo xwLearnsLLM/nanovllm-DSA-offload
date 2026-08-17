@@ -68,6 +68,12 @@ struct RunParamStr {  // 分核与切块需要使用到参数
 
     int64_t qSNumInOneBlock;
     int64_t kvLoopEndIdx;
+
+    // no-MTP staged C8 metadata, resolved once for each request row.
+    int64_t stagedSlotRowOffset;
+    int32_t stagedMissCount;
+    int32_t stagedValidCount;
+    bool stagedSlotSetEmpty;
 };
 
 #define COMMON_RUN_INFO \
@@ -116,6 +122,11 @@ struct RunInfo {
 
     int64_t qSNumInOneBlock;
     int64_t kvLoopEndIdx;
+
+    int64_t stagedSlotRowOffset;
+    int32_t stagedMissCount;
+    int32_t stagedValidCount;
+    bool stagedSlotSetEmpty;
 };
 
 #define COMMON_CONST_INFO \

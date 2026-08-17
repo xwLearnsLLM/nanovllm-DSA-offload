@@ -215,6 +215,8 @@ TILING_DATA_FIELD_DEF_STRUCT(KvQuantSparseFlashAttentionSingleCoreTensorSizeMla,
 TILING_DATA_FIELD_DEF_STRUCT(KvQuantSparseFlashAttentionInnerSplitParams, innerSplitParams);
 END_TILING_DATA_DEF
 REGISTER_TILING_DATA_CLASS(A5SparseTailAttentionC8, KvQuantSparseFlashAttentionTilingDataMla)
+REGISTER_TILING_DATA_CLASS(A5SparseTailAttentionC8Stage1, KvQuantSparseFlashAttentionTilingDataMla)
+REGISTER_TILING_DATA_CLASS(A5SparseTailAttentionC8Stage2, KvQuantSparseFlashAttentionTilingDataMla)
 
 template <typename T> inline T Align(T num, T rnd)
 {

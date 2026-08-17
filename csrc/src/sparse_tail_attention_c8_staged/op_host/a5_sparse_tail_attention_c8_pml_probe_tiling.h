@@ -2,6 +2,6 @@
 #define A5_SPARSE_TAIL_ATTENTION_C8_PML_PROBE_TILING_H
 
 #define A5_C8_PML_PROBE_TILING_ONLY
-#include "a5_sparse_tail_attention_c8_state_tiling.h"
+#include "a5_sparse_tail_attention_c8_mtp_stage1_tiling.h"
 
 #endif
