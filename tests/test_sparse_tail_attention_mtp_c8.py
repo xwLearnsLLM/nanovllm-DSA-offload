@@ -5,6 +5,12 @@ Each request packs 1..4 verification queries (root + drafts). Every global
 query row r = prefix_b + i attends its OWN top-2048 HBM slots plus the causal
 dense tail C, C+1, ..., C+i, encoded as [topk || tail || -1 pad] in one
 sparse_and_tail_slots row.
+
+Beyond the CPU golden, three oracle-class gates pin the MTP packing semantics
+to independent references (mirroring ut_ops/test_sparse_tail_attention_mtp.py):
+repeat determinism, per-path serial launches of the single-path C8 op
+(bitwise), and NPUGraph replay under dynamic topk slots / block table / kv
+length (bitwise).
 """
 
 from __future__ import annotations
@@ -258,6 +264,112 @@ def check(inputs: dict[str, object], args: argparse.Namespace) -> None:
     )
 
 
+def check_determinism(inputs: dict[str, object]) -> None:
+    """Two identical launches must agree bit-for-bit (no cross-row state)."""
+    first = launch(inputs)
+    second = launch(inputs)
+    torch.npu.synchronize()
+    torch.testing.assert_close(first, second, rtol=0, atol=0)
+    print(
+        "A5_SPARSE_TAIL_ATTENTION_MTP_C8_REPEAT_CHECK bitwise=1 ok=1",
+        flush=True,
+    )
+
+
+def check_serial_oracle(
+    inputs: dict[str, object], args: argparse.Namespace
+) -> None:
+    """Each packed row must match the single-path C8 op launched alone.
+
+    The single-path op is the mature sibling sharing this kernel family;
+    comparing every (request, path) row against its solo launch pins the
+    MTP packing semantics (TND prefix-sum row offset, per-path causal tail,
+    -1 terminator) to an independent implementation instead of this file's
+    own golden assumptions.
+    """
+    query_counts: tuple[int, ...] = inputs["query_counts"]
+    device: torch.device = inputs["device"]
+    rows = []
+    for request, count in enumerate(query_counts):
+        for path in range(count):
+            row = sum(query_counts[:request]) + path
+            actual_q = torch.ones(1, dtype=torch.int32, device=device)
+            # Solo row semantics: s1=1, kv length covers this path's tail
+            # C..C+path, so resident = C + path + 1.
+            resident = torch.tensor(
+                [args.cache_tokens + path + 1],
+                dtype=torch.int32,
+                device=device,
+            )
+            solo = torch.ops.nanovllm_dsa.sparse_tail_attention_c8.default(
+                inputs["query"][row : row + 1],
+                inputs["packed"],
+                inputs["slots"][row : row + 1],
+                inputs["block_table"][request : request + 1],
+                actual_q,
+                resident,
+                inputs["scale"],
+            )
+            rows.append(solo[0])
+    serial = torch.stack(rows)
+    packed = launch(inputs)
+    torch.npu.synchronize()
+    torch.testing.assert_close(packed, serial, rtol=0, atol=0)
+    print(
+        "A5_SPARSE_TAIL_ATTENTION_MTP_C8_SERIAL_CHECK "
+        f"query_counts={query_counts} rows={len(rows)} bitwise=1 ok=1",
+        flush=True,
+    )
+
+
+def check_graph(inputs: dict[str, object], replays: int = 3) -> None:
+    """Graph replay must track dynamic topk slots / block table / kv length."""
+    eager_static = launch(inputs)
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    pool = torch.npu.graph_pool_handle()
+    with torch.npu.graph(graph, pool=pool):
+        graph_out = launch(inputs)
+    torch.npu.synchronize()
+    torch.testing.assert_close(graph_out, eager_static, rtol=0, atol=0)
+
+    slots: torch.Tensor = inputs["slots"]
+    table: torch.Tensor = inputs["block_table"]
+    resident: torch.Tensor = inputs["resident_lengths"]
+    slots_backup = slots.clone()
+    table_backup = table.clone()
+    resident_backup = resident.clone()
+    last = len(inputs["query_counts"]) - 1
+    count_last: int = inputs["query_counts"][last]
+    try:
+        for replay in range(replays):
+            # Roll only the topk region: rolling the whole row would move
+            # -1 terminators into the selection prefix.
+            topk = slots[:, :, :TOPK]
+            topk.copy_(torch.roll(topk, shifts=replay + 1, dims=2))
+            table.copy_(torch.roll(table, shifts=replay + 1, dims=1))
+            # Shrink the last request's sparse budget by one block so the
+            # derived cache_tokens stays 128-aligned; skip when it would
+            # drop below the 2048 minimum the binding enforces.
+            current_cache = int(resident[last].item()) - count_last
+            if (replay + 1) % 2 and current_cache - BLOCK_SIZE >= TOPK:
+                resident[last] -= BLOCK_SIZE
+            eager = launch(inputs)
+            graph.replay()
+            torch.npu.synchronize()
+            torch.testing.assert_close(graph_out, eager, rtol=0, atol=0)
+    finally:
+        slots.copy_(slots_backup)
+        table.copy_(table_backup)
+        resident.copy_(resident_backup)
+    print(
+        "A5_SPARSE_TAIL_ATTENTION_MTP_C8_GRAPH_CHECK "
+        f"replays={replays} dynamic_topk_slots=1 dynamic_block_table=1 "
+        "dynamic_kvlen=1 bitwise=1 ok=1",
+        flush=True,
+    )
+
+
 def benchmark(inputs: dict[str, object], args: argparse.Namespace) -> None:
     for _ in range(args.warmup):
         launch(inputs)
@@ -374,7 +486,15 @@ def main() -> None:
         current = case_args(
             args, batch, query_counts, cache_tokens, args.seed + 10 + index
         )
-        check(make_inputs(current), current)
+        inputs = make_inputs(current)
+        check(inputs, current)
+        check_determinism(inputs)
+        check_serial_oracle(inputs, current)
+        # C=0 rows hold [0..path || -1 pad]; rolling the topk region would
+        # drag terminators into the prefix, so the graph gate only runs on
+        # block-aligned sparse budgets.
+        if cache_tokens >= TOPK:
+            check_graph(inputs)
 
     case_index = 0
     for batch in args.batch_sizes:
