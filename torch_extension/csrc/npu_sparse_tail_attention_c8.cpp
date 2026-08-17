@@ -221,6 +221,8 @@ void SparseTailAttentionC8Stage1Npu(
       "C8 staged attention");
   const c10::optional<at::Tensor> no_scale = c10::nullopt;
   C8StagedAttrs attrs(scale_value);
+  char* query_layout_ptr = attrs.query_layout.data();
+  char* kv_layout_ptr = attrs.kv_layout.data();
   auto keepalive = std::make_tuple(
       query, packed_kv, sparse_and_tail_slots, block_table,
       actual_seq_lengths_query, resident_seq_lengths, miss_counts,
@@ -231,8 +233,8 @@ void SparseTailAttentionC8Stage1Npu(
       no_scale, no_scale, block_table, actual_seq_lengths_query,
       resident_seq_lengths, miss_counts, attrs.scale_value,
       attrs.key_quant_mode, attrs.value_quant_mode,
-      attrs.sparse_block_size, attrs.query_layout.data(),
-      attrs.kv_layout.data(), attrs.sparse_mode, attrs.all_tokens,
+      attrs.sparse_block_size, query_layout_ptr,
+      kv_layout_ptr, attrs.sparse_mode, attrs.all_tokens,
       attrs.all_tokens, attrs.attention_mode,
       attrs.quant_scale_repo_mode, attrs.tile_size,
       attrs.rope_head_dim, attrs.return_softmax_lse,
@@ -263,6 +265,8 @@ void SparseTailAttentionC8Stage2Npu(
               &attention_out}, "C8 staged attention");
   const c10::optional<at::Tensor> no_scale = c10::nullopt;
   C8StagedAttrs attrs(scale_value);
+  char* query_layout_ptr = attrs.query_layout.data();
+  char* kv_layout_ptr = attrs.kv_layout.data();
   auto keepalive = std::make_tuple(
       query, packed_kv, sparse_and_tail_slots, block_table,
       actual_seq_lengths_query, resident_seq_lengths, miss_counts,
@@ -274,7 +278,7 @@ void SparseTailAttentionC8Stage2Npu(
       resident_seq_lengths, miss_counts, previous_p, previous_m,
       previous_l, attrs.scale_value, attrs.key_quant_mode,
       attrs.value_quant_mode, attrs.sparse_block_size,
-      attrs.query_layout.data(), attrs.kv_layout.data(),
+      query_layout_ptr, kv_layout_ptr,
       attrs.sparse_mode, attrs.all_tokens, attrs.all_tokens,
       attrs.attention_mode, attrs.quant_scale_repo_mode,
       attrs.tile_size, attrs.rope_head_dim, attrs.return_softmax_lse,
