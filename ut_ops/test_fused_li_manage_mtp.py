@@ -1050,7 +1050,20 @@ def _compare_valid_outputs(
     if not torch.equal(left_counts, right_counts):
         raise AssertionError(f"{label}: miss_counts differ")
     if not torch.equal(left[5].cpu(), right[5].cpu()):
-        raise AssertionError(f"{label}: topk_miss_counts differ")
+        left_query_counts = left[5].cpu().to(torch.int64)
+        right_query_counts = right[5].cpu().to(torch.int64)
+        left_from_sources = (left[1].reshape(-1, TOPK).cpu() >= 0).sum(dim=1)
+        right_from_sources = (right[1].reshape(-1, TOPK).cpu() >= 0).sum(dim=1)
+        differing = torch.nonzero(
+            left_query_counts != right_query_counts
+        ).flatten().tolist()
+        raise AssertionError(
+            f"{label}: topk_miss_counts differ rows={differing} "
+            f"left={left_query_counts.tolist()} "
+            f"right={right_query_counts.tolist()} "
+            f"left_from_sources={left_from_sources.tolist()} "
+            f"right_from_sources={right_from_sources.tolist()}"
+        )
     for request, count_value in enumerate(left_counts.tolist()):
         count = int(count_value)
         if not torch.equal(

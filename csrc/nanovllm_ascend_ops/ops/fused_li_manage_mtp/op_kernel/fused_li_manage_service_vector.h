@@ -1107,9 +1107,6 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
                        BASE_TOPK, compactParams, rowMissCount);
             PipeBarrier<PIPE_V>();
             SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
-            topkMissCountsGm.SetValue(
-                info.queryBegin + queryIdx,
-                static_cast<int32_t>(rowMissCount));
             for (uint32_t rowMissIdx = 0;
                  rowMissIdx < static_cast<uint32_t>(rowMissCount);
                  ++rowMissIdx) {
@@ -1470,6 +1467,14 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
                AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE, BASE_TOPK);
         PipeBarrier<PIPE_V>();
         SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
+
+        // Publish the per-query count from the same mask used to construct
+        // the caller-visible source/slot rows below. Keeping this write in
+        // the final output pass also gives ACLGraph replay one unambiguous
+        // producer for every topk_miss_counts element.
+        topkMissCountsGm.SetValue(
+            info.queryBegin + queryIdx,
+            static_cast<int32_t>(Min(rowMissCount, tokenMissCount)));
 
         uint32_t patchCount = static_cast<uint32_t>(
             Min(rowMissCount, tokenMissCount));
