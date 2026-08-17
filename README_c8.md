@@ -1,6 +1,6 @@
 # Ascend 950 C8 Decode Offload 算子
 
-本仓库提供 GLM-5.1/5.2 W4A4C8 decode KV-cache 卸载所需的 4 个 Ascend 950 单算子。Torch namespace 为 `nanovllm_dsa`，index cache 与 KV cache 均采用 C8 格式。
+本仓库提供 GLM-5.1/5.2 W4A4C8 decode KV-cache 卸载所需的 5 个 Ascend 950 单算子。Torch namespace 为 `nanovllm_dsa`，index cache 与 KV cache 均采用 C8 格式。
 
 ## 算子
 
@@ -10,6 +10,7 @@
 | `fused_li_manage_mtp_c8` | `A5FusedLiManageMtpC8` | MTP1～3 packed query 的 C8 top-k union 与一次性缓存更新 |
 | `kvcache_scatter_copy_c8` | `A5KvcacheScatterCopyC8` | packed C8 KV 的 swapped-memory DRAM → HBM 搬运并生成 attention metadata |
 | `sparse_tail_attention_c8` | `A5SparseTailAttentionC8` | packed C8 KV 上的 top-2048 sparse + dense tail MLA |
+| `sparse_tail_attention_mtp_c8` | `A5SparseTailAttentionMtpC8` | MTP packed query 的 per-path top-2048 sparse + per-path causal tail MLA |
 
 ## 接口
 
@@ -80,9 +81,31 @@ torch.ops.nanovllm_dsa.sparse_tail_attention_c8(
     resident_seq_lengths,
     scale_value,
 ) -> attention_out          # bf16[B,Q_HEAD,512]
+
+torch.ops.nanovllm_dsa.sparse_tail_attention_mtp_c8(
+    query,                  # bf16[T,Q_HEAD,576], T=sum(query_counts)
+    packed_kv,              # C8[HBM_BLOCKS,128,1,656]
+    sparse_and_tail_slots,  # int32[T,1,2048+max(query_counts)] 每路一行:
+                            #   [0:2048) = 该路自己的 top-2048（直接取
+                            #             fused_li_manage_mtp_c8 的
+                            #             topk_destination_slots[r]）
+                            #   [2048:2048+i+1) = causal tail C, C+1, ..., C+i
+                            #             （i = 该路在请求内的位置）
+                            #   其余 = -1 终止填充
+    block_table,            # int32[B,MAX_BLOCKS]（按请求，不按 query 行）
+    actual_seq_lengths_query, # cumulative int32[B]，差分 = query_counts
+    resident_seq_lengths,   # int32[B] = C + query_counts[b]
+    scale_value,
+) -> attention_out          # bf16[T,Q_HEAD,512]
 ```
 
-固定约束：block size 128，index head dim 128，packed KV row 656 bytes，`Q_HEAD<=64`，单请求 MTP query 数为 2～4，MTP union 容量为 8192，source token ID 为 18 bit，source capacity 不超过 `262144`。两种 manager 的 `C=0` 请求严格 no-op；活跃 `req_pool_entries` 必须唯一。
+`sparse_tail_attention_mtp_c8` 的 binding 只做 shape/dtype/device 检查
+（读张量数据会在 NPUGraph capture 阶段触发同步 D2H 拷贝失败）；累计差分、
+`resident = C + query_counts`、cache_tokens 块对齐等数据契约由
+`nanovllm_dsa_a5.validate_mtp_c8_packing(actual_seq_lengths_query,
+resident_seq_lengths, T, slots_width)` 在 capture 外校验。
+
+固定约束：block size 128，index head dim 128，packed KV row 656 bytes，`Q_HEAD<=64`，MTP union 容量为 8192，source token ID 为 18 bit，source capacity 不超过 `262144`。单请求 MTP query 数：`fused_li_manage_mtp_c8` 为 2～4，`sparse_tail_attention_mtp_c8` 放宽为 1～4（兼容 1 路裸 query 复用同一算子）；后者的 `resident_seq_lengths = C + query_counts`，`C` 为 0 或块对齐且 `C + max(query_counts) >= 2048`，slots 行宽 `>= 2048 + max(query_counts)`。两种 manager 的 `C=0` 请求严格 no-op；活跃 `req_pool_entries` 必须唯一。
 
 ## 编译
 
@@ -119,5 +142,6 @@ python3 tests/test_fused_li_manage_c8.py --device npu:0 --heads 32,64 --batch-si
 python3 tests/test_fused_li_manage_mtp_c8.py --device npu:0 --batch-size 6 --heads 32,64 --source-len 20096 --queries-per-request 0 --miss-min 0 --miss-max 300 --pool-extra 7 --warmup 3 --iters 20 --seed 7
 python3 tests/test_kvcache_scatter_copy_c8.py --device npu:0 --batch-size 24 --source-len 20096 --cache-tokens 6144 --tail-tokens 64 --max-tail-tokens 512 --copy-min 0 --copy-max 300 --warmup 3 --iters 20 --seed 7
 python3 tests/test_sparse_tail_attention_c8.py --device npu:0 --heads 8 --batch-sizes 24 --cache-tokens 6144 --tail-tokens 64 --max-tail-tokens 512 --warmup 3 --iters 20 --seed 7
+python3 tests/test_sparse_tail_attention_mtp_c8.py --device npu:0 --heads 8 --batch-sizes 24 --cache-tokens 6144 --warmup 3 --iters 20 --seed 7
 python3 tests/test_offload_split_c8_graph.py --device npu:0 --replays 4 --seed 7
 ```
