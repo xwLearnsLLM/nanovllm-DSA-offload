@@ -63,6 +63,7 @@ from .ops import (  # noqa: E402
     sparse_tail_attention,
     sparse_tail_attention_c8,
     sparse_tail_attention_mtp_c8,
+    validate_mtp_c8_packing,
 )
 
 
@@ -85,5 +86,6 @@ __all__ = [
     "fused_copy_sparse_tail_attention",
     "sparse_tail_attention_c8",
     "sparse_tail_attention_mtp_c8",
+    "validate_mtp_c8_packing",
     "local_opapi_path",
 ]

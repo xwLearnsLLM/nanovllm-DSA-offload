@@ -246,6 +246,14 @@ def launch(inputs: dict[str, object]) -> torch.Tensor:
 
 
 def check(inputs: dict[str, object], args: argparse.Namespace) -> None:
+    # The C++ binding is shape-only for NPUGraph-capturability; the data
+    # contract is enforced here, outside capture.
+    nanovllm_dsa_a5.validate_mtp_c8_packing(
+        inputs["actual_q"],
+        inputs["resident_lengths"],
+        inputs["total_rows"],
+        inputs["slots"].size(2),
+    )
     expected = cpu_reference(inputs, args)
     actual = launch(inputs)
     torch.npu.synchronize()

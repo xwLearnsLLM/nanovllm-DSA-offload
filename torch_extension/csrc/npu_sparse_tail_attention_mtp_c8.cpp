@@ -1,6 +1,4 @@
-#include <algorithm>
 #include <tuple>
-#include <vector>
 
 #include "ops_common.h"
 
@@ -8,13 +6,18 @@ namespace nanovllm_dsa_a5_impl {
 namespace {
 
 constexpr int64_t kC8QueryDim = kCkvDim + kKpeDim;
-constexpr int64_t kMaxQueriesPerRequest = 4;
-constexpr int64_t kMinQueriesPerRequest = 1;
 
 // Returns query_counts[b] (the cumulative diff) for every request and validates
 // the MTP packing contract: strictly increasing totals, last total == T, and
 // per-request counts within [1, 4].
-std::vector<int64_t> CheckSparseTailAttentionMtpC8Inputs(
+//
+// NOTE: data-dependent checks (cumulative diffs, resident >= count, the
+// block-aligned cache derivation, slots row width) intentionally live in the
+// Python callers/tests, not here. Reading tensor values from the op would
+// force a synchronous D2H copy, which NPUGraph capture forbids (aclrtMemcpy
+// 107030 on a capturing stream) - the sibling C8 ops keep this binding
+// shape-only for exactly that reason.
+void CheckSparseTailAttentionMtpC8Inputs(
     const at::Tensor& query,
     const at::Tensor& packed_kv,
     const at::Tensor& sparse_and_tail_slots,
@@ -67,46 +70,10 @@ std::vector<int64_t> CheckSparseTailAttentionMtpC8Inputs(
       {&query, &packed_kv, &sparse_and_tail_slots, &block_table,
        &actual_seq_lengths_query, &resident_seq_lengths},
       "C8 MTP sparse+tail attention");
-
-  const auto totals = actual_seq_lengths_query.cpu();
-  const auto residents = resident_seq_lengths.cpu();
-  const auto totals_a = totals.accessor<int32_t, 1>();
-  const auto residents_a = residents.accessor<int32_t, 1>();
-  std::vector<int64_t> query_counts(static_cast<size_t>(batch));
-  int64_t previous = 0;
-  int64_t max_count = 0;
-  for (int64_t b = 0; b < batch; ++b) {
-    const int64_t total = totals_a[b];
-    const int64_t count = total - previous;
-    TORCH_CHECK(
-        count >= kMinQueriesPerRequest && count <= kMaxQueriesPerRequest,
-        "C8 MTP sparse+tail attention actual_seq_lengths_query must be "
-        "strictly increasing with per-request diffs in [1,4]; request ",
-        b, " has diff ", count, ".");
-    TORCH_CHECK(
-        residents_a[b] >= count,
-        "C8 MTP sparse+tail attention resident_seq_lengths[b] must cover "
-        "query_counts[b]; request ", b, " has ", residents_a[b], " < ",
-        count, ".");
-    const int64_t cache_tokens = residents_a[b] - count;
-    TORCH_CHECK(
-        cache_tokens == 0 ||
-            (cache_tokens >= kSparseCount && cache_tokens % kBlockSize == 0),
-        "C8 MTP sparse+tail attention cache_tokens must be 0 or "
-        "block-aligned >= 2048; request ", b, " has ", cache_tokens, ".");
-    query_counts[static_cast<size_t>(b)] = count;
-    max_count = std::max(max_count, count);
-    previous = total;
-  }
   TORCH_CHECK(
-      previous == query.size(0),
-      "C8 MTP sparse+tail attention actual_seq_lengths_query last value "
-      "must equal the packed query row count T.");
-  TORCH_CHECK(
-      sparse_and_tail_slots.size(2) >= kSparseCount + max_count,
-      "C8 MTP sparse+tail slots row width must cover 2048 + the largest "
-      "per-request query count.");
-  return query_counts;
+      query.size(0) >= actual_seq_lengths_query.numel(),
+      "C8 MTP sparse+tail attention packed query rows must cover every "
+      "request (T >= batch).");
 }
 
 }  // namespace

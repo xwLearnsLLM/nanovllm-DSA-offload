@@ -15,7 +15,10 @@ from .fused_copy_sparse_tail_attention import (
 )
 from .sparse_tail_attention import sparse_tail_attention
 from .sparse_tail_attention_c8 import sparse_tail_attention_c8
-from .sparse_tail_attention_mtp_c8 import sparse_tail_attention_mtp_c8
+from .sparse_tail_attention_mtp_c8 import (
+    sparse_tail_attention_mtp_c8,
+    validate_mtp_c8_packing,
+)
 
 
 __all__ = [
@@ -33,4 +36,5 @@ __all__ = [
     "fused_copy_sparse_tail_attention",
     "sparse_tail_attention_c8",
     "sparse_tail_attention_mtp_c8",
+    "validate_mtp_c8_packing",
 ]
