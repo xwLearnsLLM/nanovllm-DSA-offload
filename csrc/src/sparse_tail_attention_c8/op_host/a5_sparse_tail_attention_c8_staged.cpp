@@ -1,3 +1,5 @@
+#if defined(A5_C8_NOMTP_STAGE1_HOST_ONLY) || defined(A5_C8_NOMTP_STAGE2_HOST_ONLY)
+
 #include <cstdint>
 #include <vector>
 
@@ -8,6 +10,7 @@ namespace ops {
 namespace {
 constexpr int64_t kRopeDim = 64;
 
+#ifdef A5_C8_NOMTP_STAGE1_HOST_ONLY
 ge::graphStatus InferStage1Shape(gert::InferShapeContext *context)
 {
     if (context == nullptr || context->GetInputShape(0) == nullptr ||
@@ -38,7 +41,9 @@ ge::graphStatus InferStage1Dtype(gert::InferDataTypeContext *context)
     context->SetOutputDataType(2, ge::DT_FLOAT);
     return ge::GRAPH_SUCCESS;
 }
+#endif
 
+#ifdef A5_C8_NOMTP_STAGE2_HOST_ONLY
 ge::graphStatus InferStage2Shape(gert::InferShapeContext *context)
 {
     if (context == nullptr || context->GetInputShape(0) == nullptr ||
@@ -62,6 +67,7 @@ ge::graphStatus InferStage2Dtype(gert::InferDataTypeContext *context)
     context->SetOutputDataType(0, context->GetInputDataType(0));
     return ge::GRAPH_SUCCESS;
 }
+#endif
 
 void AddCommonAttrs(OpDef &op)
 {
@@ -139,6 +145,7 @@ void AddA5Config(OpDef &op, bool stage1)
 }
 } // namespace
 
+#ifdef A5_C8_NOMTP_STAGE1_HOST_ONLY
 class A5SparseTailAttentionC8Stage1 : public OpDef {
 public:
     explicit A5SparseTailAttentionC8Stage1(const char *name) : OpDef(name)
@@ -154,6 +161,12 @@ public:
     }
 };
 
+OP_ADD(A5SparseTailAttentionC8Stage1);
+IMPL_OP_INFERSHAPE(A5SparseTailAttentionC8Stage1)
+    .InferShape(InferStage1Shape).InferDataType(InferStage1Dtype);
+#endif
+
+#ifdef A5_C8_NOMTP_STAGE2_HOST_ONLY
 class A5SparseTailAttentionC8Stage2 : public OpDef {
 public:
     explicit A5SparseTailAttentionC8Stage2(const char *name) : OpDef(name)
@@ -171,10 +184,10 @@ public:
     }
 };
 
-OP_ADD(A5SparseTailAttentionC8Stage1);
-IMPL_OP_INFERSHAPE(A5SparseTailAttentionC8Stage1)
-    .InferShape(InferStage1Shape).InferDataType(InferStage1Dtype);
 OP_ADD(A5SparseTailAttentionC8Stage2);
 IMPL_OP_INFERSHAPE(A5SparseTailAttentionC8Stage2)
     .InferShape(InferStage2Shape).InferDataType(InferStage2Dtype);
+#endif
 } // namespace ops
+
+#endif
