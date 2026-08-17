@@ -1106,10 +1106,10 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
                        missMask.template ReinterpretCast<uint32_t>(), true,
                        BASE_TOPK, compactParams, rowMissCount);
             PipeBarrier<PIPE_V>();
+            SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
             topkMissCountsGm.SetValue(
                 info.queryBegin + queryIdx,
                 static_cast<int32_t>(rowMissCount));
-            SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
             for (uint32_t rowMissIdx = 0;
                  rowMissIdx < static_cast<uint32_t>(rowMissCount);
                  ++rowMissIdx) {
