@@ -37,6 +37,12 @@ constexpr BaseApi::C8StageMode C8_STAGE_MODE = BaseApi::C8StageMode::STAGE2_MERG
 constexpr BaseApi::C8StageMode C8_STAGE_MODE = BaseApi::C8StageMode::NATIVE;
 #endif
 
+#if defined(A5_C8_NOMTP_STAGE1_ONLY)
+#define A5_C8_ATTENTION_OUT_DTYPE_IS(dtype) true
+#else
+#define A5_C8_ATTENTION_OUT_DTYPE_IS(dtype) (ORIG_DTYPE_ATTENTION_OUT == (dtype))
+#endif
+
 #if (__CCE_AICORE__ == 310)
 #if defined(__DAV_C310_CUBE__)
 #define QSFA_OP_IMPL(templateClass, tilingdataClass, stageMode, ...)                                      \
@@ -92,43 +98,37 @@ __aicore__ inline void DispatchKernelDtype310(
     __gm__ uint8_t *user, __gm__ uint8_t *tiling, TPipe &tPipe)
 {
     if constexpr (ORIG_DTYPE_QUERY == DT_BF16 && ORIG_DTYPE_KEY == DT_FLOAT8_E4M3FN &&
-                  (C8_STAGE_MODE == BaseApi::C8StageMode::STAGE1_STATE ||
-                   ORIG_DTYPE_ATTENTION_OUT == DT_BF16)) {
+                  A5_C8_ATTENTION_OUT_DTYPE_IS(DT_BF16)) {
         QSFA_OP_IMPL(BaseApi::KvQuantSparseFlashAttentionMla, KvQuantSparseFlashAttentionTilingDataMla, C8_STAGE_MODE,
             bfloat16_t, fp8_e4m3fn_t, float, bfloat16_t, FLASH_DECODE, PAGE_ATTENTION,
             static_cast<QSFA_LAYOUT>(LAYOUT_T), static_cast<QSFA_LAYOUT>(KV_LAYOUT_T),
             static_cast<QSFATemplateMode>(TEMPLATE_MODE), IS_SPLIT_G);
     } else if constexpr (ORIG_DTYPE_QUERY == DT_BF16 && ORIG_DTYPE_KEY == DT_HIFLOAT8 &&
-                         (C8_STAGE_MODE == BaseApi::C8StageMode::STAGE1_STATE ||
-                          ORIG_DTYPE_ATTENTION_OUT == DT_BF16)) {
+                         A5_C8_ATTENTION_OUT_DTYPE_IS(DT_BF16)) {
         QSFA_OP_IMPL(BaseApi::KvQuantSparseFlashAttentionMla, KvQuantSparseFlashAttentionTilingDataMla, C8_STAGE_MODE,
             bfloat16_t, hifloat8_t, float, bfloat16_t, FLASH_DECODE, PAGE_ATTENTION,
             static_cast<QSFA_LAYOUT>(LAYOUT_T), static_cast<QSFA_LAYOUT>(KV_LAYOUT_T),
             static_cast<QSFATemplateMode>(TEMPLATE_MODE), IS_SPLIT_G);
     } else if constexpr (ORIG_DTYPE_QUERY == DT_BF16 && ORIG_DTYPE_KEY == DT_INT8 &&
-                         (C8_STAGE_MODE == BaseApi::C8StageMode::STAGE1_STATE ||
-                          ORIG_DTYPE_ATTENTION_OUT == DT_BF16)) {
+                         A5_C8_ATTENTION_OUT_DTYPE_IS(DT_BF16)) {
         QSFA_OP_IMPL(BaseApi::KvQuantSparseFlashAttentionMla, KvQuantSparseFlashAttentionTilingDataMla, C8_STAGE_MODE,
             bfloat16_t, int8_t, float, bfloat16_t, FLASH_DECODE, PAGE_ATTENTION,
             static_cast<QSFA_LAYOUT>(LAYOUT_T), static_cast<QSFA_LAYOUT>(KV_LAYOUT_T),
             static_cast<QSFATemplateMode>(TEMPLATE_MODE), IS_SPLIT_G);
     } else if constexpr (ORIG_DTYPE_QUERY == DT_FLOAT16 && ORIG_DTYPE_KEY == DT_FLOAT8_E4M3FN &&
-                         (C8_STAGE_MODE == BaseApi::C8StageMode::STAGE1_STATE ||
-                          ORIG_DTYPE_ATTENTION_OUT == DT_FLOAT16)) {
+                         A5_C8_ATTENTION_OUT_DTYPE_IS(DT_FLOAT16)) {
         QSFA_OP_IMPL(BaseApi::KvQuantSparseFlashAttentionMla, KvQuantSparseFlashAttentionTilingDataMla, C8_STAGE_MODE,
             half, fp8_e4m3fn_t, float, half, FLASH_DECODE, PAGE_ATTENTION,
             static_cast<QSFA_LAYOUT>(LAYOUT_T), static_cast<QSFA_LAYOUT>(KV_LAYOUT_T),
             static_cast<QSFATemplateMode>(TEMPLATE_MODE), IS_SPLIT_G);
     } else if constexpr (ORIG_DTYPE_QUERY == DT_FLOAT16 && ORIG_DTYPE_KEY == DT_HIFLOAT8 &&
-                         (C8_STAGE_MODE == BaseApi::C8StageMode::STAGE1_STATE ||
-                          ORIG_DTYPE_ATTENTION_OUT == DT_FLOAT16)) {
+                         A5_C8_ATTENTION_OUT_DTYPE_IS(DT_FLOAT16)) {
         QSFA_OP_IMPL(BaseApi::KvQuantSparseFlashAttentionMla, KvQuantSparseFlashAttentionTilingDataMla, C8_STAGE_MODE,
             half, hifloat8_t, float, half, FLASH_DECODE, PAGE_ATTENTION,
             static_cast<QSFA_LAYOUT>(LAYOUT_T), static_cast<QSFA_LAYOUT>(KV_LAYOUT_T),
             static_cast<QSFATemplateMode>(TEMPLATE_MODE), IS_SPLIT_G);
     } else if constexpr (ORIG_DTYPE_QUERY == DT_FLOAT16 && ORIG_DTYPE_KEY == DT_INT8 &&
-                         (C8_STAGE_MODE == BaseApi::C8StageMode::STAGE1_STATE ||
-                          ORIG_DTYPE_ATTENTION_OUT == DT_FLOAT16)) {
+                         A5_C8_ATTENTION_OUT_DTYPE_IS(DT_FLOAT16)) {
         QSFA_OP_IMPL(BaseApi::KvQuantSparseFlashAttentionMla, KvQuantSparseFlashAttentionTilingDataMla, C8_STAGE_MODE,
             half, int8_t, float, half, FLASH_DECODE, PAGE_ATTENTION,
             static_cast<QSFA_LAYOUT>(LAYOUT_T), static_cast<QSFA_LAYOUT>(KV_LAYOUT_T),
@@ -191,7 +191,7 @@ a5_sparse_tail_attention_c8(__gm__ uint8_t *query, __gm__ uint8_t *key, __gm__ u
 #endif
 #else
     if constexpr (ORIG_DTYPE_QUERY == DT_FLOAT16 && ORIG_DTYPE_KEY == DT_INT8 &&
-                  ORIG_DTYPE_ATTENTION_OUT == DT_FLOAT16) {
+                  A5_C8_ATTENTION_OUT_DTYPE_IS(DT_FLOAT16)) {
         QSFA_OP_IMPL(KvQuantSparseFlashAttentionMla, KvQuantSparseFlashAttentionTilingDataMla, half, int8_t,
             half, FLASH_DECODE, static_cast<QSFA_LAYOUT>(LAYOUT_T), static_cast<QSFA_LAYOUT>(KV_LAYOUT_T),
             TEMPLATE_MODE);
