@@ -1,5 +1,13 @@
 # GLM MTP3 offloading operators
 
+> `fused_li_manage_mtp` current ABI (the legacy block below is retained only
+> for historical context): `index_weights, query_dequant_scale, query,
+> index_key_dequant_scale, index_key_cache, index_block_table,
+> actual_seq_lengths_query, actual_seq_lengths_key,
+> offload_seq_lengths_key, req_valid, req_pool_entries, cache_state,
+> cache_slots_pool, topk_src_ids, topk_dst_slots, miss_src_ids,
+> miss_dst_slots, miss_counts`.
+
 这是 GLM MTP3 decode offloading 算子的独立调优工程，不包含 nanovllm 推理框架，也不依赖 `nanovllm-DSA-offload-mtp` 的源码或编译产物。当前公开并测试 `fused_li_manage_mtp`、`scatter_copy`、`sparse_tail_attention_mtp` 和实验性的 `fused_copy_sfa_mtp`。
 
 　
@@ -7,7 +15,7 @@
 ## 算子接口
 
 ```python
-torch.ops.nanovllm_dsa.fused_li_manage_mtp(
+torch.ops.nanovllm_dsa.fused_li_manage_mtp(  # new ABI: variable 1-4 queries/request
     query,                    # bf16/fp16 [B*4, 32, 128]，只读
     index_weights,            # bf16/fp16 [B*4, 32]，只读
     index_key_cache,          # bf16/fp16 [blocks, 128, 1, 128]，只读

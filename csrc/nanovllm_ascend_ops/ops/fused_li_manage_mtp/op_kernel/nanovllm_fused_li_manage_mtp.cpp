@@ -19,8 +19,9 @@ using namespace AscendC;
     do {                                                                        \
         templateClass<LIType<__VA_ARGS__>> op;                                  \
         COPY_MTP_TILING_DATA(LIUMtpTilingData, tiling);                         \
-        op.Init(query, key, weights, reqPoolEntries, cacheSlots, cacheTokens,   \
-                candidateLens, blockTable, topkSlots, topkSourceIds,            \
+        op.Init(query, key, weights, reqPoolEntries, cacheState, cacheSlots,    \
+                actualQueryLens, actualKeyLens, offloadKeyLens, reqValid,       \
+                blockTable, topkSlots, topkSourceIds,                           \
                 missSourceIds,                                                  \
                 missDestinationSlots, missCounts, user, tiling_data, &tPipe);   \
         op.Process();                                                            \
@@ -28,18 +29,25 @@ using namespace AscendC;
 
 template <int DT>
 __global__ __aicore__ void nanovllm_fused_li_manage_mtp(
-    __gm__ uint8_t *query, __gm__ uint8_t *key, __gm__ uint8_t *weights,
-    __gm__ uint8_t *reqPoolEntries, __gm__ uint8_t *cacheSlots,
-    __gm__ uint8_t *cacheTokens, __gm__ uint8_t *candidateLens,
-    __gm__ uint8_t *blockTable, __gm__ uint8_t *topkSlots,
-    __gm__ uint8_t *topkSourceIds,
+    __gm__ uint8_t *weights, __gm__ uint8_t *queryDequantScale,
+    __gm__ uint8_t *query, __gm__ uint8_t *keyDequantScale,
+    __gm__ uint8_t *key, __gm__ uint8_t *blockTable,
+    __gm__ uint8_t *actualQueryLens, __gm__ uint8_t *actualKeyLens,
+    __gm__ uint8_t *offloadKeyLens, __gm__ uint8_t *reqValid,
+    __gm__ uint8_t *reqPoolEntries, __gm__ uint8_t *cacheState,
+    __gm__ uint8_t *cacheSlots, __gm__ uint8_t *topkSourceIds,
+    __gm__ uint8_t *topkSlots,
     __gm__ uint8_t *missSourceIds, __gm__ uint8_t *missDestinationSlots,
-    __gm__ uint8_t *missCounts, __gm__ uint8_t *cacheSlotsOut,
+    __gm__ uint8_t *missCounts, __gm__ uint8_t *cacheStateOut,
+    __gm__ uint8_t *cacheSlotsOut,
     __gm__ uint8_t *workspace, __gm__ uint8_t *tiling)
 {
 #if (__CCE_AICORE__ == 310) || (defined __DAV_310R6__) || (__CCE_AICORE__ == 200)
 #else
     TPipe tPipe;
+    (void)queryDequantScale;
+    (void)keyDequantScale;
+    (void)cacheStateOut;
     (void)cacheSlotsOut;
     __gm__ uint8_t *user = GetUserWorkspace(workspace);
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);

@@ -28,12 +28,16 @@ struct RunInfo {
     // Physical query row.  It equals bIdx for regular decode and bIdx * 4 +
     // queryIdx for the fixed-width MTP3 verification path.
     uint32_t queryRow;
+    uint32_t queryBegin;
+    uint32_t queryCount;
     uint32_t queryIdx;
     uint32_t s2Idx;
     uint32_t segmentChunkIdx;
     uint32_t actS2Size;
     uint32_t cacheTokenCount;
     uint32_t cacheRowIdx;
+    int32_t cacheState;
+    bool isPlainLi;
     uint32_t actualSingleProcessSInnerSize;
     uint32_t actualSingleProcessSInnerSizeAlign;
     bool isFirstS2InnerLoop;
@@ -90,4 +94,3 @@ __aicore__ inline T CeilDiv(T num, T rnd)
 } // namespace LICommon
 
 #endif // FUSED_LI_MANAGE_COMMON_H
-

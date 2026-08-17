@@ -58,12 +58,17 @@ ge::graphStatus LIUMtpTiling::GetTensors(LIUMtpTilingInfo &info) const
                    return ge::GRAPH_FAILED);                                    \
     } while (0)
     LOAD_INPUT(query, MTP_QUERY_INDEX);
+    LOAD_INPUT(queryScale, MTP_QUERY_SCALE_INDEX);
     LOAD_INPUT(key, MTP_KEY_INDEX);
+    LOAD_INPUT(keyScale, MTP_KEY_SCALE_INDEX);
     LOAD_INPUT(weights, MTP_WEIGHTS_INDEX);
     LOAD_INPUT(reqPoolEntries, MTP_REQ_POOL_INDEX);
+    LOAD_INPUT(reqValid, MTP_REQ_VALID_INDEX);
+    LOAD_INPUT(cacheState, MTP_CACHE_STATE_INDEX);
     LOAD_INPUT(cacheSlots, MTP_CACHE_SLOTS_INDEX);
-    LOAD_INPUT(cacheTokens, MTP_CACHE_TOKENS_INDEX);
-    LOAD_INPUT(candidateLens, MTP_CANDIDATE_LENS_INDEX);
+    LOAD_INPUT(actualQueryLens, MTP_ACTUAL_QUERY_INDEX);
+    LOAD_INPUT(actualKeyLens, MTP_ACTUAL_KEY_INDEX);
+    LOAD_INPUT(offloadKeyLens, MTP_OFFLOAD_KEY_INDEX);
     LOAD_INPUT(blockTable, MTP_BLOCK_TABLE_INDEX);
     LOAD_OUTPUT(topkSlots, MTP_TOPK_SLOTS_OUT);
     LOAD_OUTPUT(topkSource, MTP_TOPK_SOURCE_OUT);
@@ -71,6 +76,7 @@ ge::graphStatus LIUMtpTiling::GetTensors(LIUMtpTilingInfo &info) const
     LOAD_OUTPUT(missSlots, MTP_MISS_SLOTS_OUT);
     LOAD_OUTPUT(missCounts, MTP_MISS_COUNTS_OUT);
     LOAD_OUTPUT(cacheSlotsOut, MTP_CACHE_SLOTS_OUT);
+    LOAD_OUTPUT(cacheStateOut, MTP_CACHE_STATE_OUT);
 #undef LOAD_INPUT
 #undef LOAD_OUTPUT
     return ge::GRAPH_SUCCESS;
@@ -87,16 +93,24 @@ ge::graphStatus LIUMtpTiling::CheckDtypes(const LIUMtpTilingInfo &info) const
                    t.weights.desc->GetDataType() != queryType,
                OPS_LOG_E(info.opName, "query/key/weights dtype must match."),
                return ge::GRAPH_FAILED);
+    OPS_ERR_IF(t.queryScale.desc->GetDataType() != ge::DT_FLOAT ||
+                   t.keyScale.desc->GetDataType() != ge::DT_FLOAT,
+               OPS_LOG_E(info.opName, "dequant scales must be fp32."),
+               return ge::GRAPH_FAILED);
     OPS_ERR_IF(t.reqPoolEntries.desc->GetDataType() != ge::DT_INT32 ||
+                   t.reqValid.desc->GetDataType() != ge::DT_INT32 ||
+                   t.cacheState.desc->GetDataType() != ge::DT_INT32 ||
                    t.cacheSlots.desc->GetDataType() != ge::DT_INT32 ||
-                   t.cacheTokens.desc->GetDataType() != ge::DT_INT32 ||
-                   t.candidateLens.desc->GetDataType() != ge::DT_INT32 ||
+                   t.actualQueryLens.desc->GetDataType() != ge::DT_INT32 ||
+                   t.actualKeyLens.desc->GetDataType() != ge::DT_INT32 ||
+                   t.offloadKeyLens.desc->GetDataType() != ge::DT_INT32 ||
                    t.blockTable.desc->GetDataType() != ge::DT_INT32 ||
                    t.topkSlots.desc->GetDataType() != ge::DT_INT32 ||
                    t.topkSource.desc->GetDataType() != ge::DT_INT32 ||
                    t.missSource.desc->GetDataType() != ge::DT_INT32 ||
                    t.missSlots.desc->GetDataType() != ge::DT_INT32 ||
                    t.missCounts.desc->GetDataType() != ge::DT_INT32 ||
+                   t.cacheStateOut.desc->GetDataType() != ge::DT_INT32 ||
                    t.cacheSlotsOut.desc->GetDataType() != ge::DT_INT32,
                OPS_LOG_E(info.opName, "all metadata tensors must be int32."),
                return ge::GRAPH_FAILED);
@@ -107,12 +121,17 @@ ge::graphStatus LIUMtpTiling::CheckShapes(LIUMtpTilingInfo &info) const
 {
     const auto &t = info.tensors;
     const auto &q = t.query.shape->GetStorageShape();
+    const auto &queryScale = t.queryScale.shape->GetStorageShape();
     const auto &k = t.key.shape->GetStorageShape();
+    const auto &keyScale = t.keyScale.shape->GetStorageShape();
     const auto &w = t.weights.shape->GetStorageShape();
     const auto &req = t.reqPoolEntries.shape->GetStorageShape();
     const auto &cache = t.cacheSlots.shape->GetStorageShape();
-    const auto &cacheTokens = t.cacheTokens.shape->GetStorageShape();
-    const auto &lens = t.candidateLens.shape->GetStorageShape();
+    const auto &actualQuery = t.actualQueryLens.shape->GetStorageShape();
+    const auto &actualKey = t.actualKeyLens.shape->GetStorageShape();
+    const auto &offloadKey = t.offloadKeyLens.shape->GetStorageShape();
+    const auto &reqValid = t.reqValid.shape->GetStorageShape();
+    const auto &cacheState = t.cacheState.shape->GetStorageShape();
     const auto &blocks = t.blockTable.shape->GetStorageShape();
     const auto &topkSlots = t.topkSlots.shape->GetStorageShape();
     const auto &topkSource = t.topkSource.shape->GetStorageShape();
@@ -120,11 +139,15 @@ ge::graphStatus LIUMtpTiling::CheckShapes(LIUMtpTilingInfo &info) const
     const auto &missSlots = t.missSlots.shape->GetStorageShape();
     const auto &missCounts = t.missCounts.shape->GetStorageShape();
     const auto &cacheOut = t.cacheSlotsOut.shape->GetStorageShape();
+    const auto &cacheStateOut = t.cacheStateOut.shape->GetStorageShape();
 
-    OPS_ERR_IF(q.GetDimNum() != 3 || k.GetDimNum() != 4 ||
+    OPS_ERR_IF(q.GetDimNum() != 3 || queryScale.GetDimNum() != 2 ||
+                   k.GetDimNum() != 4 || keyScale.GetDimNum() != 3 ||
                    w.GetDimNum() != 2 || req.GetDimNum() != 1 ||
-                   cache.GetDimNum() != 2 || cacheTokens.GetDimNum() != 1 ||
-                   lens.GetDimNum() != 1 || blocks.GetDimNum() != 2,
+                   cache.GetDimNum() != 2 || actualQuery.GetDimNum() != 1 ||
+                   actualKey.GetDimNum() != 1 || offloadKey.GetDimNum() != 1 ||
+                   reqValid.GetDimNum() != 1 || cacheState.GetDimNum() != 1 ||
+                   blocks.GetDimNum() != 2,
                OPS_LOG_E(info.opName, "invalid MTP LIM input ranks."),
                return ge::GRAPH_FAILED);
     info.tokenRows = static_cast<uint32_t>(q.GetDim(0));
@@ -136,8 +159,9 @@ ge::graphStatus LIUMtpTiling::CheckShapes(LIUMtpTilingInfo &info) const
     info.maxBlocks = static_cast<uint32_t>(blocks.GetDim(1));
 
     OPS_ERR_IF(info.batchSize == 0 || info.poolSize == 0 ||
-                   info.maxBlocks == 0 || info.tokenRows != info.batchSize * MTP_QUERY_COUNT,
-               OPS_LOG_E(info.opName, "require T=4*B and non-empty pool/table."),
+                   info.maxBlocks == 0 || info.tokenRows > info.batchSize * MTP_QUERY_COUNT ||
+                   info.tokenRows < info.batchSize,
+               OPS_LOG_E(info.opName, "require B<=T<=4B and non-empty pool/table."),
                return ge::GRAPH_FAILED);
     OPS_ERR_IF((info.queryHeads != MTP_HEADS_MIN &&
                     info.queryHeads != MTP_HEADS_MAX) ||
@@ -145,14 +169,26 @@ ge::graphStatus LIUMtpTiling::CheckShapes(LIUMtpTilingInfo &info) const
                    w.GetDim(0) != info.tokenRows ||
                    w.GetDim(1) != info.queryHeads,
                OPS_LOG_E(info.opName,
-                         "query must be [4B,H,128] and weights [4B,H], H=32 or 64."),
+                         "query must be [T,H,128] and weights [T,H], H=32 or 64."),
+               return ge::GRAPH_FAILED);
+    OPS_ERR_IF(queryScale.GetDim(0) != info.tokenRows ||
+                   queryScale.GetDim(1) != info.queryHeads,
+               OPS_LOG_E(info.opName, "query scale must be [T,H]."),
                return ge::GRAPH_FAILED);
     OPS_ERR_IF(k.GetDim(0) == 0 || k.GetDim(1) != MTP_BLOCK_SIZE ||
                    k.GetDim(2) != MTP_KEY_HEADS || k.GetDim(3) != MTP_HEAD_DIM,
                OPS_LOG_E(info.opName, "key must be [blocks,128,1,128]."),
                return ge::GRAPH_FAILED);
-    OPS_ERR_IF(cacheTokens.GetDim(0) != info.batchSize ||
-                   lens.GetDim(0) != info.batchSize ||
+    OPS_ERR_IF(keyScale.GetDim(0) != k.GetDim(0) ||
+                   keyScale.GetDim(1) != MTP_BLOCK_SIZE ||
+                   keyScale.GetDim(2) != MTP_KEY_HEADS,
+               OPS_LOG_E(info.opName, "key scale must be [blocks,128,1]."),
+               return ge::GRAPH_FAILED);
+    OPS_ERR_IF(actualQuery.GetDim(0) != info.batchSize ||
+                   actualKey.GetDim(0) != info.batchSize ||
+                   offloadKey.GetDim(0) != info.batchSize ||
+                   reqValid.GetDim(0) != info.batchSize ||
+                   cacheState.GetDim(0) != info.poolSize ||
                    blocks.GetDim(0) != info.batchSize ||
                    info.maxBlocks > (1U << 11) ||
                    info.sourceCapacity != info.maxBlocks * MTP_BLOCK_SIZE ||
@@ -184,6 +220,10 @@ ge::graphStatus LIUMtpTiling::CheckShapes(LIUMtpTilingInfo &info) const
                    cacheOut.GetDim(0) != cache.GetDim(0) ||
                    cacheOut.GetDim(1) != cache.GetDim(1),
                OPS_LOG_E(info.opName, "cache_slots_out must alias the pool shape."),
+               return ge::GRAPH_FAILED);
+    OPS_ERR_IF(cacheStateOut.GetDimNum() != 1 ||
+                   cacheStateOut.GetDim(0) != cacheState.GetDim(0),
+               OPS_LOG_E(info.opName, "cache_state_out must alias cache_state shape."),
                return ge::GRAPH_FAILED);
     info.queryType = t.query.desc->GetDataType();
     return ge::GRAPH_SUCCESS;

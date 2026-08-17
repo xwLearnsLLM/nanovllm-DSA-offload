@@ -113,6 +113,7 @@ public:
         GlobalTensor<int32_t> missSourceIdsGm,
         GlobalTensor<int32_t> missDestinationSlotsGm,
         GlobalTensor<int32_t> missCountGm,
+        GlobalTensor<int32_t> cacheStateGm,
         GlobalTensor<float> scoresGm,
         GlobalTensor<int32_t> mtpTopkPayloadsGm,
         GlobalTensor<float> mtpThresholdsGm);
@@ -131,6 +132,7 @@ protected:
     GlobalTensor<int32_t> topkIndexGm;
     GlobalTensor<int32_t> topkSlotsGm;
     GlobalTensor<int32_t> missCountGm;
+    GlobalTensor<int32_t> cacheStateGm;
     GlobalTensor<float> scoresGm;
     GlobalTensor<float> partialTopkGm;
     GlobalTensor<int32_t> partialMetaGm;
@@ -188,7 +190,7 @@ private:
     __aicore__ inline void WriteScoreChunk(uint32_t bIdx, int32_t s2BaseIdx,
                                            const LocalTensor<float> &scoreLocal, int32_t alignedLen);
     __aicore__ inline void WriteMtpAggregateScoreChunk(
-        uint32_t bIdx, uint32_t queryIdx, int32_t s2BaseIdx,
+        uint32_t bIdx, uint32_t queryIdx, uint32_t queryCount, int32_t s2BaseIdx,
         const LocalTensor<float> &scoreLocal, int32_t alignedLen);
     __aicore__ inline void CollectMtpEvictCandidateChunk(
         const LICommon::RunInfo &info,
@@ -197,6 +199,7 @@ private:
         uint32_t cachedChunkIdx);
     __aicore__ inline void StoreMtpQueryTopK(const LICommon::RunInfo &info);
     __aicore__ inline void FinalizeMtpRequest(const LICommon::RunInfo &info);
+    __aicore__ inline void FinalizePlainLiRequest(const LICommon::RunInfo &info);
     __aicore__ inline void WritePartialTopK(uint32_t coreIdx, uint32_t partialSlot, uint32_t bIdx);
     __aicore__ inline void SortEvictCandidateChunk(uint32_t bIdx, uint32_t cacheRowIdx, uint32_t chunkIdx,
                                                    uint32_t actualSeqLen,
@@ -323,6 +326,7 @@ __aicore__ inline void LIVector<LIT>::InitMtpGlobalTensor(
     GlobalTensor<int32_t> missSourceIdsGm,
     GlobalTensor<int32_t> missDestinationSlotsGm,
     GlobalTensor<int32_t> missCountGm,
+    GlobalTensor<int32_t> cacheStateGm,
     GlobalTensor<float> scoresGm,
     GlobalTensor<int32_t> mtpTopkPayloadsGm,
     GlobalTensor<float> mtpThresholdsGm)
@@ -335,6 +339,7 @@ __aicore__ inline void LIVector<LIT>::InitMtpGlobalTensor(
     this->mtpMissSourceIdsGm = missSourceIdsGm;
     this->mtpMissDestinationSlotsGm = missDestinationSlotsGm;
     this->missCountGm = missCountGm;
+    this->cacheStateGm = cacheStateGm;
     this->scoresGm = scoresGm;
     this->mtpTopkPayloadsGm = mtpTopkPayloadsGm;
     this->mtpThresholdsGm = mtpThresholdsGm;
@@ -389,6 +394,12 @@ __aicore__ inline void LIVector<LIT>::FinishPayload(LocalTensor<int32_t> &payloa
                                                     int32_t validLen)
 {
     SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
+    // The packed TopK payload has one invalid-slot representation. Normalize
+    // both -65536 and the 1-based free-slot bindings (-s) to that internal
+    // representation; FinalizeMtpRequest reads GM again to distinguish them.
+    Maxs(payloadLocal, payloadLocal, LICommon::ConstInfo::INVALID_IDX,
+         validLen);
+    PipeBarrier<PIPE_V>();
     ShiftLeft(payloadLocal.template ReinterpretCast<uint32_t>(), payloadLocal.template ReinterpretCast<uint32_t>(),
               INDEX_BITS, validLen);
     PipeBarrier<PIPE_V>();
@@ -466,7 +477,7 @@ __aicore__ inline void LIVector<LIT>::WriteScoreChunk(uint32_t bIdx, int32_t s2B
 
 template <typename LIT>
 __aicore__ inline void LIVector<LIT>::WriteMtpAggregateScoreChunk(
-    uint32_t bIdx, uint32_t queryIdx, int32_t s2BaseIdx,
+    uint32_t bIdx, uint32_t queryIdx, uint32_t queryCount, int32_t s2BaseIdx,
     const LocalTensor<float> &scoreLocal, int32_t alignedLen)
 {
     uint64_t gmOffset = static_cast<uint64_t>(bIdx) * scoreStride_ +
@@ -490,7 +501,7 @@ __aicore__ inline void LIVector<LIT>::WriteMtpAggregateScoreChunk(
     // q1..q2 write the previous chunk's aggregate from this same UB scratch.
     // Delay that write's completion until the scratch is actually reused so
     // MTE3 can overlap the intervening TopK merge and next MM/scale work.
-    if (queryIdx + 1U != MTP_QUERY_COUNT && s2BaseIdx > 0) {
+    if (queryIdx + 1U != queryCount && s2BaseIdx > 0) {
         SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
     }
     SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
@@ -501,7 +512,7 @@ __aicore__ inline void LIVector<LIT>::WriteMtpAggregateScoreChunk(
     SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
     Max(previousScore, previousScore, scoreLocal, alignedLen);
     PipeBarrier<PIPE_V>();
-    if (queryIdx + 1U == MTP_QUERY_COUNT) {
+    if (queryIdx + 1U == queryCount) {
         // q3 produces the final max(q0..q3) score.  Its consumer now builds
         // the eviction candidate prefix directly from this UB tensor, so a
         // final GM write would only be read back by the old finalize scan.
@@ -997,6 +1008,34 @@ __aicore__ inline void LIVector<LIT>::StoreMtpQueryTopK(const LICommon::RunInfo 
 }
 
 template <typename LIT>
+__aicore__ inline void LIVector<LIT>::FinalizePlainLiRequest(
+    const LICommon::RunInfo &info)
+{
+    LocalTensor<float> storage = outQueue_.AllocTensor<float>();
+    LocalTensor<int32_t> tokens = storage.template ReinterpretCast<int32_t>();
+    LocalTensor<int32_t> payloads = tokens[BASE_TOPK];
+    AscendC::DataCopyExtParams copyIn{1, BASE_TOPK * sizeof(int32_t), 0, 0, 0};
+    AscendC::DataCopyPadExtParams<int32_t> pad{false, 0, 0, 0};
+    AscendC::DataCopyParams copyOut{
+        1, static_cast<uint16_t>(BASE_TOPK * sizeof(int32_t)), 0, 0};
+    for (uint32_t queryIdx = 0; queryIdx < info.queryCount; ++queryIdx) {
+        uint64_t rowOffset =
+            static_cast<uint64_t>(info.queryBegin + queryIdx) * BASE_TOPK;
+        DataCopyPad(payloads, mtpTopkPayloadsGm[rowOffset], copyIn, pad);
+        SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
+        DecodeIndexFromPayload(tokens.template ReinterpretCast<uint32_t>(),
+                               payloads.template ReinterpretCast<uint32_t>(),
+                               BASE_TOPK);
+        SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
+        DataCopyPad(topkSlotsGm[rowOffset], tokens, copyOut);
+        DataCopyPad(mtpTopkSourceIdsGm[rowOffset], tokens, copyOut);
+        SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
+    }
+    WriteMtpZeroMissCount(info.bIdx);
+    outQueue_.FreeTensor(storage);
+}
+
+template <typename LIT>
 __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo &info)
 {
     // Two VECIN buffers hold the membership bitset and ordered union misses.
@@ -1037,9 +1076,9 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
         compactParams.src0RepeatStride = B32_VEC_REPEAT_STRIDE;
         compactParams.src1RepeatStride = B32_VEC_REPEAT_STRIDE;
 
-        for (uint32_t queryIdx = 0; queryIdx < MTP_QUERY_COUNT; ++queryIdx) {
+        for (uint32_t queryIdx = 0; queryIdx < info.queryCount; ++queryIdx) {
             uint64_t rowOffset =
-                static_cast<uint64_t>(info.bIdx * MTP_QUERY_COUNT + queryIdx) * BASE_TOPK;
+                static_cast<uint64_t>(info.queryBegin + queryIdx) * BASE_TOPK;
             SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
             DataCopyPad(topkPayloads, mtpTopkPayloadsGm[rowOffset], copyIn, intPad);
             SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
@@ -1082,6 +1121,64 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
         }
     }
 
+    // Consume pre-bound/free slots before entering the existing full-cache
+    // eviction path. Negative slot bindings are 1-based: -s -> slot s-1.
+    uint32_t updateCount = 0;
+    int32_t cacheState = info.cacheState;
+    uint32_t scanCursor = cacheState >= 0 ?
+        static_cast<uint32_t>(cacheState) % info.actS2Size : 0U;
+    while (updateCount < missCount && cacheState >= 0) {
+        uint32_t missToken =
+            static_cast<uint32_t>(missTokens.GetValue(updateCount));
+        int32_t value = cacheSlotsGm.GetValue(cacheBase + missToken);
+        int32_t slot = LICommon::ConstInfo::INVALID_IDX;
+        if (value < 0 && value != -65536) {
+            slot = -value - 1;
+        } else {
+            bool found = false;
+            for (uint32_t scanned = 0; scanned < info.actS2Size; ++scanned) {
+                uint32_t pos = (scanCursor + scanned) % info.actS2Size;
+                int32_t freeValue = cacheSlotsGm.GetValue(cacheBase + pos);
+                if (freeValue < 0 && freeValue != -65536) {
+                    slot = -freeValue - 1;
+                    cacheSlotsGm.SetValue(cacheBase + pos, -65536);
+                    scanCursor = (pos + 1U) % info.actS2Size;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                cacheState = -1;
+                cacheStateGm.SetValue(info.cacheRowIdx, cacheState);
+                break;
+            }
+        }
+        if (slot < 0 || slot >= INVALID_SLOT14) {
+            cacheState = -1;
+            cacheStateGm.SetValue(info.cacheRowIdx, cacheState);
+            break;
+        }
+        cacheSlotsGm.SetValue(cacheBase + missToken, slot);
+        destinationSlots.SetValue(updateCount, slot);
+        ++updateCount;
+        cacheStateGm.SetValue(info.cacheRowIdx,
+                              static_cast<int32_t>(scanCursor));
+    }
+    if (cacheState >= 0 && updateCount > 0U && updateCount == missCount) {
+        bool hasFree = false;
+        for (uint32_t scanned = 0; scanned < info.actS2Size; ++scanned) {
+            uint32_t pos = (scanCursor + scanned) % info.actS2Size;
+            int32_t value = cacheSlotsGm.GetValue(cacheBase + pos);
+            if (value < 0 && value != -65536) {
+                scanCursor = pos;
+                hasFree = true;
+                break;
+            }
+        }
+        cacheState = hasFree ? static_cast<int32_t>(scanCursor) : -1;
+        cacheStateGm.SetValue(info.cacheRowIdx, cacheState);
+    }
+
     uint32_t candidateCap = 0;
     if (missCount > 0U) {
         candidateCap = CeilDiv(missCount, S2_BASE_SIZE) * S2_BASE_SIZE;
@@ -1091,16 +1188,15 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
         // prefix up to the complete 2048-entry preload capacity.
     }
 
-    uint32_t updateCount = 0;
     LocalTensor<uint32_t> candidateBits =
         evictCandidateUb_.template ReinterpretCast<uint32_t>();
     bool safeCandidatePrefix = (missCount == 0U);
     if (missCount > 0U && missCount <= candidateCap) {
-        float minThreshold = mtpThresholdsGm.GetValue(info.bIdx * MTP_QUERY_COUNT);
+        float minThreshold = mtpThresholdsGm.GetValue(info.queryBegin);
         bool thresholdsValid = (minThreshold == minThreshold);
-        for (uint32_t queryIdx = 1U; queryIdx < MTP_QUERY_COUNT; ++queryIdx) {
+        for (uint32_t queryIdx = 1U; queryIdx < info.queryCount; ++queryIdx) {
             float threshold = mtpThresholdsGm.GetValue(
-                info.bIdx * MTP_QUERY_COUNT + queryIdx);
+                info.queryBegin + queryIdx);
             thresholdsValid = thresholdsValid && (threshold == threshold);
             minThreshold = threshold < minThreshold ? threshold : minThreshold;
         }
@@ -1128,9 +1224,10 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
         // Every selected victim scores below all four TopK thresholds, so it
         // cannot belong to their union.  The candidate order is unchanged
         // from the exact path; only its 8192-entry membership scan is skipped.
-        for (; updateCount < missCount; ++updateCount) {
+        uint32_t victimIdx = 0U;
+        for (; updateCount < missCount; ++updateCount, ++victimIdx) {
             uint32_t payload = candidateBits.GetValue(
-                updateCount * VALUE_AND_INDEX_NUM + 1U);
+                victimIdx * VALUE_AND_INDEX_NUM + 1U);
             uint32_t evictToken = payload & INDEX_MASK;
             int32_t evictSlot = static_cast<int32_t>(payload >> INDEX_BITS);
             uint32_t missToken =
@@ -1147,9 +1244,9 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
         Duplicate(unionBits, 0U, activeUnionWords);
         PipeBarrier<PIPE_V>();
         SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
-        for (uint32_t queryIdx = 0; queryIdx < MTP_QUERY_COUNT; ++queryIdx) {
+        for (uint32_t queryIdx = 0; queryIdx < info.queryCount; ++queryIdx) {
             uint64_t rowOffset =
-                static_cast<uint64_t>(info.bIdx * MTP_QUERY_COUNT + queryIdx) * BASE_TOPK;
+                static_cast<uint64_t>(info.queryBegin + queryIdx) * BASE_TOPK;
             DataCopyPad(topkPayloads, mtpTopkPayloadsGm[rowOffset], copyIn, intPad);
             SetWaitFlag<HardEvent::MTE2_S>(HardEvent::MTE2_S);
             for (uint32_t topkIdx = 0; topkIdx < BASE_TOPK; ++topkIdx) {
@@ -1297,7 +1394,7 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
         1, static_cast<uint16_t>(BASE_TOPK * sizeof(int32_t)), 0, 0};
     LocalTensor<int32_t> slotPong = destinationSlots[BASE_TOPK];
     LocalTensor<int32_t> sourcePong = destinationSlots[BASE_TOPK * 2U];
-    for (uint32_t queryIdx = 0; queryIdx < MTP_QUERY_COUNT; ++queryIdx) {
+    for (uint32_t queryIdx = 0; queryIdx < info.queryCount; ++queryIdx) {
         if (queryIdx == 2U) {
             // q0/q1 used the two ping-pong output pairs.  Wait only when q2
             // is about to reuse q0's pair, after q1 computation has already
@@ -1310,7 +1407,7 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
         LocalTensor<int32_t> rowSources =
             (queryIdx & 1U) == 0U ? topkPayloads : sourcePong;
         uint64_t rowOffset =
-            static_cast<uint64_t>(info.bIdx * MTP_QUERY_COUNT + queryIdx) * BASE_TOPK;
+            static_cast<uint64_t>(info.queryBegin + queryIdx) * BASE_TOPK;
         DataCopyPad(rowSources, mtpTopkPayloadsGm[rowOffset], copyIn, intPad);
         SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
         ShiftRight(
@@ -1409,8 +1506,13 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
     int64_t payloadBufIdx = info.s2Idx % PAYLOAD_BUF_SLOTS;
     LocalTensor<int32_t> payloadUb =
         payloadBuf_.Get<int32_t>()[payloadBufIdx * s2BaseSize_];
-    StartPayloadCopy(payloadUb, info.cacheRowIdx, cuBaseS2Idx, cuS2Len,
-                     s2BaseSize_);
+    if (info.isPlainLi) {
+        Duplicate(payloadUb, LICommon::ConstInfo::INVALID_IDX, s2BaseSize_);
+        PipeBarrier<PIPE_V>();
+    } else {
+        StartPayloadCopy(payloadUb, info.cacheRowIdx, cuBaseS2Idx, cuS2Len,
+                         s2BaseSize_);
+    }
     LocalTensor<float> reduceOutBuff = reduceOutBuf_.Get<float>();
     LocalTensor<float> reduceOutInner = reduceOutBuff[s2BaseSize_];
     LocalTensor<float> brcBuf = brcBuf_.Get<float>();
@@ -1449,12 +1551,12 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
     PipeBarrier<PIPE_V>();
     Adds(sortScoreUb, reduceOutInner, 0.0f, cuS2Len);
     FinishPayload(payloadUb, cuBaseS2Idx, cuS2Len);
-    WriteMtpAggregateScoreChunk(info.bIdx, info.queryIdx, cuBaseS2Idx,
+    WriteMtpAggregateScoreChunk(info.bIdx, info.queryIdx, info.queryCount, cuBaseS2Idx,
                                 sortScoreUb, s2BaseSize_);
 
     LocalTensor<float> tmpSortBuf = outQueue_.AllocTensor<float>();
     uint32_t cachedChunkIdx = info.segmentChunkIdx % PAYLOAD_BUF_SLOTS;
-    if (info.queryIdx + 1U == MTP_QUERY_COUNT) {
+    if (!info.isPlainLi && info.queryIdx + 1U == info.queryCount) {
         CollectMtpEvictCandidateChunk(info, payloadUb, tmpSortBuf,
                                       cachedChunkIdx);
     }
@@ -1488,8 +1590,12 @@ __aicore__ inline void LIVector<LIT>::ProcessVecMtp(const LICommon::RunInfo &inf
 
     if (info.isLastS2InnerLoop) {
         StoreMtpQueryTopK(info);
-        if (info.queryIdx + 1U == MTP_QUERY_COUNT) {
-            FinalizeMtpRequest(info);
+        if (info.queryIdx + 1U == info.queryCount) {
+            if (info.isPlainLi) {
+                FinalizePlainLiRequest(info);
+            } else {
+                FinalizeMtpRequest(info);
+            }
         }
     }
 }

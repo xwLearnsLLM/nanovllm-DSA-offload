@@ -35,6 +35,13 @@ class MtpCase:
     query: torch.Tensor
     key: torch.Tensor
     weights: torch.Tensor
+    query_scale: torch.Tensor
+    key_scale: torch.Tensor
+    actual_query_lens: torch.Tensor
+    actual_key_lens: torch.Tensor
+    offload_key_lens: torch.Tensor
+    req_valid: torch.Tensor
+    cache_state: torch.Tensor
     req_pool_entries: torch.Tensor
     cache_tokens: torch.Tensor
     candidate_lens: torch.Tensor
@@ -251,7 +258,7 @@ def _make_cache_state(
         zip(candidate_lens, cache_tokens, miss_fractions)
     ):
         pool_row = int(req_pool_entries[request])
-        state[pool_row].fill_(-1)
+        state[pool_row].fill_(-65536)
         if budget == 0:
             if exact_miss_counts is not None and exact_miss_counts[request] != 0:
                 raise ValueError("C=0 rows require exact miss_count=0")
@@ -340,7 +347,7 @@ def _make_balanced_mtp_cache_state(
         zip(candidate_lens, cache_tokens)
     ):
         pool_row = int(req_pool_entries[request])
-        state[pool_row].fill_(-1)
+        state[pool_row].fill_(-65536)
         rows = topk_rows[request * QUERY_COUNT : (request + 1) * QUERY_COUNT]
         union = _ordered_union(rows)
         unions.append(union)
@@ -576,6 +583,22 @@ def make_case(
         query=query,
         key=key,
         weights=weights,
+        query_scale=torch.empty(
+            query.shape[:2], dtype=torch.float32, device=device
+        ),
+        key_scale=torch.empty(
+            (physical_blocks, BLOCK_SIZE, 1), dtype=torch.float32, device=device
+        ),
+        actual_query_lens=torch.arange(
+            QUERY_COUNT, batch_size * QUERY_COUNT + 1, QUERY_COUNT,
+            dtype=torch.int32, device=device,
+        ),
+        actual_key_lens=candidate,
+        offload_key_lens=candidate,
+        req_valid=(cache_tokens_cpu > 0).to(torch.int32).to(device),
+        cache_state=torch.full(
+            (batch_size + 3,), -1, dtype=torch.int32, device=device
+        ),
         req_pool_entries=req_entries_cpu.to(device),
         cache_tokens=cache_tokens_cpu.to(device),
         candidate_lens=candidate,
@@ -606,13 +629,18 @@ def call_mtp_with_buffers(
     miss_counts: torch.Tensor,
 ):
     torch.ops.nanovllm_dsa.fused_li_manage_mtp.default(
-        case.query,
         case.weights,
+        case.query_scale,
+        case.query,
+        case.key_scale,
         case.key,
         case.block_table,
-        case.candidate_lens,
-        case.cache_tokens,
+        case.actual_query_lens,
+        case.actual_key_lens,
+        case.offload_key_lens,
+        case.req_valid,
         case.req_pool_entries,
+        case.cache_state,
         cache_slots,
         topk_source_ids,
         topk_slots,
@@ -658,10 +686,11 @@ def make_outputs(case: MtpCase) -> tuple[torch.Tensor, ...]:
 
 def run_meta_check() -> None:
     batch_size = 2
+    token_rows = 3  # mixed MTP0 (one query) + MTP1 (two queries)
     source_capacity = 8192
     meta = torch.device("meta")
     query = torch.empty(
-        batch_size * QUERY_COUNT, HEADS, HEAD_DIM, device=meta, dtype=torch.bfloat16
+        token_rows, HEADS, HEAD_DIM, device=meta, dtype=torch.bfloat16
     )
     key = torch.empty(
         batch_size * source_capacity // BLOCK_SIZE,
@@ -672,7 +701,14 @@ def run_meta_check() -> None:
         dtype=torch.bfloat16,
     )
     weights = torch.empty(
-        batch_size * QUERY_COUNT, HEADS, device=meta, dtype=torch.bfloat16
+        token_rows, HEADS, device=meta, dtype=torch.bfloat16
+    )
+    query_scale = torch.empty(
+        token_rows, HEADS, device=meta, dtype=torch.float32
+    )
+    key_scale = torch.empty(
+        batch_size * source_capacity // BLOCK_SIZE, BLOCK_SIZE, 1,
+        device=meta, dtype=torch.float32,
     )
     req_entries = torch.empty(batch_size, device=meta, dtype=torch.int32)
     cache_slots = torch.empty(
@@ -680,6 +716,11 @@ def run_meta_check() -> None:
     )
     cache_tokens = torch.empty(batch_size, device=meta, dtype=torch.int32)
     candidate_lens = torch.empty(batch_size, device=meta, dtype=torch.int32)
+    actual_query_lens = torch.tensor([1, 3], device=meta, dtype=torch.int32)
+    req_valid = torch.ones(batch_size, device=meta, dtype=torch.int32)
+    cache_state = torch.full(
+        (batch_size + 1,), -1, device=meta, dtype=torch.int32
+    )
     block_table = torch.empty(
         batch_size,
         source_capacity // BLOCK_SIZE,
@@ -687,8 +728,8 @@ def run_meta_check() -> None:
         dtype=torch.int32,
     )
     expected_shapes = (
-        (batch_size * QUERY_COUNT, 1, TOPK),
-        (batch_size * QUERY_COUNT, 1, TOPK),
+        (token_rows, 1, TOPK),
+        (token_rows, 1, TOPK),
         (batch_size, UNION_CAPACITY),
         (batch_size, UNION_CAPACITY),
         (batch_size,),
@@ -701,13 +742,18 @@ def run_meta_check() -> None:
         torch.empty(expected_shapes[4], device=meta, dtype=torch.int32),
     )
     result = torch.ops.nanovllm_dsa.fused_li_manage_mtp.default(
-        query,
         weights,
+        query_scale,
+        query,
+        key_scale,
         key,
         block_table,
+        actual_query_lens,
         candidate_lens,
-        cache_tokens,
+        candidate_lens,
+        req_valid,
         req_entries,
+        cache_state,
         cache_slots,
         buffers[1],
         buffers[0],
@@ -995,6 +1041,54 @@ def run_semantic_case(case: MtpCase) -> None:
         f"miss_counts={counts} shuffled_pool_entries=1 random_block_table=1 ok=1",
         flush=True,
     )
+
+
+def run_new_state_cases(device: torch.device, seed: int) -> None:
+    case = make_case(
+        name="new_state_protocol", device=device, dtype=torch.bfloat16,
+        candidate_lens=(4096,), cache_tokens=(4096,), miss_fractions=(0.0,),
+        seed=seed,
+    )
+    pool_row = int(case.req_pool_entries_cpu[0])
+
+    # Empty hot buffer: negative values use 1-based slot encoding.
+    empty = torch.full_like(case.initial_cache_cpu, -777)
+    empty[pool_row].fill_(-65536)
+    empty[pool_row, :4096] = -torch.arange(1, 4097, dtype=torch.int32)
+    case.cache_state.fill_(-1)
+    case.cache_state[pool_row] = 0
+    cache = empty.to(device)
+    outputs = call_mtp(case, cache)
+    torch.npu.synchronize()
+    union = case.union_cpu[0]
+    after = cache.cpu()[pool_row]
+    if bool((after[union] < 0).any()):
+        raise AssertionError("free-slot path did not cache the complete TopK union")
+    count = int(outputs[4][0].cpu())
+    if count != int(union.numel()):
+        raise AssertionError("free-slot path miss union count differs")
+    if not torch.equal(
+        torch.sort(outputs[2][0, :count].cpu().to(torch.int64)).values,
+        torch.sort(union).values,
+    ):
+        raise AssertionError("free-slot path source union differs")
+
+    # -3 bypasses cache management and writes raw 0-based token IDs to both
+    # TopK outputs.
+    case.cache_state[pool_row] = -3
+    plain_before = cache.clone()
+    plain = call_mtp(case, cache)
+    torch.npu.synchronize()
+    if not torch.equal(cache, plain_before) or int(plain[4][0].cpu()) != 0:
+        raise AssertionError("plain LI path modified cache state or reported misses")
+    for query_idx in range(QUERY_COUNT):
+        src = plain[1][query_idx].reshape(-1).cpu().to(torch.int64)
+        dst = plain[0][query_idx].reshape(-1).cpu().to(torch.int64)
+        if not torch.equal(src, dst) or not torch.equal(
+            torch.sort(src).values, torch.sort(case.topk_cpu[query_idx]).values
+        ):
+            raise AssertionError("plain LI outputs differ from native TopK")
+    print("FUSED_LI_MANAGE_MTP_NEW_STATE_CHECK free_slots=1 plain_li=1 ok=1", flush=True)
 
 
 def run_graph_case(device: torch.device, seed: int, replays: int) -> None:
@@ -1453,6 +1547,8 @@ def main() -> None:
     run_semantic_case(fp16)
     del fp16
     torch.npu.empty_cache()
+
+    run_new_state_cases(device, args.seed + 2000)
 
     run_graph_case(device, args.seed, args.graph_replays)
     if not args.skip_performance:

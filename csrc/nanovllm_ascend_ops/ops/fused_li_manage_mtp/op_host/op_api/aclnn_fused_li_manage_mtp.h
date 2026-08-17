@@ -14,14 +14,18 @@ extern "C" {
 
 __attribute__((visibility("default")))
 aclnnStatus aclnnNanovllmFusedLiManageMtpGetWorkspaceSize(
-    const aclTensor *query, const aclTensor *key, const aclTensor *weights,
-    const aclTensor *reqPoolEntries, const aclTensor *cacheSlots,
-    const aclTensor *cacheTokens, const aclTensor *candidateLens,
-    const aclTensor *blockTable, const aclTensor *topkSlotsOut,
-    const aclTensor *topkSourceIdsOut,
+    const aclTensor *weights, const aclTensor *queryDequantScale,
+    const aclTensor *query, const aclTensor *keyDequantScale,
+    const aclTensor *key, const aclTensor *blockTable,
+    const aclTensor *actualQueryLens, const aclTensor *actualKeyLens,
+    const aclTensor *offloadKeyLens, const aclTensor *reqValid,
+    const aclTensor *reqPoolEntries, const aclTensor *cacheState,
+    const aclTensor *cacheSlots, const aclTensor *topkSourceIdsOut,
+    const aclTensor *topkSlotsOut,
     const aclTensor *missSourceIdsOut,
     const aclTensor *missDestinationSlotsOut, const aclTensor *missCountsOut,
-    const aclTensor *cacheSlotsOut, uint64_t *workspaceSize,
+    const aclTensor *cacheStateOut, const aclTensor *cacheSlotsOut,
+    uint64_t *workspaceSize,
     aclOpExecutor **executor);
 
 __attribute__((visibility("default")))

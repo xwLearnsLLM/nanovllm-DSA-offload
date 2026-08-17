@@ -20,21 +20,27 @@ struct MtpRequiredTensor {
     const gert::StorageShape *shape = nullptr;
 };
 
-constexpr uint32_t MTP_QUERY_INDEX = 0;
-constexpr uint32_t MTP_KEY_INDEX = 1;
-constexpr uint32_t MTP_WEIGHTS_INDEX = 2;
-constexpr uint32_t MTP_REQ_POOL_INDEX = 3;
-constexpr uint32_t MTP_CACHE_SLOTS_INDEX = 4;
-constexpr uint32_t MTP_CACHE_TOKENS_INDEX = 5;
-constexpr uint32_t MTP_CANDIDATE_LENS_INDEX = 6;
-constexpr uint32_t MTP_BLOCK_TABLE_INDEX = 7;
+constexpr uint32_t MTP_WEIGHTS_INDEX = 0;
+constexpr uint32_t MTP_QUERY_SCALE_INDEX = 1;
+constexpr uint32_t MTP_QUERY_INDEX = 2;
+constexpr uint32_t MTP_KEY_SCALE_INDEX = 3;
+constexpr uint32_t MTP_KEY_INDEX = 4;
+constexpr uint32_t MTP_BLOCK_TABLE_INDEX = 5;
+constexpr uint32_t MTP_ACTUAL_QUERY_INDEX = 6;
+constexpr uint32_t MTP_ACTUAL_KEY_INDEX = 7;
+constexpr uint32_t MTP_OFFLOAD_KEY_INDEX = 8;
+constexpr uint32_t MTP_REQ_VALID_INDEX = 9;
+constexpr uint32_t MTP_REQ_POOL_INDEX = 10;
+constexpr uint32_t MTP_CACHE_STATE_INDEX = 11;
+constexpr uint32_t MTP_CACHE_SLOTS_INDEX = 12;
 
-constexpr uint32_t MTP_TOPK_SLOTS_OUT = 0;
-constexpr uint32_t MTP_TOPK_SOURCE_OUT = 1;
+constexpr uint32_t MTP_TOPK_SOURCE_OUT = 0;
+constexpr uint32_t MTP_TOPK_SLOTS_OUT = 1;
 constexpr uint32_t MTP_MISS_SOURCE_OUT = 2;
 constexpr uint32_t MTP_MISS_SLOTS_OUT = 3;
 constexpr uint32_t MTP_MISS_COUNTS_OUT = 4;
-constexpr uint32_t MTP_CACHE_SLOTS_OUT = 5;
+constexpr uint32_t MTP_CACHE_STATE_OUT = 5;
+constexpr uint32_t MTP_CACHE_SLOTS_OUT = 6;
 
 constexpr uint32_t MTP_QUERY_COUNT = 4;
 constexpr uint32_t MTP_HEADS_MIN = 32;
@@ -61,12 +67,17 @@ struct LIUMtpCompileInfo {};
 
 struct LIUMtpTensors {
     MtpRequiredTensor query;
+    MtpRequiredTensor queryScale;
     MtpRequiredTensor key;
+    MtpRequiredTensor keyScale;
     MtpRequiredTensor weights;
     MtpRequiredTensor reqPoolEntries;
+    MtpRequiredTensor reqValid;
+    MtpRequiredTensor cacheState;
     MtpRequiredTensor cacheSlots;
-    MtpRequiredTensor cacheTokens;
-    MtpRequiredTensor candidateLens;
+    MtpRequiredTensor actualQueryLens;
+    MtpRequiredTensor actualKeyLens;
+    MtpRequiredTensor offloadKeyLens;
     MtpRequiredTensor blockTable;
     MtpRequiredTensor topkSlots;
     MtpRequiredTensor topkSource;
@@ -74,6 +85,7 @@ struct LIUMtpTensors {
     MtpRequiredTensor missSlots;
     MtpRequiredTensor missCounts;
     MtpRequiredTensor cacheSlotsOut;
+    MtpRequiredTensor cacheStateOut;
 };
 
 class LIUMtpTilingInfo {

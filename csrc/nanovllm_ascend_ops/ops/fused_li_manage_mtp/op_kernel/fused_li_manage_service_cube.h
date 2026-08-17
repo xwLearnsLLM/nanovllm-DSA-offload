@@ -178,7 +178,7 @@ __aicore__ inline void LIMatmul<LIT>::ComputeMm1(const LICommon::RunInfo &runInf
         }
         if (s2GmOffset + S2_BASIC_BLOCK >= s2ProcessSize &&
             runInfo.isLastS2InnerLoop &&
-            runInfo.queryIdx + 1U == MTP_QUERY_COUNT) {
+            runInfo.queryIdx + 1U == runInfo.queryCount) {
             SetFlag<HardEvent::MTE1_MTE2>(QUERY_MTE1_MTE2_EVENT);
         }
 
@@ -231,7 +231,7 @@ template <typename LIT>
 __aicore__ inline void LIMatmul<LIT>::QueryNd2Nz(const LICommon::RunInfo &runInfo)
 {
     Nd2NzParams nd2nzPara;
-    nd2nzPara.ndNum = MTP_QUERY_COUNT;
+    nd2nzPara.ndNum = runInfo.queryCount;
     nd2nzPara.nValue = constInfo_.qHeadNum;
     nd2nzPara.dValue = constInfo_.headDim;
     nd2nzPara.srcDValue = constInfo_.headDim;
@@ -240,7 +240,7 @@ __aicore__ inline void LIMatmul<LIT>::QueryNd2Nz(const LICommon::RunInfo &runInf
     uint64_t queryElements = constInfo_.qHeadNum * constInfo_.headDim;
     nd2nzPara.srcNdMatrixStride = queryElements;
     nd2nzPara.dstNzMatrixStride = queryElements;
-    uint64_t firstQueryRow = static_cast<uint64_t>(runInfo.bIdx) * MTP_QUERY_COUNT;
+    uint64_t firstQueryRow = runInfo.queryBegin;
     DataCopy(queryL1_, queryGm_[firstQueryRow * queryElements], nd2nzPara);
 }
 

@@ -9,40 +9,51 @@ class NanovllmFusedLiManageMtp : public OpDef {
 public:
     explicit NanovllmFusedLiManageMtp(const char *name) : OpDef(name)
     {
-        this->Input("query").ParamType(REQUIRED)
-            .DataType({ge::DT_BF16, ge::DT_FLOAT16})
-            .FormatList({ge::FORMAT_ND}).AutoContiguous();
-        this->Input("key").ParamType(REQUIRED)
-            .DataType({ge::DT_BF16, ge::DT_FLOAT16})
-            .FormatList({ge::FORMAT_ND}).AutoContiguous();
         this->Input("weights").ParamType(REQUIRED)
             .DataType({ge::DT_BF16, ge::DT_FLOAT16})
             .FormatList({ge::FORMAT_ND}).AutoContiguous();
+        this->Input("query_dequant_scale").ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT}).FormatList({ge::FORMAT_ND}).AutoContiguous();
+        this->Input("query").ParamType(REQUIRED)
+            .DataType({ge::DT_BF16, ge::DT_FLOAT16})
+            .FormatList({ge::FORMAT_ND}).AutoContiguous();
+        this->Input("key_dequant_scale").ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT}).FormatList({ge::FORMAT_ND}).AutoContiguous();
+        this->Input("key").ParamType(REQUIRED)
+            .DataType({ge::DT_BF16, ge::DT_FLOAT16})
+            .FormatList({ge::FORMAT_ND}).AutoContiguous();
+        this->Input("block_table").ParamType(REQUIRED)
+            .DataTypeList({ge::DT_INT32}).FormatList({ge::FORMAT_ND})
+            .AutoContiguous();
+        this->Input("actual_seq_lengths_query").ParamType(REQUIRED)
+            .DataTypeList({ge::DT_INT32}).FormatList({ge::FORMAT_ND}).AutoContiguous();
+        this->Input("actual_seq_lengths_key").ParamType(REQUIRED)
+            .DataTypeList({ge::DT_INT32}).FormatList({ge::FORMAT_ND}).AutoContiguous();
+        this->Input("offload_seq_lengths_key").ParamType(REQUIRED)
+            .DataTypeList({ge::DT_INT32}).FormatList({ge::FORMAT_ND}).AutoContiguous();
+        this->Input("req_valid").ParamType(REQUIRED)
+            .DataTypeList({ge::DT_INT32}).FormatList({ge::FORMAT_ND}).AutoContiguous();
         this->Input("req_pool_entries").ParamType(REQUIRED)
+            .DataTypeList({ge::DT_INT32}).FormatList({ge::FORMAT_ND})
+            .AutoContiguous();
+        this->Input("cache_state").ParamType(REQUIRED)
             .DataTypeList({ge::DT_INT32}).FormatList({ge::FORMAT_ND})
             .AutoContiguous();
         this->Input("cache_slots").ParamType(REQUIRED)
             .DataTypeList({ge::DT_INT32}).FormatList({ge::FORMAT_ND})
             .AutoContiguous();
-        this->Input("cache_tokens").ParamType(REQUIRED)
-            .DataTypeList({ge::DT_INT32}).FormatList({ge::FORMAT_ND})
-            .AutoContiguous();
-        this->Input("candidate_lens").ParamType(REQUIRED)
-            .DataTypeList({ge::DT_INT32}).FormatList({ge::FORMAT_ND})
-            .AutoContiguous();
-        this->Input("block_table").ParamType(REQUIRED)
-            .DataTypeList({ge::DT_INT32}).FormatList({ge::FORMAT_ND})
-            .AutoContiguous();
 
-        this->Output("topk_slots").ParamType(REQUIRED)
-            .DataTypeList({ge::DT_INT32}).FormatList({ge::FORMAT_ND});
         this->Output("topk_source_ids").ParamType(REQUIRED)
+            .DataTypeList({ge::DT_INT32}).FormatList({ge::FORMAT_ND});
+        this->Output("topk_slots").ParamType(REQUIRED)
             .DataTypeList({ge::DT_INT32}).FormatList({ge::FORMAT_ND});
         this->Output("miss_source_ids").ParamType(REQUIRED)
             .DataTypeList({ge::DT_INT32}).FormatList({ge::FORMAT_ND});
         this->Output("miss_destination_slots").ParamType(REQUIRED)
             .DataTypeList({ge::DT_INT32}).FormatList({ge::FORMAT_ND});
         this->Output("miss_counts").ParamType(REQUIRED)
+            .DataTypeList({ge::DT_INT32}).FormatList({ge::FORMAT_ND});
+        this->Output("cache_state_out").ParamType(REQUIRED)
             .DataTypeList({ge::DT_INT32}).FormatList({ge::FORMAT_ND});
         this->Output("cache_slots_out").ParamType(REQUIRED)
             .DataTypeList({ge::DT_INT32}).FormatList({ge::FORMAT_ND});

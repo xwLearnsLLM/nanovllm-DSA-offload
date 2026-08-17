@@ -9,14 +9,18 @@ extern "C" {
 #endif
 
 extern aclnnStatus aclnnInnerNanovllmFusedLiManageMtpGetWorkspaceSize(
-    const aclTensor *query, const aclTensor *key, const aclTensor *weights,
-    const aclTensor *reqPoolEntries, const aclTensor *cacheSlots,
-    const aclTensor *cacheTokens, const aclTensor *candidateLens,
-    const aclTensor *blockTable, const aclTensor *topkSlotsOut,
-    const aclTensor *topkSourceIdsOut,
+    const aclTensor *weights, const aclTensor *queryDequantScale,
+    const aclTensor *query, const aclTensor *keyDequantScale,
+    const aclTensor *key, const aclTensor *blockTable,
+    const aclTensor *actualQueryLens, const aclTensor *actualKeyLens,
+    const aclTensor *offloadKeyLens, const aclTensor *reqValid,
+    const aclTensor *reqPoolEntries, const aclTensor *cacheState,
+    const aclTensor *cacheSlots, const aclTensor *topkSourceIdsOut,
+    const aclTensor *topkSlotsOut,
     const aclTensor *missSourceIdsOut,
     const aclTensor *missDestinationSlotsOut, const aclTensor *missCountsOut,
-    const aclTensor *cacheSlotsOut, uint64_t *workspaceSize,
+    const aclTensor *cacheStateOut, const aclTensor *cacheSlotsOut,
+    uint64_t *workspaceSize,
     aclOpExecutor **executor);
 
 extern aclnnStatus aclnnInnerNanovllmFusedLiManageMtp(
@@ -24,21 +28,26 @@ extern aclnnStatus aclnnInnerNanovllmFusedLiManageMtp(
     const aclrtStream stream);
 
 aclnnStatus aclnnNanovllmFusedLiManageMtpGetWorkspaceSize(
-    const aclTensor *query, const aclTensor *key, const aclTensor *weights,
-    const aclTensor *reqPoolEntries, const aclTensor *cacheSlots,
-    const aclTensor *cacheTokens, const aclTensor *candidateLens,
-    const aclTensor *blockTable, const aclTensor *topkSlotsOut,
-    const aclTensor *topkSourceIdsOut,
+    const aclTensor *weights, const aclTensor *queryDequantScale,
+    const aclTensor *query, const aclTensor *keyDequantScale,
+    const aclTensor *key, const aclTensor *blockTable,
+    const aclTensor *actualQueryLens, const aclTensor *actualKeyLens,
+    const aclTensor *offloadKeyLens, const aclTensor *reqValid,
+    const aclTensor *reqPoolEntries, const aclTensor *cacheState,
+    const aclTensor *cacheSlots, const aclTensor *topkSourceIdsOut,
+    const aclTensor *topkSlotsOut,
     const aclTensor *missSourceIdsOut,
     const aclTensor *missDestinationSlotsOut, const aclTensor *missCountsOut,
-    const aclTensor *cacheSlotsOut, uint64_t *workspaceSize,
+    const aclTensor *cacheStateOut, const aclTensor *cacheSlotsOut,
+    uint64_t *workspaceSize,
     aclOpExecutor **executor)
 {
     return aclnnInnerNanovllmFusedLiManageMtpGetWorkspaceSize(
-        query, key, weights, reqPoolEntries, cacheSlots, cacheTokens,
-        candidateLens, blockTable, topkSlotsOut, topkSourceIdsOut,
+        weights, queryDequantScale, query, keyDequantScale, key, blockTable,
+        actualQueryLens, actualKeyLens, offloadKeyLens, reqValid,
+        reqPoolEntries, cacheState, cacheSlots, topkSourceIdsOut, topkSlotsOut,
         missSourceIdsOut,
-        missDestinationSlotsOut, missCountsOut, cacheSlotsOut, workspaceSize,
+        missDestinationSlotsOut, missCountsOut, cacheStateOut, cacheSlotsOut, workspaceSize,
         executor);
 }
 

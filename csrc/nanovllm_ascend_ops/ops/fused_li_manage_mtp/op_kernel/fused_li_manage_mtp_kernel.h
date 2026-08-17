@@ -29,8 +29,10 @@ public:
     __aicore__ inline void Init(
         __gm__ uint8_t *query, __gm__ uint8_t *key,
         __gm__ uint8_t *weights, __gm__ uint8_t *reqPoolEntries,
-        __gm__ uint8_t *cacheSlots, __gm__ uint8_t *cacheTokens,
-        __gm__ uint8_t *candidateLens, __gm__ uint8_t *blockTable,
+        __gm__ uint8_t *cacheState, __gm__ uint8_t *cacheSlots,
+        __gm__ uint8_t *actualQueryLens, __gm__ uint8_t *actualKeyLens,
+        __gm__ uint8_t *offloadKeyLens, __gm__ uint8_t *reqValid,
+        __gm__ uint8_t *blockTable,
         __gm__ uint8_t *topkSlots, __gm__ uint8_t *topkSourceIds,
         __gm__ uint8_t *missSourceIds,
         __gm__ uint8_t *missDestinationSlots, __gm__ uint8_t *missCounts,
@@ -40,7 +42,6 @@ public:
 
 private:
     static constexpr uint32_t WS_DOUBLE = 2;
-    static constexpr uint32_t QUERY_COUNT = 4;
     static constexpr uint32_t MIN_SOURCE_TOKENS = 2048;
     static constexpr uint32_t MAX_UNION_TOKENS = 8192;
 
@@ -51,9 +52,12 @@ private:
     GlobalTensor<K_T> keyGm;
     GlobalTensor<K_T> weightsGm;
     GlobalTensor<int32_t> reqPoolEntriesGm;
+    GlobalTensor<int32_t> cacheStateGm;
     GlobalTensor<int32_t> cacheSlotsGm;
-    GlobalTensor<int32_t> cacheTokensGm;
-    GlobalTensor<uint32_t> candidateLensGm;
+    GlobalTensor<int32_t> actualQueryLensGm;
+    GlobalTensor<int32_t> actualKeyLensGm;
+    GlobalTensor<int32_t> offloadKeyLensGm;
+    GlobalTensor<int32_t> reqValidGm;
     GlobalTensor<int32_t> blockTableGm;
     GlobalTensor<int32_t> topkSlotsGm;
     GlobalTensor<int32_t> topkSourceIdsGm;
@@ -99,8 +103,10 @@ __aicore__ inline void LIMtpPreload<LIT>::InitRequestRange(uint32_t requestedCor
 template <typename LIT>
 __aicore__ inline void LIMtpPreload<LIT>::Init(
     __gm__ uint8_t *query, __gm__ uint8_t *key, __gm__ uint8_t *weights,
-    __gm__ uint8_t *reqPoolEntries, __gm__ uint8_t *cacheSlots,
-    __gm__ uint8_t *cacheTokens, __gm__ uint8_t *candidateLens,
+    __gm__ uint8_t *reqPoolEntries, __gm__ uint8_t *cacheState,
+    __gm__ uint8_t *cacheSlots, __gm__ uint8_t *actualQueryLens,
+    __gm__ uint8_t *actualKeyLens, __gm__ uint8_t *offloadKeyLens,
+    __gm__ uint8_t *reqValid,
     __gm__ uint8_t *blockTable, __gm__ uint8_t *topkSlots,
     __gm__ uint8_t *topkSourceIds,
     __gm__ uint8_t *missSourceIds, __gm__ uint8_t *missDestinationSlots,
@@ -145,10 +151,16 @@ __aicore__ inline void LIMtpPreload<LIT>::Init(
 
     reqPoolEntriesGm.SetGlobalBuffer((__gm__ int32_t *)reqPoolEntries,
                                      constInfo.batchSize);
-    cacheTokensGm.SetGlobalBuffer((__gm__ int32_t *)cacheTokens,
-                                  constInfo.batchSize);
-    candidateLensGm.SetGlobalBuffer((__gm__ uint32_t *)candidateLens,
+    cacheStateGm.SetGlobalBuffer((__gm__ int32_t *)cacheState,
+                                 constInfo.poolSize);
+    actualQueryLensGm.SetGlobalBuffer((__gm__ int32_t *)actualQueryLens,
+                                      constInfo.batchSize);
+    actualKeyLensGm.SetGlobalBuffer((__gm__ int32_t *)actualKeyLens,
                                     constInfo.batchSize);
+    offloadKeyLensGm.SetGlobalBuffer((__gm__ int32_t *)offloadKeyLens,
+                                     constInfo.batchSize);
+    reqValidGm.SetGlobalBuffer((__gm__ int32_t *)reqValid,
+                               constInfo.batchSize);
     cacheSlotsGm.SetGlobalBuffer((__gm__ int32_t *)cacheSlots);
     InitRequestRange(tiling->usedCoreNum);
 
@@ -167,6 +179,7 @@ __aicore__ inline void LIMtpPreload<LIT>::Init(
             mm1ResGm, weightsGm, cacheSlotsGm, topkSlotsGm,
             topkSourceIdsGm,
             missSourceIdsGm, missDestinationSlotsGm, missCountsGm,
+            cacheStateGm,
             aggregateScoresGm, internalTopkPayloadsGm,
             internalThresholdsGm);
         vectorService.InitMtpBuffers(pipe);
@@ -216,38 +229,61 @@ __aicore__ inline void LIMtpPreload<LIT>::ProcessMain()
     for (uint32_t requestOffset = 0; requestOffset < requestCount;
          ++requestOffset) {
         uint32_t bIdx = requestStart + requestOffset;
-        uint32_t candidateLen = candidateLensGm.GetValue(bIdx);
+        if (reqValidGm.GetValue(bIdx) == 0) {
+            CleanRequest(bIdx);
+            continue;
+        }
+        int32_t queryBeginValue = bIdx == 0U ? 0 : actualQueryLensGm.GetValue(bIdx - 1U);
+        int32_t queryEndValue = actualQueryLensGm.GetValue(bIdx);
         int32_t poolEntry = reqPoolEntriesGm.GetValue(bIdx);
-        int32_t cacheTokenCount = cacheTokensGm.GetValue(bIdx);
-        uint32_t requiredCache = Min(candidateLen, MAX_UNION_TOKENS);
+        if (queryBeginValue < 0 || queryEndValue <= queryBeginValue ||
+            queryEndValue - queryBeginValue > 4 || poolEntry < 0 ||
+            static_cast<uint32_t>(poolEntry) >= constInfo.poolSize) {
+            CleanRequest(bIdx);
+            continue;
+        }
+        int32_t cacheState = cacheStateGm.GetValue(poolEntry);
+        bool isPlainLi = cacheState == -3;
+        int32_t actualKeyLen = actualKeyLensGm.GetValue(bIdx);
+        int32_t offloadKeyLen = offloadKeyLensGm.GetValue(bIdx);
+        if (actualKeyLen < 0 || offloadKeyLen < 0 ||
+            offloadKeyLen > actualKeyLen ||
+            (!isPlainLi && static_cast<uint32_t>(offloadKeyLen) %
+                               constInfo.kCacheBlockSize != 0U)) {
+            CleanRequest(bIdx);
+            continue;
+        }
+        int32_t keyLenValue = isPlainLi ? actualKeyLen : offloadKeyLen;
+        uint32_t candidateLen = keyLenValue > 0 ?
+            static_cast<uint32_t>(keyLenValue) / constInfo.kCacheBlockSize *
+                constInfo.kCacheBlockSize : 0U;
         if (candidateLen < MIN_SOURCE_TOKENS ||
             candidateLen > constInfo.kSeqSize ||
             candidateLen > constInfo.cacheSlotsSize ||
-            poolEntry < 0 ||
-            static_cast<uint32_t>(poolEntry) >= constInfo.poolSize ||
-            cacheTokenCount == 0 || cacheTokenCount < 0 ||
-            static_cast<uint32_t>(cacheTokenCount) < requiredCache ||
-            static_cast<uint32_t>(cacheTokenCount) >
-                static_cast<uint32_t>(LIServiceVec::INVALID_SLOT14) ||
-            static_cast<uint32_t>(cacheTokenCount) > candidateLen) {
+            (!isPlainLi && cacheState < -1)) {
             CleanRequest(bIdx);
             continue;
         }
 
         uint32_t chunkCount = CeilDiv(candidateLen, constInfo.s2BaseSize);
-        for (uint32_t queryIdx = 0; queryIdx < QUERY_COUNT; ++queryIdx) {
+        uint32_t queryCount = static_cast<uint32_t>(queryEndValue - queryBeginValue);
+        for (uint32_t queryIdx = 0; queryIdx < queryCount; ++queryIdx) {
             for (uint32_t chunkIdx = 0; chunkIdx < chunkCount; ++chunkIdx) {
                 RunInfo runInfo{};
                 runInfo.loop = loop++;
                 runInfo.bIdx = bIdx;
-                runInfo.queryRow = bIdx * QUERY_COUNT + queryIdx;
+                runInfo.queryBegin = static_cast<uint32_t>(queryBeginValue);
+                runInfo.queryCount = queryCount;
+                runInfo.queryRow = runInfo.queryBegin + queryIdx;
                 runInfo.queryIdx = queryIdx;
                 runInfo.s2Idx = chunkIdx;
                 runInfo.segmentChunkIdx = chunkIdx;
                 runInfo.actS2Size = candidateLen;
                 runInfo.cacheTokenCount =
-                    static_cast<uint32_t>(cacheTokenCount);
+                    static_cast<uint32_t>(LIServiceVec::INVALID_SLOT14);
                 runInfo.cacheRowIdx = static_cast<uint32_t>(poolEntry);
+                runInfo.cacheState = cacheState;
+                runInfo.isPlainLi = isPlainLi;
                 uint32_t chunkStart = chunkIdx * constInfo.s2BaseSize;
                 runInfo.actualSingleProcessSInnerSize =
                     Min(constInfo.s2BaseSize, candidateLen - chunkStart);

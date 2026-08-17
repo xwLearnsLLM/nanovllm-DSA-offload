@@ -19,13 +19,18 @@ thread_local int g_hashOffset = 0;
 namespace {
 
 void fused_li_manage_mtp_torch_op(
-    const at::Tensor& query,
     const at::Tensor& index_weights,
+    const at::Tensor& query_dequant_scale,
+    const at::Tensor& query,
+    const at::Tensor& index_key_dequant_scale,
     const at::Tensor& index_key_cache,
     const at::Tensor& index_block_table,
-    const at::Tensor& num_candidate_tokens,
-    const at::Tensor& num_cache_tokens,
+    const at::Tensor& actual_seq_lengths_query,
+    const at::Tensor& actual_seq_lengths_key,
+    const at::Tensor& offload_seq_lengths_key,
+    const at::Tensor& req_valid,
     const at::Tensor& req_pool_entries,
+    at::Tensor cache_state,
     at::Tensor cache_slots_pool,
     at::Tensor topk_src_ids,
     at::Tensor topk_dst_slots,
@@ -33,20 +38,27 @@ void fused_li_manage_mtp_torch_op(
     at::Tensor miss_dst_slots,
     at::Tensor miss_counts) {
   vllm_ascend::npu_fused_li_manage_mtp(
-      query, index_weights, index_key_cache, index_block_table,
-      num_candidate_tokens, num_cache_tokens, req_pool_entries,
+      index_weights, query_dequant_scale, query, index_key_dequant_scale,
+      index_key_cache, index_block_table, actual_seq_lengths_query,
+      actual_seq_lengths_key, offload_seq_lengths_key, req_valid, req_pool_entries,
+      cache_state,
       cache_slots_pool, topk_src_ids, topk_dst_slots, miss_src_ids,
       miss_dst_slots, miss_counts);
 }
 
 void fused_li_manage_mtp_meta(
-    const at::Tensor& query,
     const at::Tensor& index_weights,
+    const at::Tensor& query_dequant_scale,
+    const at::Tensor& query,
+    const at::Tensor& index_key_dequant_scale,
     const at::Tensor& index_key_cache,
     const at::Tensor& index_block_table,
-    const at::Tensor& num_candidate_tokens,
-    const at::Tensor& num_cache_tokens,
+    const at::Tensor& actual_seq_lengths_query,
+    const at::Tensor& actual_seq_lengths_key,
+    const at::Tensor& offload_seq_lengths_key,
+    const at::Tensor& req_valid,
     const at::Tensor& req_pool_entries,
+    at::Tensor cache_state,
     at::Tensor cache_slots_pool,
     at::Tensor topk_src_ids,
     at::Tensor topk_dst_slots,
@@ -57,9 +69,14 @@ void fused_li_manage_mtp_meta(
   (void)index_weights;
   (void)index_key_cache;
   (void)index_block_table;
-  (void)num_candidate_tokens;
-  (void)num_cache_tokens;
+  (void)query_dequant_scale;
+  (void)index_key_dequant_scale;
+  (void)actual_seq_lengths_query;
+  (void)actual_seq_lengths_key;
+  (void)offload_seq_lengths_key;
+  (void)req_valid;
   (void)req_pool_entries;
+  (void)cache_state;
   (void)cache_slots_pool;
   (void)topk_src_ids;
   (void)topk_dst_slots;
@@ -217,13 +234,14 @@ void fused_copy_sfa_mtp_meta(
 
 TORCH_LIBRARY(nanovllm_dsa, ops) {
   ops.def(
-      "fused_li_manage_mtp(Tensor query, Tensor index_weights,"
-      " Tensor index_key_cache, Tensor index_block_table,"
-      " Tensor num_candidate_tokens, Tensor num_cache_tokens,"
-      " Tensor req_pool_entries, Tensor(a!) cache_slots_pool,"
-      " Tensor(b!) topk_src_ids, Tensor(c!) topk_dst_slots,"
-      " Tensor(d!) miss_src_ids, Tensor(e!) miss_dst_slots,"
-      " Tensor(f!) miss_counts) -> ()");
+      "fused_li_manage_mtp(Tensor index_weights, Tensor query_dequant_scale,"
+      " Tensor query, Tensor index_key_dequant_scale, Tensor index_key_cache,"
+      " Tensor index_block_table, Tensor actual_seq_lengths_query,"
+      " Tensor actual_seq_lengths_key, Tensor offload_seq_lengths_key,"
+      " Tensor req_valid, Tensor req_pool_entries, Tensor(a!) cache_state,"
+      " Tensor(b!) cache_slots_pool, Tensor(c!) topk_src_ids,"
+      " Tensor(d!) topk_dst_slots, Tensor(e!) miss_src_ids,"
+      " Tensor(f!) miss_dst_slots, Tensor(g!) miss_counts) -> ()");
   ops.def(
       "scatter_copy(Tensor src_ids, Tensor dst_slots, Tensor copy_counts,"
       " Tensor hbm_block_table, Tensor dram_block_table,"
