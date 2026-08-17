@@ -241,5 +241,159 @@
             {"name": "return_softmax_lse", "param_type": "optional", "type": "bool", "default_value": false},
             {"name": "prefetch_rows_per_step", "param_type": "optional", "type": "int", "default_value": 5}
         ]
+    },
+    {
+        "op": "A5SparseTailAttentionC8State",
+        "language": "cpp",
+        "input_desc": [
+            {"name": "query", "param_type": "required", "format": ["ND", "ND"], "type": ["bf16", "fp16"]},
+            {"name": "key", "param_type": "required", "format": ["ND", "ND"], "type": ["int8", "int8"]},
+            {"name": "value", "param_type": "required", "format": ["ND", "ND"], "type": ["int8", "int8"]},
+            {"name": "sparse_indices", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "key_dequant_scale", "param_type": "optional", "format": ["ND", "ND"], "type": ["float", "float"]},
+            {"name": "value_dequant_scale", "param_type": "optional", "format": ["ND", "ND"], "type": ["float", "float"]},
+            {"name": "block_table", "param_type": "optional", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "actual_seq_lengths_query", "param_type": "optional", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "actual_seq_lengths_kv", "param_type": "optional", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "miss_counts", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "cache_tokens", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]}
+        ],
+        "output_desc": [
+            {"name": "partial_out", "param_type": "required", "format": ["ND", "ND"], "type": ["float", "float"]},
+            {"name": "softmax_max", "param_type": "required", "format": ["ND", "ND"], "type": ["float", "float"]},
+            {"name": "softmax_sum", "param_type": "required", "format": ["ND", "ND"], "type": ["float", "float"]}
+        ],
+        "attr": [
+            {"name": "scale_value", "param_type": "required", "type": "float"},
+            {"name": "key_quant_mode", "param_type": "required", "type": "int"},
+            {"name": "value_quant_mode", "param_type": "required", "type": "int"},
+            {"name": "sparse_block_size", "param_type": "optional", "type": "int", "default_value": 1},
+            {"name": "layout_query", "param_type": "optional", "type": "string", "default_value": "TND"},
+            {"name": "layout_kv", "param_type": "optional", "type": "string", "default_value": "PA_BSND"},
+            {"name": "sparse_mode", "param_type": "optional", "type": "int", "default_value": 3},
+            {"name": "pre_tokens", "param_type": "optional", "type": "int", "default_value": 9223372036854775807},
+            {"name": "next_tokens", "param_type": "optional", "type": "int", "default_value": 9223372036854775807},
+            {"name": "attention_mode", "param_type": "optional", "type": "int", "default_value": 2},
+            {"name": "quant_scale_repo_mode", "param_type": "optional", "type": "int", "default_value": 1},
+            {"name": "tile_size", "param_type": "optional", "type": "int", "default_value": 128},
+            {"name": "rope_head_dim", "param_type": "optional", "type": "int", "default_value": 64},
+            {"name": "stage_mode", "param_type": "optional", "type": "int", "default_value": 1}
+        ]
+    },
+    {
+        "op": "A5SparseTailAttentionC8Stage2",
+        "language": "cpp",
+        "input_desc": [
+            {"name": "query", "param_type": "required", "format": ["ND", "ND"], "type": ["bf16", "fp16"]},
+            {"name": "key", "param_type": "required", "format": ["ND", "ND"], "type": ["int8", "int8"]},
+            {"name": "value", "param_type": "required", "format": ["ND", "ND"], "type": ["int8", "int8"]},
+            {"name": "sparse_indices", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "key_dequant_scale", "param_type": "optional", "format": ["ND", "ND"], "type": ["float", "float"]},
+            {"name": "value_dequant_scale", "param_type": "optional", "format": ["ND", "ND"], "type": ["float", "float"]},
+            {"name": "block_table", "param_type": "optional", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "actual_seq_lengths_query", "param_type": "optional", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "actual_seq_lengths_kv", "param_type": "optional", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "miss_counts", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "cache_tokens", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "previous_p", "param_type": "required", "format": ["ND", "ND"], "type": ["float", "float"]},
+            {"name": "previous_m", "param_type": "required", "format": ["ND", "ND"], "type": ["float", "float"]},
+            {"name": "previous_l", "param_type": "required", "format": ["ND", "ND"], "type": ["float", "float"]}
+        ],
+        "output_desc": [
+            {"name": "attention_out", "param_type": "required", "format": ["ND", "ND"], "type": ["bf16", "fp16"]}
+        ],
+        "attr": [
+            {"name": "scale_value", "param_type": "required", "type": "float"},
+            {"name": "key_quant_mode", "param_type": "required", "type": "int"},
+            {"name": "value_quant_mode", "param_type": "required", "type": "int"},
+            {"name": "sparse_block_size", "param_type": "optional", "type": "int", "default_value": 1},
+            {"name": "layout_query", "param_type": "optional", "type": "string", "default_value": "TND"},
+            {"name": "layout_kv", "param_type": "optional", "type": "string", "default_value": "PA_BSND"},
+            {"name": "sparse_mode", "param_type": "optional", "type": "int", "default_value": 3},
+            {"name": "pre_tokens", "param_type": "optional", "type": "int", "default_value": 9223372036854775807},
+            {"name": "next_tokens", "param_type": "optional", "type": "int", "default_value": 9223372036854775807},
+            {"name": "attention_mode", "param_type": "optional", "type": "int", "default_value": 2},
+            {"name": "quant_scale_repo_mode", "param_type": "optional", "type": "int", "default_value": 1},
+            {"name": "tile_size", "param_type": "optional", "type": "int", "default_value": 128},
+            {"name": "rope_head_dim", "param_type": "optional", "type": "int", "default_value": 64},
+            {"name": "stage_mode", "param_type": "optional", "type": "int", "default_value": 2}
+        ]
+    },
+    {
+        "op": "A5SparseTailAttentionC8PmlProbe",
+        "language": "cpp",
+        "input_desc": [
+            {"name": "query", "param_type": "required", "format": ["ND", "ND"], "type": ["bf16", "fp16"]},
+            {"name": "key", "param_type": "required", "format": ["ND", "ND"], "type": ["int8", "int8"]},
+            {"name": "value", "param_type": "required", "format": ["ND", "ND"], "type": ["int8", "int8"]},
+            {"name": "sparse_indices", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "key_dequant_scale", "param_type": "optional", "format": ["ND", "ND"], "type": ["float", "float"]},
+            {"name": "value_dequant_scale", "param_type": "optional", "format": ["ND", "ND"], "type": ["float", "float"]},
+            {"name": "block_table", "param_type": "optional", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "actual_seq_lengths_query", "param_type": "optional", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "actual_seq_lengths_kv", "param_type": "optional", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "miss_counts", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "cache_tokens", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]}
+        ],
+        "output_desc": [
+            {"name": "attention_out", "param_type": "required", "format": ["ND", "ND"], "type": ["bf16", "fp16"]},
+            {"name": "partial_out", "param_type": "required", "format": ["ND", "ND"], "type": ["float", "float"]},
+            {"name": "softmax_max", "param_type": "required", "format": ["ND", "ND"], "type": ["float", "float"]},
+            {"name": "softmax_sum", "param_type": "required", "format": ["ND", "ND"], "type": ["float", "float"]}
+        ],
+        "attr": [
+            {"name": "scale_value", "param_type": "required", "type": "float"},
+            {"name": "key_quant_mode", "param_type": "required", "type": "int"},
+            {"name": "value_quant_mode", "param_type": "required", "type": "int"},
+            {"name": "sparse_block_size", "param_type": "optional", "type": "int", "default_value": 1},
+            {"name": "layout_query", "param_type": "optional", "type": "string", "default_value": "TND"},
+            {"name": "layout_kv", "param_type": "optional", "type": "string", "default_value": "PA_BSND"},
+            {"name": "sparse_mode", "param_type": "optional", "type": "int", "default_value": 3},
+            {"name": "pre_tokens", "param_type": "optional", "type": "int", "default_value": 9223372036854775807},
+            {"name": "next_tokens", "param_type": "optional", "type": "int", "default_value": 9223372036854775807},
+            {"name": "attention_mode", "param_type": "optional", "type": "int", "default_value": 2},
+            {"name": "quant_scale_repo_mode", "param_type": "optional", "type": "int", "default_value": 1},
+            {"name": "tile_size", "param_type": "optional", "type": "int", "default_value": 128},
+            {"name": "rope_head_dim", "param_type": "optional", "type": "int", "default_value": 64},
+            {"name": "stage_mode", "param_type": "optional", "type": "int", "default_value": 3},
+            {"name": "probe_enabled", "param_type": "optional", "type": "bool", "default_value": false}
+        ]
+    },
+    {
+        "op": "A5SparseTailAttentionC8TndProbe",
+        "language": "cpp",
+        "input_desc": [
+            {"name": "query", "param_type": "required", "format": ["ND", "ND"], "type": ["bf16", "fp16"]},
+            {"name": "key", "param_type": "required", "format": ["ND", "ND"], "type": ["int8", "int8"]},
+            {"name": "value", "param_type": "required", "format": ["ND", "ND"], "type": ["int8", "int8"]},
+            {"name": "sparse_indices", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "key_dequant_scale", "param_type": "optional", "format": ["ND", "ND"], "type": ["float", "float"]},
+            {"name": "value_dequant_scale", "param_type": "optional", "format": ["ND", "ND"], "type": ["float", "float"]},
+            {"name": "block_table", "param_type": "optional", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "actual_seq_lengths_query", "param_type": "optional", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "actual_seq_lengths_kv", "param_type": "optional", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "miss_counts", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "cache_tokens", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]}
+        ],
+        "output_desc": [
+            {"name": "attention_out", "param_type": "required", "format": ["ND", "ND"], "type": ["bf16", "fp16"]}
+        ],
+        "attr": [
+            {"name": "scale_value", "param_type": "required", "type": "float"},
+            {"name": "key_quant_mode", "param_type": "required", "type": "int"},
+            {"name": "value_quant_mode", "param_type": "required", "type": "int"},
+            {"name": "sparse_block_size", "param_type": "optional", "type": "int", "default_value": 1},
+            {"name": "layout_query", "param_type": "optional", "type": "string", "default_value": "TND"},
+            {"name": "layout_kv", "param_type": "optional", "type": "string", "default_value": "PA_BSND"},
+            {"name": "sparse_mode", "param_type": "optional", "type": "int", "default_value": 3},
+            {"name": "pre_tokens", "param_type": "optional", "type": "int", "default_value": 9223372036854775807},
+            {"name": "next_tokens", "param_type": "optional", "type": "int", "default_value": 9223372036854775807},
+            {"name": "attention_mode", "param_type": "optional", "type": "int", "default_value": 2},
+            {"name": "quant_scale_repo_mode", "param_type": "optional", "type": "int", "default_value": 1},
+            {"name": "tile_size", "param_type": "optional", "type": "int", "default_value": 128},
+            {"name": "rope_head_dim", "param_type": "optional", "type": "int", "default_value": 64},
+            {"name": "stage_mode", "param_type": "optional", "type": "int", "default_value": 4},
+            {"name": "probe_enabled", "param_type": "optional", "type": "bool", "default_value": false}
+        ]
     }
 ]

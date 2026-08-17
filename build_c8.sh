@@ -30,12 +30,17 @@ OP_NAMES=(
     A5FusedLiManageMtpC8
     A5KvcacheScatterCopyC8
     A5SparseTailAttentionC8
+    A5SparseTailAttentionC8State
+    A5SparseTailAttentionC8Stage2
+    A5SparseTailAttentionC8PmlProbe
+    A5SparseTailAttentionC8TndProbe
 )
 OP_DIRS=(
     fused_li_manage_c8
     fused_li_manage_mtp_c8
     kvcache_scatter_copy_c8
     sparse_tail_attention_c8
+    sparse_tail_attention_c8_staged
 )
 for op_dir in "${OP_DIRS[@]}"; do
     [[ -d "${SOURCE_ROOT}/${op_dir}" ]] || {

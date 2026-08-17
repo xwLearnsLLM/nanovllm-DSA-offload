@@ -58,6 +58,71 @@
     } while (0)
 #endif
 
+// CANN releases do not consistently install err/ops_err.h. These helpers
+// only report validation failures; callers still return the graph status.
+#ifndef NANOVLLM_OP_LOG_INVALID
+#define NANOVLLM_OP_LOG_INVALID(op_name, ...)           \
+    do {                                                \
+        (void)(op_name);                                \
+        std::fprintf(stderr, "[ERROR] invalid operator argument\n"); \
+    } while (0)
+#endif
+
+#ifndef OP_LOGE_FOR_INVALID_ARGUMENT_WITH_REASON
+#define OP_LOGE_FOR_INVALID_ARGUMENT_WITH_REASON(op_name, ...) \
+    NANOVLLM_OP_LOG_INVALID(op_name, __VA_ARGS__)
+#endif
+
+#ifndef OP_LOGE_FOR_INVALID_DTYPES_WITH_REASON
+#define OP_LOGE_FOR_INVALID_DTYPES_WITH_REASON(op_name, ...) \
+    NANOVLLM_OP_LOG_INVALID(op_name, __VA_ARGS__)
+#endif
+
+#ifndef OP_LOGE_FOR_INVALID_DTYPE_WITH_REASON
+#define OP_LOGE_FOR_INVALID_DTYPE_WITH_REASON(op_name, ...) \
+    NANOVLLM_OP_LOG_INVALID(op_name, __VA_ARGS__)
+#endif
+
+#ifndef OP_LOGE_FOR_INVALID_SHAPE
+#define OP_LOGE_FOR_INVALID_SHAPE(op_name, ...) \
+    NANOVLLM_OP_LOG_INVALID(op_name, __VA_ARGS__)
+#endif
+
+#ifndef OP_LOGE_FOR_INVALID_SHAPEDIM_WITH_REASON
+#define OP_LOGE_FOR_INVALID_SHAPEDIM_WITH_REASON(op_name, ...) \
+    NANOVLLM_OP_LOG_INVALID(op_name, __VA_ARGS__)
+#endif
+
+#ifndef OP_LOGE_FOR_INVALID_SHAPESIZE_WITH_REASON
+#define OP_LOGE_FOR_INVALID_SHAPESIZE_WITH_REASON(op_name, ...) \
+    NANOVLLM_OP_LOG_INVALID(op_name, __VA_ARGS__)
+#endif
+
+#ifndef OP_LOGE_FOR_INVALID_SHAPES_WITH_REASON
+#define OP_LOGE_FOR_INVALID_SHAPES_WITH_REASON(op_name, ...) \
+    NANOVLLM_OP_LOG_INVALID(op_name, __VA_ARGS__)
+#endif
+
+#ifndef OP_LOGE_FOR_INVALID_SHAPE_WITH_REASON
+#define OP_LOGE_FOR_INVALID_SHAPE_WITH_REASON(op_name, ...) \
+    NANOVLLM_OP_LOG_INVALID(op_name, __VA_ARGS__)
+#endif
+
+#ifndef OP_LOGE_FOR_INVALID_VALUE
+#define OP_LOGE_FOR_INVALID_VALUE(op_name, ...) \
+    NANOVLLM_OP_LOG_INVALID(op_name, __VA_ARGS__)
+#endif
+
+#ifndef OP_LOGE_FOR_INVALID_VALUES_WITH_REASON
+#define OP_LOGE_FOR_INVALID_VALUES_WITH_REASON(op_name, ...) \
+    NANOVLLM_OP_LOG_INVALID(op_name, __VA_ARGS__)
+#endif
+
+#ifndef OP_LOGE_FOR_INVALID_VALUE_WITH_REASON
+#define OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(op_name, ...) \
+    NANOVLLM_OP_LOG_INVALID(op_name, __VA_ARGS__)
+#endif
+
 // Some reference kernels use the older OPS_* spellings from
 // error/ops_error.h.  That private header is not shipped by every CANN 9.1
 // Ascend 950 package, so keep the small subset needed by this standalone

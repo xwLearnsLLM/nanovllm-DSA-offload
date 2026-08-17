@@ -34,6 +34,7 @@ setup(
                 str(CSRC / "npu_kvcache_scatter_copy_c8.cpp"),
                 str(CSRC / "npu_sparse_tail_attention.cpp"),
                 str(CSRC / "npu_sparse_tail_attention_c8.cpp"),
+                str(CSRC / "npu_sparse_tail_attention_c8_staged.cpp"),
                 str(CSRC / "npu_fused_copy_sparse_tail_attention.cpp"),
                 str(CSRC / "op_api_common.cpp"),
             ],
