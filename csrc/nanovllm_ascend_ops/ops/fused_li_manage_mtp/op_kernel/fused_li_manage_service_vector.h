@@ -1468,14 +1468,6 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
         PipeBarrier<PIPE_V>();
         SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
 
-        // Publish the per-query count from the same mask used to construct
-        // the caller-visible source/slot rows below. Keeping this write in
-        // the final output pass also gives ACLGraph replay one unambiguous
-        // producer for every topk_miss_counts element.
-        topkMissCountsGm.SetValue(
-            info.queryBegin + queryIdx,
-            static_cast<int32_t>(Min(rowMissCount, tokenMissCount)));
-
         uint32_t patchCount = static_cast<uint32_t>(
             Min(rowMissCount, tokenMissCount));
         for (uint32_t missIdx = 0; missIdx < patchCount; ++missIdx) {
@@ -1507,6 +1499,18 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
             }
             rowSlots.SetValue(position, resolvedSlot);
         }
+
+        // Publish through MTE3 instead of a scalar GM SetValue. This loop also
+        // has large TopK MTE3 writes in flight; on ACLGraph replay, mixing the
+        // scalar GM store with those copies can leave individual rows
+        // untouched. missPositions is dead for this row after patching and is
+        // therefore a safe one-element staging buffer.
+        missPositions.SetValue(0, static_cast<int32_t>(patchCount));
+        SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
+        LIServiceVec::CopyOut(
+            topkMissCountsGm[info.queryBegin + queryIdx], missPositions, 1);
+        SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
+
         SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
         DataCopyPad(topkSlotsGm[rowOffset], rowSlots, topkCopy);
         DataCopyPad(mtpTopkSourceIdsGm[rowOffset], rowSources, topkCopy);
