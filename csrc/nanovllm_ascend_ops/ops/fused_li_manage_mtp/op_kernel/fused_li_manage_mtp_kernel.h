@@ -44,6 +44,7 @@ public:
 private:
     static constexpr uint32_t WS_DOUBLE = 2;
     static constexpr uint32_t MIN_SOURCE_TOKENS = 2048;
+    static constexpr uint32_t TOPK_TOKENS = 2048;
     static constexpr uint32_t MAX_UNION_TOKENS = 8192;
 
     LIMatmul<LIT> matmulService;
@@ -307,6 +308,46 @@ __aicore__ inline void LIMtpPreload<LIT>::ProcessMain()
             continue;
         }
 
+        // While free slots remain, recover C from the complete persistent
+        // pool row rather than only from the current offloaded prefix.  This
+        // is the one phase in which the 1-based negative bindings still carry
+        // the capacity information. Once cache_state reaches -1, all slots
+        // are valid and the established full-cache path needs no rescan.
+        uint32_t cacheTokenCount =
+            static_cast<uint32_t>(LIServiceVec::INVALID_SLOT14);
+        if (!isPlainLi && cacheState >= 0) {
+            cacheTokenCount = 0U;
+            bool invalidCapacity = false;
+            uint64_t cacheBase = static_cast<uint64_t>(poolEntry) *
+                                 constInfo.cacheSlotsSize;
+            for (uint32_t token = 0; token < constInfo.cacheSlotsSize;
+                 ++token) {
+                int32_t value = cacheSlotsGm.GetValue(cacheBase + token);
+                uint32_t encodedCapacity = 0U;
+                if (value >= 0) {
+                    encodedCapacity = static_cast<uint32_t>(value) + 1U;
+                } else if (value != -65536) {
+                    // Avoid signed overflow for malformed INT32_MIN input.
+                    encodedCapacity =
+                        static_cast<uint32_t>(-(value + 1)) + 1U;
+                }
+                if (encodedCapacity >
+                    static_cast<uint32_t>(LIServiceVec::INVALID_SLOT14)) {
+                    invalidCapacity = true;
+                    break;
+                }
+                cacheTokenCount = Max(cacheTokenCount, encodedCapacity);
+            }
+            uint32_t requestTopkCapacity =
+                static_cast<uint32_t>(queryEndValue - queryBeginValue) *
+                TOPK_TOKENS;
+            uint32_t requiredCache = Min(candidateLen, requestTopkCapacity);
+            if (invalidCapacity || cacheTokenCount < requiredCache) {
+                CleanRequest(bIdx);
+                continue;
+            }
+        }
+
         uint32_t chunkCount = CeilDiv(candidateLen, constInfo.s2BaseSize);
         uint32_t queryCount = static_cast<uint32_t>(queryEndValue - queryBeginValue);
         for (uint32_t queryIdx = 0; queryIdx < queryCount; ++queryIdx) {
@@ -321,8 +362,7 @@ __aicore__ inline void LIMtpPreload<LIT>::ProcessMain()
                 runInfo.s2Idx = chunkIdx;
                 runInfo.segmentChunkIdx = chunkIdx;
                 runInfo.actS2Size = candidateLen;
-                runInfo.cacheTokenCount =
-                    static_cast<uint32_t>(LIServiceVec::INVALID_SLOT14);
+                runInfo.cacheTokenCount = cacheTokenCount;
                 runInfo.cacheRowIdx = static_cast<uint32_t>(poolEntry);
                 runInfo.cacheState = cacheState;
                 runInfo.isPlainLi = isPlainLi;

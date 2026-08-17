@@ -1450,14 +1450,41 @@ def run_graph_case(device: torch.device, seed: int, replays: int) -> None:
         if not torch.equal(graph_cache.cpu(), eager_cache.cpu()):
             raise AssertionError(f"graph replay={replay} cache state differs")
 
+    # Plain LI has the same caller-owned per-query count output but bypasses
+    # cache management. Capture it separately to cover its zero-count MTE3
+    # writeback under ACLGraph replay.
+    for pool_row in case.req_pool_entries.cpu().tolist():
+        case.cache_state[int(pool_row)] = -3
+    plain_graph_cache = case.initial_cache_cpu.to(device)
+    plain_eager_cache = case.initial_cache_cpu.to(device)
+    plain_buffers = make_outputs(case)
+    plain_graph = torch.npu.NPUGraph()
+    plain_pool = torch.npu.graph_pool_handle()
+    with torch.npu.graph(plain_graph, pool=plain_pool):
+        plain_graph_outputs = call_mtp_with_buffers(
+            case, plain_graph_cache, *plain_buffers
+        )
+    torch.npu.synchronize()
+    plain_graph.replay()
+    torch.npu.synchronize()
+    plain_eager_outputs = call_mtp(case, plain_eager_cache)
+    torch.npu.synchronize()
+    _compare_valid_outputs(
+        case, plain_graph_outputs, plain_eager_outputs,
+        label="graph/plain_li",
+    )
+    if not bool((plain_graph_outputs[5].cpu() == 0).all()):
+        raise AssertionError("graph/plain_li: topk_miss_counts must be zero")
+
     print(
         "FUSED_LI_MANAGE_MTP_GRAPH_CHECK "
         f"batch={batch_size} replays={replays} dynamic_query=1 "
         "dynamic_weights=1 dynamic_pool_entries=1 dynamic_lengths=1 "
-        "dynamic_block_table=1 evolving_state=1 ok=1",
+        "dynamic_block_table=1 evolving_state=1 plain_li=1 ok=1",
         flush=True,
     )
     del case, graph_cache, eager_cache, warm_cache
+    del plain_graph_cache, plain_eager_cache
     torch.npu.empty_cache()
 
 

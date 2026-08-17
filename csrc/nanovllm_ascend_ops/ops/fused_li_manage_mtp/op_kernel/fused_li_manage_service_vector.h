@@ -1033,7 +1033,10 @@ __aicore__ inline void LIVector<LIT>::FinalizePlainLiRequest(
         SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
         DataCopyPad(topkSlotsGm[rowOffset], tokens, copyOut);
         DataCopyPad(mtpTopkSourceIdsGm[rowOffset], tokens, copyOut);
-        topkMissCountsGm.SetValue(info.queryBegin + queryIdx, 0);
+        payloads.SetValue(0, 0);
+        SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
+        LIServiceVec::CopyOut(
+            topkMissCountsGm[info.queryBegin + queryIdx], payloads, 1);
         SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
     }
     WriteMtpZeroMissCount(info.bIdx);
@@ -1126,25 +1129,7 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
         }
     }
 
-    // Recover the real HBM capacity from persistent mappings before/during
-    // the partially-free phase as max(slot+1, -binding). Once state is -1,
-    // all slots are known valid and the original packed-slot bound is enough.
-    uint32_t cacheCapacity = static_cast<uint32_t>(INVALID_SLOT14);
-    if (info.cacheState >= 0) {
-        cacheCapacity = 0U;
-        for (uint32_t token = 0; token < info.actS2Size; ++token) {
-            int32_t value = cacheSlotsGm.GetValue(cacheBase + token);
-            if (value >= 0) {
-                cacheCapacity = Max(cacheCapacity,
-                                    static_cast<uint32_t>(value) + 1U);
-            } else if (value != -65536) {
-                cacheCapacity = Max(cacheCapacity,
-                                    static_cast<uint32_t>(-value));
-            }
-        }
-        cacheCapacity = Min(cacheCapacity,
-                            static_cast<uint32_t>(INVALID_SLOT14));
-    }
+    const uint32_t cacheCapacity = info.cacheTokenCount;
 
     // Consume pre-bound/free slots before entering the existing full-cache
     // eviction path. Negative slot bindings are 1-based: -s -> slot s-1.
