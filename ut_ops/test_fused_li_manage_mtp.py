@@ -6,6 +6,7 @@ import argparse
 import statistics
 from collections.abc import Callable
 from dataclasses import dataclass
+from itertools import accumulate
 
 import torch
 import torch_npu  # type: ignore
@@ -659,7 +660,7 @@ def call_mtp_with_buffers(
 
 def make_outputs(case: MtpCase) -> tuple[torch.Tensor, ...]:
     topk_slots = torch.full(
-        (case.batch_size * QUERY_COUNT, 1, TOPK),
+        (case.query.size(0), 1, TOPK),
         -313,
         dtype=torch.int32,
         device=case.device,
@@ -682,6 +683,56 @@ def make_outputs(case: MtpCase) -> tuple[torch.Tensor, ...]:
         miss_destinations,
         miss_counts,
     )
+
+
+def _pack_query_counts(case: MtpCase, counts: tuple[int, ...]) -> list[int]:
+    """Select the first 1-4 query rows per request and update packed metadata."""
+
+    if len(counts) != case.batch_size or any(count < 1 or count > 4 for count in counts):
+        raise ValueError("query counts must contain one value in [1,4] per request")
+    rows = [
+        request * QUERY_COUNT + query_idx
+        for request, count in enumerate(counts)
+        for query_idx in range(count)
+    ]
+    row_index = torch.tensor(rows, dtype=torch.int64, device=case.device)
+    case.query = case.query.index_select(0, row_index).contiguous()
+    case.weights = case.weights.index_select(0, row_index).contiguous()
+    case.query_scale = torch.empty(
+        case.query.shape[:2], dtype=torch.float32, device=case.device
+    )
+    case.actual_query_lens = torch.tensor(
+        list(accumulate(counts)),
+        dtype=torch.int32,
+        device=case.device,
+    )
+    return rows
+
+
+def _native_packed_topk(case: MtpCase, lengths: torch.Tensor) -> torch.Tensor:
+    """Native LI golden with each packed query evaluated independently."""
+
+    ends = case.actual_query_lens.cpu().tolist()
+    starts = [0, *ends[:-1]]
+    request_rows = [
+        request
+        for request, (start, end) in enumerate(zip(starts, ends))
+        for _ in range(end - start)
+    ]
+    request_index = torch.tensor(
+        request_rows, dtype=torch.int64, device=case.device
+    )
+    return _call_native_li(
+        case.query,
+        case.key,
+        case.weights,
+        case.block_table.index_select(0, request_index).contiguous(),
+        lengths.index_select(0, request_index).contiguous(),
+        torch.arange(
+            1, case.query.size(0) + 1,
+            dtype=torch.int32, device=case.device,
+        ),
+    ).reshape(case.query.size(0), TOPK).cpu().to(torch.int64)
 
 
 def run_meta_check() -> None:
@@ -1072,6 +1123,9 @@ def run_new_state_cases(device: torch.device, seed: int) -> None:
         torch.sort(union).values,
     ):
         raise AssertionError("free-slot path source union differs")
+    state = int(case.cache_state[pool_row].cpu())
+    if state < 0 or not (-4096 <= int(after[state]) <= -1):
+        raise AssertionError("partially free cache_state does not point to a free binding")
 
     # -3 bypasses cache management and writes raw 0-based token IDs to both
     # TopK outputs.
@@ -1089,6 +1143,165 @@ def run_new_state_cases(device: torch.device, seed: int) -> None:
         ):
             raise AssertionError("plain LI outputs differ from native TopK")
     print("FUSED_LI_MANAGE_MTP_NEW_STATE_CHECK free_slots=1 plain_li=1 ok=1", flush=True)
+
+
+def run_variable_query_case(device: torch.device, seed: int) -> None:
+    counts = (1, 2, 3, 4)
+    lengths = (4096, 8192, 12288, 16384)
+    case = make_case(
+        name="variable_mtp0123", device=device, dtype=torch.bfloat16,
+        candidate_lens=lengths, cache_tokens=lengths,
+        miss_fractions=(0.0,) * len(counts), seed=seed,
+    )
+    _pack_query_counts(case, counts)
+    golden = _native_packed_topk(case, case.offload_key_lens)
+    cache = case.initial_cache_cpu.to(device)
+    outputs = call_mtp(case, cache)
+    torch.npu.synchronize()
+    actual_slots = outputs[0].reshape(-1, TOPK).cpu().to(torch.int64)
+    actual_sources = outputs[1].reshape(-1, TOPK).cpu().to(torch.int64)
+    ends = case.actual_query_lens.cpu().tolist()
+    starts = [0, *ends[:-1]]
+    after = cache.cpu()
+    for request, (start, end) in enumerate(zip(starts, ends)):
+        pool_row = int(case.req_pool_entries_cpu[request])
+        length = lengths[request]
+        slot_to_token = torch.empty(length, dtype=torch.int64)
+        tokens = torch.arange(length, dtype=torch.int64)
+        slot_to_token[after[pool_row, :length].to(torch.int64)] = tokens
+        for row in range(start, end):
+            actual_tokens = slot_to_token[actual_slots[row]]
+            if not torch.equal(
+                torch.sort(actual_tokens).values,
+                torch.sort(golden[row]).values,
+            ):
+                raise AssertionError(
+                    f"variable MTP request={request} row={row} TopK differs"
+                )
+            if not bool((actual_sources[row] == -1).all()):
+                raise AssertionError("fully cached variable MTP row reported misses")
+    if not bool((outputs[4].cpu() == 0).all()):
+        raise AssertionError("fully cached variable MTP requests reported misses")
+    print(
+        "FUSED_LI_MANAGE_MTP_VARIABLE_QUERY_CHECK counts=[1,2,3,4] ok=1",
+        flush=True,
+    )
+
+
+def run_offload_tail_and_plain_case(device: torch.device, seed: int) -> None:
+    case = make_case(
+        name="offload_tail_plain", device=device, dtype=torch.bfloat16,
+        candidate_lens=(4096,), cache_tokens=(4096,), miss_fractions=(0.0,),
+        source_capacity=8192, seed=seed,
+    )
+    case.actual_key_lens = torch.tensor([8192], dtype=torch.int32, device=device)
+    case.offload_key_lens = torch.tensor([4096], dtype=torch.int32, device=device)
+    offload_golden = _native_packed_topk(case, case.offload_key_lens)
+    full_golden = _native_packed_topk(case, case.actual_key_lens)
+    if all(
+        torch.equal(torch.sort(left).values, torch.sort(right).values)
+        for left, right in zip(offload_golden, full_golden)
+    ):
+        raise AssertionError("tail boundary workload did not distinguish full/offload LI")
+
+    pool_row = int(case.req_pool_entries_cpu[0])
+    cache = case.initial_cache_cpu.to(device)
+    managed = call_mtp(case, cache)
+    torch.npu.synchronize()
+    managed_slots = managed[0].reshape(-1, TOPK).cpu().to(torch.int64)
+    after = cache.cpu()[pool_row]
+    slot_to_token = torch.empty(4096, dtype=torch.int64)
+    slot_to_token[after[:4096].to(torch.int64)] = torch.arange(4096)
+    for row in range(QUERY_COUNT):
+        tokens = slot_to_token[managed_slots[row]]
+        if not torch.equal(
+            torch.sort(tokens).values, torch.sort(offload_golden[row]).values
+        ):
+            raise AssertionError("managed LI included dense tail tokens")
+
+    case.cache_state[pool_row] = -3
+    before_plain = cache.clone()
+    plain = call_mtp(case, cache)
+    torch.npu.synchronize()
+    if not torch.equal(cache, before_plain) or int(plain[4][0].cpu()) != 0:
+        raise AssertionError("plain LI changed cache or miss count")
+    for row in range(QUERY_COUNT):
+        src = plain[1][row].reshape(-1).cpu().to(torch.int64)
+        dst = plain[0][row].reshape(-1).cpu().to(torch.int64)
+        if not torch.equal(src, dst) or not torch.equal(
+            torch.sort(src).values, torch.sort(full_golden[row]).values
+        ):
+            raise AssertionError("plain LI did not use full actual key range")
+    print(
+        "FUSED_LI_MANAGE_MTP_SOURCE_RANGE_CHECK offload_prefix=4096 "
+        "dense_tail=4096 plain_full=8192 ok=1",
+        flush=True,
+    )
+
+
+def run_free_scan_transition_case(device: torch.device, seed: int) -> None:
+    case = make_case(
+        name="free_scan_transition", device=device, dtype=torch.bfloat16,
+        candidate_lens=(4096,), cache_tokens=(4096,), miss_fractions=(0.0,),
+        seed=seed,
+    )
+    _pack_query_counts(case, (1,))
+    golden = _native_packed_topk(case, case.offload_key_lens)[0]
+    pool_row = int(case.req_pool_entries_cpu[0])
+    initial = torch.full_like(case.initial_cache_cpu, -777)
+    initial[pool_row].fill_(-65536)
+    initial[pool_row, :TOPK] = -torch.arange(1, TOPK + 1, dtype=torch.int32)
+    direct = golden[golden < TOPK]
+    scanned = golden[golden >= TOPK]
+    if direct.numel() == 0 or scanned.numel() == 0:
+        raise AssertionError("free-slot workload did not cover both allocation paths")
+    case.cache_state.fill_(-1)
+    case.cache_state[pool_row] = 0
+    cache = initial.to(device)
+    outputs = call_mtp(case, cache)
+    torch.npu.synchronize()
+    after = cache.cpu()[pool_row]
+    if int(outputs[4][0].cpu()) != TOPK or bool((after[golden] < 0).any()):
+        raise AssertionError("free-slot scan failed to cache the complete TopK")
+    slots = after[golden].to(torch.int64)
+    if torch.unique(slots).numel() != TOPK or int(slots.min()) != 0 or int(slots.max()) != TOPK - 1:
+        raise AssertionError("free-slot scan did not produce a slot permutation")
+    if int(case.cache_state[pool_row].cpu()) != -1:
+        raise AssertionError("consuming the final free slot did not set cache_state=-1")
+    print(
+        "FUSED_LI_MANAGE_MTP_FREE_SCAN_CHECK direct_binding=1 "
+        "unbound_scan=1 transition_full=1 ok=1",
+        flush=True,
+    )
+
+
+def run_skip_boundary_case(device: torch.device, seed: int) -> None:
+    case = make_case(
+        name="skip_boundaries", device=device, dtype=torch.bfloat16,
+        candidate_lens=(4096, 4096, 4096, 4096),
+        cache_tokens=(4096, 4096, 4096, 4096),
+        miss_fractions=(0.0, 0.0, 0.0, 0.0), seed=seed,
+    )
+    case.req_valid[0] = 0
+    case.cache_state[int(case.req_pool_entries_cpu[1])] = -2
+    case.offload_key_lens[2] = 4095  # not block aligned
+    case.actual_key_lens[3] = 2048
+    case.offload_key_lens[3] = 4096  # offload > actual
+    before = case.initial_cache_cpu.to(device)
+    cache = before.clone()
+    outputs = call_mtp(case, cache)
+    torch.npu.synchronize()
+    if not torch.equal(cache, before):
+        raise AssertionError("skipped/invalid requests changed cache slots")
+    if not bool((outputs[4].cpu() == 0).all()):
+        raise AssertionError("skipped/invalid requests must write zero miss counts")
+    if not bool((outputs[0].cpu() == -313).all()) or not bool((outputs[1].cpu() == -313).all()):
+        raise AssertionError("skipped/invalid requests unexpectedly wrote TopK rows")
+    print(
+        "FUSED_LI_MANAGE_MTP_SKIP_CHECK req_valid=0 state_minus2=1 "
+        "unaligned_offload=1 offload_gt_actual=1 ok=1",
+        flush=True,
+    )
 
 
 def run_graph_case(device: torch.device, seed: int, replays: int) -> None:
@@ -1159,6 +1372,8 @@ def run_graph_case(device: torch.device, seed: int, replays: int) -> None:
         case.weights.copy_(weights_cpu.to(device))
         case.req_pool_entries.copy_(pool_entries_cpu.to(device))
         case.candidate_lens.copy_(candidate_cpu.to(device))
+        case.actual_key_lens.copy_(candidate_cpu.to(device))
+        case.offload_key_lens.copy_(candidate_cpu.to(device))
         case.block_table.copy_(table_cpu.to(device))
         torch.npu.current_stream().synchronize()
         graph.replay()
@@ -1548,7 +1763,24 @@ def main() -> None:
     del fp16
     torch.npu.empty_cache()
 
+    minimum = make_case(
+        name="minimum_topk_source_bf16",
+        device=device,
+        dtype=torch.bfloat16,
+        candidate_lens=(TOPK,),
+        cache_tokens=(TOPK,),
+        miss_fractions=(0.0,),
+        seed=args.seed + 1500,
+    )
+    run_semantic_case(minimum)
+    del minimum
+    torch.npu.empty_cache()
+
     run_new_state_cases(device, args.seed + 2000)
+    run_variable_query_case(device, args.seed + 2100)
+    run_offload_tail_and_plain_case(device, args.seed + 2200)
+    run_free_scan_transition_case(device, args.seed + 2300)
+    run_skip_boundary_case(device, args.seed + 2400)
 
     run_graph_case(device, args.seed, args.graph_replays)
     if not args.skip_performance:

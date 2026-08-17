@@ -89,7 +89,7 @@ export PYTHONUNBUFFERED=1
 export PYTHONPATH=$PWD:$PYTHONPATH
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export ASCEND_LAUNCH_BLOCKING=0
-export ASCEND_RT_VISIBLE_DEVICES=4
+export ASCEND_RT_VISIBLE_DEVICES=10
 
 python3 ut_ops/test_fused_li_manage_mtp.py \
   --device npu:0 \
@@ -104,7 +104,21 @@ python3 ut_ops/test_fused_li_manage_mtp.py \
   --seed 7
 ```
 
-UT 覆盖 BF16/FP16 语义、乱序 request-pool、动态 ACLGraph replay，以及 `B=24` 典型负载时延。性能日志中的 `index_management_mtp3_us` 定义为：
+```bash
+python3 ut_ops/test_fused_li_manage_mtp.py \
+  --device npu:0 \
+  --batch-size 12 \
+  --source-len 40064 \
+  --cache-tokens 8192 \
+  --perf-query-miss-count 500 \
+  --perf-query-noise 0.25 \
+  --graph-replays 3 \
+  --warmup 10 \
+  --iters 100 \
+  --seed 7
+```
+
+UT 覆盖 BF16/FP16 语义、乱序 request-pool、混合 MTP0～MTP3、offload/tail source 范围、空槽扫描与满槽状态切换、请求跳过边界、动态 ACLGraph replay，以及 `B=24` 和 `B=12` 两种典型负载时延。性能日志中的 `index_management_mtp3_us` 定义为：
 
 ```text
 fused_lim_mtp3_us - official_li_mtp3_us
