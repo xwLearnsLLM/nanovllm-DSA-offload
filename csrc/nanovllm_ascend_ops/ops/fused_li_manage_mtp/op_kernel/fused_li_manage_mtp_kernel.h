@@ -34,6 +34,7 @@ public:
         __gm__ uint8_t *offloadKeyLens, __gm__ uint8_t *reqValid,
         __gm__ uint8_t *blockTable,
         __gm__ uint8_t *topkSlots, __gm__ uint8_t *topkSourceIds,
+        __gm__ uint8_t *topkMissCounts,
         __gm__ uint8_t *missSourceIds,
         __gm__ uint8_t *missDestinationSlots, __gm__ uint8_t *missCounts,
         __gm__ uint8_t *workspace,
@@ -61,6 +62,7 @@ private:
     GlobalTensor<int32_t> blockTableGm;
     GlobalTensor<int32_t> topkSlotsGm;
     GlobalTensor<int32_t> topkSourceIdsGm;
+    GlobalTensor<int32_t> topkMissCountsGm;
     GlobalTensor<int32_t> missSourceIdsGm;
     GlobalTensor<int32_t> missDestinationSlotsGm;
     GlobalTensor<int32_t> missCountsGm;
@@ -79,6 +81,7 @@ private:
     __aicore__ inline void ProcessMain();
     __aicore__ inline void ProcessChunk(const RunInfo &runInfo);
     __aicore__ inline void CleanRequest(uint32_t bIdx);
+    __aicore__ inline bool IsQueryLayoutValid();
 };
 
 template <typename LIT>
@@ -109,6 +112,7 @@ __aicore__ inline void LIMtpPreload<LIT>::Init(
     __gm__ uint8_t *reqValid,
     __gm__ uint8_t *blockTable, __gm__ uint8_t *topkSlots,
     __gm__ uint8_t *topkSourceIds,
+    __gm__ uint8_t *topkMissCounts,
     __gm__ uint8_t *missSourceIds, __gm__ uint8_t *missDestinationSlots,
     __gm__ uint8_t *missCounts, __gm__ uint8_t *workspace,
     const LIUMtpTilingData *__restrict tiling, TPipe *pipe)
@@ -121,6 +125,7 @@ __aicore__ inline void LIMtpPreload<LIT>::Init(
     }
 
     constInfo.batchSize = tiling->bSize;
+    constInfo.qSeqSize = tiling->tSize;
     constInfo.kSeqSize = tiling->s2Size;
     constInfo.kCacheBlockSize = tiling->blockSize;
     constInfo.maxBlockNumPerBatch = tiling->maxBlockNumPerBatch;
@@ -171,6 +176,8 @@ __aicore__ inline void LIMtpPreload<LIT>::Init(
         weightsGm.SetGlobalBuffer((__gm__ K_T *)weights);
         topkSlotsGm.SetGlobalBuffer((__gm__ int32_t *)topkSlots);
         topkSourceIdsGm.SetGlobalBuffer((__gm__ int32_t *)topkSourceIds);
+        topkMissCountsGm.SetGlobalBuffer((__gm__ int32_t *)topkMissCounts,
+                                         constInfo.qSeqSize);
         missSourceIdsGm.SetGlobalBuffer((__gm__ int32_t *)missSourceIds);
         missDestinationSlotsGm.SetGlobalBuffer(
             (__gm__ int32_t *)missDestinationSlots);
@@ -179,6 +186,7 @@ __aicore__ inline void LIMtpPreload<LIT>::Init(
             mm1ResGm, weightsGm, cacheSlotsGm, topkSlotsGm,
             topkSourceIdsGm,
             missSourceIdsGm, missDestinationSlotsGm, missCountsGm,
+            topkMissCountsGm,
             cacheStateGm,
             aggregateScoresGm, internalTopkPayloadsGm,
             internalThresholdsGm);
@@ -200,14 +208,44 @@ __aicore__ inline void LIMtpPreload<LIT>::CleanRequest(uint32_t bIdx)
     if ASCEND_IS_AIV {
         if ((tmpBlockIdx & 1U) == 0U) {
             vectorService.WriteMtpZeroMissCount(bIdx);
+            int32_t begin = bIdx == 0U ? 0 : actualQueryLensGm.GetValue(bIdx - 1U);
+            int32_t end = actualQueryLensGm.GetValue(bIdx);
+            if (begin >= 0 && end >= begin &&
+                static_cast<uint32_t>(end) <= constInfo.qSeqSize) {
+                for (int32_t row = begin; row < end; ++row) {
+                    topkMissCountsGm.SetValue(static_cast<uint32_t>(row), 0);
+                }
+            }
         }
     }
+}
+
+template <typename LIT>
+__aicore__ inline bool LIMtpPreload<LIT>::IsQueryLayoutValid()
+{
+    int32_t begin = 0;
+    for (uint32_t bIdx = 0; bIdx < constInfo.batchSize; ++bIdx) {
+        int32_t end = actualQueryLensGm.GetValue(bIdx);
+        if (end <= begin || end - begin > 4 ||
+            static_cast<uint32_t>(end) > constInfo.qSeqSize) {
+            return false;
+        }
+        begin = end;
+    }
+    return static_cast<uint32_t>(begin) == constInfo.qSeqSize;
 }
 
 template <typename LIT>
 __aicore__ inline void LIMtpPreload<LIT>::Process()
 {
     if (requestCount == 0U) {
+        return;
+    }
+    if (!IsQueryLayoutValid()) {
+        for (uint32_t requestOffset = 0; requestOffset < requestCount;
+             ++requestOffset) {
+            CleanRequest(requestStart + requestOffset);
+        }
         return;
     }
     ProcessMain();
@@ -243,6 +281,10 @@ __aicore__ inline void LIMtpPreload<LIT>::ProcessMain()
             continue;
         }
         int32_t cacheState = cacheStateGm.GetValue(poolEntry);
+        // req_pool_entries selects the request's persistent state row.  Once
+        // -3 is observed, the plain-LI path bypasses cache_slots_pool and all
+        // miss-union management; the row lookup itself is still unavoidable
+        // because cache_state is indexed by POOL_SIZE rather than by B.
         bool isPlainLi = cacheState == -3;
         int32_t actualKeyLen = actualKeyLensGm.GetValue(bIdx);
         int32_t offloadKeyLen = offloadKeyLensGm.GetValue(bIdx);

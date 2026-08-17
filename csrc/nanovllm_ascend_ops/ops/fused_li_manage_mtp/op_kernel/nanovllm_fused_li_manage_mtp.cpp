@@ -21,7 +21,7 @@ using namespace AscendC;
         COPY_MTP_TILING_DATA(LIUMtpTilingData, tiling);                         \
         op.Init(query, key, weights, reqPoolEntries, cacheState, cacheSlots,    \
                 actualQueryLens, actualKeyLens, offloadKeyLens, reqValid,       \
-                blockTable, topkSlots, topkSourceIds,                           \
+                blockTable, topkSlots, topkSourceIds, topkMissCounts,           \
                 missSourceIds,                                                  \
                 missDestinationSlots, missCounts, user, tiling_data, &tPipe);   \
         op.Process();                                                            \
@@ -37,6 +37,7 @@ __global__ __aicore__ void nanovllm_fused_li_manage_mtp(
     __gm__ uint8_t *reqPoolEntries, __gm__ uint8_t *cacheState,
     __gm__ uint8_t *cacheSlots, __gm__ uint8_t *topkSourceIds,
     __gm__ uint8_t *topkSlots,
+    __gm__ uint8_t *topkMissCounts,
     __gm__ uint8_t *missSourceIds, __gm__ uint8_t *missDestinationSlots,
     __gm__ uint8_t *missCounts, __gm__ uint8_t *cacheStateOut,
     __gm__ uint8_t *cacheSlotsOut,

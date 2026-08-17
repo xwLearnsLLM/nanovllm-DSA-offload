@@ -33,15 +33,17 @@ static ge::graphStatus InferShapeNanovllmFusedLiManageMtp(
                OPS_LOG_E(context, "invalid MTP LIM input ranks."),
                return ge::GRAPH_FAILED);
 
-    gert::Shape *topkSlots = context->GetOutputShape(0);
-    gert::Shape *topkSource = context->GetOutputShape(1);
-    gert::Shape *missSource = context->GetOutputShape(2);
-    gert::Shape *missSlots = context->GetOutputShape(3);
-    gert::Shape *missCounts = context->GetOutputShape(4);
-    gert::Shape *cacheStateOut = context->GetOutputShape(5);
-    gert::Shape *cacheOut = context->GetOutputShape(6);
+    gert::Shape *topkSource = context->GetOutputShape(0);
+    gert::Shape *topkSlots = context->GetOutputShape(1);
+    gert::Shape *topkMissCounts = context->GetOutputShape(2);
+    gert::Shape *missSource = context->GetOutputShape(3);
+    gert::Shape *missSlots = context->GetOutputShape(4);
+    gert::Shape *missCounts = context->GetOutputShape(5);
+    gert::Shape *cacheStateOut = context->GetOutputShape(6);
+    gert::Shape *cacheOut = context->GetOutputShape(7);
     OPS_LOG_E_IF_NULL(context, topkSlots, return ge::GRAPH_FAILED);
     OPS_LOG_E_IF_NULL(context, topkSource, return ge::GRAPH_FAILED);
+    OPS_LOG_E_IF_NULL(context, topkMissCounts, return ge::GRAPH_FAILED);
     OPS_LOG_E_IF_NULL(context, missSource, return ge::GRAPH_FAILED);
     OPS_LOG_E_IF_NULL(context, missSlots, return ge::GRAPH_FAILED);
     OPS_LOG_E_IF_NULL(context, missCounts, return ge::GRAPH_FAILED);
@@ -53,6 +55,8 @@ static ge::graphStatus InferShapeNanovllmFusedLiManageMtp(
     topkSlots->SetDim(1, 1);
     topkSlots->SetDim(2, TOPK);
     *topkSource = *topkSlots;
+    topkMissCounts->SetDimNum(1);
+    topkMissCounts->SetDim(0, query->GetDim(0));
     missSource->SetDimNum(2);
     missSource->SetDim(0, req->GetDim(0));
     missSource->SetDim(1, UNION_CAPACITY);
@@ -71,7 +75,7 @@ static ge::graphStatus InferDataTypeNanovllmFusedLiManageMtp(
                OPS_LOG_E("NanovllmFusedLiManageMtp",
                          "InferDataTypeContext is nullptr."),
                return ge::GRAPH_FAILED);
-    for (uint32_t output = 0; output < 7; ++output) {
+    for (uint32_t output = 0; output < 8; ++output) {
         context->SetOutputDataType(output, ge::DT_INT32);
     }
     return ge::GRAPH_SUCCESS;

@@ -36,11 +36,12 @@ constexpr uint32_t MTP_CACHE_SLOTS_INDEX = 12;
 
 constexpr uint32_t MTP_TOPK_SOURCE_OUT = 0;
 constexpr uint32_t MTP_TOPK_SLOTS_OUT = 1;
-constexpr uint32_t MTP_MISS_SOURCE_OUT = 2;
-constexpr uint32_t MTP_MISS_SLOTS_OUT = 3;
-constexpr uint32_t MTP_MISS_COUNTS_OUT = 4;
-constexpr uint32_t MTP_CACHE_STATE_OUT = 5;
-constexpr uint32_t MTP_CACHE_SLOTS_OUT = 6;
+constexpr uint32_t MTP_TOPK_MISS_COUNTS_OUT = 2;
+constexpr uint32_t MTP_MISS_SOURCE_OUT = 3;
+constexpr uint32_t MTP_MISS_SLOTS_OUT = 4;
+constexpr uint32_t MTP_MISS_COUNTS_OUT = 5;
+constexpr uint32_t MTP_CACHE_STATE_OUT = 6;
+constexpr uint32_t MTP_CACHE_SLOTS_OUT = 7;
 
 constexpr uint32_t MTP_QUERY_COUNT = 4;
 constexpr uint32_t MTP_HEADS_MIN = 32;
@@ -53,6 +54,7 @@ constexpr uint32_t MTP_UNION_CAPACITY = 8192;
 
 BEGIN_TILING_DATA_DEF(LIUMtpTilingData)
 TILING_DATA_FIELD_DEF(uint32_t, bSize)
+TILING_DATA_FIELD_DEF(uint32_t, tSize)
 TILING_DATA_FIELD_DEF(uint32_t, s2Size)
 TILING_DATA_FIELD_DEF(uint32_t, usedCoreNum)
 TILING_DATA_FIELD_DEF(uint32_t, blockSize)
@@ -81,6 +83,7 @@ struct LIUMtpTensors {
     MtpRequiredTensor blockTable;
     MtpRequiredTensor topkSlots;
     MtpRequiredTensor topkSource;
+    MtpRequiredTensor topkMissCounts;
     MtpRequiredTensor missSource;
     MtpRequiredTensor missSlots;
     MtpRequiredTensor missCounts;

@@ -113,6 +113,7 @@ public:
         GlobalTensor<int32_t> missSourceIdsGm,
         GlobalTensor<int32_t> missDestinationSlotsGm,
         GlobalTensor<int32_t> missCountGm,
+        GlobalTensor<int32_t> topkMissCountsGm,
         GlobalTensor<int32_t> cacheStateGm,
         GlobalTensor<float> scoresGm,
         GlobalTensor<int32_t> mtpTopkPayloadsGm,
@@ -132,6 +133,7 @@ protected:
     GlobalTensor<int32_t> topkIndexGm;
     GlobalTensor<int32_t> topkSlotsGm;
     GlobalTensor<int32_t> missCountGm;
+    GlobalTensor<int32_t> topkMissCountsGm;
     GlobalTensor<int32_t> cacheStateGm;
     GlobalTensor<float> scoresGm;
     GlobalTensor<float> partialTopkGm;
@@ -326,6 +328,7 @@ __aicore__ inline void LIVector<LIT>::InitMtpGlobalTensor(
     GlobalTensor<int32_t> missSourceIdsGm,
     GlobalTensor<int32_t> missDestinationSlotsGm,
     GlobalTensor<int32_t> missCountGm,
+    GlobalTensor<int32_t> topkMissCountsGm,
     GlobalTensor<int32_t> cacheStateGm,
     GlobalTensor<float> scoresGm,
     GlobalTensor<int32_t> mtpTopkPayloadsGm,
@@ -339,6 +342,7 @@ __aicore__ inline void LIVector<LIT>::InitMtpGlobalTensor(
     this->mtpMissSourceIdsGm = missSourceIdsGm;
     this->mtpMissDestinationSlotsGm = missDestinationSlotsGm;
     this->missCountGm = missCountGm;
+    this->topkMissCountsGm = topkMissCountsGm;
     this->cacheStateGm = cacheStateGm;
     this->scoresGm = scoresGm;
     this->mtpTopkPayloadsGm = mtpTopkPayloadsGm;
@@ -1029,6 +1033,7 @@ __aicore__ inline void LIVector<LIT>::FinalizePlainLiRequest(
         SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
         DataCopyPad(topkSlotsGm[rowOffset], tokens, copyOut);
         DataCopyPad(mtpTopkSourceIdsGm[rowOffset], tokens, copyOut);
+        topkMissCountsGm.SetValue(info.queryBegin + queryIdx, 0);
         SetWaitFlag<HardEvent::MTE3_MTE2>(HardEvent::MTE3_MTE2);
     }
     WriteMtpZeroMissCount(info.bIdx);
@@ -1101,6 +1106,9 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
                        missMask.template ReinterpretCast<uint32_t>(), true,
                        BASE_TOPK, compactParams, rowMissCount);
             PipeBarrier<PIPE_V>();
+            topkMissCountsGm.SetValue(
+                info.queryBegin + queryIdx,
+                static_cast<int32_t>(rowMissCount));
             SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
             for (uint32_t rowMissIdx = 0;
                  rowMissIdx < static_cast<uint32_t>(rowMissCount);
@@ -1119,6 +1127,26 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
                 }
             }
         }
+    }
+
+    // Recover the real HBM capacity from persistent mappings before/during
+    // the partially-free phase as max(slot+1, -binding). Once state is -1,
+    // all slots are known valid and the original packed-slot bound is enough.
+    uint32_t cacheCapacity = static_cast<uint32_t>(INVALID_SLOT14);
+    if (info.cacheState >= 0) {
+        cacheCapacity = 0U;
+        for (uint32_t token = 0; token < info.actS2Size; ++token) {
+            int32_t value = cacheSlotsGm.GetValue(cacheBase + token);
+            if (value >= 0) {
+                cacheCapacity = Max(cacheCapacity,
+                                    static_cast<uint32_t>(value) + 1U);
+            } else if (value != -65536) {
+                cacheCapacity = Max(cacheCapacity,
+                                    static_cast<uint32_t>(-value));
+            }
+        }
+        cacheCapacity = Min(cacheCapacity,
+                            static_cast<uint32_t>(INVALID_SLOT14));
     }
 
     // Consume pre-bound/free slots before entering the existing full-cache
@@ -1153,7 +1181,7 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
                 break;
             }
         }
-        if (slot < 0 || slot >= INVALID_SLOT14) {
+        if (slot < 0 || static_cast<uint32_t>(slot) >= cacheCapacity) {
             cacheState = -1;
             cacheStateGm.SetValue(info.cacheRowIdx, cacheState);
             break;
@@ -1217,7 +1245,7 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
         safeCandidatePrefix = thresholdsValid &&
             lastCandidateKey > safeStopKey && lastSlot != INVALID_SLOT14 &&
             lastToken < info.actS2Size &&
-            static_cast<uint32_t>(lastSlot) < info.cacheTokenCount;
+            static_cast<uint32_t>(lastSlot) < cacheCapacity;
     }
 
     if (safeCandidatePrefix) {
@@ -1233,7 +1261,7 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
             uint32_t missToken =
                 static_cast<uint32_t>(missTokens.GetValue(updateCount));
             cacheSlotsGm.SetValue(cacheBase + evictToken,
-                                  LICommon::ConstInfo::INVALID_IDX);
+                                  -65536);
             cacheSlotsGm.SetValue(cacheBase + missToken, evictSlot);
             destinationSlots.SetValue(updateCount, evictSlot);
         }
@@ -1275,7 +1303,7 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
                 uint32_t token = payload & INDEX_MASK;
                 int32_t slot = static_cast<int32_t>(payload >> INDEX_BITS);
                 if (slot == INVALID_SLOT14 || token >= info.actS2Size ||
-                    static_cast<uint32_t>(slot) >= info.cacheTokenCount) {
+                    static_cast<uint32_t>(slot) >= cacheCapacity) {
                     continue;
                 }
                 uint32_t unionWord = unionBits.GetValue(token >> 5U);
@@ -1290,7 +1318,7 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
             while (!found && fallbackCursor < info.actS2Size) {
                 uint32_t token = fallbackCursor++;
                 int32_t slot = cacheSlotsGm.GetValue(cacheBase + token);
-                if (slot < 0 || static_cast<uint32_t>(slot) >= info.cacheTokenCount) {
+                if (slot < 0 || static_cast<uint32_t>(slot) >= cacheCapacity) {
                     continue;
                 }
                 uint32_t unionWord = unionBits.GetValue(token >> 5U);
@@ -1308,7 +1336,7 @@ __aicore__ inline void LIVector<LIT>::FinalizeMtpRequest(const LICommon::RunInfo
             uint32_t missToken =
                 static_cast<uint32_t>(missTokens.GetValue(updateCount));
             cacheSlotsGm.SetValue(cacheBase + evictToken,
-                                  LICommon::ConstInfo::INVALID_IDX);
+                                  -65536);
             cacheSlotsGm.SetValue(cacheBase + missToken, evictSlot);
             destinationSlots.SetValue(updateCount, evictSlot);
             ++updateCount;

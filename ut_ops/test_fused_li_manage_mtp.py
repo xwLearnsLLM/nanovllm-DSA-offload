@@ -628,6 +628,7 @@ def call_mtp_with_buffers(
     miss_source_ids: torch.Tensor,
     miss_destination_slots: torch.Tensor,
     miss_counts: torch.Tensor,
+    topk_miss_counts: torch.Tensor,
 ):
     torch.ops.nanovllm_dsa.fused_li_manage_mtp.default(
         case.weights,
@@ -645,6 +646,7 @@ def call_mtp_with_buffers(
         cache_slots,
         topk_source_ids,
         topk_slots,
+        topk_miss_counts,
         miss_source_ids,
         miss_destination_slots,
         miss_counts,
@@ -655,6 +657,7 @@ def call_mtp_with_buffers(
         miss_source_ids,
         miss_destination_slots,
         miss_counts,
+        topk_miss_counts,
     )
 
 
@@ -676,12 +679,16 @@ def make_outputs(case: MtpCase) -> tuple[torch.Tensor, ...]:
     miss_counts = torch.full(
         (case.batch_size,), -313, dtype=torch.int32, device=case.device
     )
+    topk_miss_counts = torch.full(
+        (case.query.size(0),), -313, dtype=torch.int32, device=case.device
+    )
     return (
         topk_slots,
         topk_source_ids,
         miss_sources,
         miss_destinations,
         miss_counts,
+        topk_miss_counts,
     )
 
 
@@ -784,6 +791,7 @@ def run_meta_check() -> None:
         (batch_size, UNION_CAPACITY),
         (batch_size, UNION_CAPACITY),
         (batch_size,),
+        (token_rows,),
     )
     buffers = (
         torch.empty(expected_shapes[0], device=meta, dtype=torch.int32),
@@ -791,6 +799,7 @@ def run_meta_check() -> None:
         torch.empty(expected_shapes[2], device=meta, dtype=torch.int32),
         torch.empty(expected_shapes[3], device=meta, dtype=torch.int32),
         torch.empty(expected_shapes[4], device=meta, dtype=torch.int32),
+        torch.empty(expected_shapes[5], device=meta, dtype=torch.int32),
     )
     result = torch.ops.nanovllm_dsa.fused_li_manage_mtp.default(
         weights,
@@ -808,6 +817,7 @@ def run_meta_check() -> None:
         cache_slots,
         buffers[1],
         buffers[0],
+        buffers[5],
         buffers[2],
         buffers[3],
         buffers[4],
@@ -838,6 +848,7 @@ def validate_result(
         miss_sources,
         miss_destinations,
         miss_counts,
+        topk_miss_counts,
     ) = outputs
     after_cpu = cache_slots.cpu()
     topk_slots_cpu = topk_slots.reshape(-1, TOPK).cpu().to(torch.int64)
@@ -847,6 +858,7 @@ def validate_result(
     sources_cpu = miss_sources.cpu().to(torch.int64)
     destinations_cpu = miss_destinations.cpu().to(torch.int64)
     counts_cpu = miss_counts.cpu().to(torch.int64)
+    topk_miss_counts_cpu = topk_miss_counts.cpu().to(torch.int64)
     active_pool_rows = set(int(value) for value in case.req_pool_entries_cpu.tolist())
 
     for pool_row in range(before_cpu.shape[0]):
@@ -921,6 +933,12 @@ def validate_result(
                     f"{label}: request={request} query={query_idx} "
                     "aligned source IDs differ"
                 )
+            expected_row_misses = int((before[actual_tokens] < 0).sum())
+            if int(topk_miss_counts_cpu[query_row]) != expected_row_misses:
+                raise AssertionError(
+                    f"{label}: request={request} query={query_idx} "
+                    "topk_miss_counts differs"
+                )
             golden_tokens = case.topk_cpu[query_row]
             if not torch.equal(
                 torch.sort(actual_tokens).values,
@@ -987,6 +1005,10 @@ def validate_result(
         old_tokens = torch.nonzero(before[:candidate_len] >= 0).flatten()
         evicted = old_tokens[after[old_tokens] < 0]
         if evicted.numel():
+            if not bool((after[evicted] == -65536).all()):
+                raise AssertionError(
+                    f"{label}: request={request} evicted token is not -65536"
+                )
             union_mask = torch.zeros(candidate_len, dtype=torch.bool)
             union_mask[union] = True
             if bool(union_mask[evicted].any()):
@@ -1027,6 +1049,8 @@ def _compare_valid_outputs(
     right_counts = right[4].cpu()
     if not torch.equal(left_counts, right_counts):
         raise AssertionError(f"{label}: miss_counts differ")
+    if not torch.equal(left[5].cpu(), right[5].cpu()):
+        raise AssertionError(f"{label}: topk_miss_counts differ")
     for request, count_value in enumerate(left_counts.tolist()):
         count = int(count_value)
         if not torch.equal(
@@ -1084,6 +1108,8 @@ def run_semantic_case(case: MtpCase) -> None:
     )
     if any(repeat_counts):
         raise AssertionError(f"{case.name}: identical repeat must be zero miss")
+    if not bool((repeat_outputs[5].cpu() == 0).all()):
+        raise AssertionError(f"{case.name}: identical repeat has per-query misses")
     print(
         "FUSED_LI_MANAGE_MTP_SEMANTIC_CHECK "
         f"case={case.name} dtype={case.dtype} batch={case.batch_size} "
@@ -1135,6 +1161,8 @@ def run_new_state_cases(device: torch.device, seed: int) -> None:
     torch.npu.synchronize()
     if not torch.equal(cache, plain_before) or int(plain[4][0].cpu()) != 0:
         raise AssertionError("plain LI path modified cache state or reported misses")
+    if not bool((plain[5].cpu() == 0).all()):
+        raise AssertionError("plain LI path reported per-query misses")
     for query_idx in range(QUERY_COUNT):
         src = plain[1][query_idx].reshape(-1).cpu().to(torch.int64)
         dst = plain[0][query_idx].reshape(-1).cpu().to(torch.int64)
@@ -1182,6 +1210,8 @@ def run_variable_query_case(device: torch.device, seed: int) -> None:
                 raise AssertionError("fully cached variable MTP row reported misses")
     if not bool((outputs[4].cpu() == 0).all()):
         raise AssertionError("fully cached variable MTP requests reported misses")
+    if not bool((outputs[5].cpu() == 0).all()):
+        raise AssertionError("fully cached variable MTP rows reported misses")
     print(
         "FUSED_LI_MANAGE_MTP_VARIABLE_QUERY_CHECK counts=[1,2,3,4] ok=1",
         flush=True,
@@ -1225,6 +1255,8 @@ def run_offload_tail_and_plain_case(device: torch.device, seed: int) -> None:
     torch.npu.synchronize()
     if not torch.equal(cache, before_plain) or int(plain[4][0].cpu()) != 0:
         raise AssertionError("plain LI changed cache or miss count")
+    if not bool((plain[5].cpu() == 0).all()):
+        raise AssertionError("plain LI reported per-query misses")
     for row in range(QUERY_COUNT):
         src = plain[1][row].reshape(-1).cpu().to(torch.int64)
         dst = plain[0][row].reshape(-1).cpu().to(torch.int64)
@@ -1295,12 +1327,31 @@ def run_skip_boundary_case(device: torch.device, seed: int) -> None:
         raise AssertionError("skipped/invalid requests changed cache slots")
     if not bool((outputs[4].cpu() == 0).all()):
         raise AssertionError("skipped/invalid requests must write zero miss counts")
+    if not bool((outputs[5].cpu() == 0).all()):
+        raise AssertionError("skipped/invalid requests must write zero TopK miss counts")
     # TopK rows of skipped requests are intentionally unspecified and must not
     # be consumed by the caller. Only cache immutability and miss_counts=0 are
     # part of the skip contract.
+
+    # The final cumulative query length must equal T. A malformed packed
+    # layout is rejected before any LI/cache work, preventing query-row OOB.
+    layout_case = make_case(
+        name="invalid_query_layout", device=device, dtype=torch.bfloat16,
+        candidate_lens=(4096,), cache_tokens=(4096,), miss_fractions=(0.0,),
+        seed=seed + 1,
+    )
+    layout_case.actual_query_lens[-1] = layout_case.query.size(0) - 1
+    layout_before = layout_case.initial_cache_cpu.to(device)
+    layout_cache = layout_before.clone()
+    layout_outputs = call_mtp(layout_case, layout_cache)
+    torch.npu.synchronize()
+    if not torch.equal(layout_cache, layout_before):
+        raise AssertionError("invalid cumulative query layout changed cache slots")
+    if int(layout_outputs[4][0].cpu()) != 0:
+        raise AssertionError("invalid cumulative query layout reported misses")
     print(
         "FUSED_LI_MANAGE_MTP_SKIP_CHECK req_valid=0 state_minus2=1 "
-        "unaligned_offload=1 offload_gt_actual=1 ok=1",
+        "unaligned_offload=1 offload_gt_actual=1 cumulative_layout=1 ok=1",
         flush=True,
     )
 

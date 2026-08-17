@@ -34,6 +34,7 @@ void fused_li_manage_mtp_torch_op(
     at::Tensor cache_slots_pool,
     at::Tensor topk_src_ids,
     at::Tensor topk_dst_slots,
+    at::Tensor topk_miss_counts,
     at::Tensor miss_src_ids,
     at::Tensor miss_dst_slots,
     at::Tensor miss_counts) {
@@ -42,7 +43,7 @@ void fused_li_manage_mtp_torch_op(
       index_key_cache, index_block_table, actual_seq_lengths_query,
       actual_seq_lengths_key, offload_seq_lengths_key, req_valid, req_pool_entries,
       cache_state,
-      cache_slots_pool, topk_src_ids, topk_dst_slots, miss_src_ids,
+      cache_slots_pool, topk_src_ids, topk_dst_slots, topk_miss_counts, miss_src_ids,
       miss_dst_slots, miss_counts);
 }
 
@@ -62,6 +63,7 @@ void fused_li_manage_mtp_meta(
     at::Tensor cache_slots_pool,
     at::Tensor topk_src_ids,
     at::Tensor topk_dst_slots,
+    at::Tensor topk_miss_counts,
     at::Tensor miss_src_ids,
     at::Tensor miss_dst_slots,
     at::Tensor miss_counts) {
@@ -80,6 +82,7 @@ void fused_li_manage_mtp_meta(
   (void)cache_slots_pool;
   (void)topk_src_ids;
   (void)topk_dst_slots;
+  (void)topk_miss_counts;
   (void)miss_src_ids;
   (void)miss_dst_slots;
   (void)miss_counts;
@@ -240,8 +243,9 @@ TORCH_LIBRARY(nanovllm_dsa, ops) {
       " Tensor actual_seq_lengths_key, Tensor offload_seq_lengths_key,"
       " Tensor req_valid, Tensor req_pool_entries, Tensor(a!) cache_state,"
       " Tensor(b!) cache_slots_pool, Tensor(c!) topk_src_ids,"
-      " Tensor(d!) topk_dst_slots, Tensor(e!) miss_src_ids,"
-      " Tensor(f!) miss_dst_slots, Tensor(g!) miss_counts) -> ()");
+      " Tensor(d!) topk_dst_slots, Tensor(e!) topk_miss_counts,"
+      " Tensor(f!) miss_src_ids, Tensor(g!) miss_dst_slots,"
+      " Tensor(h!) miss_counts) -> ()");
   ops.def(
       "scatter_copy(Tensor src_ids, Tensor dst_slots, Tensor copy_counts,"
       " Tensor hbm_block_table, Tensor dram_block_table,"

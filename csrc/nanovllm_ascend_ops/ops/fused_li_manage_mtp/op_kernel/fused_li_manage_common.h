@@ -60,6 +60,7 @@ struct ConstInfo {
     static constexpr uint32_t syncV1C1 = 0;
 
     uint64_t batchSize = 0ULL;
+    uint64_t qSeqSize = 0ULL;
     uint64_t kSeqSize = 0ULL;
     uint32_t kCacheBlockSize = 0;
     uint32_t maxBlockNumPerBatch = 0;
