@@ -157,11 +157,14 @@ private:
     TQue<QuePosition::VECOUT, 1> stage1OutQue[2]; // 2份表示可能存在pingpong
     TQue<QuePosition::VECIN, 2> stage0InQue; // for v0 input, 2份表示可能存在pingpong
     TQue<QuePosition::VECOUT, 2> stage0OutQue; // for v0 output, 2份表示可能存在pingpong
-    TQue<QuePosition::VECIN, 2> previousPQue;
+    TBuf<> previousPBuf;
     TBuf<> stage2OutBuf;
     TEventID mte3ToVId[2]; // 存放MTE3_V的eventId, 2份表示可能存在pingpong
     TEventID vToMte3Id[2]; // 存放V_MTE3的eventId, 2份表示可能存在pingpong
     TEventID mte2ToVId;
+    TEventID mte2ToSId;
+    TEventID vToSId;
+    TEventID vToMte2Id;
     TBuf<> softmaxMaxBuf[2];
     TBuf<> softmaxSumBuf[2];
     TBuf<> softmaxExpBuf[2];
@@ -775,40 +778,44 @@ __aicore__ inline void QSFAVectorService<TEMPLATE_ARGS>::MergePreviousStateAndCo
         scalarPadParams);
     DataCopyPad(previousLUb, softmaxSumGm[scalarOffset], scalarParams,
         scalarPadParams);
+    // Previous M/L are consumed by both vector instructions and scalar
+    // GetValue below.  The original MTE2_V dependency alone did not make the
+    // DMA result visible to the scalar pipe.
     SetFlag<HardEvent::MTE2_V>(mte2ToVId);
+    SetFlag<HardEvent::MTE2_S>(mte2ToSId);
     WaitFlag<HardEvent::MTE2_V>(mte2ToVId);
-
-    LocalTensor<float> firstPreviousP =
-        previousPQue.AllocTensor<float>();
-    DataCopy(firstPreviousP,
-        partialOutGm[runInfo.attentionOutOffset], stateD);
-    previousPQue.EnQue(firstPreviousP);
+    WaitFlag<HardEvent::MTE2_S>(mte2ToSId);
 
     Max(mergeTmpUb, previousMUb, currentM, runInfo.vec2MRealSize);
+    PipeBarrier<PIPE_V>();
     Sub(previousDiffUb, previousMUb, mergeTmpUb,
         runInfo.vec2MRealSize);
     Sub(currentDiffUb, currentM, mergeTmpUb,
         runInfo.vec2MRealSize);
+    PipeBarrier<PIPE_V>();
     Exp(previousWeightUb, previousDiffUb, runInfo.vec2MRealSize);
     Exp(currentWeightUb, currentDiffUb, runInfo.vec2MRealSize);
+    PipeBarrier<PIPE_V>();
     Mul(mergeTmpUb, previousWeightUb, previousLUb,
         runInfo.vec2MRealSize);
     Mul(mergedLUb, currentWeightUb, currentL,
         runInfo.vec2MRealSize);
+    PipeBarrier<PIPE_V>();
     Add(mergedLUb, mergeTmpUb, mergedLUb, runInfo.vec2MRealSize);
     PipeBarrier<PIPE_V>();
+    // The per-row scalar path reads the weights and merged L produced above.
+    SetFlag<HardEvent::V_S>(vToSId);
+    WaitFlag<HardEvent::V_S>(vToSId);
 
+    LocalTensor<float> previousP = previousPBuf.template Get<float>();
     for (int64_t row = 0; row < runInfo.vec2MRealSize; ++row) {
         const int64_t rowPBase =
             runInfo.attentionOutOffset + row * stateD;
-        LocalTensor<float> previousP = previousPQue.DeQue<float>();
-        if (row + 1 < runInfo.vec2MRealSize) {
-            LocalTensor<float> nextPreviousP =
-                previousPQue.AllocTensor<float>();
-            DataCopy(nextPreviousP, partialOutGm[rowPBase + stateD],
-                stateD);
-            previousPQue.EnQue(nextPreviousP);
-        }
+        // Correctness-first serialized previous-P load.  Do not start the
+        // next MTE2 copy until V has finished consuming this single buffer.
+        DataCopy(previousP, partialOutGm[rowPBase], stateD);
+        SetFlag<HardEvent::MTE2_V>(mte2ToVId);
+        WaitFlag<HardEvent::MTE2_V>(mte2ToVId);
 
         const float previousL = previousLUb.GetValue(row);
         const float currentLValue = currentL.GetValue(row);
@@ -844,16 +851,26 @@ __aicore__ inline void QSFAVectorService<TEMPLATE_ARGS>::MergePreviousStateAndCo
             if (scaleCurrent) {
                 Muls(currentPRow, currentPRow, currentWeight, stateD);
             }
+            // Add consumes the rows potentially updated by the Muls above.
+            PipeBarrier<PIPE_V>();
             Add(currentPRow, previousP, currentPRow, stateD);
         } else if (hasPrevious) {
             Adds(currentPRow, previousP, 0.0f, stateD);
         } else if (!hasCurrent) {
             Duplicate(currentPRow, 0.0f, stateD);
         }
+        // Final normalization consumes the merged/current P produced by the
+        // branch above.  Waiting only after the whole row loop is too late for
+        // this read-after-write dependency.
+        PipeBarrier<PIPE_V>();
         if (mergedL > 0.0f) {
             Muls(currentPRow, currentPRow, 1.0f / mergedL, stateD);
         }
-        previousPQue.FreeTensor(previousP);
+        // The next loop reuses previousPBuf from MTE2, so PIPE_V alone is not
+        // sufficient: establish the cross-pipe V -> MTE2 dependency too.
+        PipeBarrier<PIPE_V>();
+        SetFlag<HardEvent::V_MTE2>(vToMte2Id);
+        WaitFlag<HardEvent::V_MTE2>(vToMte2Id);
     }
     PipeBarrier<PIPE_ALL>();
     this->Bmm2DataCopyOut(
@@ -1012,8 +1029,11 @@ __aicore__ inline void QSFAVectorService<TEMPLATE_ARGS>::InitLocalBuffer(TPipe *
 
     if constexpr (STAGE_MODE == C8StageMode::STAGE2_MERGE) {
         tPipe->InitBuffer(commonTBuf, 8 * 64 * sizeof(float));
-        tPipe->InitBuffer(previousPQue, 2, dVTemplateType * sizeof(float));
+        tPipe->InitBuffer(previousPBuf, dVTemplateType * sizeof(float));
         mte2ToVId = GetTPipePtr()->AllocEventID<HardEvent::MTE2_V>();
+        mte2ToSId = GetTPipePtr()->AllocEventID<HardEvent::MTE2_S>();
+        vToSId = GetTPipePtr()->AllocEventID<HardEvent::V_S>();
+        vToMte2Id = GetTPipePtr()->AllocEventID<HardEvent::V_MTE2>();
     } else {
         tPipe->InitBuffer(commonTBuf, 512); // commonTBuf内存申请512B
     }
