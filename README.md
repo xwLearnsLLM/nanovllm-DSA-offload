@@ -1,5 +1,7 @@
 # nano-vLLM Ascend：GLM-5.1 / GLM-5.2 W4A8
 
+本项目基于 [nanovllm](https://github.com/GeeeekExplorer/nano-vllm) 项目修改，在昇腾 Ascend910C 上支持了 decode DSA KVcache offloading (HBM 上只保留少部分 KVcache ，请求的全量 KVcache 卸载到DRAM，在decode过程中动态加载需要的KVcache) 。目前支持 GLM-5.1-w4a8 和 GLM-5.2-w4a8 模型。
+
 运行时要求 BF16、Expert Parallel、128-token KV block，以及 ModelSlim 1.0.0 per-channel W4A8 checkpoint。Routed experts 保持原生 W4A8；Attention、dense/shared MLP 的 W8A8 权重在加载时反量化为 BF16。
 
 `main-glm52` 支持 `GLM-5.2-w4a8` 在 20K～64K 范围内使用 `MTP0/MTP3 × none/offload_split/offload_fuse × eager/FULL_DECODE_ONLY`。MTP3 target verification 一次处理每请求四路因果 query；offload 路径使用对应的 `*_mtp` LIM 和 Attention 算子。
