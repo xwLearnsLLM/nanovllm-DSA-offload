@@ -271,11 +271,14 @@ private:
     uint32_t dramMaxBlockNum_ = 0;
     int32_t queryMissCountRow_ = -1;
     int32_t cachedQueryMissCount_ = 0;
-    static constexpr uint32_t SOURCE_REUSE_CACHE_CAPACITY = 1024;
+    static constexpr uint32_t SOURCE_REUSE_CACHE_CAPACITY = 512;
     int32_t sourceReuseBatch_ = -1;
     int32_t sourceReuseQueryRow_ = -1;
+    uint32_t pendingSourceCount_ = 0;
     int32_t completedSourceIds_[SOURCE_REUSE_CACHE_CAPACITY];
     int32_t pendingSourceIds_[SOURCE_REUSE_CACHE_CAPACITY];
+    int32_t pendingSourceQueryRows_[SOURCE_REUSE_CACHE_CAPACITY];
+    uint16_t pendingSourceSlots_[SOURCE_REUSE_CACHE_CAPACITY];
 
     // ================================Local Buffer====================================
     TBuf<> inputBuff1;            // 32K
@@ -442,6 +445,7 @@ __aicore__ inline void SFAVectorService<SFAT>::InitSourceAwareGatherGlobalTensor
     this->cachedQueryMissCount_ = 0;
     this->sourceReuseBatch_ = -1;
     this->sourceReuseQueryRow_ = -1;
+    this->pendingSourceCount_ = 0;
 }
 
 template <typename SFAT>
@@ -965,9 +969,10 @@ SFAVectorService<SFAT>::BeginSourceAwareQuery(
     if (sourceReuseBatch_ != batch) {
         sourceReuseBatch_ = batch;
         sourceReuseQueryRow_ = queryRow;
+        pendingSourceCount_ = 0;
         for (uint32_t slot = 0; slot < SOURCE_REUSE_CACHE_CAPACITY; ++slot) {
             completedSourceIds_[slot] = -1;
-            pendingSourceIds_[slot] = -1;
+            pendingSourceQueryRows_[slot] = -1;
         }
         return;
     }
@@ -975,21 +980,18 @@ SFAVectorService<SFAT>::BeginSourceAwareQuery(
         return;
     }
 
-    // The prior query's MTE3 writebacks are complete before this MTE2 gather
-    // may consume their HBM slots.  The query pipeline is drained between
-    // MTP rows, and this explicit dependency also covers the final flush.
-    SetFlag<AscendC::HardEvent::MTE3_MTE2>(2);
-    WaitFlag<AscendC::HardEvent::MTE3_MTE2>(2);
-    for (uint32_t slot = 0; slot < SOURCE_REUSE_CACHE_CAPACITY; ++slot) {
-        const int32_t sourceToken = pendingSourceIds_[slot];
-        if (sourceToken >= 0) {
-            const uint32_t target =
-                static_cast<uint32_t>(sourceToken) &
-                (SOURCE_REUSE_CACHE_CAPACITY - 1U);
-            completedSourceIds_[target] = sourceToken;
+    if (pendingSourceCount_ > 0) {
+        // The prior query's MTE3 writebacks are complete before this MTE2
+        // gather may consume their HBM slots. The query pipeline is drained
+        // between MTP rows, and this covers the final writeback flush.
+        SetFlag<AscendC::HardEvent::MTE3_MTE2>(2);
+        WaitFlag<AscendC::HardEvent::MTE3_MTE2>(2);
+        for (uint32_t index = 0; index < pendingSourceCount_; ++index) {
+            const uint32_t slot = pendingSourceSlots_[index];
+            completedSourceIds_[slot] = pendingSourceIds_[slot];
         }
-        pendingSourceIds_[slot] = -1;
     }
+    pendingSourceCount_ = 0;
     sourceReuseQueryRow_ = queryRow;
 }
 
@@ -1023,6 +1025,17 @@ SFAVectorService<SFAT>::RecordSourceForNextQuery(
     }
     const uint32_t slot = static_cast<uint32_t>(sourceToken) &
         (SOURCE_REUSE_CACHE_CAPACITY - 1U);
+    if (pendingSourceQueryRows_[slot] != sourceReuseQueryRow_) {
+        ASSERT_MSG(
+            pendingSourceCount_ < SOURCE_REUSE_CACHE_CAPACITY,
+            "source-aware pending reuse cache overflow.");
+        if (pendingSourceCount_ >= SOURCE_REUSE_CACHE_CAPACITY) {
+            return;
+        }
+        pendingSourceQueryRows_[slot] = sourceReuseQueryRow_;
+        pendingSourceSlots_[pendingSourceCount_++] =
+            static_cast<uint16_t>(slot);
+    }
     pendingSourceIds_[slot] = sourceToken;
 }
 
