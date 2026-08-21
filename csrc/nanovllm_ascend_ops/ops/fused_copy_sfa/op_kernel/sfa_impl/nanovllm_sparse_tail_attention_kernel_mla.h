@@ -82,7 +82,7 @@ public:
     __aicore__ inline void InitSourceAwareGather(
         __gm__ uint8_t *dramKeyRope, __gm__ uint8_t *dramKey,
         __gm__ uint8_t *dramBlockTable, __gm__ uint8_t *sourceTokenIds,
-        __gm__ uint8_t *copyCounts, uint32_t copyCap,
+        __gm__ uint8_t *queryMissCounts, uint32_t copyCap,
         uint32_t dramMaxBlockNum);
 
 private:
@@ -168,7 +168,7 @@ private:
     GlobalTensor<KV_T> dramKeyGm;
     GlobalTensor<int32_t> dramBlockTableGm;
     GlobalTensor<int32_t> sourceTokenIdsGm;
-    GlobalTensor<int32_t> copyCountsGm;
+    GlobalTensor<int32_t> queryMissCountsGm;
 
     GlobalTensor<int32_t> actualSeqLengthsQGm;
     GlobalTensor<int32_t> actualSeqLengthsKVGm;
@@ -557,7 +557,7 @@ __aicore__ inline void
 NanovllmSparseTailAttentionMla<SFAT>::InitSourceAwareGather(
     __gm__ uint8_t *dramKeyRope, __gm__ uint8_t *dramKey,
     __gm__ uint8_t *dramBlockTable, __gm__ uint8_t *sourceTokenIds,
-    __gm__ uint8_t *copyCounts, uint32_t copyCap,
+    __gm__ uint8_t *queryMissCounts, uint32_t copyCap,
     uint32_t dramMaxBlockNum)
 {
     if constexpr (SFAT::sourceAwareGather) {
@@ -566,11 +566,14 @@ NanovllmSparseTailAttentionMla<SFAT>::InitSourceAwareGather(
             dramKeyGm.SetGlobalBuffer((__gm__ KV_T *)dramKey);
             dramBlockTableGm.SetGlobalBuffer((__gm__ int32_t *)dramBlockTable);
             sourceTokenIdsGm.SetGlobalBuffer((__gm__ int32_t *)sourceTokenIds);
-            copyCountsGm.SetGlobalBuffer(
-                (__gm__ int32_t *)copyCounts, constInfo.batchSize);
+            const uint32_t queryCount = MTP3_MODE
+                ? constInfo.batchSize * SFA_MTP3_QUERY_COUNT
+                : constInfo.batchSize;
+            queryMissCountsGm.SetGlobalBuffer(
+                (__gm__ int32_t *)queryMissCounts, queryCount);
             vectorService.InitSourceAwareGatherGlobalTensor(
                 dramKeyRopeGm, dramKeyGm, dramBlockTableGm,
-                sourceTokenIdsGm, copyCountsGm, copyCap,
+                sourceTokenIdsGm, queryMissCountsGm, copyCap,
                 dramMaxBlockNum);
         }
     }

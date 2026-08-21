@@ -417,6 +417,7 @@ def call_fused_attention_out(
     cache_tokens: torch.Tensor,
     topk_dst_slots: torch.Tensor,
     topk_src_ids: torch.Tensor,
+    topk_miss_counts: torch.Tensor,
     miss_src_ids: torch.Tensor,
     miss_dst_slots: torch.Tensor,
     miss_counts: torch.Tensor,
@@ -437,6 +438,7 @@ def call_fused_attention_out(
         cache_tokens,
         topk_dst_slots,
         topk_src_ids,
+        topk_miss_counts,
         miss_src_ids,
         miss_dst_slots,
         miss_counts,
@@ -460,6 +462,28 @@ def attention_diff_by_query(
     )
     per_query = difference.amax(dim=(0, 2, 3)).cpu().tolist()
     return float(difference.max().cpu()), [float(value) for value in per_query]
+
+
+def validate_topk_miss_prefix(metadata: tuple[torch.Tensor, ...]) -> None:
+    topk_src_ids = metadata[1].reshape(-1, TOPK).cpu()
+    topk_miss_counts = metadata[5].reshape(-1).cpu()
+    if topk_miss_counts.numel() != topk_src_ids.shape[0]:
+        raise AssertionError(
+            "topk_miss_counts must contain one entry for every MTP query"
+        )
+    for query_idx, count in enumerate(topk_miss_counts.tolist()):
+        if count < 0 or count > TOPK:
+            raise AssertionError(
+                f"topk_miss_counts[{query_idx}]={count} is outside [0, {TOPK}]"
+            )
+        if count and not bool((topk_src_ids[query_idx, :count] >= 0).all()):
+            raise AssertionError(
+                f"query {query_idx} has a hit in its miss prefix"
+            )
+        if count < TOPK and not bool((topk_src_ids[query_idx, count:] < 0).all()):
+            raise AssertionError(
+                f"query {query_idx} has a miss after its hit suffix starts"
+            )
 
 
 def run_chain(args: argparse.Namespace, device: torch.device) -> None:
@@ -584,6 +608,7 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
         metadata: tuple[torch.Tensor, ...],
         attention_output: torch.Tensor,
     ) -> torch.Tensor:
+        validate_topk_miss_prefix(metadata)
         torch.ops.nanovllm_dsa.fused_copy_sfa_mtp.default(
             query_rope,
             query,
@@ -592,6 +617,7 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
             case.cache_tokens,
             metadata[0],
             metadata[1],
+            metadata[5],
             metadata[2],
             metadata[3],
             metadata[4],
@@ -760,6 +786,7 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
             kpe_seed: torch.Tensor,
             ckv_seed: torch.Tensor,
             topk_src_ids: torch.Tensor,
+            topk_miss_counts: torch.Tensor,
             miss_counts: torch.Tensor,
             actual_kv: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -774,6 +801,7 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
                 cache_tokens=case.cache_tokens,
                 topk_dst_slots=eager_outputs[0],
                 topk_src_ids=topk_src_ids,
+                topk_miss_counts=topk_miss_counts,
                 miss_src_ids=eager_outputs[2],
                 miss_dst_slots=eager_outputs[3],
                 miss_counts=miss_counts,
@@ -814,6 +842,7 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
                 kpe_seed=eager_kpe,
                 ckv_seed=eager_ckv,
                 topk_src_ids=hbm_only_src_ids,
+                topk_miss_counts=torch.zeros_like(eager_outputs[5]),
                 miss_counts=canonical_counts,
                 actual_kv=diagnostic_actual_kv,
             )
@@ -822,6 +851,7 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
                     kpe_seed=eager_kpe,
                     ckv_seed=eager_ckv,
                     topk_src_ids=hbm_only_src_ids,
+                    topk_miss_counts=torch.zeros_like(eager_outputs[5]),
                     miss_counts=nonzero_counts,
                     actual_kv=diagnostic_actual_kv,
                 )
@@ -830,6 +860,7 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
                 kpe_seed=initial_kpe_cpu.to(device),
                 ckv_seed=initial_ckv_cpu.to(device),
                 topk_src_ids=eager_outputs[1],
+                topk_miss_counts=eager_outputs[5],
                 miss_counts=eager_outputs[4],
                 actual_kv=diagnostic_actual_kv,
             )
@@ -1080,6 +1111,7 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
                 perf_case.cache_tokens,
                 perf_outputs[0],
                 perf_outputs[1],
+                perf_outputs[5],
                 perf_outputs[2],
                 perf_outputs[3],
                 perf_outputs[4],

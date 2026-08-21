@@ -30,6 +30,7 @@ __aicore__ inline void RunFusedMtp(
     __gm__ uint8_t *dramKvCache,
     __gm__ uint8_t *dramBlockTable,
     __gm__ uint8_t *topkSourceIds,
+    __gm__ uint8_t *topkMissCounts,
     __gm__ uint8_t *missSourceIds,
     __gm__ uint8_t *missDestinationSlots,
     __gm__ uint8_t *missCounts,
@@ -44,6 +45,7 @@ __aicore__ inline void RunFusedMtp(
     // for metadata/COPYSFA composition but needs no separate pre-copy pass.
     (void)missSourceIds;
     (void)missDestinationSlots;
+    (void)missCounts;
 
     using MtpType = SFAType<
         T, T, T, false, SFA_LAYOUT::TND, SFA_LAYOUT::PA_BSND,
@@ -59,7 +61,7 @@ __aicore__ inline void RunFusedMtp(
         attentionWorkspace, attentionTiling, tiling, pipe);
     attention.InitSourceAwareGather(
         dramKeyRope, dramKvCache, dramBlockTable, topkSourceIds,
-        missCounts, fusedTiling->copyCap,
+        topkMissCounts, fusedTiling->copyCap,
         fusedTiling->dramMaxBlockNum);
     attention.Process();
 }
@@ -81,6 +83,7 @@ extern "C" __global__ __aicore__ void nanovllm_fused_copy_sfa_mtp(
     __gm__ uint8_t *dramKvCache,
     __gm__ uint8_t *dramBlockTable,
     __gm__ uint8_t *topkSourceIds,
+    __gm__ uint8_t *topkMissCounts,
     __gm__ uint8_t *missSourceIds,
     __gm__ uint8_t *missDestinationSlots,
     __gm__ uint8_t *missCounts,
@@ -103,7 +106,7 @@ extern "C" __global__ __aicore__ void nanovllm_fused_copy_sfa_mtp(
                 hbmBlockTable, actualSeqLengthsQuery,
                 actualSeqLengthsKv, queryRope, hbmKeyRope,
                 dramKeyRope, dramKvCache, dramBlockTable,
-                topkSourceIds, missSourceIds, missDestinationSlots,
+                topkSourceIds, topkMissCounts, missSourceIds, missDestinationSlots,
                 missCounts,
                 attentionOut, attentionWorkspace, fusedTiling,
                 tiling, &pipe);
@@ -113,7 +116,7 @@ extern "C" __global__ __aicore__ void nanovllm_fused_copy_sfa_mtp(
                 hbmBlockTable, actualSeqLengthsQuery,
                 actualSeqLengthsKv, queryRope, hbmKeyRope,
                 dramKeyRope, dramKvCache, dramBlockTable,
-                topkSourceIds, missSourceIds, missDestinationSlots,
+                topkSourceIds, topkMissCounts, missSourceIds, missDestinationSlots,
                 missCounts,
                 attentionOut, attentionWorkspace, fusedTiling,
                 tiling, &pipe);

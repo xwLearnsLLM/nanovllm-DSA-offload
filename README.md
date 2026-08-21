@@ -98,6 +98,7 @@ torch.ops.nanovllm_dsa.fused_copy_sfa_mtp(
     num_cache_tokens,
     topk_dst_slots,
     topk_src_ids,
+    topk_miss_counts,        # [4B], miss-prefix length for each query
     miss_src_ids,
     miss_dst_slots,
     miss_counts,

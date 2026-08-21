@@ -14,6 +14,7 @@ inline void npu_fused_copy_sfa_mtp(
     const at::Tensor& num_cache_tokens,
     const at::Tensor& topk_dst_slots,
     const at::Tensor& topk_src_ids,
+    const at::Tensor& topk_miss_counts,
     const at::Tensor& miss_src_ids,
     const at::Tensor& miss_dst_slots,
     const at::Tensor& miss_counts,
@@ -52,6 +53,9 @@ inline void npu_fused_copy_sfa_mtp(
               "Fused MTP topk_slots must be [4B, 1, 2048].");
   TORCH_CHECK(topk_src_ids.sizes() == topk_dst_slots.sizes(),
               "Fused MTP topk_source_ids must match topk_slots.");
+  TORCH_CHECK(topk_miss_counts.dim() == 1 &&
+                  topk_miss_counts.size(0) == query.size(0),
+              "Fused MTP topk_miss_counts must be [4B].");
   TORCH_CHECK(miss_src_ids.dim() == 2 &&
                   miss_src_ids.size(0) == batch_size &&
                   miss_src_ids.size(1) == kQueryCount * kTopK &&
@@ -107,9 +111,10 @@ inline void npu_fused_copy_sfa_mtp(
                 "All fused MTP floating-point tensors must share one dtype.");
   }
   for (const at::Tensor* tensor :
-       std::array<const at::Tensor*, 10>{
+       std::array<const at::Tensor*, 11>{
            &actual_seq_lengths_query, &actual_seq_lengths_kv,
            &num_cache_tokens, &topk_dst_slots, &topk_src_ids,
+           &topk_miss_counts,
            &miss_src_ids, &miss_dst_slots, &miss_counts,
            &hbm_block_table,
            &dram_block_table}) {
@@ -119,10 +124,11 @@ inline void npu_fused_copy_sfa_mtp(
 
   const auto device = query.device();
   for (const at::Tensor* tensor :
-       std::array<const at::Tensor*, 17>{
+       std::array<const at::Tensor*, 18>{
            &query_rope, &query, &actual_seq_lengths_query,
            &actual_seq_lengths_kv, &num_cache_tokens, &topk_dst_slots,
-           &topk_src_ids, &miss_src_ids, &miss_dst_slots, &miss_counts,
+           &topk_src_ids, &topk_miss_counts, &miss_src_ids,
+           &miss_dst_slots, &miss_counts,
            &hbm_block_table, &dram_block_table, &hbm_k_rope,
            &hbm_kv_cache, &dram_k_rope, &dram_kv_cache,
            &attention_out}) {
@@ -141,7 +147,8 @@ inline void npu_fused_copy_sfa_mtp(
   auto keepalive = std::make_tuple(
       query_rope, query, actual_seq_lengths_query,
       actual_seq_lengths_kv, num_cache_tokens, topk_dst_slots,
-      topk_src_ids, miss_src_ids, miss_dst_slots, miss_counts,
+      topk_src_ids, topk_miss_counts, miss_src_ids, miss_dst_slots,
+      miss_counts,
       hbm_block_table, dram_block_table, hbm_k_rope,
       hbm_kv_cache, dram_k_rope, dram_kv_cache, attention_out);
   EXEC_NPU_CMD_ORDERED(
@@ -161,6 +168,7 @@ inline void npu_fused_copy_sfa_mtp(
       dram_kv_cache,
       dram_block_table,
       topk_src_ids,
+      topk_miss_counts,
       miss_src_ids,
       miss_dst_slots,
       miss_counts,

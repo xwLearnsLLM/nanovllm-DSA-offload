@@ -351,6 +351,9 @@ def materialize_metadata(
     )
     miss_dst_slots = torch.full_like(miss_src_ids, -313)
     miss_counts = torch.zeros(case.batch_size, dtype=torch.int32)
+    topk_miss_counts = torch.zeros(
+        case.batch_size * QUERY_COUNT, dtype=torch.int32
+    )
 
     for request in range(case.batch_size):
         pool_row = int(case.req_pool_entries_cpu[request])
@@ -378,15 +381,24 @@ def materialize_metadata(
 
         for query_idx, row in enumerate(rows):
             output_row = request * QUERY_COUNT + query_idx
-            slots = after[row]
+            miss_mask = before[row] < 0
+            # Match fused_li_manage_mtp's source-aware contract: misses are
+            # the contiguous prefix and hits follow it in the same TopK row.
+            order = torch.cat(
+                (torch.nonzero(miss_mask).flatten(),
+                 torch.nonzero(~miss_mask).flatten())
+            )
+            ordered_row = row[order]
+            slots = after[ordered_row]
             if bool((slots < 0).any()) or torch.unique(slots).numel() != TOPK:
                 raise AssertionError("materialized TopK slots are invalid")
             topk_dst_slots[output_row, 0] = slots.to(torch.int32)
             topk_src_ids[output_row, 0] = torch.where(
-                before[row] < 0,
-                row,
-                torch.full_like(row, -1),
+                before[ordered_row] < 0,
+                ordered_row,
+                torch.full_like(ordered_row, -1),
             ).to(torch.int32)
+            topk_miss_counts[output_row] = int(miss_mask.sum())
         miss_src_ids[request, :count] = misses.to(torch.int32)
         miss_dst_slots[request, :count] = destinations.to(torch.int32)
         miss_counts[request] = count
@@ -399,6 +411,7 @@ def materialize_metadata(
             miss_src_ids,
             miss_dst_slots,
             miss_counts,
+            topk_miss_counts,
         )
     )
 

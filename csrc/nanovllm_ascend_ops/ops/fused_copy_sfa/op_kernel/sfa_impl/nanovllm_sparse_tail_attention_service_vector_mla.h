@@ -50,7 +50,7 @@ public:
         const GlobalTensor<KV_T> &dramKeyGm,
         const GlobalTensor<int32_t> &dramBlockTableGm,
         const GlobalTensor<int32_t> &sourceTokenIdsGm,
-        const GlobalTensor<int32_t> &copyCountsGm,
+        const GlobalTensor<int32_t> &queryMissCountsGm,
         uint32_t copyCap, uint32_t dramMaxBlockNum);
     __aicore__ inline void InitVec1GlobalTensor(GlobalTensor<MM1_OUT_T> mm1ResGm, GlobalTensor<KV_T> vec1ResGm,
                                                 GlobalTensor<int32_t> actualSeqLengthsQGm,
@@ -260,11 +260,11 @@ private:
     GlobalTensor<KV_T> dramKeyGm_;
     GlobalTensor<int32_t> dramBlockTableGm_;
     GlobalTensor<int32_t> sourceTokenIdsGm_;
-    GlobalTensor<int32_t> copyCountsGm_;
+    GlobalTensor<int32_t> queryMissCountsGm_;
     uint32_t copyCap_ = 0;
     uint32_t dramMaxBlockNum_ = 0;
-    int32_t copyCountBatch_ = -1;
-    int32_t cachedCopyCount_ = 0;
+    int32_t queryMissCountRow_ = -1;
+    int32_t cachedQueryMissCount_ = 0;
 
     // ================================Local Buffer====================================
     TBuf<> inputBuff1;            // 32K
@@ -417,18 +417,18 @@ __aicore__ inline void SFAVectorService<SFAT>::InitSourceAwareGatherGlobalTensor
     const GlobalTensor<KV_T> &dramKeyGm,
     const GlobalTensor<int32_t> &dramBlockTableGm,
     const GlobalTensor<int32_t> &sourceTokenIdsGm,
-    const GlobalTensor<int32_t> &copyCountsGm,
+    const GlobalTensor<int32_t> &queryMissCountsGm,
     uint32_t copyCap, uint32_t dramMaxBlockNum)
 {
     this->dramKeyRopeGm_ = dramKeyRopeGm;
     this->dramKeyGm_ = dramKeyGm;
     this->dramBlockTableGm_ = dramBlockTableGm;
     this->sourceTokenIdsGm_ = sourceTokenIdsGm;
-    this->copyCountsGm_ = copyCountsGm;
+    this->queryMissCountsGm_ = queryMissCountsGm;
     this->copyCap_ = copyCap;
     this->dramMaxBlockNum_ = dramMaxBlockNum;
-    this->copyCountBatch_ = -1;
-    this->cachedCopyCount_ = 0;
+    this->queryMissCountRow_ = -1;
+    this->cachedQueryMissCount_ = 0;
 }
 
 template <typename SFAT>
@@ -917,14 +917,15 @@ __aicore__ inline int32_t
 SFAVectorService<SFAT>::GetSourceAwareMissCount(
     const RunInfo &runInfo)
 {
-    if (copyCountBatch_ != static_cast<int32_t>(runInfo.bIdx)) {
-        cachedCopyCount_ = copyCountsGm_.GetValue(runInfo.bIdx);
-        copyCountBatch_ = static_cast<int32_t>(runInfo.bIdx);
+    ASSERT_MSG(copyCap_ != 0, "source-aware gather capacity must be nonzero.");
+    const int32_t queryRow = static_cast<int32_t>(
+        runInfo.topKBaseOffset / copyCap_);
+    if (queryMissCountRow_ != queryRow) {
+        cachedQueryMissCount_ = queryMissCountsGm_.GetValue(queryRow);
+        queryMissCountRow_ = queryRow;
     }
-    const int32_t missCount = cachedCopyCount_;
-    const int32_t maxCopyCount = SFAT::mtp3Mode
-        ? static_cast<int32_t>(copyCap_ * SFA_MTP3_QUERY_COUNT)
-        : static_cast<int32_t>(copyCap_);
+    const int32_t missCount = cachedQueryMissCount_;
+    const int32_t maxCopyCount = static_cast<int32_t>(copyCap_);
     ASSERT_MSG(
         missCount >= 0 &&
             missCount <= maxCopyCount,
@@ -1674,9 +1675,9 @@ SFAVectorService<SFAT>::MergeSourceAwareSparseRange(
         sourceTileStart + s2GmStartOffset;
     const int64_t rangeSize =
         s2GmLimit - s2GmStartOffset;
-    const int64_t missAfterRangeStart = ALIGNED_MISS
-        ? (missCount > 0 ? rangeSize : 0)
-        : static_cast<int64_t>(missCount) - sourceRangeStart;
+    // MTP source ids are ordered as a DRAM-miss prefix followed by HBM hits.
+    const int64_t missAfterRangeStart =
+        static_cast<int64_t>(missCount) - sourceRangeStart;
     const int64_t missRangeSize = missAfterRangeStart <= 0
         ? 0
         : (missAfterRangeStart < rangeSize ? missAfterRangeStart : rangeSize);
