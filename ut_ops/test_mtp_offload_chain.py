@@ -608,7 +608,6 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
         metadata: tuple[torch.Tensor, ...],
         attention_output: torch.Tensor,
     ) -> torch.Tensor:
-        validate_topk_miss_prefix(metadata)
         torch.ops.nanovllm_dsa.fused_copy_sfa_mtp.default(
             query_rope,
             query,
@@ -699,6 +698,9 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
         return counts, float((actual - golden).abs().max())
 
     eager_outputs = fixture.materialize_metadata(case)
+    # This check copies metadata to host, so it must remain outside NPU Graph
+    # capture.  launch_fused() itself is capture-safe.
+    validate_topk_miss_prefix(eager_outputs)
     eager_kpe = initial_kpe_cpu.to(device)
     eager_ckv = initial_ckv_cpu.to(device)
     eager_attention_buffer = torch.empty(
@@ -1030,6 +1032,7 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
             generator=torch.Generator().manual_seed(args.seed + 8017),
         )
         perf_outputs = fixture.materialize_metadata(perf_case)
+        validate_topk_miss_prefix(perf_outputs)
         perf_counts = [int(value) for value in perf_outputs[4].cpu().tolist()]
         query_miss_occurrences = int((perf_outputs[1] >= 0).sum().cpu())
         (
