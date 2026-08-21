@@ -486,6 +486,48 @@ def validate_topk_miss_prefix(metadata: tuple[torch.Tensor, ...]) -> None:
             )
 
 
+def count_pair_dma_candidates(
+    metadata: tuple[torch.Tensor, ...],
+    dram_block_table: torch.Tensor,
+    hbm_block_table: torch.Tensor,
+) -> int:
+    """Count miss pairs eligible for the kernel's order-preserving two-block DMA."""
+    topk_src_ids = metadata[1].reshape(-1, TOPK).cpu()
+    topk_dst_slots = metadata[0].reshape(-1, TOPK).cpu()
+    topk_miss_counts = metadata[5].reshape(-1).cpu()
+    dram_blocks = dram_block_table.cpu()
+    hbm_blocks = hbm_block_table.cpu()
+    candidates = 0
+    for query_idx, count_value in enumerate(topk_miss_counts.tolist()):
+        count = int(count_value) & ~1
+        if count == 0:
+            continue
+        request_idx = query_idx // QUERY_COUNT
+        sources = topk_src_ids[query_idx, :count].to(torch.int64).view(-1, 2)
+        destinations = topk_dst_slots[query_idx, :count].to(torch.int64).view(
+            -1, 2
+        )
+        hbm_offsets = (
+            hbm_blocks[request_idx, destinations // BLOCK_SIZE].to(torch.int64)
+            * BLOCK_SIZE
+            + destinations % BLOCK_SIZE
+        )
+        sources = torch.where(
+            (hbm_offsets[:, 1] < hbm_offsets[:, 0]).unsqueeze(1),
+            sources.flip(1),
+            sources,
+        )
+        physical_offsets = (
+            dram_blocks[request_idx, sources // BLOCK_SIZE].to(torch.int64)
+            * BLOCK_SIZE
+            + sources % BLOCK_SIZE
+        )
+        candidates += int(
+            (physical_offsets[:, 1] > physical_offsets[:, 0]).sum().item()
+        )
+    return candidates
+
+
 def run_chain(args: argparse.Namespace, device: torch.device) -> None:
     batch_size = args.batch_size
     cache_tokens = args.cache_tokens
@@ -1033,6 +1075,9 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
         )
         perf_outputs = fixture.materialize_metadata(perf_case)
         validate_topk_miss_prefix(perf_outputs)
+        pair_dma_candidates = count_pair_dma_candidates(
+            perf_outputs, dram_table_cpu, hbm_table_cpu
+        )
         perf_counts = [int(value) for value in perf_outputs[4].cpu().tolist()]
         query_miss_occurrences = int((perf_outputs[1] >= 0).sum().cpu())
         (
@@ -1158,6 +1203,7 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
             f"query_miss_occurrences_by_query=[{formatted_query_miss_means}] "
             f"miss_overlap_rate_requested={args.perf_miss_overlap_rate:.6f} "
             f"miss_overlap_rate_actual={actual_overlap_rate:.6f} "
+            f"dram_pair_dma_candidates={pair_dma_candidates} "
             f"split_ms={split_ms:.6f} "
             f"kvcache_scatter_copy_ms={scatter_ms:.6f} "
             f"sparse_tail_attention_mtp_ms={sfa_ms:.6f} "

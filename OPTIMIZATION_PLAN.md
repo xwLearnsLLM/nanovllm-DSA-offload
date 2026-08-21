@@ -10,6 +10,10 @@
 - **P1 回退**：回退 request-affinity 的 whole-request 分配，以及跨 query 的
   `source -> HBM` 哈希缓存、MTE3→MTE2 同步和对应的复用专项测试。它们不再进入
   后续基线。
+- **MTE2-A 已实现，待 Ascend 验证**：在现有 32-row UB flush 内，两个 DRAM miss
+  若保持 kernel 当前的行顺序且物理 DRAM stride 为正，则合并为一次 two-block DMA
+  （CKV 和 KPE 各一次）；不满足条件时严格回退两次单行 DMA。该版本减少 MTE2 DMA
+  指令启动次数，不改变 payload、TopK 行顺序或跨 query 调度。
 
 本轮 case：`B=24`、`heads=8`、`source_len=65536`、`cache_tokens=8192`、
 `tail_tokens=64`、每 request 300 个 unique miss；4 个 query 合计每 request

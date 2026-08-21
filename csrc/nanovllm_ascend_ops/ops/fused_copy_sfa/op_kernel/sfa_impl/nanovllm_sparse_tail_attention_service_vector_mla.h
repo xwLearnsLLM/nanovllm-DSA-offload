@@ -112,6 +112,13 @@ public:
         int64_t &mte2Size, int64_t mte3Size, int64_t mergeMte3Idx,
         int64_t sourceTokenIdx,
         const RunInfo &runInfo);
+    __aicore__ inline void CopyInDramKvPair(
+        int64_t &mte2Size, int64_t mte3Size, int64_t mergeMte3Idx,
+        int64_t sourceToken0, int64_t sourceToken1,
+        const RunInfo &runInfo);
+    __aicore__ inline void CopyInDramKvByOffset(
+        int64_t &mte2Size, int64_t mte3Size, int64_t mergeMte3Idx,
+        int64_t dramOffset, const RunInfo &runInfo);
     __aicore__ inline void CopyInSourceAwareKvPair(
         int64_t &mte2Size, int64_t mte3Size, int64_t mergeMte3Idx,
         int32_t sourceToken0, int32_t sourceToken1,
@@ -1106,6 +1113,19 @@ __aicore__ inline void SFAVectorService<SFAT>::CopyInDramKv(
         return;
     }
 
+    CopyInDramKvByOffset(
+        mte2Size, mte3Size, mergeMte3Idx, dramOffset, runInfo);
+}
+
+template <typename SFAT>
+__aicore__ inline void SFAVectorService<SFAT>::CopyInDramKvByOffset(
+    int64_t &mte2Size, int64_t mte3Size, int64_t mergeMte3Idx,
+    int64_t dramOffset, const RunInfo &runInfo)
+{
+    if (dramOffset < 0) {
+        return;
+    }
+
     const int64_t ubRow = mte2Size - mte3Size;
     DataCopyExtParams copyParams;
     copyParams.blockCount = 1;
@@ -1126,6 +1146,62 @@ __aicore__ inline void SFAVectorService<SFAT>::CopyInDramKv(
         dramKeyRopeGm_[dramOffset * constInfo.headDimRope],
         copyParams, padParams);
     mte2Size += 1;
+}
+
+template <typename SFAT>
+__aicore__ inline void SFAVectorService<SFAT>::CopyInDramKvPair(
+    int64_t &mte2Size, int64_t mte3Size, int64_t mergeMte3Idx,
+    int64_t sourceToken0, int64_t sourceToken1,
+    const RunInfo &runInfo)
+{
+    ASSERT_MSG(
+        constInfo.sparseBlockSize == 1,
+        "source-aware gather requires sparse_block_size=1.");
+    const int64_t dramOffset0 =
+        GetDramKeyGmOffset(sourceToken0, runInfo);
+    const int64_t dramOffset1 =
+        GetDramKeyGmOffset(sourceToken1, runInfo);
+
+    // Preserve the original TopK order in UB. A multi-block DMA only accepts
+    // a non-negative source stride, so reverse-physical-order pairs use the
+    // original single-row copies instead of changing the attention order.
+    const int64_t keySrcStride =
+        (dramOffset1 - dramOffset0 - 1) * constInfo.headDim * sizeof(KV_T);
+    const int64_t ropeSrcStride =
+        (dramOffset1 - dramOffset0 - 1) * constInfo.headDimRope * sizeof(KV_T);
+    const bool canUsePairDma =
+        dramOffset0 >= 0 && dramOffset1 > dramOffset0 &&
+        keySrcStride >= 0 && keySrcStride < INT32_MAX &&
+        ropeSrcStride >= 0 && ropeSrcStride < INT32_MAX;
+    if (unlikely(!canUsePairDma)) {
+        CopyInDramKvByOffset(
+            mte2Size, mte3Size, mergeMte3Idx, dramOffset0, runInfo);
+        CopyInDramKvByOffset(
+            mte2Size, mte3Size, mergeMte3Idx, dramOffset1, runInfo);
+        return;
+    }
+
+    const int64_t ubRow = mte2Size - mte3Size;
+    DataCopyExtParams copyParams;
+    copyParams.blockCount = 2;
+    copyParams.blockLen = constInfo.headDim * sizeof(KV_T);
+    copyParams.srcStride = keySrcStride;
+    copyParams.dstStride = 0;
+    DataCopyPadExtParams<KV_T> padParams;
+    DataCopyPad(
+        kvMergUb_[mergeMte3Idx % 2 * 32 * 512 +
+                  ubRow * constInfo.headDim],
+        dramKeyGm_[dramOffset0 * constInfo.headDim],
+        copyParams, padParams);
+
+    copyParams.blockLen = constInfo.headDimRope * sizeof(KV_T);
+    copyParams.srcStride = ropeSrcStride;
+    DataCopyPad(
+        ropeMergUb_[mergeMte3Idx % 2 * 32 * 64 +
+                    ubRow * constInfo.headDimRope],
+        dramKeyRopeGm_[dramOffset0 * constInfo.headDimRope],
+        copyParams, padParams);
+    mte2Size += 2;
 }
 
 template <typename SFAT>
@@ -1195,6 +1271,12 @@ SFAVectorService<SFAT>::CopyInSourceAwareKvPair(
             ? static_cast<int32_t>(destinationSlot1) : -1;
         persistentDestination1 = source0FromDram
             ? static_cast<int32_t>(destinationSlot0) : -1;
+        if (source1FromDram && source0FromDram) {
+            CopyInDramKvPair(
+                mte2Size, mte3Size, mergeMte3Idx,
+                sourceToken1, sourceToken0, runInfo);
+            return;
+        }
         if (source1FromDram) {
             CopyInDramKv(
                 mte2Size, mte3Size, mergeMte3Idx,
@@ -1222,6 +1304,12 @@ SFAVectorService<SFAT>::CopyInSourceAwareKvPair(
         ? static_cast<int32_t>(destinationSlot0) : -1;
     persistentDestination1 = source1FromDram
         ? static_cast<int32_t>(destinationSlot1) : -1;
+    if (source0FromDram && source1FromDram) {
+        CopyInDramKvPair(
+            mte2Size, mte3Size, mergeMte3Idx,
+            sourceToken0, sourceToken1, runInfo);
+        return;
+    }
     if (source0FromDram) {
         CopyInDramKv(
             mte2Size, mte3Size, mergeMte3Idx,
@@ -1555,7 +1643,11 @@ __aicore__ inline void SFAVectorService<SFAT>::MergeKvRange(
                     flushHasActualMiss = flushHasActualMiss ||
                         source0FromDram || source1FromDram;
                     if (source0FromDram || source1FromDram) {
-                        if (source0FromDram) {
+                        if (source0FromDram && source1FromDram) {
+                            CopyInDramKvPair(
+                                mte2Size, mte3Size, mergeMte3Idx,
+                                realS2Idx0, realS2Idx1, runInfo);
+                        } else if (source0FromDram) {
                             CopyInDramKv(
                                 mte2Size, mte3Size, mergeMte3Idx,
                                 realS2Idx0, runInfo);
