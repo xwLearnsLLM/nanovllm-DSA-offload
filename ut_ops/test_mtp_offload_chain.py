@@ -466,16 +466,12 @@ def attention_diff_by_query(
 
 def validate_topk_miss_prefix(metadata: tuple[torch.Tensor, ...]) -> None:
     topk_src_ids = metadata[1].reshape(-1, TOPK).cpu()
-    topk_dst_slots = metadata[0].reshape(-1, TOPK).cpu()
     topk_miss_counts = metadata[5].reshape(-1).cpu()
     if topk_miss_counts.numel() != topk_src_ids.shape[0]:
         raise AssertionError(
             "topk_miss_counts must contain one entry for every MTP query"
         )
-    destination_by_source: dict[int, int] = {}
     for query_idx, count in enumerate(topk_miss_counts.tolist()):
-        if query_idx % QUERY_COUNT == 0:
-            destination_by_source.clear()
         if count < 0 or count > TOPK:
             raise AssertionError(
                 f"topk_miss_counts[{query_idx}]={count} is outside [0, {TOPK}]"
@@ -488,16 +484,6 @@ def validate_topk_miss_prefix(metadata: tuple[torch.Tensor, ...]) -> None:
             raise AssertionError(
                 f"query {query_idx} has a miss after its hit suffix starts"
             )
-        for source, destination in zip(
-            topk_src_ids[query_idx, :count].tolist(),
-            topk_dst_slots[query_idx, :count].tolist(),
-        ):
-            previous = destination_by_source.setdefault(source, destination)
-            if previous != destination:
-                raise AssertionError(
-                    f"source {source} maps to inconsistent HBM slots "
-                    f"within request {query_idx // QUERY_COUNT}"
-                )
 
 
 def run_chain(args: argparse.Namespace, device: torch.device) -> None:
@@ -1142,37 +1128,6 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
                 fused_perf_out,
             )
             return fused_perf_out
-
-        # The functional chain above uses disjoint TopK rows for broad copy
-        # coverage.  Validate the overlap fixture separately so this path
-        # exercises intra-request DRAM-to-HBM reuse before it is timed.
-        split_copy_attention()
-        fused_copy_attention()
-        torch.npu.synchronize()
-        if not torch.equal(fused_perf_kpe.cpu(), split_perf_kpe.cpu()) or not torch.equal(
-            fused_perf_ckv.cpu(), split_perf_ckv.cpu()
-        ):
-            raise AssertionError(
-                "overlap fixture fused HBM cache payloads differ from split"
-            )
-        perf_attention_max_abs = float(
-            (fused_perf_out.float() - split_perf_out.float()).abs().max().cpu()
-        )
-        if not allow_known_fused_diff:
-            torch.testing.assert_close(
-                fused_perf_out, split_perf_out, rtol=0, atol=0
-            )
-        print(
-            "FUSED_COPY_SFA_MTP_REUSE_CHECK "
-            f"attention_max_abs={perf_attention_max_abs:.6f} "
-            "hbm_cache_exact=1 ok=1",
-            flush=True,
-        )
-        split_perf_kpe.copy_(perf_initial_kpe_cpu.to(device))
-        split_perf_ckv.copy_(perf_initial_ckv_cpu.to(device))
-        fused_perf_kpe.copy_(perf_initial_kpe_cpu.to(device))
-        fused_perf_ckv.copy_(perf_initial_ckv_cpu.to(device))
-        torch.npu.synchronize()
 
         def elapsed_ms(fn) -> float:
             for _ in range(args.warmup):

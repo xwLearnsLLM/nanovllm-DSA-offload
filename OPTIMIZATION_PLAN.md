@@ -1,5 +1,72 @@
 # FusedCopySfaMtp 性能优化方案
 
+> **状态更新（2026-08-21，优先级以本节为准）**
+
+### 已完成的验证
+
+- **P0 保留**：已接入上游提供的 `topk_miss_counts[4B]`，按每个 query 的
+  miss 前缀、hit 后缀进行精确分流；Graph capture 下的 metadata 校验已移到
+  capture 外，功能测试通过。
+- **P1 回退**：回退 request-affinity 的 whole-request 分配，以及跨 query 的
+  `source -> HBM` 哈希缓存、MTE3→MTE2 同步和对应的复用专项测试。它们不再进入
+  后续基线。
+
+本轮 case：`B=24`、`heads=8`、`source_len=65536`、`cache_tokens=8192`、
+`tail_tokens=64`、每 request 300 个 unique miss；4 个 query 合计每 request
+600 个 miss occurrence，实际 overlap 为 1/3。
+
+| 版本 / 阶段 | fused_ms | 结论 |
+|---|---:|---|
+| 初始基线 | 0.509566 | 对照 |
+| P0 精确分流 | 0.507968 | 功能正确，收益在测试噪声范围内 |
+| P1：初始 HBM reuse cache | 0.521743 | 明显劣化 |
+| P1：缩小并稀疏清理 cache 后 | 0.504288 | 接近基线，未形成可重复收益 |
+
+上述数值来自不同运行轮次；最后一项不能作为 P1 已提速的证据。P1 的复杂度、
+同步与标量开销没有换来稳定的端到端收益，故回退。
+
+### Profiling 判断
+
+`PipeUtilization` 中有 28 条 fused task，前 4 条为 1.53–1.58 ms 的冷启动数据。
+对其余 24 条稳态任务统计：
+
+| 指标 | 均值 | P50 | P90 |
+|---|---:|---:|---:|
+| Task Duration (us) | 598.5 | 534.5 | 813.0 |
+| AIC MTE2 ratio | 61.4% | 63.0% | 64.8% |
+| AIC MAC ratio | 15.9% | 13.9% | 22.6% |
+| AIV vector ratio | 4.0% | 3.7% | 5.7% |
+| AIV scalar ratio | 62.1% | 63.8% | 67.5% |
+| Task Wait (us) | 48.4 | 2.9 | 3.1 |
+
+结论是 **MTE2 的 GM→UB 搬运是主要瓶颈，AIV 还存在较高的索引/控制标量占比**；
+不是 Cube 或 AIV 向量算力不足。P1 只是把先前 query 的数据写入 HBM，再由后续
+query 从 HBM 经 MTE2 读回，未避开 MTE2，且增加了 hash、cache 清理与事件同步，
+因而不适合作为后续方向。`B=24` 同时 `Block Dim=24`，原调度已接近一 request
+一个 mixed group，P1 的调度改动在该 case 也没有可挖掘的并行度收益。
+
+### 新的最高优先级：直接复用 UB 中的 source KV tile
+
+后续优化以“减少 MTE2 payload”为验收目标，而非预取到 HBM/workspace：
+
+1. 在一个 request-local mixed group 内，以共同的 source-token / source-tile 为外层
+   遍历；一次 `DRAM(GM) -> UB` 后，在 KV tile 仍驻留 UB 时连续计算 q0/q1/q2/q3
+   对该 tile 的贡献。
+2. 每个 query 保持独立的 online-softmax accumulator、位置和 mask；仅共享只读的
+   KV UB tile。先以较小的 64/128-token sub-tile 验证 UB 容量与双缓冲事件，再考虑
+   扩大 tile，不能把完整 512-token tile 当作无条件可缓存对象。
+3. 该重排需要建立 “source token -> 哪些 query 需要该 token” 的 membership/cursor，
+   并保持每个 query 原有的 sparse 顺序和 online-softmax 数值语义。若上游不能提供
+   有序的共同 source 视图，则先评估在 kernel 内构建该视图的标量成本。
+4. 只在 `B >= active AIC` 时采用 whole-request affinity；小 batch 仍保留 query 粒度
+   并行，避免为 UB 复用牺牲核利用率。
+
+验收要求：同一输入下先进行 split/fused 正确性对比；随后使用未采样 benchmark
+取得至少 3 轮稳定测量。只有 fused 端到端延迟稳定改善 >= 3%，并且 profiler 中
+MTE2 相关时间/流量明确下降，才保留实现。下一次 profile 应与 P0 基线使用相同命令
+采集 `--aic-metrics=Memory,MemoryUB`，再与候选版本逐项比较。
+
+
 ## 1. 目标与结论
 
 目标算子为 `fused_copy_sfa_mtp`：在 Ascend 上完成 MTP token 级 DRAM -> HBM KV 搬运，并执行 Sparse Flash Attention (SFA)。
@@ -304,4 +371,3 @@ MTE2 stall、MTE3 stall、Vector0 时间、Cube 时间
 3. **M3 / P1**：实现 `query_group_size = 1/2/4` 的 request-affinity tiling；先不启用 ready-slot，只验证调度和核利用率。
 4. **M4 / P1 完整版**：增加 ready-slot 位图、query 边界同步和 DRAM -> HBM 复用；仅在满足 batch/重合率阈值时启用。
 5. **M5 / P2-P4**：根据 profiler 选择 block-table 缓存、look-ahead 预取或连续 run 合并。
-
