@@ -60,6 +60,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--perf-hit-overlap-rate",
+        type=float,
+        default=0.0,
+        help=(
+            "Fraction of the per-query hit suffix shared by all four MTP "
+            "queries in the performance-only fixture. 0 retains query-local "
+            "hits; 1 makes the common hit prefix fully shared."
+        ),
+    )
+    parser.add_argument(
         "--allow-fused-attention-diff",
         action="store_true",
         help=(
@@ -107,6 +117,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--perf-miss-count must be in [0,8192]")
     if not 0.0 <= args.perf_miss_overlap_rate <= 1.0:
         raise ValueError("--perf-miss-overlap-rate must be in [0,1]")
+    if not 0.0 <= args.perf_hit_overlap_rate <= 1.0:
+        raise ValueError("--perf-hit-overlap-rate must be in [0,1]")
     query_miss_occurrences = args.perf_miss_count + round(
         3 * args.perf_miss_count * args.perf_miss_overlap_rate
     )
@@ -486,46 +498,21 @@ def validate_topk_miss_prefix(metadata: tuple[torch.Tensor, ...]) -> None:
             )
 
 
-def count_pair_dma_candidates(
-    metadata: tuple[torch.Tensor, ...],
-    dram_block_table: torch.Tensor,
-    hbm_block_table: torch.Tensor,
-) -> int:
-    """Count miss pairs eligible for the kernel's order-preserving two-block DMA."""
-    topk_src_ids = metadata[1].reshape(-1, TOPK).cpu()
-    topk_dst_slots = metadata[0].reshape(-1, TOPK).cpu()
-    topk_miss_counts = metadata[5].reshape(-1).cpu()
-    dram_blocks = dram_block_table.cpu()
-    hbm_blocks = hbm_block_table.cpu()
-    candidates = 0
-    for query_idx, count_value in enumerate(topk_miss_counts.tolist()):
-        count = int(count_value) & ~1
-        if count == 0:
-            continue
-        request_idx = query_idx // QUERY_COUNT
-        sources = topk_src_ids[query_idx, :count].to(torch.int64).view(-1, 2)
-        destinations = topk_dst_slots[query_idx, :count].to(torch.int64).view(
-            -1, 2
-        )
-        hbm_offsets = (
-            hbm_blocks[request_idx, destinations // BLOCK_SIZE].to(torch.int64)
-            * BLOCK_SIZE
-            + destinations % BLOCK_SIZE
-        )
-        sources = torch.where(
-            (hbm_offsets[:, 1] < hbm_offsets[:, 0]).unsqueeze(1),
-            sources.flip(1),
-            sources,
-        )
-        physical_offsets = (
-            dram_blocks[request_idx, sources // BLOCK_SIZE].to(torch.int64)
-            * BLOCK_SIZE
-            + sources % BLOCK_SIZE
-        )
-        candidates += int(
-            (physical_offsets[:, 1] > physical_offsets[:, 0]).sum().item()
-        )
-    return candidates
+def topk_reuse_stats(case: fixture.MtpCase) -> tuple[int, int, int, float, float]:
+    total_positions = case.batch_size * QUERY_COUNT * TOPK
+    unique_tokens = sum(int(union.numel()) for union in case.union_cpu)
+    reuse_occurrences = total_positions - unique_tokens
+    reuse_ratio = reuse_occurrences / total_positions
+    normalized_overlap = reuse_occurrences / (
+        case.batch_size * (QUERY_COUNT - 1) * TOPK
+    )
+    return (
+        total_positions,
+        unique_tokens,
+        reuse_occurrences,
+        reuse_ratio,
+        normalized_overlap,
+    )
 
 
 def run_chain(args: argparse.Namespace, device: torch.device) -> None:
@@ -1059,6 +1046,7 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
             miss_fractions=(0.0,) * batch_size,
             exact_miss_count=args.perf_miss_count,
             miss_overlap_rate=args.perf_miss_overlap_rate,
+            hit_overlap_rate=args.perf_hit_overlap_rate,
             seed=args.seed + 8000,
             topk_profile="miss_overlap",
         )
@@ -1075,9 +1063,13 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
         )
         perf_outputs = fixture.materialize_metadata(perf_case)
         validate_topk_miss_prefix(perf_outputs)
-        pair_dma_candidates = count_pair_dma_candidates(
-            perf_outputs, dram_table_cpu, hbm_table_cpu
-        )
+        (
+            topk_positions_total,
+            topk_unique_tokens_total,
+            topk_reuse_occurrences_total,
+            topk_reuse_ratio,
+            topk_overlap_rate_actual,
+        ) = topk_reuse_stats(perf_case)
         perf_counts = [int(value) for value in perf_outputs[4].cpu().tolist()]
         query_miss_occurrences = int((perf_outputs[1] >= 0).sum().cpu())
         (
@@ -1203,7 +1195,12 @@ def run_chain(args: argparse.Namespace, device: torch.device) -> None:
             f"query_miss_occurrences_by_query=[{formatted_query_miss_means}] "
             f"miss_overlap_rate_requested={args.perf_miss_overlap_rate:.6f} "
             f"miss_overlap_rate_actual={actual_overlap_rate:.6f} "
-            f"dram_pair_dma_candidates={pair_dma_candidates} "
+            f"hit_overlap_rate_requested={args.perf_hit_overlap_rate:.6f} "
+            f"topk_positions_total={topk_positions_total} "
+            f"topk_unique_tokens_total={topk_unique_tokens_total} "
+            f"topk_reuse_occurrences_total={topk_reuse_occurrences_total} "
+            f"topk_reuse_ratio={topk_reuse_ratio:.6f} "
+            f"topk_overlap_rate_actual={topk_overlap_rate_actual:.6f} "
             f"split_ms={split_ms:.6f} "
             f"kvcache_scatter_copy_ms={scatter_ms:.6f} "
             f"sparse_tail_attention_mtp_ms={sfa_ms:.6f} "

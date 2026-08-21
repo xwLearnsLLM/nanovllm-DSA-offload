@@ -61,6 +61,7 @@ def _make_request_topk(
     generator: torch.Generator,
     unique_miss_count: int | None = None,
     miss_overlap_rate: float | None = None,
+    hit_overlap_rate: float | None = None,
 ) -> tuple[list[torch.Tensor], torch.Tensor | None]:
     permutation = torch.randperm(source_capacity, generator=generator).to(torch.int64)
     if profile == "broad":
@@ -79,6 +80,10 @@ def _make_request_topk(
         raise ValueError("unique miss count must be in [0,8192]")
     if not 0.0 <= miss_overlap_rate <= 1.0:
         raise ValueError("miss overlap rate must be in [0,1]")
+    if hit_overlap_rate is None:
+        hit_overlap_rate = 0.0
+    if not 0.0 <= hit_overlap_rate <= 1.0:
+        raise ValueError("hit overlap rate must be in [0,1]")
 
     # Every unique miss has one unavoidable query occurrence and at most three
     # duplicates.  Spread the duplicates as evenly as possible across unique
@@ -132,17 +137,29 @@ def _make_request_topk(
                 rows_parts[query_idx].append(token)
                 query_loads[query_idx] += 1
 
-    # Fill every TopK row with request-local hit tokens.  Filler tokens are
-    # intentionally unique across queries: only miss membership is controlled.
+    # Share a configurable prefix of the remaining hit positions across all
+    # four queries. The rest stays query-local, preserving the former fixture
+    # when hit_overlap_rate is zero.
+    hit_counts = [
+        TOPK - sum(int(part.numel()) for part in parts)
+        for parts in rows_parts
+    ]
+    shared_hit_count = round(min(hit_counts) * hit_overlap_rate)
+    shared_hits = permutation[cursor : cursor + shared_hit_count]
+    cursor += shared_hit_count
     for query_idx in range(QUERY_COUNT):
-        current = sum(int(part.numel()) for part in rows_parts[query_idx])
-        needed = TOPK - current
+        needed = hit_counts[query_idx]
         if needed < 0:
             raise ValueError(
-                f"query={query_idx} receives {current} misses, exceeding TopK={TOPK}"
+                f"query={query_idx} receives {-needed + TOPK} misses, "
+                f"exceeding TopK={TOPK}"
             )
-        rows_parts[query_idx].append(permutation[cursor : cursor + needed])
-        cursor += needed
+        rows_parts[query_idx].append(shared_hits)
+        unique_hit_count = needed - shared_hit_count
+        rows_parts[query_idx].append(
+            permutation[cursor : cursor + unique_hit_count]
+        )
+        cursor += unique_hit_count
     if cursor > source_capacity:
         raise AssertionError("miss-overlap fixture exceeds source capacity")
 
@@ -268,6 +285,7 @@ def make_case(
     topk_profile: str,
     exact_miss_count: int | None = None,
     miss_overlap_rate: float | None = None,
+    hit_overlap_rate: float | None = None,
 ) -> MtpCase:
     if source_capacity < UNION_CAPACITY or source_capacity % BLOCK_SIZE:
         raise ValueError("source capacity must be block aligned and >=8192")
@@ -277,6 +295,8 @@ def make_case(
         raise ValueError("miss fractions must match batch size")
     if miss_overlap_rate is not None and topk_profile != "miss_overlap":
         raise ValueError("miss overlap construction requires topk_profile=miss_overlap")
+    if hit_overlap_rate is not None and topk_profile != "miss_overlap":
+        raise ValueError("hit overlap construction requires topk_profile=miss_overlap")
 
     generator = torch.Generator().manual_seed(seed)
     req_pool_entries = torch.randperm(
@@ -294,6 +314,7 @@ def make_case(
             generator=generator,
             unique_miss_count=exact_miss_count,
             miss_overlap_rate=miss_overlap_rate,
+            hit_overlap_rate=hit_overlap_rate,
         )
         topk_rows.extend(rows)
         unions.append(ordered_union(rows))

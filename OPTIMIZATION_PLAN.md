@@ -10,10 +10,16 @@
 - **P1 回退**：回退 request-affinity 的 whole-request 分配，以及跨 query 的
   `source -> HBM` 哈希缓存、MTE3→MTE2 同步和对应的复用专项测试。它们不再进入
   后续基线。
-- **MTE2-A 已实现，待 Ascend 验证**：在现有 32-row UB flush 内，两个 DRAM miss
-  若保持 kernel 当前的行顺序且物理 DRAM stride 为正，则合并为一次 two-block DMA
-  （CKV 和 KPE 各一次）；不满足条件时严格回退两次单行 DMA。该版本减少 MTE2 DMA
-  指令启动次数，不改变 payload、TopK 行顺序或跨 query 调度。
+- **MTE2-A 已回退**：two-block DRAM DMA 只减少指令启动次数，不减少 MTE2 payload；
+  因无稳定端到端收益，已从 kernel 移除。
+- **MTE2-A 验证结论**：默认性能 case 中有 `dram_pair_dma_candidates=3604`，说明
+  two-block DMA 覆盖了约一半的 DRAM miss pair；但 `fused_ms=0.506379`，相对 P0 的
+  `0.507968` 仅约 0.3%，处于跨轮运行波动范围。该优化不作为最终保留项，后续不再
+  投入更多 DRAM DMA 指令合并变体。
+- **性能 fixture 已扩展**：新增 `--perf-hit-overlap-rate`（默认 `0`，保持原基线），
+  可让四个 query 共享一定比例的 hit suffix；性能输出增加总 TopK 位置、unique token、
+  重复 occurrence、reuse ratio 与归一化 overall overlap。后续跨 query UB/workspace
+  重排只能在该整体 TopK 重合率足够高时进入实现。
 
 本轮 case：`B=24`、`heads=8`、`source_len=65536`、`cache_tokens=8192`、
 `tail_tokens=64`、每 request 300 个 unique miss；4 个 query 合计每 request
