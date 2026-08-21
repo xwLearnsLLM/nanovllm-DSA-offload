@@ -586,6 +586,36 @@ template <typename SFAT> __aicore__ inline void NanovllmSparseTailAttentionMla<S
 	uint32_t actBatchS2 = 1;
 	uint32_t coreNum = usedCoreNum;
     uint32_t currCoreIdx = aiCoreIdx;
+    if constexpr (MTP3_MODE) {
+        // Source-aware MTP reuse is local to an AIC/AIV group.  Split whole
+        // requests, rather than the flattened [4B] query rows, so all four
+        // queries of a request run on one group even when B exceeds coreNum.
+        const uint32_t requestCount = constInfo.batchSize;
+        const uint32_t activeCoreNum = requestCount < coreNum
+            ? requestCount : coreNum;
+        usedCoreNum = activeCoreNum;
+        if (currCoreIdx >= activeCoreNum) {
+            return;
+        }
+        const uint32_t requestsPerCore = requestCount / activeCoreNum;
+        const uint32_t remainder = requestCount % activeCoreNum;
+        const uint32_t extraBefore = currCoreIdx < remainder
+            ? currCoreIdx : remainder;
+        const uint32_t requestStart =
+            currCoreIdx * requestsPerCore + extraBefore;
+        const uint32_t requestCountForCore = requestsPerCore +
+            (currCoreIdx < remainder ? 1U : 0U);
+        const uint32_t requestEnd =
+            requestStart + requestCountForCore - 1U;
+        const uint32_t kvHeads = static_cast<uint32_t>(kvHeadNum);
+        constInfo.bN2Start = requestStart * kvHeads;
+        constInfo.bN2End = (requestEnd + 1U) * kvHeads - 1U;
+        constInfo.gS1Start = 0;
+        constInfo.gS1End = SFA_MTP3_QUERY_COUNT - 1U;
+        constInfo.s2End = 0;
+        constInfo.coreStartKVSplitPos = 0;
+        return;
+    }
     uint32_t actBatchS1 = 1;
     for (uint32_t bIdx = 0; bIdx < constInfo.batchSize; bIdx++) {
 		uint32_t actBatchS1 = GetBalanceActualSeqLengths(actualSeqLengthsQGm, bIdx);
